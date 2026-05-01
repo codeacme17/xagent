@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,6 +31,7 @@ from src.xagent.core.tools.core.RAG_tools.management import (
 )
 from src.xagent.core.tools.core.RAG_tools.management import (
     delete_collection,
+    delete_document,
     get_document_stats,
     list_collections,
     list_documents,
@@ -36,6 +39,7 @@ from src.xagent.core.tools.core.RAG_tools.management import (
 )
 from src.xagent.core.tools.core.RAG_tools.management.status import load_ingestion_status
 from src.xagent.core.tools.core.RAG_tools.storage import get_vector_index_store
+from src.xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from src.xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.core.tools.core.RAG_tools.file.register_document import register_document
 
@@ -261,6 +265,128 @@ async def test_list_collections_admin_includes_config_from_other_user(
     assert info.ingestion_config is not None
 
 
+@pytest.mark.asyncio
+async def test_list_collections_includes_empty_metadata_only_collection(
+    temp_lancedb_dir: str,
+) -> None:
+    """Persisted collection metadata should keep empty collections visible."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    await get_metadata_store().save_collection(CollectionInfo(name="empty_collection"))
+
+    result = await list_collections(user_id=None, is_admin=True)
+
+    assert result.status == "success"
+    collection_map = {info.name: info for info in result.collections}
+    assert "empty_collection" in collection_map
+    collection_info = collection_map["empty_collection"]
+    assert collection_info.documents == 0
+    assert collection_info.document_names == []
+
+
+@pytest.mark.asyncio
+async def test_list_collections_non_admin_only_sees_owned_metadata_only_collections(
+    temp_lancedb_dir: str,
+) -> None:
+    """Non-admin listing should not expose other users' metadata-only collections."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name="mine_only"))
+    await store.save_collection(CollectionInfo(name="theirs_only"))
+    await store.save_collection_config("mine_only", "{}", user_id=1)
+    await store.save_collection_config("theirs_only", "{}", user_id=2)
+
+    result = await list_collections(user_id=1, is_admin=False)
+
+    assert result.status == "success"
+    collection_names = {info.name for info in result.collections}
+    assert "mine_only" in collection_names
+    assert "theirs_only" not in collection_names
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_removes_empty_collection_metadata(
+    temp_lancedb_dir: str,
+) -> None:
+    """Deleting a collection should remove metadata-only empty collections too."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name="empty_collection"))
+    await store.save_collection_config("empty_collection", "{}", user_id=1)
+
+    result = delete_collection("empty_collection", user_id=1, is_admin=False)
+
+    assert result.status == "success"
+
+    listed = await list_collections(user_id=None, is_admin=True)
+    collection_names = {info.name for info in listed.collections}
+    assert "empty_collection" not in collection_names
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_preserves_other_users_shared_collection_data(
+    temp_lancedb_dir: str,
+) -> None:
+    """Tenant-scoped deletes should not wipe another user's shared collection rows."""
+
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    collection = "shared_collection"
+    now = datetime.now(timezone.utc)
+    store = get_metadata_store()
+    await store.save_collection(CollectionInfo(name=collection))
+    await store.save_collection_config(collection, "{}", user_id=1)
+    await store.save_collection_config(collection, "{}", user_id=2)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-user-1",
+                "source_path": "/path/user-1.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-user-1",
+                "uploaded_at": now,
+                "title": "User 1",
+                "language": "zh",
+                "user_id": 1,
+            },
+            {
+                "collection": collection,
+                "doc_id": "doc-user-2",
+                "source_path": "/path/user-2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-user-2",
+                "uploaded_at": now,
+                "title": "User 2",
+                "language": "en",
+                "user_id": 2,
+            },
+        ]
+    )
+
+    result = delete_collection(collection, user_id=1, is_admin=False)
+
+    assert result.status == "success"
+
+    user_one_documents = list_documents(
+        collection=collection, user_id=1, is_admin=False
+    )
+    user_two_documents = list_documents(
+        collection=collection, user_id=2, is_admin=False
+    )
+    assert user_one_documents.documents == []
+    assert {doc.doc_id for doc in user_two_documents.documents} == {"doc-user-2"}
+
+    listed_for_admin = await list_collections(user_id=None, is_admin=True)
+    assert collection in {info.name for info in listed_for_admin.collections}
+
+
 def test_get_document_stats_missing_document(temp_lancedb_dir: str) -> None:
     """Missing documents should yield zero counts but succeed."""
 
@@ -379,7 +505,7 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
     cleared_calls: List[tuple[str, str]] = []
 
-    def _fake_clear(collection: str, doc_id: str) -> None:
+    def _fake_clear(collection: str, doc_id: str, **_: object) -> None:
         cleared_calls.append((collection, doc_id))
 
     monkeypatch.setattr(
@@ -392,6 +518,41 @@ def test_delete_collection_invokes_cleanup_all_documents(
 
     assert result.status == "success"
     assert "documents" in result.deleted_counts
+
+
+def test_delete_collection_preserves_partial_vector_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings_from_store = "Failed to delete from 'parses': parse delete failed"
+
+    mock_store = MagicMock()
+    mock_store.list_document_records.side_effect = [
+        [SimpleNamespace(doc_id="doc-1")],
+        [],
+    ]
+
+    def _delete_collection_data(**kwargs):
+        kwargs["warnings_out"].append(warnings_from_store)
+        return {"documents": 1}
+
+    mock_store.delete_collection_data.side_effect = _delete_collection_data
+    monkeypatch.setattr(
+        collections_module, "get_vector_index_store", lambda: mock_store
+    )
+    monkeypatch.setattr(
+        collections_module, "clear_ingestion_status", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        collections_module,
+        "delete_collection_metadata_sync",
+        lambda **kwargs: {},
+    )
+
+    result = delete_collection("demo", user_id=1, is_admin=False)
+
+    assert result.status == "partial_success"
+    assert result.deleted_counts == {"documents": 1}
+    assert result.warnings == [warnings_from_store]
 
 
 def test_e2e_register_and_list_documents_with_legacy_empty_string_file_id(
@@ -575,3 +736,149 @@ async def test_delete_collection_clears_metadata_cache(temp_lancedb_dir: str) ->
     result = await list_collections(user_id=None, is_admin=True)
     remaining = [c.name for c in result.collections]
     assert collection not in remaining
+
+
+def test_delete_document_authorizes_before_cascade() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+    vector_store.iter_batches.return_value = []
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(collections_module, "cleanup_document_cascade") as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-1", user_id=7, is_admin=False)
+
+    assert result.status == "error"
+    assert result.message == "Document not found or not accessible."
+    vector_store.count_rows.assert_called_once_with(
+        table_name="documents",
+        filters={"collection": "demo", "doc_id": "doc-1"},
+        user_id=7,
+        is_admin=False,
+    )
+    mock_cleanup.assert_not_called()
+    mock_clear.assert_not_called()
+
+
+def test_delete_document_allows_legacy_owner_recovered_from_source_path() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+
+    legacy_batch = MagicMock()
+    legacy_batch.num_rows = 1
+    legacy_batch.to_pylist.return_value = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-legacy",
+            "user_id": None,
+            "source_path": "/uploads/user_7/demo/legacy.csv",
+        }
+    ]
+    vector_store.iter_batches.return_value = [legacy_batch]
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(
+            collections_module,
+            "cleanup_document_cascade",
+            return_value={"documents": 1, "main_pointers": 1},
+        ) as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-legacy", user_id=7, is_admin=False)
+
+    assert result.status == "success"
+    mock_cleanup.assert_called_once_with(
+        collection="demo",
+        doc_id="doc-legacy",
+        user_id=7,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+    mock_clear.assert_called_once_with(
+        "demo",
+        "doc-legacy",
+        user_id=None,
+        is_admin=True,
+    )
+    vector_store.iter_batches.assert_called_once_with(
+        table_name="documents",
+        columns=["collection", "doc_id", "user_id", "source_path"],
+        batch_size=1,
+        filters={"collection": "demo", "doc_id": "doc-legacy"},
+        user_id=None,
+        is_admin=True,
+    )
+
+
+def test_delete_document_rejects_legacy_row_owned_by_another_user() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 0
+
+    foreign_batch = MagicMock()
+    foreign_batch.num_rows = 1
+    foreign_batch.to_pylist.return_value = [
+        {
+            "collection": "demo",
+            "doc_id": "doc-foreign",
+            "user_id": None,
+            "source_path": "/uploads/user_99/demo/foreign.csv",
+        }
+    ]
+    vector_store.iter_batches.return_value = [foreign_batch]
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(collections_module, "cleanup_document_cascade") as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-foreign", user_id=7, is_admin=False)
+
+    assert result.status == "error"
+    assert result.message == "Document not found or not accessible."
+    mock_cleanup.assert_not_called()
+    mock_clear.assert_not_called()
+
+
+def test_delete_document_clears_status_with_caller_scope() -> None:
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 1
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(
+            collections_module,
+            "cleanup_document_cascade",
+            return_value={"documents": 1, "main_pointers": 1},
+        ) as mock_cleanup,
+        patch.object(collections_module, "clear_ingestion_status") as mock_clear,
+    ):
+        result = delete_document("demo", "doc-1", user_id=9, is_admin=True)
+
+    assert result.status == "success"
+    assert result.details == {"documents": 1, "main_pointers": 1}
+    mock_cleanup.assert_called_once_with(
+        collection="demo",
+        doc_id="doc-1",
+        user_id=9,
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
+    )
+    mock_clear.assert_called_once_with(
+        "demo",
+        "doc-1",
+        user_id=9,
+        is_admin=True,
+    )

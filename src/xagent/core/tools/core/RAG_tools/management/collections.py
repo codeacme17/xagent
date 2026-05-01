@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import warnings as py_warnings
 from collections import defaultdict
 from datetime import datetime
@@ -47,10 +48,60 @@ from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
 from ..version_management.cascade_cleaner import cleanup_document_cascade
+from .collection_manager import delete_collection_metadata_sync
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = DEFAULT_LANCEDB_SCAN_BATCH_SIZE
+
+
+def _extract_user_id_from_source_path(source_path: Optional[str]) -> Optional[int]:
+    """Recover an owning user ID from legacy upload paths."""
+    if not source_path:
+        return None
+
+    match = re.search(r"/user_(\d+)(?:/|$)", source_path)
+    if match is None:
+        return None
+
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_document_owner_context(
+    collection: str, doc_id: str
+) -> Optional[Dict[str, Any]]:
+    """Load exact document ownership metadata without applying user filters."""
+    vector_store = get_vector_index_store()
+
+    for batch in vector_store.iter_batches(
+        table_name="documents",
+        columns=["collection", "doc_id", "user_id", "source_path"],
+        batch_size=1,
+        filters={"collection": collection, "doc_id": doc_id},
+        user_id=None,
+        is_admin=True,
+    ):
+        if getattr(batch, "num_rows", 0) == 0:
+            continue
+
+        rows = batch.to_pylist()
+        if not rows:
+            continue
+
+        row = rows[0]
+        raw_user_id = row.get("user_id")
+        owner_user_id = int(raw_user_id) if raw_user_id is not None else None
+        source_path = row.get("source_path")
+
+        return {
+            "owner_user_id": owner_user_id,
+            "source_path": str(source_path) if source_path is not None else None,
+        }
+
+    return None
 
 
 def _iter_batches(
@@ -534,7 +585,41 @@ async def list_collections(
     warnings: List[str] = []
 
     try:
+        metadata_store = get_metadata_store()
         vector_store = get_vector_index_store()
+        metadata_collections: List[CollectionInfo] = []
+        metadata_collection_names: Set[str] = set()
+        metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
+        metadata_processed_documents_by_name: Dict[str, int] = {}
+        try:
+            metadata_collections = list(
+                await metadata_store.list_collections(
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            )
+            metadata_collection_names = {
+                collection.name
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_stats_by_name = {
+                collection.name: {
+                    "documents": collection.documents,
+                    "parses": collection.parses,
+                    "chunks": collection.chunks,
+                    "embeddings": collection.embeddings,
+                }
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_processed_documents_by_name = {
+                collection.name: collection.processed_documents
+                for collection in metadata_collections
+                if collection.name
+            }
+        except Exception as exc:
+            logger.warning("Could not load persisted collection metadata: %s", exc)
 
         document_names: Dict[str, Set[str]] = defaultdict(set)
         owners: Dict[str, Set[int]] = defaultdict(set)
@@ -645,17 +730,13 @@ async def list_collections(
                     except (TypeError, ValueError):
                         pass
 
-        collection_keys = sorted(document_names.keys())
+        collection_keys = sorted(document_names.keys() | metadata_collection_names)
 
         # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
         stats: Dict[str, Dict[str, int]] = {}
         if not force_realtime:
             try:
-                from ..storage.factory import get_metadata_store
-
-                metadata_store = get_metadata_store()
-                cached = await metadata_store.list_collections()
-                for info in cached:
+                for info in metadata_collections:
                     if info.name in collection_keys or is_admin:
                         stats[info.name] = {
                             "documents": info.documents,
@@ -682,21 +763,21 @@ async def list_collections(
             )
             for key in collection_keys:
                 if key not in stats:
-                    stats[key] = realtime_stats.get(
-                        key,
-                        {
+                    if key in realtime_stats:
+                        stats[key] = realtime_stats[key]
+                    elif key in metadata_stats_by_name:
+                        stats[key] = metadata_stats_by_name[key]
+                    else:
+                        stats[key] = {
                             "documents": 0,
                             "parses": 0,
                             "chunks": 0,
                             "embeddings": 0,
-                        },
-                    )
+                        }
 
         # Async write stats back to metadata cache for next request
         if used_realtime:
             try:
-                from ..storage.factory import get_metadata_store
-
                 metadata_store = get_metadata_store()
                 for collection in collection_keys:
                     info = CollectionInfo(
@@ -720,6 +801,9 @@ async def list_collections(
                     await metadata_store.save_collection(info)
             except Exception as exc:
                 logger.debug("Failed to cache collection metadata: %s", exc)
+        collection_keys = sorted(
+            stats.keys() | document_names.keys() | metadata_collection_names
+        )
 
         # Load configs for collections (admin sees cross-tenant configs)
         collection_configs: Dict[str, IngestionConfig] = {}
@@ -750,9 +834,11 @@ async def list_collections(
                 parses=stats[collection]["parses"],
                 chunks=stats[collection]["chunks"],
                 embeddings=stats[collection]["embeddings"],
-                processed_documents=stats[collection][
-                    "parses"
-                ],  # Use parses count as processed documents
+                processed_documents=(
+                    stats[collection]["parses"]
+                    if stats[collection]["parses"] > 0
+                    else metadata_processed_documents_by_name.get(collection, 0)
+                ),
                 document_names=sorted(document_names[collection]),
                 document_metadata=sorted(
                     document_metadata[collection],
@@ -1103,6 +1189,7 @@ def delete_collection(
     """
 
     warnings: List[str] = []
+    metadata_cleanup_counts: dict[str, int] = {}
 
     try:
         # Use storage abstraction for deletion
@@ -1119,16 +1206,40 @@ def delete_collection(
         doc_ids = sorted({r.doc_id for r in doc_records})
 
         # Delete all data using storage abstraction
-        deleted_counts = vector_store.delete_collection_data(collection_name=collection)
+        deleted_counts = vector_store.delete_collection_data(
+            collection_name=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            warnings_out=warnings,
+        )
 
         # Clear ingestion status for all documents
         for doc_id in doc_ids:
             try:
-                clear_ingestion_status(collection, doc_id)
+                clear_ingestion_status(
+                    collection,
+                    doc_id,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
             except Exception as exc:  # noqa: BLE001
                 warning = f"Failed to clear ingestion status for '{doc_id}': {exc}"
                 logger.warning(warning)
                 warnings.append(warning)
+
+        remaining_collection_records = vector_store.list_document_records(
+            collection_name=collection,
+            user_id=None,
+            is_admin=True,
+            max_results=1,
+        )
+
+        metadata_cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            delete_orphaned_metadata=not remaining_collection_records,
+        )
 
     except Exception as exc:  # noqa: BLE001 - convert to structured failure
         logger.error(
@@ -1153,7 +1264,8 @@ def delete_collection(
         for doc_id in doc_ids
     ]
 
-    if not doc_ids and not deleted_counts:
+    metadata_cleanup_total = sum(metadata_cleanup_counts.values())
+    if not doc_ids and not deleted_counts and metadata_cleanup_total == 0:
         summary = f"No documents found in collection '{collection}'."
         return CollectionOperationResult(
             status="success",
@@ -1164,16 +1276,20 @@ def delete_collection(
             deleted_counts={},
         )
 
-    if affected and not warnings:
+    if (affected or metadata_cleanup_total > 0) and not warnings:
         status = "success"
-    elif affected:
+    elif affected or metadata_cleanup_total > 0:
         status = "partial_success"
     else:
         status = "error"
 
-    summary = f"Deleted {len(affected)} documents from collection '{collection}'."
+    summary = f"Deleted collection '{collection}'."
     logger.info(
-        f"Deleted collection '{collection}' - {sum(deleted_counts.values())} total rows across {len(deleted_counts)} tables"
+        "Deleted collection '%s' - %s vector rows across %s tables, %s metadata/config rows",
+        collection,
+        sum(deleted_counts.values()),
+        len(deleted_counts),
+        metadata_cleanup_total,
     )
     return CollectionOperationResult(
         status=status,
@@ -1200,6 +1316,66 @@ def delete_document(
     Returns:
         DocumentOperationResult: Operation result with deletion counts.
     """
+    vector_store = get_vector_index_store()
+
+    authorized_via_legacy_source_path = False
+
+    try:
+        document_count = vector_store.count_rows(
+            table_name="documents",
+            filters={"collection": collection, "doc_id": doc_id},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to authorize document deletion %s/%s: %s",
+            collection,
+            doc_id,
+            exc,
+        )
+        return DocumentOperationResult(
+            status="error",
+            collection=collection,
+            doc_id=doc_id,
+            new_status=DocumentProcessingStatus.FAILED,
+            message=f"Failed to delete document: {exc}",
+            warnings=[],
+            details={},
+        )
+
+    if document_count == 0:
+        owner_context = _load_document_owner_context(collection, doc_id)
+        if owner_context is None:
+            return DocumentOperationResult(
+                status="error",
+                collection=collection,
+                doc_id=doc_id,
+                new_status=DocumentProcessingStatus.FAILED,
+                message="Document not found or not accessible.",
+                warnings=[],
+                details={},
+            )
+
+        owner_user_id = owner_context.get("owner_user_id")
+        if owner_user_id is None:
+            owner_user_id = _extract_user_id_from_source_path(
+                owner_context.get("source_path")
+            )
+
+        if not is_admin and owner_user_id != user_id:
+            return DocumentOperationResult(
+                status="error",
+                collection=collection,
+                doc_id=doc_id,
+                new_status=DocumentProcessingStatus.FAILED,
+                message="Document not found or not accessible.",
+                warnings=[],
+                details={},
+            )
+
+        authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
+
     try:
         # Use cascade cleanup to delete all related data
         counts = cleanup_document_cascade(
@@ -1210,7 +1386,12 @@ def delete_document(
             preview_only=False,
             confirm=True,
         )
-        clear_ingestion_status(collection, doc_id)
+        clear_ingestion_status(
+            collection,
+            doc_id,
+            user_id=None if authorized_via_legacy_source_path else user_id,
+            is_admin=is_admin or authorized_via_legacy_source_path,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to delete document %s/%s: %s", collection, doc_id, exc)
         return DocumentOperationResult(

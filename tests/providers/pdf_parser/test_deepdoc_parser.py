@@ -1,9 +1,12 @@
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
+from openpyxl import Workbook
 
 from xagent.providers.pdf_parser.base import ParseResult
-from xagent.providers.pdf_parser.deepdoc import DeepDocParser
+from xagent.providers.pdf_parser.deepdoc import DeepDocParser, _parse_xlsx_rows
 
 
 # A fixture to easily access test resource files
@@ -217,3 +220,63 @@ async def test_deepdoc_excel_details(resource_path: Path):
     assert len(result.text_segments) > 1
     # Check content of a known row/cell if possible (highly dependent on test file content)
     # For now, we just ensure segments are created.
+
+
+@pytest.mark.asyncio
+async def test_deepdoc_xlsx_parses_rows_without_repeating_title(tmp_path: Path):
+    file_path = tmp_path / "structured.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(["Quarterly Enrollment Review"])
+    ws.append(["Track", "Candidate ID", "Name", "Status"])
+    ws.append(["Direct Entry", "A-0001", "Student One", "Passed"])
+    ws.append(["Direct Entry", "A-0002", "Student Two", "Passed"])
+    wb.save(file_path)
+
+    parser = DeepDocParser()
+    result = await parser.parse(str(file_path))
+
+    assert result.text_segments[0].metadata["row_type"] == "title"
+    assert result.text_segments[0].text == "Quarterly Enrollment Review"
+    assert result.text_segments[1].metadata["row_type"] == "header"
+    assert result.text_segments[1].text == "Track | Candidate ID | Name | Status"
+
+    first_data_row = result.text_segments[2]
+    assert first_data_row.metadata["row_type"] == "data"
+    assert "Quarterly Enrollment Review" not in first_data_row.text
+    assert (
+        first_data_row.text
+        == "Track: Direct Entry | Candidate ID: A-0001 | Name: Student One | Status: Passed"
+    )
+
+
+def test_parse_xlsx_rows_closes_workbook() -> None:
+    workbook = Mock()
+    workbook.sheetnames = ["Sheet1"]
+    worksheet = Mock()
+    worksheet.title = "Sheet1"
+    worksheet.iter_rows.return_value = iter(
+        [
+            ("Quarterly Enrollment Review", None),
+            ("Track", "Status"),
+            ("Direct Entry", "Passed"),
+        ]
+    )
+    workbook.worksheets = [worksheet]
+
+    with patch(
+        "xagent.providers.pdf_parser.deepdoc.load_workbook", return_value=workbook
+    ):
+        result = _parse_xlsx_rows("structured.xlsx")
+
+    assert result.text_segments
+    workbook.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_deepdoc_invalid_xlsx_raises_parse_error() -> None:
+    parser = DeepDocParser()
+
+    with pytest.raises(ValueError, match="Failed to parse spreadsheet rows"):
+        await parser.parse(BytesIO(b"not-a-valid-xlsx"), file_ext=".xlsx")

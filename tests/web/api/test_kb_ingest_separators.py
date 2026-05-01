@@ -284,6 +284,11 @@ def test_delete_document_allowed_for_admin_any_doc(app_with_kb_admin, admin_user
                 "source_path": "/tmp/doc.txt",
             }
         ]
+        mock_delete_document.return_value = type(
+            "DeleteResult",
+            (),
+            {"status": "success", "message": "ok"},
+        )()
 
         client = TestClient(app_with_kb_admin)
         resp = client.delete(

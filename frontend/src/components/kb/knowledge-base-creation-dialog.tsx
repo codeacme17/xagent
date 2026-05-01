@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -11,7 +11,8 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select } from "@/components/ui/select"
 import { getApiUrl } from "@/lib/utils"
-import { appendIngestionConfigToFormData } from "@/lib/ingestion-form"
+import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
+import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
@@ -71,9 +72,13 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadProgressDetail, setUploadProgressDetail] = useState<string | null>(null)
   const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
+  const [currentUploadCollection, setCurrentUploadCollection] = useState<string | null>(null)
+  const [completedUploadCount, setCompletedUploadCount] = useState(0)
 
   // Web ingestion state
   const [isWebIngesting, setIsWebIngesting] = useState(false)
@@ -117,12 +122,50 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   // Embedding models state
   const [embeddingModels, setEmbeddingModels] = useState<Model[]>([])
+  const trimmedCollectionName = newCollectionName.trim()
+  const requiresExplicitCollectionName =
+    (activeImportTab === "file" && selectedFiles.length > 1) ||
+    (activeImportTab === "cloud" && totalCloudFiles > 1)
 
   useEffect(() => {
     if (open) {
       fetchEmbeddingModels()
     }
   }, [open])
+
+  useEffect(() => {
+    if (!isUploading || !currentUploadFileName || !currentUploadCollection) return
+
+    let cancelled = false
+
+    const pollProgress = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/progress?task_type=ingestion`)
+        if (!response.ok) return
+        const data = await response.json()
+        const tasks = (data.tasks || []) as KBProgressTask[]
+        const task = findMatchingIngestionTask(tasks, currentUploadCollection, currentUploadFileName)
+        if (!task || cancelled) return
+
+        const detail = getKBTaskProgressDetail(task)
+        const taskPercent = getKBTaskProgressPercent(task)
+        if (detail) setUploadProgressDetail(detail)
+        if (typeof taskPercent === "number") {
+          const overall = ((completedUploadCount + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
+          setUploadProgress(Math.max(0, Math.min(100, overall)))
+        }
+      } catch {
+        // Ignore transient progress polling failures; upload request remains source of truth.
+      }
+    }
+
+    pollProgress()
+    const interval = window.setInterval(pollProgress, 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [isUploading, currentUploadFileName, currentUploadCollection, completedUploadCount, selectedFiles.length])
 
   const fetchEmbeddingModels = async () => {
     try {
@@ -256,9 +299,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       return
     }
 
+    if (selectedFiles.length > 1 && !trimmedCollectionName) {
+      toast.error(t("kb.errors.multiFileNameRequired"))
+      return
+    }
+
     setIsUploading(true)
     setUploadProgress(0)
+    setUploadProgressDetail(null)
     setIngestionResults([])
+    setCompletedUploadCount(0)
 
     const successfulCollections: string[] = []
 
@@ -267,11 +317,17 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         const file = selectedFiles[i]
         const formData = new FormData()
 
-        const collectionName = newCollectionName || file.name.replace(/\.[^/.]+$/, "")
+        const collectionName = trimmedCollectionName || file.name.replace(/\.[^/.]+$/, "")
+        setCurrentUploadFileName(file.name)
+        setCurrentUploadCollection(collectionName)
+        setUploadProgressDetail(null)
 
         formData.append("file", file)
         formData.append("collection", collectionName)
-        appendIngestionConfigToFormData(formData, ingestionConfig)
+        appendIngestionConfigToFormData(
+          formData,
+          normalizeIngestionConfigForFilename(ingestionConfig, file.name)
+        )
 
         const response = await apiRequest(`${getApiUrl()}/api/kb/ingest`, {
           method: "POST",
@@ -295,6 +351,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         }
 
         successfulCollections.push(collectionName)
+        setCompletedUploadCount(i + 1)
         setUploadProgress(((i + 1) / selectedFiles.length) * 100)
       }
 
@@ -309,6 +366,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       }
     } finally {
       setIsUploading(false)
+      setCurrentUploadFileName(null)
+      setCurrentUploadCollection(null)
+      setUploadProgressDetail(null)
     }
   }
 
@@ -325,7 +385,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     try {
       const formData = new FormData()
 
-      const collectionName = newCollectionName || "web_collection"
+      const collectionName = trimmedCollectionName || "web_collection"
 
       formData.append("collection", collectionName)
       formData.append("start_url", webIngestionConfig.start_url)
@@ -398,7 +458,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       )
 
       // Determine collection name
-      let collectionName = newCollectionName
+      if (filesToIngest.length > 1 && !trimmedCollectionName) {
+        toast.error(t("kb.errors.multiFileNameRequired"))
+        return
+      }
+
+      let collectionName = trimmedCollectionName
       if (!collectionName && filesToIngest.length > 0) {
         // Use first file name without extension as default collection name
         collectionName = filesToIngest[0].fileName.replace(/\.[^/.]+$/, "")
@@ -503,6 +568,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                   onChange={(e) => setNewCollectionName(e.target.value)}
                   placeholder={t("kb.dialog.basicInfo.namePlaceholder")}
                 />
+                {requiresExplicitCollectionName && !trimmedCollectionName && (
+                  <p className="mt-2 text-sm text-destructive">
+                    {t("kb.dialog.basicInfo.multiFileRequiredHint")}
+                  </p>
+                )}
               </div>
               <div>
                 <Label htmlFor="collection_description">{t("kb.dialog.basicInfo.descriptionLabel")}</Label>
@@ -603,6 +673,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                         <span>{Math.round(uploadProgress)}%</span>
                       </div>
                       <Progress value={uploadProgress} className="w-full" />
+                      {uploadProgressDetail && (
+                        <p className="text-xs text-muted-foreground">{uploadProgressDetail}</p>
+                      )}
                     </div>
                   )}
 
@@ -1042,9 +1115,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
                 }
               }}
               disabled={
-                (activeImportTab === "file" && selectedFiles.length === 0) ||
+                (activeImportTab === "file" && (selectedFiles.length === 0 || (selectedFiles.length > 1 && !trimmedCollectionName))) ||
                 (activeImportTab === "web" && !webIngestionConfig.start_url) ||
-                (activeImportTab === "cloud" && totalCloudFiles === 0) ||
+                (activeImportTab === "cloud" && (totalCloudFiles === 0 || (totalCloudFiles > 1 && !trimmedCollectionName))) ||
                 isUploading ||
                 isWebIngesting ||
                 isCloudConnecting

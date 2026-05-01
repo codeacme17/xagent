@@ -17,6 +17,7 @@ import pyarrow as pa  # type: ignore
 from ..core.parser_registry import get_supported_parsers, validate_parser_compatibility
 from ..core.schemas import CollectionInfo
 from ..LanceDB.schema_manager import _safe_close_table
+from ..storage.contracts import MetadataStore
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
@@ -163,11 +164,20 @@ class CollectionManager:
     """
 
     def __init__(self) -> None:
-        self._metadata_store = get_metadata_store()
+        pass
+
+    def _get_metadata_store(self) -> MetadataStore:
+        """Return the current metadata store singleton.
+
+        Tests reset the storage factory between isolated LanceDB directories, so
+        collection manager must resolve the store lazily instead of caching the
+        first instance forever.
+        """
+        return get_metadata_store()
 
     async def _get_connection(self) -> Any:
         """Get raw metadata storage connection for legacy helper methods."""
-        return self._metadata_store.get_raw_connection()
+        return self._get_metadata_store().get_raw_connection()
 
     async def get_collection(self, collection_name: str) -> CollectionInfo:
         """Get collection metadata from storage.
@@ -182,7 +192,7 @@ class CollectionManager:
             ValueError: If collection not found
         """
         try:
-            return await self._metadata_store.get_collection(collection_name)
+            return await self._get_metadata_store().get_collection(collection_name)
 
         except Exception as e:
             # Table might not exist yet, or other backend errors
@@ -200,6 +210,24 @@ class CollectionManager:
         async with lock:
             await self._save_collection_with_retry(collection)
 
+    async def delete_collection_metadata(
+        self,
+        collection_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
+    ) -> dict[str, int]:
+        """Delete persisted metadata/config rows for a collection."""
+        lock = _get_collection_lock(collection_name)
+
+        async with lock:
+            return await self._get_metadata_store().delete_collection_metadata(
+                collection_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                delete_orphaned_metadata=delete_orphaned_metadata,
+            )
+
     async def _save_collection_with_retry(
         self, collection: CollectionInfo, max_retries: int = 3
     ) -> None:
@@ -214,7 +242,7 @@ class CollectionManager:
         """
         for attempt in range(max_retries):
             try:
-                await self._metadata_store.save_collection(collection)
+                await self._get_metadata_store().save_collection(collection)
                 return
 
             except Exception as e:
@@ -590,6 +618,21 @@ def mark_collection_accessed_sync(collection_name: str) -> None:
         collection_name: Name of the collection to mark as accessed
     """
     _sync_wrapper(collection_manager.mark_collection_accessed)(collection_name)
+
+
+def delete_collection_metadata_sync(
+    collection_name: str,
+    user_id: Optional[int],
+    is_admin: bool = False,
+    delete_orphaned_metadata: bool = False,
+) -> dict[str, int]:
+    """Synchronous version of delete_collection_metadata."""
+    return _sync_wrapper(collection_manager.delete_collection_metadata)(
+        collection_name,
+        user_id,
+        is_admin,
+        delete_orphaned_metadata,
+    )
 
 
 def resolve_effective_embedding_model_sync(
