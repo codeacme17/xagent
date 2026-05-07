@@ -80,15 +80,15 @@ def temp_uploads_dir(monkeypatch):
 
 
 def create_auth_headers(user):
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     import jwt
 
     payload = {
         "sub": user.username,
         "type": "access",
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow(),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        "iat": datetime.now(timezone.utc),
         "user_id": user.id,
     }
     token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)

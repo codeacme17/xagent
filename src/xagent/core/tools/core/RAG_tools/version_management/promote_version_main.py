@@ -358,7 +358,12 @@ def promote_version_main(
             notes.append("Requires re-embed")
 
         logger.info(
-            f"Promoted version for {collection}/{doc_id}/{resolved_step_type.value} to {technical_id} (operator: {operator})"
+            "Promoted version for %s/%s/%s to %s (operator: %s)",
+            collection,
+            doc_id,
+            resolved_step_type.value,
+            technical_id,
+            operator,
         )
 
         return {

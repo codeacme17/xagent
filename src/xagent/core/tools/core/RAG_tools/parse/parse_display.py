@@ -96,14 +96,14 @@ def reconstruct_parse_result_from_db(
 
         parsed_content = record.get("parsed_content")
         if not parsed_content:
-            logger.warning(f"Empty parsed_content for doc_id={doc_id}")
+            logger.warning("Empty parsed_content for doc_id=%s", doc_id)
             return ([], actual_parse_hash)
 
         # Parse JSON string with error handling for data corruption
         try:
             data = json.loads(parsed_content)
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode parsed_content for doc_id={doc_id}: {e}")
+            logger.error("Failed to decode parsed_content for doc_id=%s: %s", doc_id, e)
             raise DatabaseOperationError(
                 f"Document parse data is corrupted for doc_id={doc_id}"
             )
@@ -125,17 +125,17 @@ def reconstruct_parse_result_from_db(
                 elements.append({"type": "figure", "text": text, "metadata": metadata})
             else:
                 # Unknown layout type, treat as text
-                logger.debug(f"Unknown layout_type '{layout_type}', treating as text")
+                logger.debug("Unknown layout_type '%s', treating as text", layout_type)
                 elements.append({"type": "text", "text": text, "metadata": metadata})
 
-        logger.info(f"Reconstructed parse result: {len(elements)} elements")
+        logger.info("Reconstructed parse result: %s elements", len(elements))
 
         return (elements, actual_parse_hash)
 
     except DocumentNotFoundError:
         raise
     except Exception as e:
-        logger.error(f"Failed to reconstruct parse result: {e}")
+        logger.error("Failed to reconstruct parse result: %s", e)
         raise DatabaseOperationError(f"Failed to read parse result: {e}") from e
 
 
@@ -201,7 +201,7 @@ def paginate_parse_results(
                 )
             else:
                 # Unknown type, fallback to text
-                logger.debug(f"Unknown element type '{elem_type}', treating as text")
+                logger.debug("Unknown element type '%s', treating as text", elem_type)
                 paginated_elements.append(
                     ParsedTextSegmentDisplay(
                         type="text",
@@ -211,7 +211,7 @@ def paginate_parse_results(
                 )
         except Exception as e:
             logger.warning(
-                f"Failed to convert element to Pydantic model: {e}, elem={elem}"
+                "Failed to convert element to Pydantic model: %s, elem=%s", e, elem
             )
             # Fallback to text segment on conversion error
             paginated_elements.append(

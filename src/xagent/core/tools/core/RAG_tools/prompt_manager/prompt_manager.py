@@ -99,14 +99,14 @@ def create_prompt_template(
         )
 
         logger.info(
-            f"Created prompt template '{name}' version {prompt_template.version}"
+            "Created prompt template '%s' version %s", name, prompt_template.version
         )
         return prompt_template
 
     except (ConfigurationError, DatabaseOperationError):
         raise
     except Exception as e:
-        logger.error(f"Failed to create prompt template '{name}': {str(e)}")
+        logger.error("Failed to create prompt template '%s': %s", name, str(e))
         raise DatabaseOperationError(
             f"Failed to create prompt template: {str(e)}"
         ) from e
@@ -197,7 +197,7 @@ def read_prompt_template(
     except (ConfigurationError, DocumentNotFoundError):
         raise
     except Exception as e:
-        logger.error(f"Failed to read prompt template: {str(e)}")
+        logger.error("Failed to read prompt template: %s", str(e))
         raise DatabaseOperationError(f"Failed to read prompt template: {str(e)}") from e
 
 
@@ -303,7 +303,9 @@ def update_prompt_template(
             )
 
             logger.info(
-                f"Created new version {updated_template.version} for prompt template '{current_template.name}'"
+                "Created new version %s for prompt template '%s'",
+                updated_template.version,
+                current_template.name,
             )
             return updated_template
 
@@ -331,14 +333,16 @@ def update_prompt_template(
             )
 
             logger.info(
-                f"Updated metadata for prompt template '{current_template.name}' (version {updated_template.version})"
+                "Updated metadata for prompt template '%s' (version %s)",
+                current_template.name,
+                updated_template.version,
             )
             return updated_template
 
     except (ConfigurationError, DocumentNotFoundError):
         raise
     except Exception as e:
-        logger.error(f"Failed to update prompt template {prompt_id}: {str(e)}")
+        logger.error("Failed to update prompt template %s: %s", prompt_id, str(e))
         raise DatabaseOperationError(
             f"Failed to update prompt template: {str(e)}"
         ) from e
@@ -381,7 +385,7 @@ def delete_prompt_template(
                 raise DocumentNotFoundError(
                     f"Prompt template with ID '{prompt_id}' not found."
                 )
-            logger.info(f"Deleted prompt template with ID '{prompt_id}'")
+            logger.info("Deleted prompt template with ID '%s'", prompt_id)
             return True
         else:
             # Normalize name
@@ -392,15 +396,15 @@ def delete_prompt_template(
             # Delete by name using store method (handles version management automatically)
             store.delete_by_name(name=name, version=version, user_id=None)
             if version is not None:
-                logger.info(f"Deleted prompt template '{name}' version {version}")
+                logger.info("Deleted prompt template '%s' version %s", name, version)
             else:
-                logger.info(f"Deleted all versions of prompt template '{name}'")
+                logger.info("Deleted all versions of prompt template '%s'", name)
             return True
 
     except (ConfigurationError, DocumentNotFoundError):
         raise
     except Exception as e:
-        logger.error(f"Failed to delete prompt template: {str(e)}")
+        logger.error("Failed to delete prompt template: %s", str(e))
         raise DatabaseOperationError(
             f"Failed to delete prompt template: {str(e)}"
         ) from e
@@ -464,13 +468,13 @@ def list_prompt_templates(
                 )
             )
 
-        logger.info(f"Listed {len(templates)} prompt templates (limit: {limit})")
+        logger.info("Listed %s prompt templates (limit: %s)", len(templates), limit)
         return templates
 
     except (ConfigurationError, DatabaseOperationError):
         raise
     except Exception as e:
-        logger.error(f"Failed to list prompt templates: {str(e)}")
+        logger.error("Failed to list prompt templates: %s", str(e))
         raise DatabaseOperationError(
             f"Failed to list prompt templates: {str(e)}"
         ) from e

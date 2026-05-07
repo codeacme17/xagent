@@ -80,3 +80,9 @@ def test_coordinator_uses_factory_stores(monkeypatch) -> None:
 
     assert coordinator.metadata_store() is f.get_metadata_store()
     assert coordinator.vector_index_store() is f.get_vector_index_store()
+
+
+def test_reset_rag_storage_for_tests_is_idempotent(monkeypatch) -> None:
+    """Unified test reset entry should run without error (default LanceDB backend)."""
+    factory.reset_rag_storage_for_tests()
+    factory.reset_rag_storage_for_tests()

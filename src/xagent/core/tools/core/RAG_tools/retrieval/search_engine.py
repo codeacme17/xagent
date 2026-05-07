@@ -137,7 +137,7 @@ def search_dense_engine(
         return search_results, index_status, index_advice
 
     except Exception as e:
-        logger.error(f"Failed to execute dense search: {str(e)}")
+        logger.error("Failed to execute dense search: %s", str(e))
         raise
 
 
@@ -259,5 +259,5 @@ async def search_dense_engine_async(
         return search_results, index_status, index_advice
 
     except Exception as e:
-        logger.error(f"Failed to execute async dense search: {str(e)}")
+        logger.error("Failed to execute async dense search: %s", str(e))
         raise

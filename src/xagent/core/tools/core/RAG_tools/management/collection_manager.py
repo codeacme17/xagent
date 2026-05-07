@@ -26,10 +26,17 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
-# In-memory locks for collection operations to prevent concurrent initialization conflicts
-# Lock key is (loop_id, collection_name) to prevent cross-thread deadlock
+# In-memory locks for collection operations to prevent concurrent initialization conflicts.
+# Lock key is (loop_id, collection_name): avoids cross-thread deadlock and avoids sharing
+# asyncio.Lock instances across different event loops.
 _collection_locks: dict[tuple[int, str], asyncio.Lock] = {}
 _collection_locks_lock = threading.Lock()
+
+
+def reset_locks_for_testing() -> None:
+    """Clear in-memory collection locks for test isolation."""
+    with _collection_locks_lock:
+        _collection_locks.clear()
 
 
 def _run_in_separate_loop(coro: Awaitable[T]) -> T:
@@ -84,7 +91,7 @@ def _run_in_separate_loop(coro: Awaitable[T]) -> T:
             return asyncio.run(coro)  # type: ignore
     except Exception as e:
         # Fallback for unexpected errors in loop detection
-        logger.error(f"Error in async execution wrapper: {e}")
+        logger.error("Error in async execution wrapper: %s", e)
         raise e
 
     # Handle results from thread execution
@@ -125,7 +132,6 @@ def _get_collection_lock(collection_name: str) -> asyncio.Lock:
     Returns:
         asyncio.Lock for the specific (loop_id, collection_name) combination
     """
-    # Get current event loop ID for lock key
     try:
         loop = asyncio.get_running_loop()
         loop_id = id(loop)
@@ -142,18 +148,13 @@ def _get_collection_lock(collection_name: str) -> asyncio.Lock:
     # Second check (with lock) - for safety on cold path
     with _collection_locks_lock:
         if lock_key not in _collection_locks:
+            logger.debug(
+                "[COLLECTION_LOCK] Creating new lock for '%s' (loop %s)",
+                collection_name,
+                loop_id,
+            )
             _collection_locks[lock_key] = asyncio.Lock()
         return _collection_locks[lock_key]
-
-
-def reset_locks_for_testing() -> None:
-    """Clear all collection locks for test isolation.
-
-    This function should only be called in test contexts to ensure
-    clean state between tests.
-    """
-    with _collection_locks_lock:
-        _collection_locks.clear()
 
 
 class CollectionManager:
@@ -196,7 +197,7 @@ class CollectionManager:
 
         except Exception as e:
             # Table might not exist yet, or other backend errors
-            logger.debug(f"Error reading collection {collection_name}: {e}")
+            logger.debug("Error reading collection %s: %s", collection_name, e)
             raise ValueError(f"Collection '{collection_name}' not found")
 
     async def save_collection(self, collection: CollectionInfo) -> None:
@@ -248,14 +249,21 @@ class CollectionManager:
             except Exception as e:
                 if attempt == max_retries - 1:
                     logger.error(
-                        f"Failed to save collection {collection.name} after {max_retries} attempts: {e}"
+                        "Failed to save collection %s after %s attempts: %s",
+                        collection.name,
+                        max_retries,
+                        e,
                     )
                     raise
 
                 # Exponential backoff
                 wait_time = 0.1 * (2**attempt)
                 logger.warning(
-                    f"Save attempt {attempt + 1} failed for {collection.name}, retrying in {wait_time}s: {e}"
+                    "Save attempt %s failed for %s, retrying in %ss: %s",
+                    attempt + 1,
+                    collection.name,
+                    wait_time,
+                    e,
                 )
                 await asyncio.sleep(wait_time)
 
@@ -302,13 +310,13 @@ class CollectionManager:
                 existing_tables = table_names_fn()
                 table_exists = "collection_metadata" in existing_tables
             except Exception as e:
-                logger.debug(f"Table names check failed: {e}")
+                logger.debug("Table names check failed: %s", e)
 
         if not table_exists:
             try:
                 conn.create_table("collection_metadata", schema=schema)
             except Exception as e:
-                logger.debug(f"Table creation failed (may already exist): {e}")
+                logger.debug("Table creation failed (may already exist): %s", e)
                 # Table might already exist, continue
         else:
             # Table exists: ensure it has the "owners" column (schema compat; column is not maintained)
@@ -348,9 +356,16 @@ class CollectionManager:
         Raises:
             ValueError: If collection already initialized with different model
         """
+        logger.debug(
+            "[COLLECTION_INIT] Initializing '%s' with model '%s'",
+            collection_name,
+            embedding_model_id,
+        )
         lock = _get_collection_lock(collection_name)
+        logger.debug("[COLLECTION_INIT] Acquiring lock for '%s'...", collection_name)
 
         async with lock:
+            logger.debug("[COLLECTION_INIT] Lock acquired for '%s'", collection_name)
             # Get current state
             try:
                 collection = await self.get_collection(collection_name)
@@ -384,8 +399,11 @@ class CollectionManager:
             await self._save_collection_with_retry(updated_collection)
 
             logger.info(
-                f"Initialized collection '{collection_name}' with embedding model '{embedding_model_id}'"
+                "Initialized collection '%s' with embedding model '%s'",
+                collection_name,
+                embedding_model_id,
             )
+            logger.debug("[COLLECTION_INIT] Releasing lock for '%s'", collection_name)
             return updated_collection
 
     async def update_collection_stats(
@@ -514,7 +532,7 @@ class CollectionManager:
             await self._save_collection_with_retry(updated)
         except Exception as e:
             logger.debug(
-                f"Failed to update last_accessed_at for {collection_name}: {e}"
+                "Failed to update last_accessed_at for %s: %s", collection_name, e
             )
 
 
@@ -787,7 +805,7 @@ async def rebuild_collection_metadata() -> None:
     result = await collections.list_collections(is_admin=True, force_realtime=True)
 
     if result.status != "success":
-        logger.error(f"Failed to list collections: {result.message}")
+        logger.error("Failed to list collections: %s", result.message)
         return
 
     if not result.collections:
@@ -882,4 +900,4 @@ async def rebuild_collection_metadata() -> None:
             # Use the async save_collection method through sync wrapper
             _sync_wrapper(collection_manager.save_collection)(updated_collection)
         except Exception as e:
-            logger.error(f"Failed to rebuild collection '{collection.name}': {e}")
+            logger.error("Failed to rebuild collection '%s': %s", collection.name, e)

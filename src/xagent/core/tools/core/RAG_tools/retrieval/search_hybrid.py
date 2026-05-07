@@ -206,7 +206,7 @@ def search_hybrid(
     all_warnings: List[SearchWarning] = []
 
     # 1. Execute Dense Search
-    logger.info(f"Executing dense search for model {model_tag}...")
+    logger.info("Executing dense search for model %s...", model_tag)
     dense_response = search_dense(
         collection=collection,
         model_tag=model_tag,
@@ -223,7 +223,7 @@ def search_hybrid(
     all_warnings.extend(dense_response.warnings)
 
     # 2. Execute Sparse Search
-    logger.info(f"Executing sparse search for model {model_tag}...")
+    logger.info("Executing sparse search for model %s...", model_tag)
     sparse_response = search_sparse(
         collection=collection,
         model_tag=model_tag,
@@ -263,7 +263,7 @@ def search_hybrid(
         sparse_score_map[unique_id] = result.score
 
     # 4. Fuse Results
-    logger.info(f"Fusing results using strategy: {fusion_config.strategy.value}")
+    logger.info("Fusing results using strategy: %s", fusion_config.strategy.value)
     fused_results: List[SearchResult] = []
     if fusion_config.strategy == FusionStrategy.RRF:
         fused_results = _rrf_fusion(
@@ -280,7 +280,8 @@ def search_hybrid(
     else:
         # Fallback for unknown strategy, or simply return dense results
         logger.warning(
-            f"Unknown fusion strategy: {fusion_config.strategy}. Defaulting to dense results."
+            "Unknown fusion strategy: %s. Defaulting to dense results.",
+            fusion_config.strategy,
         )
         fused_results = dense_results  # Fallback to dense if strategy is unknown
 

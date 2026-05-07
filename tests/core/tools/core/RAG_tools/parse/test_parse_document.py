@@ -167,7 +167,8 @@ class TestParseDocumentCore:
         assert p1["written"] is True
         assert p2["written"] is True
         assert p1["parse_hash"] == p2["parse_hash"]  # same method/params
-        assert len(p1["paragraphs"]) >= 0 and len(p2["paragraphs"]) >= 0
+        # Both parses should return the same number of paragraphs
+        assert len(p1["paragraphs"]) == len(p2["paragraphs"])
 
     def test_parse_pdf_pypdf(
         self, temp_lancedb_dir: str, test_collection: str, test_doc_id: str
@@ -187,10 +188,11 @@ class TestParseDocumentCore:
             is_admin=True,
         )
         assert out["doc_id"] == test_doc_id
-        assert out["written"] in (True, False)
+        # Successful parse should write data
+        assert out["written"] is True
         assert isinstance(out.get("paragraphs"), list)
-        # For a valid sample pdf we expect at least zero or more paragraphs (be lenient)
-        assert len(out["paragraphs"]) >= 0
+        # Valid sample PDF should contain at least some paragraphs
+        assert len(out["paragraphs"]) > 0
 
     def test_invalid_params_rejected(
         self, temp_lancedb_dir: str, test_collection: str, test_doc_id: str

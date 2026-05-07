@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -49,7 +49,7 @@ def test_load_task_execution_context_messages_summarizes_list_files_results():
                 build_id=None,
                 event_id="tool-event-1",
                 event_type="tool_execution_end",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 step_id="step_1",
                 parent_event_id=None,
                 data={
@@ -106,7 +106,7 @@ async def test_load_task_execution_recovery_state_recovers_skill_context(monkeyp
                 build_id=None,
                 event_id="skill-event-1",
                 event_type="skill_select_end",
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 step_id=None,
                 parent_event_id=None,
                 data={

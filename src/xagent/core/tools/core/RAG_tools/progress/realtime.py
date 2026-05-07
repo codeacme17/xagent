@@ -42,7 +42,7 @@ class ProgressBroadcaster:
                 self._connections[task_id] = set()
             self._connections[task_id].add(connection)
 
-            logger.info(f"WebSocket connected for task {task_id}")
+            logger.info("WebSocket connected for task %s", task_id)
 
     async def disconnect(self, task_id: str, connection: WebSocketConnection) -> None:
         """Disconnect a WebSocket from task updates.
@@ -57,7 +57,7 @@ class ProgressBroadcaster:
                 if not self._connections[task_id]:
                     del self._connections[task_id]
 
-                logger.info(f"WebSocket disconnected from task {task_id}")
+                logger.info("WebSocket disconnected from task %s", task_id)
 
     async def broadcast_progress(self, task_progress: TaskProgress) -> None:
         """Broadcast progress update to all subscribers of the task.
@@ -122,7 +122,7 @@ class ProgressBroadcaster:
         try:
             message = event.model_dump_json()
         except Exception as e:
-            logger.error(f"Failed to serialize progress event: {e}")
+            logger.error("Failed to serialize progress event: %s", e)
             return
 
         # Send to all connections
@@ -134,7 +134,7 @@ class ProgressBroadcaster:
                 else:
                     disconnected.append(connection)
             except Exception as e:
-                logger.warning(f"Failed to send progress update to connection: {e}")
+                logger.warning("Failed to send progress update to connection: %s", e)
                 disconnected.append(connection)
 
         # Clean up disconnected connections
@@ -178,7 +178,7 @@ class ProgressBroadcaster:
                         pass
 
                 del self._connections[task_id]
-                logger.info(f"Cleaned up connections for completed task {task_id}")
+                logger.info("Cleaned up connections for completed task %s", task_id)
 
     async def _reset(self) -> None:
         """Reset the broadcaster state (FOR TESTING ONLY)."""

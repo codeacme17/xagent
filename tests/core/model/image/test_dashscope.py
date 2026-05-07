@@ -130,15 +130,18 @@ class TestDashScopeImageModel:
     @pytest.mark.asyncio
     async def test_generate_image_no_api_key(self):
         """Test image generation without API key."""
-        model = DashScopeImageModel(
-            model_name="qwen-image",
-            api_key=None,
-        )
+        # Clear environment variable to ensure no API key is available
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}, clear=False):
+            model = DashScopeImageModel(
+                model_name="qwen-image",
+                api_key=None,
+            )
 
-        with pytest.raises(
-            RuntimeError, match="DASHSCOPE_API_KEY is required|Image generation failed"
-        ):
-            await model.generate_image("A beautiful landscape")
+            with pytest.raises(
+                RuntimeError,
+                match="DASHSCOPE_API_KEY is required|Image generation failed",
+            ):
+                await model.generate_image("A beautiful landscape")
 
     def test_generate_image_success(self, model):
         """Test successful image generation - just test the payload structure."""

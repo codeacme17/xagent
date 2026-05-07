@@ -94,10 +94,10 @@ class ProgressManager:
                     DocumentProcessingStatus.FAILED,
                     DocumentProcessingStatus.CANCELLED,
                 ):
-                    logger.info(f"Task {task_id} exists in terminal state, resetting")
+                    logger.info("Task %s exists in terminal state, resetting", task_id)
                     self._active_tasks.pop(task_id, None)
                 else:
-                    logger.warning(f"Task {task_id} already exists, reusing")
+                    logger.warning("Task %s already exists, reusing", task_id)
                     return task_id
 
             task_progress = TaskProgress(
@@ -115,7 +115,10 @@ class ProgressManager:
             self.persistence.save_task_progress(task_progress)
 
             logger.info(
-                f"Created progress task: {task_id} ({task_type}) for user {user_id}"
+                "Created progress task: %s (%s) for user %s",
+                task_id,
+                task_type,
+                user_id,
             )
             return task_id
 
@@ -138,7 +141,7 @@ class ProgressManager:
 
             for task_id in tasks_to_remove:
                 self._active_tasks.pop(task_id, None)
-                logger.debug(f"Cleaned up stale task: {task_id}")
+                logger.debug("Cleaned up stale task: %s", task_id)
 
     def get_task_progress(self, task_id: str) -> Optional[TaskProgress]:
         """Get current progress for a task."""
@@ -158,7 +161,7 @@ class ProgressManager:
         with self._lock:
             task = self._active_tasks.get(task_id)
             if not task:
-                logger.warning(f"Task {task_id} not found for update")
+                logger.warning("Task %s not found for update", task_id)
                 return
 
             # Update fields
@@ -209,7 +212,7 @@ class ProgressManager:
                             )
             except Exception as e:
                 # For updates, we log as error but don't crash the pipeline
-                logger.error(f"Failed to persist/broadcast task update: {e}")
+                logger.error("Failed to persist/broadcast task update: %s", e)
 
     def complete_task(self, task_id: str, success: bool = True) -> None:
         """Mark a task as completed."""
@@ -248,7 +251,7 @@ class ProgressManager:
             yield tracker
             self.complete_task(task_id, success=True)
         except Exception as e:
-            logger.exception(f"Task {task_id} failed: {e}")
+            logger.exception("Task %s failed: %s", task_id, e)
             self.update_task_progress(
                 task_id,
                 status=DocumentProcessingStatus.FAILED,

@@ -299,12 +299,12 @@ class TestTemplatesAPI:
             assert response.json()["views"] == 2
 
     def test_unauthorized_access(self, mock_app_state):
-        """测试未授权访问"""
+        """Test unauthorized access returns 403"""
         with patch.object(client.app, "state", mock_app_state):
             response = client.get("/api/templates/")
 
-            # 未授权访问返回 403 Forbidden 或 401 Unauthorized
-            assert response.status_code in [401, 403]
+            # Unauthorized access returns 403 Forbidden
+            assert response.status_code == 403
 
     def test_template_data_structure(self, mock_app_state, admin_headers):
         """测试模板数据结构完整性"""

@@ -36,6 +36,55 @@ def mock_schema_manager_user_id_migration() -> None:
 
 
 @patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.LanceDBMetadataStore.ensure_collection_metadata_table",
+    new_callable=AsyncMock,
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_collection_config_table"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_metadata_store_rename_collection_updates_tables(
+    mock_get_connection: Mock,
+    _mock_ensure_config: Mock,
+    _mock_ensure_meta: AsyncMock,
+) -> None:
+    """rename_collection should update collection_config and collection_metadata."""
+    from types import SimpleNamespace
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    mock_config = Mock()
+    mock_config.schema = [SimpleNamespace(name="collection")]
+    mock_meta = Mock()
+    mock_meta.schema = [SimpleNamespace(name="name")]
+
+    def _open(name: str) -> Mock:
+        if name == "collection_config":
+            return mock_config
+        if name == "collection_metadata":
+            return mock_meta
+        raise AssertionError(name)
+
+    mock_conn.open_table.side_effect = _open
+
+    store = LanceDBMetadataStore()
+    asyncio.run(store.rename_collection("old_col", "new_col"))
+
+    mock_config.update.assert_called_once()
+    cfg_where, cfg_updates = mock_config.update.call_args[0]
+    assert "old_col" in cfg_where
+    assert cfg_updates["collection"] == "new_col"
+
+    mock_meta.update.assert_called_once()
+    meta_where, meta_updates = mock_meta.update.call_args[0]
+    assert "old_col" in meta_where
+    assert meta_updates["name"] == "new_col"
+
+
+@patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
 def test_metadata_store_save_collection_config(mock_get_connection: Mock) -> None:

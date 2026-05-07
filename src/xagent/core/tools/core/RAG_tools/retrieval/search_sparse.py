@@ -195,7 +195,7 @@ def search_sparse(
 
     except Exception as e:
         logger.error(
-            f"Sparse search failed for {model_tag} with query '{query_text}': {e}"
+            "Sparse search failed for %s with query '%s': %s", model_tag, query_text, e
         )
         error_warnings = current_warnings + [
             SearchWarning(
@@ -501,7 +501,10 @@ async def search_sparse_async(
 
     except Exception as e:
         logger.error(
-            f"Async sparse search failed for {model_tag} with query '{query_text}': {e}"
+            "Async sparse search failed for %s with query '%s': %s",
+            model_tag,
+            query_text,
+            e,
         )
         error_warnings = current_warnings + [
             SearchWarning(

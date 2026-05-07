@@ -97,7 +97,7 @@ async def _parse_document_internal(
         timing_data["start"] = time.perf_counter()
         logger.debug("\n" + "=" * 60)
         logger.debug(
-            f"[PARSE TIMING] Starting document parsing: doc_id={request.doc_id}"
+            "[PARSE TIMING] Starting document parsing: doc_id=%s", request.doc_id
         )
         logger.debug("=" * 60)
 
@@ -108,7 +108,7 @@ async def _parse_document_internal(
     user_id = request.user_id
     is_admin = request.is_admin
 
-    logger.info(f"Starting document parsing: doc_id={doc_id}, method={parse_method}")
+    logger.info("Starting document parsing: doc_id=%s, method=%s", doc_id, parse_method)
 
     document = _get_document_from_db(collection, doc_id, user_id, is_admin)
     if not document:
@@ -116,19 +116,21 @@ async def _parse_document_internal(
 
     source_path = document["source_path"]
     file_type = document["file_type"]
-    logger.info(f"Found document: {source_path}")
+    logger.info("Found document: %s", source_path)
 
     _validate_parse_params(parse_method, params)
 
     parse_hash = compute_parse_hash(str(parse_method), params)
-    logger.info(f"Computed parse hash: {parse_hash}")
+    logger.info("Computed parse hash: %s", parse_hash)
 
     if _parse_exists(collection, doc_id, parse_hash, user_id, is_admin):
         existing_paragraphs = _get_existing_parse_content(
             collection, doc_id, parse_hash, user_id, is_admin
         )
         logger.info(
-            f"Parse record already exists for doc_id={doc_id}, parse_hash={parse_hash}"
+            "Parse record already exists for doc_id=%s, parse_hash=%s",
+            doc_id,
+            parse_hash,
         )
         return ParseDocumentResponse(
             doc_id=doc_id,
@@ -168,7 +170,7 @@ async def _parse_document_internal(
             timing_data["ocr_end"] = time.perf_counter()
             ocr_time = timing_data["ocr_end"] - timing_data["ocr_start"]
             logger.debug(
-                f"[PARSE TIMING] OCR processing completed: {ocr_time:.3f} seconds"
+                "[PARSE TIMING] OCR processing completed: %.3f seconds", ocr_time
             )
 
         # 2. Convert the rich ParseResult back to the RAG pipeline's ParsedParagraph list
@@ -186,11 +188,13 @@ async def _parse_document_internal(
             timing_data["convert_end"] = time.perf_counter()
             convert_time = timing_data["convert_end"] - timing_data["convert_start"]
             logger.debug(
-                f"[PARSE TIMING] Conversion completed: {convert_time:.3f} seconds (paragraphs={len(paragraphs)})"
+                "[PARSE TIMING] Conversion completed: %.3f seconds (paragraphs=%s)",
+                convert_time,
+                len(paragraphs),
             )
 
     except Exception as e:
-        logger.error(f"Document parsing failed: {e}")
+        logger.error("Document parsing failed: %s", e)
         raise DocumentValidationError(f"Parsing failed: {e}") from e
 
     # --- End of Refactored Logic ---
@@ -219,7 +223,9 @@ async def _parse_document_internal(
         timing_data["enrich_end"] = time.perf_counter()
         enrich_time = timing_data["enrich_end"] - timing_data["enrich_start"]
         logger.debug(
-            f"[PARSE TIMING] Metadata enrichment completed: {enrich_time:.3f} seconds (paragraphs={len(enriched_paragraphs)})"
+            "[PARSE TIMING] Metadata enrichment completed: %.3f seconds (paragraphs=%s)",
+            enrich_time,
+            len(enriched_paragraphs),
         )
 
     if enable_timing:
@@ -245,11 +251,13 @@ async def _parse_document_internal(
         timing_data["db_write_end"] = time.perf_counter()
         db_write_time = timing_data["db_write_end"] - timing_data["db_write_start"]
         logger.debug(
-            f"[PARSE TIMING] Database write completed: {db_write_time:.3f} seconds"
+            "[PARSE TIMING] Database write completed: %.3f seconds", db_write_time
         )
 
     logger.info(
-        f"Document parsing completed: doc_id={doc_id}, paragraphs={len(enriched_paragraphs)}"
+        "Document parsing completed: doc_id=%s, paragraphs=%s",
+        doc_id,
+        len(enriched_paragraphs),
     )
 
     if enable_timing:
@@ -280,18 +288,26 @@ async def _parse_document_internal(
         logger.debug("\n" + "=" * 60)
         logger.debug("[PARSE TIMING] Document parsing time breakdown")
         logger.debug("=" * 60)
-        logger.debug(f"  Total time: {total_time:.3f} seconds")
+        logger.debug("  Total time: %.3f seconds", total_time)
         logger.debug(
-            f"  - OCR processing: {ocr_time:.3f} seconds ({ocr_time / total_time * 100:.1f}%)"
+            "  - OCR processing: %.3f seconds (%.1f%%)",
+            ocr_time,
+            ocr_time / total_time * 100,
         )
         logger.debug(
-            f"  - Data conversion: {convert_time:.3f} seconds ({convert_time / total_time * 100:.1f}%)"
+            "  - Data conversion: %.3f seconds (%.1f%%)",
+            convert_time,
+            convert_time / total_time * 100,
         )
         logger.debug(
-            f"  - Metadata enrichment: {enrich_time:.3f} seconds ({enrich_time / total_time * 100:.1f}%)"
+            "  - Metadata enrichment: %.3f seconds (%.1f%%)",
+            enrich_time,
+            enrich_time / total_time * 100,
         )
         logger.debug(
-            f"  - Database write: {db_write_time:.3f} seconds ({db_write_time / total_time * 100:.1f}%)"
+            "  - Database write: %.3f seconds (%.1f%%)",
+            db_write_time,
+            db_write_time / total_time * 100,
         )
         logger.debug("=" * 60 + "\n")
 
@@ -495,7 +511,7 @@ def _get_existing_parse_content(
         return []
 
     except Exception as e:
-        logger.error(f"Failed to read parse content: {e}")
+        logger.error("Failed to read parse content: %s", e)
         raise DatabaseOperationError(f"Failed reading parse content: {e}") from e
 
 
@@ -521,7 +537,8 @@ def _write_parse_to_db(
         if enable_timing:
             serialize_start = time.perf_counter()
             logger.debug(
-                f"[PARSE TIMING]    - Starting serialization of paragraphs ({len(paragraphs)} items)..."
+                "[PARSE TIMING]    - Starting serialization of paragraphs (%s items)...",
+                len(paragraphs),
             )
 
         paragraphs_data = [para.model_dump() for para in paragraphs]
@@ -530,7 +547,8 @@ def _write_parse_to_db(
             serialize_end = time.perf_counter()
             serialize_time = serialize_end - serialize_start
             logger.debug(
-                f"[PARSE TIMING]    - Serialization completed: {serialize_time:.3f} seconds"
+                "[PARSE TIMING]    - Serialization completed: %.3f seconds",
+                serialize_time,
             )
             json_start = time.perf_counter()
             logger.debug("[PARSE TIMING]    - Starting JSON serialization...")
@@ -542,7 +560,9 @@ def _write_parse_to_db(
             json_time = json_end - json_start
             json_size_mb = len(parsed_content.encode("utf-8")) / (1024 * 1024)
             logger.debug(
-                f"[PARSE TIMING]    - JSON serialization completed: {json_time:.3f} seconds (size: {json_size_mb:.2f} MB)"
+                "[PARSE TIMING]    - JSON serialization completed: %.3f seconds (size: %.2f MB)",
+                json_time,
+                json_size_mb,
             )
             db_op_start = time.perf_counter()
             logger.debug(
@@ -567,11 +587,14 @@ def _write_parse_to_db(
             db_op_end = time.perf_counter()
             db_op_time = db_op_end - db_op_start
             logger.debug(
-                f"[PARSE TIMING]    - Database operation completed: {db_op_time:.3f} seconds"
+                "[PARSE TIMING]    - Database operation completed: %.3f seconds",
+                db_op_time,
             )
 
         logger.info(
-            f"Parse record written to database: doc_id={doc_id}, parse_hash={parse_hash}"
+            "Parse record written to database: doc_id=%s, parse_hash=%s",
+            doc_id,
+            parse_hash,
         )
         return True
     except Exception as e:

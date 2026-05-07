@@ -65,7 +65,7 @@ class ProgressPersistence:
 
         except Exception as e:
             logger.error(
-                f"Failed to save task progress for {task_progress.task_id}: {e}"
+                "Failed to save task progress for %s: %s", task_progress.task_id, e
             )
             raise ProgressPersistenceError(
                 f"Failed to save task progress: {e}",
@@ -93,7 +93,7 @@ class ProgressPersistence:
             return TaskProgress(**data)
 
         except Exception as e:
-            logger.error(f"Failed to load task progress for {task_id}: {e}")
+            logger.error("Failed to load task progress for %s: %s", task_id, e)
             return None
 
     def delete_task_progress(self, task_id: str) -> bool:
@@ -112,7 +112,7 @@ class ProgressPersistence:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Failed to delete task progress for {task_id}: {e}")
+            logger.error("Failed to delete task progress for %s: %s", task_id, e)
             return False
 
     def list_active_tasks(
@@ -162,11 +162,11 @@ class ProgressPersistence:
                     active_tasks.append(task)
 
                 except Exception as e:
-                    logger.warning(f"Failed to load task from {file_path}: {e}")
+                    logger.warning("Failed to load task from %s: %s", file_path, e)
                     continue
 
         except Exception as e:
-            logger.error(f"Failed to list active tasks: {e}")
+            logger.error("Failed to list active tasks: %s", e)
 
         return active_tasks
 
@@ -200,10 +200,10 @@ class ProgressPersistence:
 
                     all_tasks.append(task)
                 except Exception as e:
-                    logger.warning(f"Failed to load task from {file_path}: {e}")
+                    logger.warning("Failed to load task from %s: %s", file_path, e)
                     continue
         except Exception as e:
-            logger.error(f"Failed to list all tasks: {e}")
+            logger.error("Failed to list all tasks: %s", e)
 
         return all_tasks
 
@@ -243,13 +243,13 @@ class ProgressPersistence:
                         cleaned_count += 1
 
                 except Exception as e:
-                    logger.warning(f"Failed to process task file {file_path}: {e}")
+                    logger.warning("Failed to process task file %s: %s", file_path, e)
                     continue
 
         except Exception as e:
-            logger.error(f"Failed during cleanup: {e}")
+            logger.error("Failed during cleanup: %s", e)
 
-        logger.info(f"Cleaned up {cleaned_count} old task progress files")
+        logger.info("Cleaned up %s old task progress files", cleaned_count)
         return cleaned_count
 
     def _get_task_file_path(self, task_id: str) -> Path:

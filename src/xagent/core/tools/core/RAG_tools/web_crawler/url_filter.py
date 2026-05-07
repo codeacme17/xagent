@@ -54,7 +54,7 @@ class URLFilter:
                 self.robots_parser.set_url(self.robots_url)
                 self._fetch_robots_txt()
             except Exception as e:
-                logger.warning(f"Failed to fetch robots.txt: {e}")
+                logger.warning("Failed to fetch robots.txt: %s", e)
                 self.robots_parser = None
 
     def _fetch_robots_txt(self) -> None:
@@ -68,9 +68,9 @@ class URLFilter:
             response = httpx.get(self.robots_url, timeout=10)
             if response.status_code == 200:
                 self.robots_parser.parse(response.text.splitlines())
-                logger.info(f"Loaded robots.txt from {self.robots_url}")
+                logger.info("Loaded robots.txt from %s", self.robots_url)
         except Exception as e:
-            logger.warning(f"Failed to fetch robots.txt: {e}")
+            logger.warning("Failed to fetch robots.txt: %s", e)
 
     def is_allowed(self, url: str, user_agent: str = "*") -> bool:
         """Check if URL is allowed by robots.txt.
@@ -88,7 +88,7 @@ class URLFilter:
         try:
             return self.robots_parser.can_fetch(user_agent, url)
         except Exception as e:
-            logger.warning(f"Error checking robots.txt for {url}: {e}")
+            logger.warning("Error checking robots.txt for %s: %s", url, e)
             return True
 
     def is_same_domain(self, url: str) -> bool:
@@ -104,7 +104,7 @@ class URLFilter:
             parsed = urlparse(url)
             return parsed.netloc == self.base_domain
         except Exception as e:
-            logger.debug(f"Error checking domain for {url}: {e}")
+            logger.debug("Error checking domain for %s: %s", url, e)
             return False
 
     def matches_patterns(self, url: str) -> bool:
@@ -151,22 +151,22 @@ class URLFilter:
 
         # Check domain
         if self.same_domain_only and not self.is_same_domain(normalized):
-            logger.debug(f"Skipping {normalized}: different domain")
+            logger.debug("Skipping %s: different domain", normalized)
             return False
 
         # Check robots.txt
         if self.respect_robots_txt and not self.is_allowed(normalized, user_agent):
-            logger.debug(f"Skipping {normalized}: disallowed by robots.txt")
+            logger.debug("Skipping %s: disallowed by robots.txt", normalized)
             return False
 
         # Check exclusion patterns
         if self.is_excluded(normalized):
-            logger.debug(f"Skipping {normalized}: matches exclusion pattern")
+            logger.debug("Skipping %s: matches exclusion pattern", normalized)
             return False
 
         # Check inclusion patterns
         if not self.matches_patterns(normalized):
-            logger.debug(f"Skipping {normalized}: does not match inclusion pattern")
+            logger.debug("Skipping %s: does not match inclusion pattern", normalized)
             return False
 
         return True
@@ -212,5 +212,5 @@ class URLFilter:
             return normalized
 
         except Exception as e:
-            logger.warning(f"Failed to normalize URL {url}: {e}")
+            logger.warning("Failed to normalize URL %s: %s", url, e)
             return None

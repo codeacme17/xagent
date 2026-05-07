@@ -9,6 +9,7 @@ are provided for existing code.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Optional
 
@@ -32,6 +33,8 @@ from .vector_backend import (
     get_configured_vector_backend,
     require_implemented_vector_backend,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StorageFactory:
@@ -235,6 +238,43 @@ def reset_kb_write_coordinator() -> None:
     Deprecated: Use StorageFactory.get_factory().reset_all() instead.
     """
     _get_default_factory().reset_all()
+
+
+def reset_rag_storage_for_tests() -> None:
+    """Reset all process-global KB/RAG storage state for tests.
+
+    This is the **single entry point** pytest fixtures should use instead of
+    importing vector-database modules (e.g. LanceDB) directly. It:
+
+    1. Clears backend-specific connection caches and related resources for the
+       configured :class:`~.vector_backend.VectorBackend`.
+    2. Resets :class:`StorageFactory` singletons via :func:`reset_kb_write_coordinator`.
+
+    When adding Milvus, Qdrant, etc., extend the backend branch below so test
+    isolation stays correct without changing every ``conftest.py``.
+
+    Raises:
+        ConfigurationError: If ``XAGENT_VECTOR_BACKEND`` is set to an unknown value
+            (same as :func:`~.vector_backend.get_configured_vector_backend`).
+    """
+    backend = get_configured_vector_backend()
+    if backend is VectorBackend.LANCEDB:
+        from xagent.providers.vector_store.lancedb import clear_connection_cache
+
+        clear_connection_cache()
+    elif backend is VectorBackend.MILVUS:
+        # Future: clear Milvus client pools / connection cache when implemented.
+        pass
+    elif backend is VectorBackend.QDRANT:
+        # Future: clear Qdrant client singleton when implemented.
+        pass
+    reset_kb_write_coordinator()
+
+    # Clear global collection locks to prevent test-to-test lock contamination
+    from xagent.core.tools.core.RAG_tools.management import collection_manager
+
+    collection_manager.reset_locks_for_testing()
+    logger.debug("[TEST_RESET] Global collection locks reset via public helper")
 
 
 def get_kb_write_coordinator() -> KBWriteCoordinator:

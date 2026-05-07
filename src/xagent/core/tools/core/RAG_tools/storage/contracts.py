@@ -329,6 +329,19 @@ class MetadataStore(ABC):
         """Delete persisted metadata/config rows for a collection."""
 
     @abstractmethod
+    async def rename_collection(self, old_name: str, new_name: str) -> None:
+        """Rename persisted control-plane keys after a data-plane collection rename.
+
+        Updates rows that gate :meth:`list_collections` visibility (for example
+        per-tenant config rows and aggregate metadata) so they stay aligned with
+        vector tables when the ``collection`` / ``name`` fields change.
+
+        Args:
+            old_name: Previous collection name (sanitized by the caller).
+            new_name: Target collection name (sanitized by the caller).
+        """
+
+    @abstractmethod
     async def ensure_collection_metadata_table(self) -> None:
         """Ensure control-plane metadata table exists."""
 

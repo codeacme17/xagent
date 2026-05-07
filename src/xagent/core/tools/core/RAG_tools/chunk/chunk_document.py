@@ -132,7 +132,7 @@ def chunk_document(
     }
 
     logger.info(
-        f"Starting document chunking: doc_id={doc_id}, strategy={chunk_strategy}"
+        "Starting document chunking: doc_id=%s, strategy=%s", doc_id, chunk_strategy
     )
 
     # Validate chunk parameters
@@ -144,7 +144,7 @@ def chunk_document(
     except Exception as e:
         raise DocumentValidationError(f"Failed to compute config_hash: {e}") from e
 
-    logger.info(f"Computed chunk config hash: {config_hash}")
+    logger.info("Computed chunk config hash: %s", config_hash)
 
     # OPTIMIZATION: Check and get existing chunks in a single query
     # Instead of calling _chunks_exist() then _get_existing_chunks() (2 queries),
@@ -155,7 +155,10 @@ def chunk_document(
 
     if existing_chunks:
         logger.info(
-            f"Chunk record already exists for doc_id={doc_id}, parse_hash={parse_hash}, config_hash={config_hash}"
+            "Chunk record already exists for doc_id=%s, parse_hash=%s, config_hash=%s",
+            doc_id,
+            parse_hash,
+            config_hash,
         )
         return {
             "doc_id": doc_id,
@@ -182,7 +185,7 @@ def chunk_document(
         try:
             chunks = _apply_chunking_strategy(paragraphs, chunk_strategy, params)
         except Exception as e:
-            logger.error(f"Document chunking failed: {e}")
+            logger.error("Document chunking failed: %s", e)
             raise DocumentValidationError(f"Chunking failed: {e}") from e
 
     # P2: Attach surrounding context to table/image chunks
@@ -226,11 +229,11 @@ def chunk_document(
             is_admin,
         )
     except Exception as e:
-        logger.error(f"Failed to write chunks to database: {e}")
+        logger.error("Failed to write chunks to database: %s", e)
         raise DatabaseOperationError(f"Database write failed: {e}") from e
 
     logger.info(
-        f"Document chunking completed: doc_id={doc_id}, chunks={len(indexed_chunks)}"
+        "Document chunking completed: doc_id=%s, chunks=%s", doc_id, len(indexed_chunks)
     )
     return {
         "doc_id": doc_id,
@@ -286,7 +289,7 @@ def _chunks_exist(
         }
         return vector_store.count_rows_or_zero("chunks", filters=query_filters) > 0
     except Exception as e:
-        logger.error(f"Failed to check chunk existence: {e}")
+        logger.error("Failed to check chunk existence: %s", e)
         raise DatabaseOperationError(f"Database query failed: {e}") from e
 
 
@@ -383,7 +386,7 @@ def _get_existing_chunks(
             )
         return chunks
     except Exception as e:
-        logger.error(f"Failed to get existing chunks: {e}")
+        logger.error("Failed to get existing chunks: %s", e)
         raise DatabaseOperationError(f"Database query failed: {e}") from e
 
 
@@ -441,7 +444,7 @@ def _load_paragraphs(
             for item in data
         ]
     except Exception as e:
-        logger.error(f"Failed to read parses: {e}")
+        logger.error("Failed to read parses: %s", e)
         raise DatabaseOperationError(f"Failed reading parses: {e}") from e
 
 
@@ -505,12 +508,15 @@ def _write_chunks_to_db(
         vector_store.upsert_chunks(rows)
 
         logger.info(
-            f"Chunk records written to database: doc_id={doc_id}, parse_hash={parse_hash}, config_hash={config_hash}"
+            "Chunk records written to database: doc_id=%s, parse_hash=%s, config_hash=%s",
+            doc_id,
+            parse_hash,
+            config_hash,
         )
         return True
 
     except Exception as e:
-        logger.error(f"Failed to write chunk records: {e}")
+        logger.error("Failed to write chunk records: %s", e)
         raise DatabaseOperationError(f"Database write failed: {e}") from e
 
 

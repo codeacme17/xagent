@@ -62,8 +62,9 @@ def validate_and_convert_user_id(user_id: Any) -> Optional[int]:
             if match:
                 extracted_id = int(match.group())
                 logger.warning(
-                    f"Extracted user_id from string '{original_user_id}' -> {extracted_id}. "
-                    "Please use integer user_id directly."
+                    "Extracted user_id from string '%s' -> %s. Please use integer user_id directly.",
+                    original_user_id,
+                    extracted_id,
                 )
                 return extracted_id
             else:

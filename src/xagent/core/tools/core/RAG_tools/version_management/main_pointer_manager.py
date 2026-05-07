@@ -90,7 +90,12 @@ def set_main_pointer(
             user_id=None,
         )
         logger.info(
-            f"Set main pointer for {collection}/{doc_id}/{step_type} to {technical_id} (semantic: {semantic_id})"
+            "Set main pointer for %s/%s/%s to %s (semantic: %s)",
+            collection,
+            doc_id,
+            step_type,
+            technical_id,
+            semantic_id,
         )
 
     except Exception as e:
@@ -156,7 +161,9 @@ def delete_main_pointer(
             user_id=None,
         )
         if result:
-            logger.info(f"Deleted main pointer for {collection}/{doc_id}/{step_type}")
+            logger.info(
+                "Deleted main pointer for %s/%s/%s", collection, doc_id, step_type
+            )
         return result
 
     except Exception as e:

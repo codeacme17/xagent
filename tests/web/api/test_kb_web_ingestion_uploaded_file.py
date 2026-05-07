@@ -1,11 +1,18 @@
-"""Tests for _handle_web_file function in kb.py.
+"""Tests for web-ingestion uploaded-file persistence helpers.
 
-This module tests the file handler callback used in web ingestion, which handles:
-- URL-based deduplication (in-memory cache + database)
-- File persistence (copying temp files to permanent storage)
+This module focuses on storage-level behavior around
+``xagent.web.api.kb._upsert_uploaded_file_record`` and related URL-hash
+dedup semantics used by web ingestion:
 - UploadedFile record creation/update
-- Cross-collection isolation
-- Error handling and cleanup
+- URL-hash based dedup behavior
+- Cross-collection isolation at persistence level
+- Failure cleanup expectations
+
+Additionally, this module contains API-level tests that exercise the
+web-ingestion route's internal file handler (the nested ``_handle_web_file``)
+via a stubbed ``run_web_ingestion`` implementation. This ensures the
+end-to-end handler behavior stays covered even though ``_handle_web_file``
+is not importable directly (nested function).
 """
 
 import tempfile
@@ -14,11 +21,13 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.web.api.kb import _upsert_uploaded_file_record
-from xagent.web.models.database import Base
+from xagent.web.api.kb import _upsert_uploaded_file_record, kb_router
+from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
@@ -60,8 +69,57 @@ def mock_user():
     return mock
 
 
-class TestHandleWebFile:
-    """Test _handle_web_file function for web ingestion file handling."""
+@pytest.fixture(scope="function")
+def web_test_env(tmp_path: Path):
+    """Create an app+DB env for ingest-web route tests."""
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    TestingSessionLocal = sessionmaker(bind=test_engine)
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI()
+    app.include_router(kb_router)
+    app.dependency_overrides[get_db] = override_get_db
+
+    Base.metadata.create_all(bind=test_engine)
+
+    session = TestingSessionLocal()
+    user = User(
+        username="testuser",
+        password_hash="hash",
+        is_admin=False,
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+
+    # Mock JWT token (must include type="access" for get_current_user)
+    from datetime import datetime, timedelta, timezone
+
+    import jwt
+
+    from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+    payload = {
+        "sub": user.username,
+        "user_id": user.id,
+        "type": "access",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        "iat": datetime.now(timezone.utc),
+    }
+    token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    return app, headers, user, TestingSessionLocal
+
+
+class TestWebIngestionUploadedFilePersistence:
+    """Test uploaded-file persistence behavior used by web ingestion."""
 
     def test_new_file_creation(
         self, db_session: Session, test_user: User, mock_user: MagicMock
@@ -79,7 +137,7 @@ class TestHandleWebFile:
             with patch("xagent.web.api.kb.get_upload_path") as mock_get_path:
                 mock_get_path.return_value = persistent_path / "file.md"
 
-                # Simulate the function setup inside ingest_web
+                # Simulate ingest-web persistence context
                 _processed_urls = {}
 
                 # Mock sanitize_path_component
@@ -88,7 +146,7 @@ class TestHandleWebFile:
                 ) as mock_sanitize:
                     mock_sanitize.return_value = "test_page"
 
-                    # Call the file handler logic (simplified from actual implementation)
+                    # Simulate storage-layer steps used by the ingest-web handler
                     url = "https://example.com/test"
                     collection = "test_collection"
 
@@ -434,3 +492,171 @@ class TestHandleWebFileUserIsolation:
             )
 
             assert record1.file_id != record2.file_id
+
+
+class TestIngestWebHandleWebFile:
+    """API-level coverage for ingest-web file handling and dedup semantics."""
+
+    def test_ingest_web_dedups_same_url_within_request(
+        self, web_test_env, tmp_path: Path
+    ) -> None:
+        """Same URL processed twice in one request should create only one UploadedFile row."""
+        app, headers, user, TestingSessionLocal = web_test_env
+        client = TestClient(app)
+
+        uploads_root = tmp_path / "uploads"
+
+        def patched_get_upload_path(
+            filename: str,
+            *,
+            user_id: int,
+            collection: str,
+            collection_is_sanitized: bool,
+        ) -> Path:
+            assert collection_is_sanitized is True
+            return uploads_root / f"user_{user_id}" / collection / filename
+
+        # Stub out the web ingestion runner, but exercise the provided file_handler.
+        async def stub_run_web_ingestion(
+            *,
+            collection: str,
+            crawl_config,
+            ingestion_config,
+            user_id: int,
+            is_admin: bool,
+            file_handler,
+        ):
+            temp_md = tmp_path / "temp.md"
+            temp_md.write_text("# Title\n\nBody", encoding="utf-8")
+            url = "https://example.com/page"
+            title = "My Page"
+
+            # Call file handler twice with the same URL; second call must dedup.
+            r1 = file_handler(temp_md, title, collection, url)
+            r2 = file_handler(temp_md, title, collection, url)
+            assert r1["file_id"] == r2["file_id"]
+            assert r1["file_path"] == r2["file_path"]
+
+            from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
+
+            return WebIngestionResult(
+                status="success",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=0,
+                documents_created=1,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[url],
+                failed_urls={},
+                message="ok",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
+
+        with (
+            patch(
+                "xagent.web.api.kb.get_upload_path", side_effect=patched_get_upload_path
+            ),
+            patch("xagent.web.api.kb.sanitize_path_component", return_value="my_page"),
+            patch(
+                "xagent.web.api.kb.get_session_local", return_value=TestingSessionLocal
+            ),
+            patch(
+                "xagent.web.api.kb.run_web_ingestion",
+                side_effect=stub_run_web_ingestion,
+            ),
+        ):
+            response = client.post(
+                "/api/kb/ingest-web",
+                data={"collection": "c1", "start_url": "https://example.com"},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+
+        session = TestingSessionLocal()
+        try:
+            rows = (
+                session.query(UploadedFile)
+                .filter(UploadedFile.user_id == user.id)
+                .all()
+            )
+            assert len(rows) == 1
+            assert Path(rows[0].storage_path).exists()
+        finally:
+            session.close()
+
+    def test_ingest_web_upsert_failure_cleans_up_persistent_file(
+        self, web_test_env, tmp_path: Path
+    ) -> None:
+        """If UploadedFile upsert fails, the handler should remove the orphaned persistent file."""
+        app, headers, user, TestingSessionLocal = web_test_env
+        client = TestClient(app)
+
+        uploads_root = tmp_path / "uploads"
+        # We'll compute the deterministic filename the handler will use.
+        import hashlib
+
+        url = "https://example.com/page"
+        collection = "c1"
+        url_hash = hashlib.sha256(f"{collection}:{url}".encode()).hexdigest()[:16]
+        filename = f"{url_hash}_my_page.md"
+        expected_persistent = uploads_root / f"user_{user.id}" / collection / filename
+
+        def patched_get_upload_path(
+            filename_arg: str,
+            *,
+            user_id: int,
+            collection: str,
+            collection_is_sanitized: bool,
+        ) -> Path:
+            assert filename_arg == filename
+            return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        async def stub_run_web_ingestion(
+            *,
+            collection: str,
+            crawl_config,
+            ingestion_config,
+            user_id: int,
+            is_admin: bool,
+            file_handler,
+        ):
+            temp_md = tmp_path / "temp.md"
+            temp_md.write_text("# Title\n\nBody", encoding="utf-8")
+            file_handler(temp_md, "My Page", collection, url)
+
+            from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
+
+            return WebIngestionResult(status="success", message="ok", warnings=[])
+
+        def boom_upsert(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with (
+            patch(
+                "xagent.web.api.kb.get_upload_path", side_effect=patched_get_upload_path
+            ),
+            patch("xagent.web.api.kb.sanitize_path_component", return_value="my_page"),
+            patch(
+                "xagent.web.api.kb.get_session_local", return_value=TestingSessionLocal
+            ),
+            patch(
+                "xagent.web.api.kb._upsert_uploaded_file_record",
+                side_effect=boom_upsert,
+            ),
+            patch(
+                "xagent.web.api.kb.run_web_ingestion",
+                side_effect=stub_run_web_ingestion,
+            ),
+        ):
+            response = client.post(
+                "/api/kb/ingest-web",
+                data={"collection": collection, "start_url": "https://example.com"},
+                headers=headers,
+            )
+
+        assert response.status_code == 500
+        assert not expected_persistent.exists()

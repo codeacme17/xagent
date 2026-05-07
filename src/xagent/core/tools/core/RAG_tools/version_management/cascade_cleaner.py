@@ -269,7 +269,7 @@ def _delete_by_predicates(
             cnt = _safe_count_rows(table, filt)
             if cnt > 0:
                 table.delete(filt)
-                logger.info(f"Cascade cleanup: deleted {cnt} rows from {t}")
+                logger.info("Cascade cleanup: deleted %s rows from %s", cnt, t)
             deleted[t] = cnt
         finally:
             _safe_close_table(table)
@@ -310,7 +310,9 @@ def _delete_by_predicates(
                 _safe_close_table(table)
         deleted["embeddings"] = total
         if total > 0:
-            logger.info(f"Cascade cleanup: deleted {total} rows from embeddings tables")
+            logger.info(
+                "Cascade cleanup: deleted %s rows from embeddings tables", total
+            )
 
     # Then handle known tables
     for name in order[1:]:
@@ -322,7 +324,7 @@ def _delete_by_predicates(
                 cnt = _safe_count_rows(table, filt)
                 if cnt > 0:
                     table.delete(filt)
-                    logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
+                    logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
                 deleted[name] = cnt
             finally:
                 _safe_close_table(table)
@@ -347,7 +349,7 @@ def _delete_by_predicates(
             cnt = _safe_count_rows(table, filt)
             if cnt > 0:
                 table.delete(filt)
-                logger.info(f"Cascade cleanup: deleted {cnt} rows from {name}")
+                logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
             deleted[name] = cnt
         finally:
             _safe_close_table(table)

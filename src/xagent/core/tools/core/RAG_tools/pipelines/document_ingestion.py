@@ -521,7 +521,9 @@ def process_document(
         # Initialize collection embedding config if needed
         selected_model_id = cfg.embedding_model_id
         logger.info(
-            f"Collection initialization: collection='{collection}', embedding_model_id='{selected_model_id}'"
+            "Collection initialization: collection='%s', embedding_model_id='%s'",
+            collection,
+            selected_model_id,
         )
         if selected_model_id:
             initialize_collection_embedding_sync(
@@ -530,8 +532,8 @@ def process_document(
         else:
             # Even without embedding_model_id, ensure basic metadata exists
             logger.info(
-                f"No embedding_model_id provided for collection '{collection}', "
-                "creating basic metadata without embedding configuration."
+                "No embedding_model_id provided for collection '%s', creating basic metadata without embedding configuration.",
+                collection,
             )
             from ..management.collection_manager import get_collection_sync
 
@@ -541,7 +543,7 @@ def process_document(
             except ValueError:
                 # Metadata doesn't exist, create basic entry
                 update_collection_stats_sync(collection_name=collection)
-                logger.info(f"Created basic metadata for collection '{collection}'")
+                logger.info("Created basic metadata for collection '%s'", collection)
 
         init_elapsed = int((time.time() - init_start) * 1000)
         completed_steps.append(
@@ -641,7 +643,7 @@ def process_document(
                 documents_delta=1 if register_result.get("created") else 0,
             )
         except Exception as e:
-            logger.warning(f"Failed to increment total_documents: {e}")
+            logger.warning("Failed to increment total_documents: %s", e)
 
         logger.info(
             "Step register_document completed",

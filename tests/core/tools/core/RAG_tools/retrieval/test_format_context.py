@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 import pytest
@@ -20,7 +20,7 @@ def sample_search_results() -> List[SearchResult]:
             score=0.95,
             parse_hash="hash1",
             model_tag="model-a",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             metadata={"page": 1, "section": "intro", "source": "/path/to/file.pdf"},
         ),
         SearchResult(
@@ -30,7 +30,7 @@ def sample_search_results() -> List[SearchResult]:
             score=0.88,
             parse_hash="hash2",
             model_tag="model-a",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             metadata={"page": 2, "section": "body"},
         ),
         SearchResult(
@@ -40,7 +40,7 @@ def sample_search_results() -> List[SearchResult]:
             score=0.75,
             parse_hash="hash3",
             model_tag="model-b",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             metadata=None,  # Test case with no metadata
         ),
     ]

@@ -54,11 +54,11 @@ class LinkExtractor:
                 if absolute_url:
                     links.add(absolute_url)
 
-            logger.debug(f"Extracted {len(links)} links from {current_url}")
+            logger.debug("Extracted %s links from %s", len(links), current_url)
             return links
 
         except Exception as e:
-            logger.error(f"Failed to extract links from {current_url}: {e}")
+            logger.error("Failed to extract links from %s: %s", current_url, e)
             return links
 
     def _make_absolute(self, url: str, base_url: str) -> str | None:
@@ -75,5 +75,5 @@ class LinkExtractor:
             absolute = urljoin(base_url, url)
             return absolute
         except Exception as e:
-            logger.warning(f"Failed to make URL absolute: {url} - {e}")
+            logger.warning("Failed to make URL absolute: %s - %s", url, e)
             return None

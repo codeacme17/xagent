@@ -79,6 +79,43 @@ class LanceDBMetadataStore(MetadataStore):
         except Exception as exc:
             logger.debug("Failed to delete collection metadata: %s", exc)
 
+    async def rename_collection(self, old_name: str, new_name: str) -> None:
+        """Rename ``collection_config`` and ``collection_metadata`` keys.
+
+        See :meth:`MetadataStore.rename_collection`.
+        """
+        from ..LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_collection_config_table,
+        )
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+        ensure_collection_config_table(conn)
+
+        safe_old = escape_lancedb_string(old_name)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        config_table = None
+        try:
+            config_table = conn.open_table("collection_config")
+            config_table.update(
+                f"collection = '{safe_old}'",
+                {"collection": new_name, "updated_at": now},
+            )
+        finally:
+            _safe_close_table(config_table)
+
+        meta_table = None
+        try:
+            meta_table = conn.open_table("collection_metadata")
+            meta_table.update(
+                f"name = '{safe_old}'",
+                {"name": new_name, "updated_at": now},
+            )
+        finally:
+            _safe_close_table(meta_table)
+
     async def save_collection(self, collection: CollectionInfo) -> None:
         from ..LanceDB.schema_manager import _safe_close_table
 
@@ -983,7 +1020,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     vector_index_advice = f"Index ready for {table_name} ({row_count} rows), metric: {policy.metric.value}"
 
         except Exception as e:
-            logger.error(f"Vector index operation failed for {table_name}: {str(e)}")
+            logger.error("Vector index operation failed for %s: %s", table_name, e)
             vector_index_status = "index_corrupted"
             vector_index_advice = (
                 f"Vector index check failed for {table_name}: {str(e)}"
@@ -998,7 +1035,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     idx.index_type == "FTS" and "text" in idx.columns for idx in indexes
                 )
             except Exception as e:
-                logger.warning(f"Failed to check FTS index status: {e}")
+                logger.warning("Failed to check FTS index status: %s", e)
 
             # FTS Index Management (if enabled)
             if policy.fts_enabled and not fts_enabled:
@@ -1017,7 +1054,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                         pass
                 except Exception as e:
                     logger.warning(
-                        f"FTS index creation/check failed for {table_name}: {str(e)}"
+                        "FTS index creation/check failed for %s: %s", table_name, str(e)
                     )
         finally:
             _safe_close_table(table)
@@ -1069,7 +1106,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return False
 
         except Exception as e:
-            logger.error(f"Failed to check reindex status for {table_name}: {e}")
+            logger.error("Failed to check reindex status for %s: %s", table_name, e)
             return False
         finally:
             _safe_close_table(table)
@@ -2039,7 +2076,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
             table.add([record])
 
         except Exception as e:
-            logger.error(f"Failed to write ingestion status: {e}")
+            logger.error("Failed to write ingestion status: %s", e)
             raise
         finally:
             _safe_close_table(table)
@@ -2075,7 +2112,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
             return cast(List[Dict[str, Any]], result.to_pylist())
 
         except Exception as e:
-            logger.error(f"Failed to load ingestion status: {e}")
+            logger.error("Failed to load ingestion status: %s", e)
             raise
         finally:
             _safe_close_table(table)
@@ -2105,7 +2142,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
                 table.delete(filter_expr)
 
         except Exception as e:
-            logger.error(f"Failed to clear ingestion status: {e}")
+            logger.error("Failed to clear ingestion status: %s", e)
             raise
         finally:
             _safe_close_table(table)

@@ -13,108 +13,56 @@ import logging
 import shutil
 import uuid
 from pathlib import Path
-from typing import List, Optional, Union
 
 import pytest
 
-from xagent.core.model.embedding.base import BaseEmbedding
-from xagent.core.model.model import EmbeddingModelConfig
 from xagent.core.storage.manager import initialize_storage_manager
-from xagent.core.tools.core.RAG_tools.core.schemas import (
-    CollectionInfo,
-    IngestionConfig,
-    ParseMethod,
-)
-from xagent.core.tools.core.RAG_tools.management import collection_manager
+from xagent.core.tools.core.RAG_tools.core.schemas import IngestionConfig, ParseMethod
 from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
 from xagent.core.tools.core.RAG_tools.utils import model_resolver
 
 logger = logging.getLogger(__name__)
 
 
-class _StubEmbeddingAdapter(BaseEmbedding):
-    """Deterministic embedding adapter for tests to ensure reproducibility."""
-
-    def encode(
-        self,
-        text: Union[str, List[str]],
-        dimension: int | None = None,
-        instruct: str | None = None,
-    ) -> Union[List[float], List[List[float]]]:
-        """Generates a fake vector based on text length."""
-        if isinstance(text, str):
-            return [float(len(text)), 0.0]
-        return [[float(len(item)), float(index)] for index, item in enumerate(text)]
-
-    def get_dimension(self) -> int:
-        return 2
-
-    @property
-    def abilities(self) -> List[str]:
-        return ["embedding"]
-
-
-def _patch_embedding_adapter(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
-    """Stub embedding adapter resolution to avoid real model calls."""
-    stub_config = EmbeddingModelConfig(
-        id=model_id,
-        model_name="test-embedding-model",
-        model_provider="test",
-        dimension=2,
-    )
-    stub_adapter = _StubEmbeddingAdapter()
-
-    # Mock both document_ingestion and model_resolver's resolve_embedding_adapter
-    monkeypatch.setattr(
-        document_ingestion,
-        "_resolve_embedding_adapter",
-        lambda _cfg: (stub_config, stub_adapter),
-    )
-
-    # Also mock resolve_embedding_adapter used by collection_manager
-
-    def mock_resolve_embedding_adapter(
-        model_id: Optional[str] = None, **kwargs
-    ) -> tuple[EmbeddingModelConfig, BaseEmbedding]:
-        """Mock resolve_embedding_adapter for collection_manager."""
-        return (stub_config, stub_adapter)
-
-    monkeypatch.setattr(
-        model_resolver,
-        "resolve_embedding_adapter",
-        mock_resolve_embedding_adapter,
-    )
-
-    # Also mock resolve_embedding_adapter in collection_manager module
-    # since it has its own import and monkeypatch can't affect already imported references
-    monkeypatch.setattr(
-        collection_manager,
-        "resolve_embedding_adapter",
-        mock_resolve_embedding_adapter,
-    )
-
-    # Mock initialize_collection_embedding_sync to avoid hub/env resolution
-
-    def mock_initialize_collection_embedding_sync(
-        collection_name: str, embedding_model_id: str
-    ) -> CollectionInfo:
-        """Mock collection initialization."""
-        return CollectionInfo(
-            name=collection_name,
-            embedding_model_id=embedding_model_id,
-            embedding_dimension=2,  # Match stub config
+def _resolve_embedding_model_id_or_skip() -> str:
+    """Resolve a real embedding model id, or skip with actionable guidance."""
+    # NOTE:
+    # This utility E2E test defaults to DashScope-style embedding setup.
+    # We intentionally pin `text-embedding-v4` as the default model id here.
+    # If you are using a different API provider, update this model id to a
+    # provider-compatible embedding model before running the test.
+    preferred_embedding_model_id = "text-embedding-v4"
+    try:
+        embedding_cfg, _ = model_resolver.resolve_embedding_adapter(
+            preferred_embedding_model_id
+        )
+        logger.info(
+            "[REAL_INGESTION_TEST] Resolved embedding model: id=%s, provider=%s, model_name=%s",
+            embedding_cfg.id,
+            embedding_cfg.model_provider,
+            embedding_cfg.model_name,
+        )
+        return embedding_cfg.id
+    except Exception as exc:
+        logger.warning(
+            "[REAL_INGESTION_TEST] Cannot resolve embedding model from ModelHub/env: %s",
+            exc,
+        )
+        logger.warning(
+            "[REAL_INGESTION_TEST] Test default model is '%s'.",
+            preferred_embedding_model_id,
+        )
+        logger.warning(
+            "[REAL_INGESTION_TEST] To run this test, ensure API key is valid and model id matches your provider."
+        )
+        logger.warning(
+            "[REAL_INGESTION_TEST] If needed, update preferred_embedding_model_id in this test file."
+        )
+        pytest.skip(
+            f"No resolvable real embedding model for '{preferred_embedding_model_id}'."
         )
 
-    monkeypatch.setattr(
-        collection_manager,
-        "initialize_collection_embedding_sync",
-        mock_initialize_collection_embedding_sync,
-    )
 
-
-@pytest.mark.skip(
-    reason="E2E ingestion pipeline test is environment-dependent and not required for KB delete permissions changes."
-)
 def test_run_real_ingestion_pipeline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -142,11 +90,14 @@ def test_run_real_ingestion_pipeline(
         uploads_dir.mkdir(parents=True, exist_ok=True)
         initialize_storage_manager(str(storage_root), str(uploads_dir))
 
-        embedding_model_id = "rag-test-embedding-deterministic"
-        _patch_embedding_adapter(monkeypatch, embedding_model_id)
+        embedding_model_id = _resolve_embedding_model_id_or_skip()
 
         logger.info("--- E2E Ingestion Pipeline Runner ---")
         logger.info(f"[*] Using output LanceDB directory: {db_output_dir.resolve()}")
+        logger.info(
+            "[*] Using real embedding model id: %s (no stub adapter)",
+            embedding_model_id,
+        )
 
         # 2. --- Pipeline Execution ---
         # Robustly locate the project root relative to this test file

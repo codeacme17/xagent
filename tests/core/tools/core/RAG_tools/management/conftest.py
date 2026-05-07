@@ -12,7 +12,7 @@ from xagent.core.tools.core.RAG_tools.management.collection_manager import (
 )
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_vector_index_store,
-    reset_kb_write_coordinator,
+    reset_rag_storage_for_tests,
 )
 
 
@@ -32,13 +32,13 @@ def temp_lancedb_dir() -> Generator[str, None, None]:
         # Set environment variable for this test
         os.environ["LANCEDB_DIR"] = os.path.join(tmpdir, ".lancedb")
 
-        # Reset coordinator to ensure clean state
-        reset_kb_write_coordinator()
+        # Reset storage (vector backend caches + factory) for clean state
+        reset_rag_storage_for_tests()
 
         yield tmpdir
     finally:
         # Cleanup
-        reset_kb_write_coordinator()
+        reset_rag_storage_for_tests()
 
         # Restore old environment
         if old_env is not None:

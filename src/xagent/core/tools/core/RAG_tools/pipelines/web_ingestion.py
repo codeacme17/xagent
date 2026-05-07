@@ -91,8 +91,9 @@ async def run_web_ingestion(
     ing_cfg = coerce_ingestion_config(ingestion_config)
 
     logger.info(
-        f"Starting web ingestion: collection={collection}, "
-        f"start_url={crawl_config.start_url}"
+        "Starting web ingestion: collection=%s, start_url=%s",
+        collection,
+        crawl_config.start_url,
     )
 
     # Step 1: Crawl the website
@@ -132,7 +133,7 @@ async def run_web_ingestion(
     pages_failed = len(failed_urls)
 
     logger.info(
-        f"Crawling completed: {pages_crawled} successful, {pages_failed} failed"
+        "Crawling completed: %s successful, %s failed", pages_crawled, pages_failed
     )
 
     # Step 2: Ingest each crawled page
@@ -175,7 +176,7 @@ async def run_web_ingestion(
                     f.write("---\n\n")
                     f.write(crawl_result.content_markdown)
 
-                logger.debug(f"Saved {crawl_result.url} to {temp_file}")
+                logger.debug("Saved %s to %s", crawl_result.url, temp_file)
 
                 # Call file_handler if provided (for persistent storage and UploadedFile record)
                 final_file_path = temp_file
@@ -198,12 +199,15 @@ async def run_web_ingestion(
                             copied_persistent_file = final_file_path
 
                         logger.debug(
-                            f"File handler returned: path={final_file_path}, file_id={final_file_id}"
+                            "File handler returned: path=%s, file_id=%s",
+                            final_file_path,
+                            final_file_id,
                         )
                     except Exception as e:
                         logger.warning(
-                            f"File handler failed for {crawl_result.url}: {e}. "
-                            f"Using temporary file instead."
+                            "File handler failed for %s: %s. Using temporary file instead.",
+                            crawl_result.url,
+                            e,
                         )
                         final_file_path = temp_file
                         final_file_id = None
@@ -240,9 +244,10 @@ async def run_web_ingestion(
                         total_chunks += ingest_result.chunk_count
                         total_embeddings += ingest_result.embedding_count
                         logger.info(
-                            f"Ingested {crawl_result.url}: "
-                            f"{ingest_result.chunk_count} chunks, "
-                            f"{ingest_result.embedding_count} embeddings"
+                            "Ingested %s: %s chunks, %s embeddings",
+                            crawl_result.url,
+                            ingest_result.chunk_count,
+                            ingest_result.embedding_count,
                         )
                         # Only clear temp file reference on success
                         copied_persistent_file = None
@@ -259,7 +264,7 @@ async def run_web_ingestion(
                         warnings.append(msg)
 
                 except Exception as e:
-                    logger.exception(f"Failed to ingest {crawl_result.url}")
+                    logger.exception("Failed to ingest %s", crawl_result.url)
                     failed_urls[crawl_result.url] = str(e)
                     warnings.append(f"Failed to ingest {crawl_result.url}: {str(e)}")
 
@@ -268,16 +273,19 @@ async def run_web_ingestion(
                         try:
                             copied_persistent_file.unlink()
                             logger.info(
-                                f"Cleaned up persistent file due to ingestion failure: {copied_persistent_file}"
+                                "Cleaned up persistent file due to ingestion failure: %s",
+                                copied_persistent_file,
                             )
                         except Exception as cleanup_error:
                             logger.warning(
-                                f"Failed to clean up persistent file {copied_persistent_file}: {cleanup_error}"
+                                "Failed to clean up persistent file %s: %s",
+                                copied_persistent_file,
+                                cleanup_error,
                             )
                     copied_persistent_file = None
 
             except Exception as e:
-                logger.exception(f"Failed to ingest {crawl_result.url}")
+                logger.exception("Failed to ingest %s", crawl_result.url)
                 failed_urls[crawl_result.url] = str(e)
                 warnings.append(f"Failed to ingest {crawl_result.url}: {str(e)}")
 
@@ -331,8 +339,10 @@ async def run_web_ingestion(
     )
 
     logger.info(
-        f"Web ingestion completed: {result.status}, "
-        f"{documents_created} documents, {elapsed_ms}ms"
+        "Web ingestion completed: %s, %s documents, %sms",
+        result.status,
+        documents_created,
+        elapsed_ms,
     )
 
     return result

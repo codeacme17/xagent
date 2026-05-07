@@ -60,7 +60,9 @@ class ContentCleaner:
                     soup = new_soup
                 else:
                     logger.warning(
-                        f"Content selector '{self.content_selector}' not found in {url}"
+                        "Content selector '%s' not found in %s",
+                        self.content_selector,
+                        url,
                     )
 
             # Convert to markdown
@@ -80,7 +82,7 @@ class ContentCleaner:
             }
 
         except Exception as e:
-            logger.error(f"Failed to clean content from {url}: {e}")
+            logger.error("Failed to clean content from %s: %s", url, e)
             return {
                 "title": None,
                 "content_markdown": "",
@@ -172,7 +174,7 @@ class ContentCleaner:
                 element.decompose()
 
         logger.debug(
-            f"Removed unwanted elements matching {len(all_selectors)} selectors"
+            "Removed unwanted elements matching %s selectors", len(all_selectors)
         )
 
     def _to_markdown(self, soup: BeautifulSoup) -> str:

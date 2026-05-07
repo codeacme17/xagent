@@ -22,8 +22,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from xagent.core.model import ChatModelConfig, EmbeddingModelConfig, RerankModelConfig
 from xagent.core.observability.langfuse_tracer import init_tracer, reset_tracer
-from xagent.core.tools.core.RAG_tools.storage import reset_kb_write_coordinator
-from xagent.providers.vector_store.lancedb import clear_connection_cache
+from xagent.core.tools.core.RAG_tools.storage import reset_rag_storage_for_tests
 
 # YAML entrypoint has been removed, commenting out these imports
 # from xagent.entrypoint.yaml.parser import MigrationManager
@@ -45,7 +44,8 @@ example_env_file = project_root / "example.env"
 if env_file.exists():
     load_dotenv(env_file, override=True)  # Force override existing env vars
 elif example_env_file.exists():
-    load_dotenv(example_env_file, override=True)
+    # Don't override existing env vars (especially API keys from user's shell)
+    load_dotenv(example_env_file, override=False)
 else:
     print("Warning: Neither .env nor example.env file found")
 
@@ -64,10 +64,29 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "docker: tests that require Docker daemon (run with --run-special)"
     )
+    config.addinivalue_line(
+        "markers",
+        "real_rag: tests that require real embedding API (DASHSCOPE_API_KEY or ZHIPU_API_KEY)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "requires_network: tests that require network access (run with --run-special or set XAGENT_TESTS_ALLOW_NETWORK=1)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip Docker tests unless --run-special is specified."""
+    """Skip Docker tests unless --run-special is specified.
+
+    Also automatically skip tests that require unavailable external dependencies.
+    Tests marked with `pytest.mark.real_rag` require embedding API keys
+    (DASHSCOPE_API_KEY or ZHIPU_API_KEY). If these keys are not configured
+    in the environment, the tests are automatically skipped rather than failing.
+
+    Tests marked with `pytest.mark.requires_network` require network access.
+    These tests are skipped unless --run-special is specified or
+    XAGENT_TESTS_ALLOW_NETWORK=1 is set.
+    """
+    # Skip Docker tests unless --run-special is specified
     if not config.getoption("--run-special", default=False):
         skip_docker = pytest.mark.skip(
             reason="Requires --run-special flag (Docker needed)"
@@ -75,6 +94,51 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "docker" in item.keywords:
                 item.add_marker(skip_docker)
+
+    # Skip real_rag tests when embedding API keys are unavailable
+    # Check for actual API keys, not placeholder values from example.env
+    dashscope_key = os.getenv("DASHSCOPE_API_KEY", "")
+    zhipu_key = os.getenv("ZHIPU_API_KEY", "")
+
+    # Common placeholder patterns that indicate the key is not set
+    placeholder_patterns = [
+        "your-dashscope-api-key",
+        "your-api-key",
+        "your-zhipu-api-key",
+        "test-key",
+    ]
+
+    def is_valid_key(key: str) -> bool:
+        """Check if the key is not a placeholder value."""
+        if not key:
+            return False
+        key_lower = key.lower().strip()
+        for pattern in placeholder_patterns:
+            if pattern in key_lower:
+                return False
+        return True
+
+    has_embedding_api = is_valid_key(dashscope_key) or is_valid_key(zhipu_key)
+    if not has_embedding_api:
+        skip_real_rag = pytest.mark.skip(
+            reason="Requires DASHSCOPE_API_KEY or ZHIPU_API_KEY environment variable"
+        )
+        for item in items:
+            if "real_rag" in item.keywords:
+                item.add_marker(skip_real_rag)
+
+    # Skip requires_network tests unless --run-special or XAGENT_TESTS_ALLOW_NETWORK=1
+    run_special = config.getoption("--run-special", default=False)
+    allow_network = os.getenv("XAGENT_TESTS_ALLOW_NETWORK", "0").strip() == "1"
+    has_network_access = run_special or allow_network
+
+    if not has_network_access:
+        skip_network = pytest.mark.skip(
+            reason="Requires --run-special flag or XAGENT_TESTS_ALLOW_NETWORK=1 (network access needed)"
+        )
+        for item in items:
+            if "requires_network" in item.keywords:
+                item.add_marker(skip_network)
 
 
 # ==========================================
@@ -97,20 +161,20 @@ def temp_dir():
 
 
 @pytest.fixture(autouse=True, scope="function")
-def isolate_lancedb_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate LanceDB and reset KB storage singletons for every test.
+def isolate_rag_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate per-test RAG/KB storage paths and reset global storage state.
 
     By default, ``LANCEDB_DIR`` is set to a fresh directory under ``tmp_path``
-    for each test. This avoids stale LanceDB schemas from a developer ``.env``
-    or a fixed path, and matches CI-style ephemeral storage. Parallel workers
+    (current default vector backend is LanceDB). This avoids stale on-disk
+    state from a developer ``.env`` or a fixed path. Parallel workers
     (pytest-xdist) each use their own process-local ``tmp_path``.
 
     If the environment sets ``XAGENT_PYTEST_RESPECT_LANCEDB_DIR=1``, the
     existing ``LANCEDB_DIR`` from the environment is left unchanged (for CI or
     local workflows that intentionally pin a path).
 
-    Clears the LanceDB connection cache and resets the process-wide KB write
-    coordinator before and after each test.
+    Calls :func:`xagent.core.tools.core.RAG_tools.storage.reset_rag_storage_for_tests`
+    before and after each test (backend-specific caches + storage factory reset).
     """
     respect_env = os.environ.get("XAGENT_PYTEST_RESPECT_LANCEDB_DIR") == "1"
     if not respect_env:
@@ -118,11 +182,9 @@ def isolate_lancedb_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
         lancedb_dir.mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv("LANCEDB_DIR", str(lancedb_dir))
 
-    clear_connection_cache()
-    reset_kb_write_coordinator()
+    reset_rag_storage_for_tests()
     yield
-    reset_kb_write_coordinator()
-    clear_connection_cache()
+    reset_rag_storage_for_tests()
 
 
 @pytest.fixture

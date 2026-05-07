@@ -12,7 +12,7 @@ from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
 )
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_vector_index_store,
-    reset_kb_write_coordinator,
+    reset_rag_storage_for_tests,
 )
 
 
@@ -32,7 +32,7 @@ def test_forward_migrate_legacy_embeddings_table_to_hub_id(
     vector_dim = 3
 
     monkeypatch.setenv("LANCEDB_DIR", str(tmp_path / ".lancedb"))
-    reset_kb_write_coordinator()
+    reset_rag_storage_for_tests()
     vector_store = get_vector_index_store()
     conn = vector_store.get_raw_connection()
 

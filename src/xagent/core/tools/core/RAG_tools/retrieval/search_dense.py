@@ -123,15 +123,22 @@ def search_dense(
         )
 
         logger.info(
-            f"Dense search completed: collection={collection}, model_tag={model_tag}, "
-            f"top_k={top_k}, returned={len(search_results)}, index_status={index_status}"
+            "Dense search completed: collection=%s, model_tag=%s, top_k=%s, returned=%s, index_status=%s",
+            collection,
+            model_tag,
+            top_k,
+            len(search_results),
+            index_status,
         )
 
         return response
 
     except Exception as e:
         logger.error(
-            f"Dense search failed for {model_tag} in collection '{collection}': {e}"
+            "Dense search failed for %s in collection '%s': %s",
+            model_tag,
+            collection,
+            e,
         )
         # Return structured error response instead of raising exception
         # This matches the behavior of search_sparse for API consistency
@@ -258,15 +265,22 @@ async def search_dense_async(
         )
 
         logger.info(
-            f"Async dense search completed: collection={collection}, model_tag={model_tag}, "
-            f"top_k={top_k}, returned={len(search_results)}, index_status={index_status}"
+            "Async dense search completed: collection=%s, model_tag=%s, top_k=%s, returned=%s, index_status=%s",
+            collection,
+            model_tag,
+            top_k,
+            len(search_results),
+            index_status,
         )
 
         return response
 
     except Exception as e:
         logger.error(
-            f"Async dense search failed for {model_tag} in collection '{collection}': {e}"
+            "Async dense search failed for %s in collection '%s': %s",
+            model_tag,
+            collection,
+            e,
         )
         # Return structured error response instead of raising exception
         # This matches the behavior of search_sparse for API consistency

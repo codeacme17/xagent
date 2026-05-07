@@ -358,8 +358,9 @@ def _resolve_adapter_generic(
     except Exception as hub_error:
         # Hub not available, will fallback to environment
         logger.warning(
-            f"Model hub not available for {model_type_name}: {hub_error}. "
-            "Falling back to environment configuration."
+            "Model hub not available for %s: %s. Falling back to environment configuration.",
+            model_type_name,
+            hub_error,
         )
         hub = None
 
@@ -386,7 +387,8 @@ def _resolve_adapter_generic(
             except ValueError:
                 # "default" model not found in hub, fallback to env
                 logger.warning(
-                    f"Model 'default' not found in hub for {model_type_name}, falling back to environment"
+                    "Model 'default' not found in hub for %s, falling back to environment",
+                    model_type_name,
                 )
 
         # Fallback to Environment
@@ -429,7 +431,8 @@ def _resolve_adapter_generic(
             except ValueError:
                 # "default" model not found in hub, fallback to env
                 logger.warning(
-                    f"Model 'default' not found in hub for {model_type_name}, falling back to environment"
+                    "Model 'default' not found in hub for %s, falling back to environment",
+                    model_type_name,
                 )
 
         # Fallback to Environment
@@ -477,8 +480,10 @@ def _resolve_adapter_generic(
             except ValueError as hub_error:
                 # Explicit ID not found in Hub
                 logger.warning(
-                    f"Model '{model_id}' not found in hub for {model_type_name}: {hub_error}. "
-                    "Falling back to environment configuration."
+                    "Model '%s' not found in hub for %s: %s. Falling back to environment configuration.",
+                    model_id,
+                    model_type_name,
+                    hub_error,
                 )
 
         # 3.2 Fallback to Environment
@@ -620,7 +625,7 @@ def _create_llm_config_from_provider_env(
             abilities=["chat"],
         )
     except (ValueError, TypeError) as e:
-        logger.warning(f"Failed to create {provider_name} config from env: {e}")
+        logger.warning("Failed to create %s config from env: %s", provider_name, e)
         return None
 
 

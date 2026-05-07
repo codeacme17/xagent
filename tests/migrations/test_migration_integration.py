@@ -35,9 +35,11 @@ class MigrationTester:
         self.engine = None
         self.alembic_cfg = None
         self.temp_db_file = None
+        self._old_database_url: str | None = None
 
     def setup_database(self):
         """Set up test database connection."""
+        self._old_database_url = os.environ.get("DATABASE_URL")
         if self.db_type == "sqlite":
             # Use temporary file for SQLite
             fd, path = tempfile.mkstemp(suffix=".db")
@@ -67,6 +69,7 @@ class MigrationTester:
                     conn.execute(text("CREATE SCHEMA public"))
         except SQLAlchemyError as exc:
             if self.db_type == "postgresql":
+                self._restore_database_url()
                 pytest.skip(f"PostgreSQL test database unavailable: {exc}")
             raise
 
@@ -77,14 +80,24 @@ class MigrationTester:
         # DO NOT create tables with SQLAlchemy - we want to test migrations
         # can build the schema from scratch
 
+    def _restore_database_url(self) -> None:
+        """Restore ``DATABASE_URL`` to its pre-test value."""
+        if self._old_database_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = self._old_database_url
+
     def teardown_database(self):
         """Clean up test database."""
-        if self.db_type == "sqlite" and self.temp_db_file:
-            os.unlink(self.temp_db_file)
-        elif self.db_type == "postgresql":
-            with self.engine.begin() as conn:
-                conn.execute(text("DROP SCHEMA public CASCADE"))
-                conn.execute(text("CREATE SCHEMA public"))
+        try:
+            if self.db_type == "sqlite" and self.temp_db_file:
+                os.unlink(self.temp_db_file)
+            elif self.db_type == "postgresql" and self.engine is not None:
+                with self.engine.begin() as conn:
+                    conn.execute(text("DROP SCHEMA public CASCADE"))
+                    conn.execute(text("CREATE SCHEMA public"))
+        finally:
+            self._restore_database_url()
 
     def get_table_names(self):
         """Get list of table names."""

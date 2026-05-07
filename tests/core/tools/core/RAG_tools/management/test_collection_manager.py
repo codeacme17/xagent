@@ -36,7 +36,7 @@ class TestCollectionManager:
     @pytest.fixture
     def manager(self):
         """Create a CollectionManager instance with real storage."""
-        # The isolate_lancedb_dir fixture in conftest.py already handles directory isolation
+        # The isolate_rag_storage fixture in conftest.py already handles directory isolation
         return CollectionManager()
 
     @pytest.mark.asyncio
@@ -447,7 +447,7 @@ class TestRebuildCollectionMetadata:
     @pytest.fixture
     def manager(self):
         """Create a CollectionManager instance with real storage."""
-        # The isolate_lancedb_dir fixture in conftest.py already handles directory isolation
+        # The isolate_rag_storage fixture in conftest.py already handles directory isolation
         return CollectionManager()
 
     @patch(

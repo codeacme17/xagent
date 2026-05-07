@@ -73,15 +73,15 @@ def cleanup_global_test_db():
 def auth_headers(test_db):
     """Authentication headers for admin user"""
     # Create a valid JWT token directly
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     import jwt
 
     payload = {
         "sub": "admin",
         "type": "access",
-        "exp": datetime.utcnow() + timedelta(hours=1),
-        "iat": datetime.utcnow(),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        "iat": datetime.now(timezone.utc),
         "user_id": test_db.id,  # Use actual user ID from test_db fixture
     }
     token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)

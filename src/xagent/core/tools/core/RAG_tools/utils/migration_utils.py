@@ -44,7 +44,7 @@ def migrate_collection_metadata(
         f"[MIGRATION_START] Collection: {collection_name}, From: {data_version}, To: {current_version}"
     )
     logger.debug(
-        f"[MIGRATION_SNAPSHOT] Original data for {collection_name}: {legacy_data}"
+        "[MIGRATION_SNAPSHOT] Original data for %s: %s", collection_name, legacy_data
     )
 
     try:
@@ -65,10 +65,12 @@ def migrate_collection_metadata(
         return data
     except Exception as e:
         logger.error(
-            f"[MIGRATION_FAILED] Collection: {collection_name}, Error: {str(e)}",
+            "[MIGRATION_FAILED] Collection: %s, Error: %s",
+            collection_name,
+            str(e),
             exc_info=True,
         )
-        logger.error(f"[MIGRATION_RECOVERY_DATA] {legacy_data}")
+        logger.error("[MIGRATION_RECOVERY_DATA] %s", legacy_data)
         raise
 
 
@@ -90,13 +92,15 @@ def _migrate_0_0_0_to_1_0_0(
 
     if embedding_model_id:
         logger.info(
-            f"[MIGRATION_INFERENCE] Inferred embedding model '{embedding_model_id}' "
-            f"(dimension: {embedding_dimension}) for collection '{collection_name}'"
+            "[MIGRATION_INFERENCE] Inferred embedding model '%s' (dimension: %s) for collection '%s'",
+            embedding_model_id,
+            embedding_dimension,
+            collection_name,
         )
     else:
         logger.warning(
-            f"[MIGRATION_INFERENCE_FAILED] Could not infer embedding model for collection '{collection_name}', "
-            "will use lazy initialization."
+            "[MIGRATION_INFERENCE_FAILED] Could not infer embedding model for collection '%s', will use lazy initialization.",
+            collection_name,
         )
 
     migrated = {
@@ -142,35 +146,38 @@ def _infer_embedding_config_from_collection(
         Tuple of (embedding_model_id, embedding_dimension), or (None, None) if cannot infer
     """
     logger.debug(
-        f"Starting embedding config inference for collection '{collection_name}'"
+        "Starting embedding config inference for collection '%s'", collection_name
     )
 
     try:
         # Get LanceDB connection
-        logger.debug(f"Connecting to LanceDB for collection '{collection_name}'")
+        logger.debug("Connecting to LanceDB for collection '%s'", collection_name)
         conn = get_vector_store_raw_connection()
 
         # Get all table names that contain embeddings
         table_names_fn = getattr(conn, "table_names", None)
         if table_names_fn is None:
             logger.info(
-                f"LanceDB connection missing table_names() for collection '{collection_name}' - will use lazy initialization"
+                "LanceDB connection missing table_names() for collection '%s' - will use lazy initialization",
+                collection_name,
             )
             return None, None
         all_table_names = table_names_fn()
         if all_table_names is None:
             logger.info(
-                f"No table names returned for collection '{collection_name}' - will use lazy initialization"
+                "No table names returned for collection '%s' - will use lazy initialization",
+                collection_name,
             )
             return None, None
         table_names = [
             name for name in all_table_names if name.startswith("embeddings_")
         ]
-        logger.debug(f"Found {len(table_names)} embedding tables: {table_names}")
+        logger.debug("Found %s embedding tables: %s", len(table_names), table_names)
 
         if not table_names:
             logger.info(
-                f"No embedding tables found for collection '{collection_name}' - will use lazy initialization"
+                "No embedding tables found for collection '%s' - will use lazy initialization",
+                collection_name,
             )
             return None, None
 
@@ -179,7 +186,7 @@ def _infer_embedding_config_from_collection(
 
         for table_name in table_names:
             logger.debug(
-                f"Checking table '{table_name}' for collection '{collection_name}'"
+                "Checking table '%s' for collection '%s'", table_name, collection_name
             )
 
             table = None
@@ -198,7 +205,10 @@ def _infer_embedding_config_from_collection(
                     )
                     vector_count = len(count_result) if not count_result.empty else 0
                     logger.debug(
-                        f"Table '{table_name}' has {vector_count} vectors for collection '{collection_name}'"
+                        "Table '%s' has %s vectors for collection '%s'",
+                        table_name,
+                        vector_count,
+                        collection_name,
                     )
 
                     if vector_count == 0:
@@ -207,7 +217,9 @@ def _infer_embedding_config_from_collection(
                     # Get model tag from table name
                     model_tag = table_name.replace("embeddings_", "")
                     logger.debug(
-                        f"Extracted model tag '{model_tag}' from table '{table_name}'"
+                        "Extracted model tag '%s' from table '%s'",
+                        model_tag,
+                        table_name,
                     )
 
                     # Get dimension from schema
@@ -221,12 +233,14 @@ def _infer_embedding_config_from_collection(
                             ):
                                 dimension = field.type.list_size
                                 logger.debug(
-                                    f"Found vector dimension {dimension} in table '{table_name}'"
+                                    "Found vector dimension %s in table '%s'",
+                                    dimension,
+                                    table_name,
                                 )
                                 break
                     except Exception as e:
                         logger.debug(
-                            f"Could not get dimension from table '{table_name}': {e}"
+                            "Could not get dimension from table '%s': %s", table_name, e
                         )
 
                     model_stats[model_tag] = {
@@ -236,24 +250,31 @@ def _infer_embedding_config_from_collection(
 
                 except Exception as e:
                     logger.debug(
-                        f"Error checking table '{table_name}' for collection '{collection_name}': {e}"
+                        "Error checking table '%s' for collection '%s': %s",
+                        table_name,
+                        collection_name,
+                        e,
                     )
                     continue
 
             except Exception as e:
-                logger.debug(f"Error opening table '{table_name}': {e}")
+                logger.debug("Error opening table '%s': %s", table_name, e)
                 continue
             finally:
                 _safe_close_table(table)
 
         if not model_stats:
             logger.info(
-                f"No vectors found for collection '{collection_name}' in any embedding table - will use lazy initialization"
+                "No vectors found for collection '%s' in any embedding table - will use lazy initialization",
+                collection_name,
             )
             return None, None
 
         logger.info(
-            f"Found vectors from {len(model_stats)} different models for collection '{collection_name}': {list(model_stats.keys())}"
+            "Found vectors from %s different models for collection '%s': %s",
+            len(model_stats),
+            collection_name,
+            list(model_stats.keys()),
         )
 
         # Choose the most used model
@@ -308,22 +329,29 @@ def _infer_embedding_config_from_collection(
         embedding_dimension = stats["dimension"]
 
         logger.info(
-            f"Selected embedding model '{embedding_model_id}' (dimension: {embedding_dimension}) "
-            f"for collection '{collection_name}' based on {stats['count']} vectors"
+            "Selected embedding model '%s' (dimension: %s) for collection '%s' based on %s vectors",
+            embedding_model_id,
+            embedding_dimension,
+            collection_name,
+            stats["count"],
         )
 
         if len(model_stats) > 1:
             logger.warning(
-                f"Collection '{collection_name}' has vectors from multiple models: {list(model_stats.keys())}. "
-                f"Choosing '{embedding_model_id}' (most used with {stats['count']} vectors). "
-                f"Consider migrating old vectors to maintain consistency."
+                "Collection '%s' has vectors from multiple models: %s. Choosing '%s' (most used with %s vectors). Consider migrating old vectors to maintain consistency.",
+                collection_name,
+                list(model_stats.keys()),
+                embedding_model_id,
+                stats["count"],
             )
 
         return embedding_model_id, embedding_dimension
 
     except Exception as e:
         logger.error(
-            f"Error inferring embedding config for collection '{collection_name}': {e}",
+            "Error inferring embedding config for collection '%s': %s",
+            collection_name,
+            e,
             exc_info=True,
         )
         return None, None
@@ -331,16 +359,16 @@ def _infer_embedding_config_from_collection(
 
 def _model_tag_to_model_id(model_tag: str) -> str:
     """Convert model tag back to model ID."""
-    logger.debug(f"Converting model tag '{model_tag}' back to model ID")
+    logger.debug("Converting model tag '%s' back to model ID", model_tag)
 
     # Handle common cases
     if model_tag.startswith("OPENAI_"):
         result = model_tag.replace("OPENAI_", "").replace("_", "-").lower()
-        logger.debug(f"Converted OpenAI model tag to: {result}")
+        logger.debug("Converted OpenAI model tag to: %s", result)
         return result
     elif model_tag.startswith("BAAI_"):
         result = model_tag.replace("BAAI_", "").replace("_", "-").lower()
-        logger.debug(f"Converted BAAI model tag to: {result}")
+        logger.debug("Converted BAAI model tag to: %s", result)
         return result
     else:
         # Fallback: try to reverse the normalization
@@ -351,7 +379,7 @@ def _model_tag_to_model_id(model_tag: str) -> str:
             result = match.group(2).replace("_", "-").lower()
         else:
             result = model_tag.replace("_", "-").lower()
-        logger.debug(f"Used fallback conversion for model tag: {result}")
+        logger.debug("Used fallback conversion for model tag: %s", result)
         return result
 
 
@@ -526,7 +554,7 @@ def migrate_embeddings_table(
         # Stream data from legacy table using Arrow batches (memory-efficient)
         total_rows = legacy_table.count_rows()
         logger.info(
-            f"Streaming {total_rows} rows from legacy table '{legacy_table_name}'"
+            "Streaming %s rows from legacy table '%s'", total_rows, legacy_table_name
         )
 
         batch_num = 0
@@ -551,7 +579,7 @@ def migrate_embeddings_table(
             # Logging (avoid I/O intensive operations)
             if batch_num % 10 == 0:
                 logger.info(
-                    f"Migration progress: {rows_migrated}/{total_rows} rows migrated"
+                    "Migration progress: %s/%s rows migrated", rows_migrated, total_rows
                 )
 
         logger.info(

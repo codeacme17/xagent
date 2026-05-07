@@ -178,6 +178,10 @@ markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",
   "postgresql: marks tests that require PostgreSQL database",
+  "real_rag: real embedding/provider/search KB integration; prefer serial CI (-n 0) under load",
+  "contract_stub: stable API contract tests using stub embedding or mocks",
+  "e2e: end-to-end style tests (may be slow)",
+  "requires_network: tests that need outbound network access",
 ]
 
 [tool.mypy]

@@ -166,7 +166,7 @@ def test_ingest_separators_valid_json_passed_to_config(app_with_kb, mock_user):
 def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
     app_with_kb, mock_user
 ):
-    """Non-admin is rejected by _check_can_delete_collection before delete_collection."""
+    """Non-admin is rejected by _ensure_collection_access before delete_collection."""
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
@@ -184,7 +184,11 @@ def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
         resp = client.delete("/api/kb/collections/test_collection")
 
     assert resp.status_code == 403
-    assert "admin users" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert (
+        "Only admin users can delete collections containing documents from other users."
+        in detail
+    )
     mock_delete_collection.assert_not_called()
 
 
@@ -259,30 +263,29 @@ def test_delete_document_forbidden_for_non_admin_other_users_doc(
             "/api/kb/collections/test_collection/documents/doc.txt",
         )
 
-    # No accessible document -> 404 from delete_document_api, and delete_document must not be called
-    assert resp.status_code == 404
+    # No accessible document -> 403 from delete_document_api, and delete_document must not be called
+    assert resp.status_code == 403
     body = resp.json()
-    assert "Document not found" in body.get("detail", "")
+    assert "Access denied for collection" in body.get("detail", "")
+    assert "test_collection" in body.get("detail", "")
     mock_delete_document.assert_not_called()
 
 
 def test_delete_document_allowed_for_admin_any_doc(app_with_kb_admin, admin_user):
     """Admin user can delete documents regardless of owner."""
     with (
-        patch(
-            "xagent.web.api.kb._list_documents_for_user"
-        ) as mock_list_documents_for_user,
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch(
             "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
         ) as mock_delete_document,
     ):
-        # For admin, list_documents path should return all matching records.
-        mock_list_documents_for_user.return_value = [
-            {
-                "collection": "test_collection",
-                "doc_id": "doc_123",
-                "source_path": "/tmp/doc.txt",
-            }
+        # New API flow resolves by vector_store.list_document_records first.
+        mock_record = MagicMock()
+        mock_record.doc_id = "doc_123"
+        mock_record.source_path = "/tmp/doc.txt"
+        mock_record.metadata = {}
+        mock_get_vector_store.return_value.list_document_records.return_value = [
+            mock_record
         ]
         mock_delete_document.return_value = type(
             "DeleteResult",

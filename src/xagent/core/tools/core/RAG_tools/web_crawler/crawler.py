@@ -72,7 +72,7 @@ class WebCrawler:
         if start_url_normalized:
             self.pending_urls.append((start_url_normalized, 0))  # (url, depth)
 
-        logger.info(f"Starting crawl from {self.config.start_url}")
+        logger.info("Starting crawl from %s", self.config.start_url)
 
         # Create HTTP client
         user_agent = self.config.user_agent or "Mozilla/5.0 (xagent WebCrawler/1.0)"
@@ -85,8 +85,10 @@ class WebCrawler:
 
         elapsed = time.time() - self.start_time
         logger.info(
-            f"Crawl completed: {len(self.crawl_results)} pages, "
-            f"{len(self.failed_urls)} failed, {elapsed:.2f}s"
+            "Crawl completed: %s pages, %s failed, %.2fs",
+            len(self.crawl_results),
+            len(self.failed_urls),
+            elapsed,
         )
 
         return self.crawl_results
@@ -123,7 +125,7 @@ class WebCrawler:
                 # Skip if exceeds max depth
                 if depth > self.config.max_depth:
                     logger.debug(
-                        f"Skipping {url}: exceeds max depth {self.config.max_depth}"
+                        "Skipping %s: exceeds max depth %s", url, self.config.max_depth
                     )
                     continue
 
@@ -140,12 +142,12 @@ class WebCrawler:
                 # Process results and extract new links
                 for result_tuple in results:
                     if isinstance(result_tuple, Exception):
-                        logger.error(f"Crawl task failed: {result_tuple}")
+                        logger.error("Crawl task failed: %s", result_tuple)
                         continue
 
                     # result_tuple should be a tuple (CrawlResult, Set[str])
                     if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
-                        logger.error(f"Invalid result format: {result_tuple}")
+                        logger.error("Invalid result format: %s", result_tuple)
                         continue
 
                     result, links = result_tuple
@@ -185,7 +187,7 @@ class WebCrawler:
         """
         async with semaphore:
             try:
-                logger.debug(f"Crawling {url} (depth: {depth})")
+                logger.debug("Crawling %s (depth: %s)", url, depth)
 
                 # Fetch page
                 response = await client.get(url, follow_redirects=True)
@@ -199,7 +201,7 @@ class WebCrawler:
                 # Validate content
                 content = cleaned["content_markdown"]
                 if not self.content_cleaner.is_valid_content(content, min_length=10):
-                    logger.warning(f"Insufficient content at {url}")
+                    logger.warning("Insufficient content at %s", url)
                     self.failed_urls[url] = "Insufficient content"
                     return None, set()
 
@@ -229,28 +231,29 @@ class WebCrawler:
 
                 self.crawl_results.append(result)
                 logger.info(
-                    f"Successfully crawled {url} "
-                    f"({cleaned['content_length']} chars, "
-                    f"{len(valid_links)} valid links)"
+                    "Successfully crawled %s (%s chars, %s valid links)",
+                    url,
+                    cleaned["content_length"],
+                    len(valid_links),
                 )
 
                 return result, valid_links
 
             except httpx.HTTPStatusError as e:
                 error_msg = f"HTTP {e.response.status_code}"
-                logger.error(f"Failed to crawl {url}: {error_msg}")
+                logger.error("Failed to crawl %s: %s", url, error_msg)
                 self.failed_urls[url] = error_msg
                 return None, set()
 
             except httpx.RequestError as e:
                 error_msg = f"Request error: {str(e)}"
-                logger.error(f"Failed to crawl {url}: {error_msg}")
+                logger.error("Failed to crawl %s: %s", url, error_msg)
                 self.failed_urls[url] = error_msg
                 return None, set()
 
             except Exception as e:
                 error_msg = f"Unexpected error: {str(e)}"
-                logger.error(f"Failed to crawl {url}: {error_msg}")
+                logger.error("Failed to crawl %s: %s", url, error_msg)
                 self.failed_urls[url] = error_msg
                 return None, set()
 

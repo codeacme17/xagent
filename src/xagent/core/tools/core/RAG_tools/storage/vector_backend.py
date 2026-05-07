@@ -3,6 +3,11 @@
 Resolve which :class:`~.contracts.VectorIndexStore` implementation to use from
 environment. Only LanceDB is implemented today; additional backends register
 here and in :meth:`StorageFactory.get_vector_index_store`.
+
+Test isolation: pytest should call ``reset_rag_storage_for_tests`` in
+``storage.factory`` instead of importing a specific provider; extend that
+function when adding a backend so connection caches are cleared alongside
+``StorageFactory.reset_all``.
 """
 
 from __future__ import annotations

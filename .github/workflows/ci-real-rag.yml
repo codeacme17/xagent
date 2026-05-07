@@ -1,0 +1,97 @@
+name: Real RAG Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual triggering
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real_rag_tests:
+    name: Real RAG E2E Tests
+    runs-on: ubuntu-latest
+    # Run only when PR is ready and DashScope embedding key+model are configured.
+    if: |
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (secrets.DASHSCOPE_API_KEY != '' && vars.DASHSCOPE_EMBEDDING_MODEL != '')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        shell: bash
+        run: |
+          set -e
+          _UV="python3 -m uv"
+          $_UV --version
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Run real_rag tests (serial, requires embedding API)
+        shell: bash
+        run: |
+          set -e
+
+          # Export embedding config for tests.
+          # We require both key and model name to avoid starting the job with incomplete config.
+          if [ -n "${{ secrets.DASHSCOPE_API_KEY }}" ]; then
+            export DASHSCOPE_API_KEY="${{ secrets.DASHSCOPE_API_KEY }}"
+            export DASHSCOPE_EMBEDDING_MODEL="${{ vars.DASHSCOPE_EMBEDDING_MODEL }}"
+            echo "✓ DASHSCOPE embedding config configured"
+          fi
+          # Run real_rag tests serially as required
+          python3 -m uv run python -m pytest -m "real_rag" -v -n 0
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DASHSCOPE_EMBEDDING_MODEL: ${{ vars.DASHSCOPE_EMBEDDING_MODEL }}
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "## Real RAG Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "These tests require both embedding API key and embedding model variables." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Required CI config:" >> $GITHUB_STEP_SUMMARY
+          echo "- DASHSCOPE_API_KEY (secret) + DASHSCOPE_EMBEDDING_MODEL (repo variable)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To enable in CI, configure both the secret and the corresponding model variable." >> $GITHUB_STEP_SUMMARY

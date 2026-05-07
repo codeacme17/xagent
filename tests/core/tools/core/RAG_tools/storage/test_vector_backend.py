@@ -47,6 +47,8 @@ def test_invalid_backend_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(VECTOR_BACKEND_ENV, "not-a-backend")
     with pytest.raises(ConfigurationError, match="Invalid"):
         get_configured_vector_backend()
+    # Ensure autouse teardown fixtures can reset storage safely.
+    monkeypatch.delenv(VECTOR_BACKEND_ENV, raising=False)
 
 
 def test_factory_creates_lancedb_store(

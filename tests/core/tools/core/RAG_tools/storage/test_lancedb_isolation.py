@@ -11,12 +11,9 @@ from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
 )
 from xagent.core.tools.core.RAG_tools.storage import (
     get_vector_index_store,
-    reset_kb_write_coordinator,
+    reset_rag_storage_for_tests,
 )
-from xagent.providers.vector_store.lancedb import (
-    LanceDBConnectionManager,
-    clear_connection_cache,
-)
+from xagent.providers.vector_store.lancedb import LanceDBConnectionManager
 
 
 def test_tests_do_not_pollute_default_lancedb_dir(
@@ -30,8 +27,7 @@ def test_tests_do_not_pollute_default_lancedb_dir(
     expected_dir = tmp_path / "lancedb"
     expected_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("LANCEDB_DIR", str(expected_dir))
-    clear_connection_cache()
-    reset_kb_write_coordinator()
+    reset_rag_storage_for_tests()
 
     default_dir = Path(LanceDBConnectionManager.get_default_lancedb_dir())
     default_exists_before = default_dir.exists()

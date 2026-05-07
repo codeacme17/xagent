@@ -21,6 +21,7 @@ from .factory import (
     get_vector_index_store,
     get_vector_store_raw_connection,
     reset_kb_write_coordinator,
+    reset_rag_storage_for_tests,
 )
 from .vector_backend import (
     VECTOR_BACKEND_ENV,
@@ -51,4 +52,5 @@ __all__ = [
     "get_prompt_template_store",
     "get_main_pointer_store",
     "reset_kb_write_coordinator",
+    "reset_rag_storage_for_tests",
 ]

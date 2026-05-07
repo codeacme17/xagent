@@ -241,8 +241,8 @@ class TestToolsAvailableAPI:
         """Test that /api/tools/available requires authentication."""
         response = client.get("/api/tools/available")
 
-        # Should return 401 (older FastAPI) or 403 (newer FastAPI) without auth
-        assert response.status_code in [401, 403]
+        # Unauthenticated requests return 403
+        assert response.status_code == 403
 
     def test_get_available_tools_falls_back_to_other_when_metadata_missing(
         self, monkeypatch

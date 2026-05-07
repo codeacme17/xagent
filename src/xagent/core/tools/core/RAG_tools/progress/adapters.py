@@ -65,7 +65,7 @@ class DeepDocProgressAdapter:
                     self.last_status = status
 
             except Exception as e:
-                logger.warning(f"Failed to process DeepDoc progress callback: {e}")
+                logger.warning("Failed to process DeepDoc progress callback: %s", e)
                 # Fallback: report the raw message
                 self.callback.on_status_update(message or "OCR processing")
 

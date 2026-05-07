@@ -1,6 +1,6 @@
 """Additional tests for metadata handling in format_context."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from xagent.core.tools.core.RAG_tools.core.schemas import SearchResult
 from xagent.core.tools.core.RAG_tools.retrieval.format_context import (
@@ -21,7 +21,7 @@ class TestFormatContextMetadata:
                 score=0.9,
                 parse_hash="hash1",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata={"page": 1, "section": "intro", "source": "/path/to/file.pdf"},
             )
         ]
@@ -44,7 +44,7 @@ class TestFormatContextMetadata:
                 score=0.9,
                 parse_hash="hash1",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata=None,
             )
         ]
@@ -67,7 +67,7 @@ class TestFormatContextMetadata:
                 score=0.9,
                 parse_hash="hash1",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata={},
             )
         ]
@@ -88,7 +88,7 @@ class TestFormatContextMetadata:
                 score=0.9,
                 parse_hash="hash1",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata={
                     "source": "/path/to/file.pdf",
                     "position": {"page": 1, "coordinates": {"x0": 0.1, "y0": 0.2}},
@@ -115,7 +115,7 @@ class TestFormatContextMetadata:
                 score=0.9,
                 parse_hash="hash1",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata={"page": 1},
             ),
             SearchResult(
@@ -125,7 +125,7 @@ class TestFormatContextMetadata:
                 score=0.8,
                 parse_hash="hash2",
                 model_tag="model1",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
                 metadata=None,
             ),
         ]

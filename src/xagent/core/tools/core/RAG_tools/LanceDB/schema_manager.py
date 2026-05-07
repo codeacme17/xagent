@@ -82,8 +82,9 @@ def _validate_schema_fields(
     except Exception as e:
         # Log other errors but don't fail - schema validation is best-effort
         logger.warning(
-            f"Could not validate schema for table '{table_name}': {e}. "
-            f"Proceeding with table creation/usage."
+            "Could not validate schema for table '%s': %s. Proceeding with table creation/usage.",
+            table_name,
+            e,
         )
     finally:
         _safe_close_table(table)
@@ -261,7 +262,7 @@ def ensure_documents_table(conn: DBConnection) -> None:
             raise
         except Exception as e:
             _safe_close_table(table)
-            logger.warning(f"Failed to check/migrate 'documents' table schema: {e}")
+            logger.warning("Failed to check/migrate 'documents' table schema: %s", e)
         else:
             _safe_close_table(table)
 
@@ -306,7 +307,7 @@ def ensure_parses_table(conn: DBConnection) -> None:
             raise
         except Exception as e:
             _safe_close_table(table)
-            logger.warning(f"Failed to check/migrate 'parses' table schema: {e}")
+            logger.warning("Failed to check/migrate 'parses' table schema: %s", e)
         else:
             _safe_close_table(table)
 
@@ -503,7 +504,7 @@ def ensure_prompt_templates_table(conn: DBConnection) -> None:
             table = conn.open_table(table_name)
             if "user_id" not in table.schema.names:
                 logger.info(
-                    f"Migrating '{table_name}' table: adding missing 'user_id' column"
+                    "Migrating '%s' table: adding missing 'user_id' column", table_name
                 )
                 table.add_columns({"user_id": "cast(null as bigint)"})
         except ValueError:
@@ -511,7 +512,9 @@ def ensure_prompt_templates_table(conn: DBConnection) -> None:
             raise
         except Exception as e:
             _safe_close_table(table)
-            logger.warning(f"Failed to check/migrate '{table_name}' table schema: {e}")
+            logger.warning(
+                "Failed to check/migrate '%s' table schema: %s", table_name, e
+            )
         else:
             _safe_close_table(table)
 
@@ -563,7 +566,7 @@ def ensure_ingestion_runs_table(conn: DBConnection) -> None:
         except Exception as e:
             _safe_close_table(table)
             logger.warning(
-                f"Failed to check/migrate 'ingestion_runs' table schema: {e}"
+                "Failed to check/migrate 'ingestion_runs' table schema: %s", e
             )
         else:
             _safe_close_table(table)

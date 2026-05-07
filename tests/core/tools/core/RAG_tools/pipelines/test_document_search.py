@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
 from unittest.mock import MagicMock, patch
@@ -445,7 +445,7 @@ def test_apply_rerank_dashscope_success(monkeypatch: pytest.MonkeyPatch) -> None
             score=0.8,
             parse_hash="ph1",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.8,
             fts_score=0.7,
             vector_rank=1,
@@ -458,7 +458,7 @@ def test_apply_rerank_dashscope_success(monkeypatch: pytest.MonkeyPatch) -> None
             score=0.7,
             parse_hash="ph2",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.7,
             fts_score=0.8,
             vector_rank=2,
@@ -471,7 +471,7 @@ def test_apply_rerank_dashscope_success(monkeypatch: pytest.MonkeyPatch) -> None
             score=0.6,
             parse_hash="ph3",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.6,
             fts_score=0.6,
             vector_rank=3,
@@ -519,7 +519,7 @@ def test_apply_rerank_dashscope_failure_fallback_to_rrf(
             score=0.8,
             parse_hash="ph1",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.8,
             fts_score=0.7,
             vector_rank=1,
@@ -532,7 +532,7 @@ def test_apply_rerank_dashscope_failure_fallback_to_rrf(
             score=0.7,
             parse_hash="ph2",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.7,
             fts_score=0.8,
             vector_rank=2,
@@ -576,7 +576,7 @@ def test_apply_rerank_rrf_fallback_no_scores(
             score=0.8,
             parse_hash="ph1",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         ),
     ]
 
@@ -605,7 +605,7 @@ def test_apply_rerank_no_rerank_config(monkeypatch: pytest.MonkeyPatch) -> None:
             score=0.8,
             parse_hash="ph1",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         ),
     ]
 
@@ -638,7 +638,7 @@ def test_apply_rerank_rrf_fallback_with_scores(
             score=0.8,
             parse_hash="ph1",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.8,
             fts_score=0.7,
             vector_rank=1,
@@ -651,7 +651,7 @@ def test_apply_rerank_rrf_fallback_with_scores(
             score=0.7,
             parse_hash="ph2",
             model_tag="m1",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             vector_score=0.7,
             fts_score=0.8,
             vector_rank=2,

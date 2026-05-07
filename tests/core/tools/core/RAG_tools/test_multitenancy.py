@@ -10,10 +10,10 @@ Also covers:
 
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -160,7 +160,7 @@ class TestMultiTenancyCollections:
                 "source_path": "/tmp/test.txt",
                 "file_type": "txt",
                 "content_hash": "hash1",
-                "uploaded_at": datetime.utcnow(),
+                "uploaded_at": datetime.now(timezone.utc),
                 "title": "Test Document",
                 "language": "en",
                 "user_id": user_id,
@@ -358,7 +358,7 @@ class TestMultiTenancySearch:
                     "vector_dimension": 1,
                     "text": "content for user 1",
                     "chunk_hash": "chash1",
-                    "created_at": datetime.utcnow(),
+                    "created_at": datetime.now(timezone.utc),
                     "metadata": "{}",
                     "user_id": 1,
                 }
@@ -378,7 +378,7 @@ class TestMultiTenancySearch:
                     "vector_dimension": 1,
                     "text": "content for user 2",
                     "chunk_hash": "chash2",
-                    "created_at": datetime.utcnow(),
+                    "created_at": datetime.now(timezone.utc),
                     "metadata": "{}",
                     "user_id": 2,
                 }
@@ -435,7 +435,7 @@ class TestMultiTenancySearch:
                         "vector_dimension": 1,
                         "text": "orphaned content should be hidden",
                         "chunk_hash": "chunk_hash_orphaned",
-                        "created_at": datetime.utcnow(),
+                        "created_at": datetime.now(timezone.utc),
                         "metadata": "{}",
                         "user_id": MIN_INT64,
                     }
@@ -829,16 +829,16 @@ class TestAPIMultiTenancy:
         assert result.total_count == 0
 
     @pytest.mark.asyncio
-    @patch("xagent.web.api.kb._check_can_delete_collection")
     @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch("xagent.web.api.kb.delete_collection_physical_dir")
     @patch("xagent.web.api.kb.delete_collection")
     async def test_delete_collection_api_with_user(
         self,
         mock_delete_collection,
         mock_delete_collection_physical_dir,
+        _mock_ensure_collection_access,
         mock_get_vector_store,
-        mock_check_can_delete,
     ):
         """Test delete_collection_api passes user context and moves dir to trash."""
         from xagent.core.tools.core.RAG_tools.core.schemas import (
@@ -885,16 +885,16 @@ class TestAPIMultiTenancy:
         assert result.status == "success"
 
     @pytest.mark.asyncio
-    @patch("xagent.web.api.kb._check_can_delete_collection")
     @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch("xagent.web.api.kb.delete_collection_physical_dir")
     @patch("xagent.web.api.kb.delete_collection")
     async def test_delete_collection_api_admin_access(
         self,
         mock_delete_collection,
         mock_delete_collection_physical_dir,
+        _mock_ensure_collection_access,
         mock_get_vector_store,
-        mock_check_can_delete,
     ):
         """Test admin can delete collections (move dir to trash)."""
         from xagent.core.tools.core.RAG_tools.core.schemas import (
