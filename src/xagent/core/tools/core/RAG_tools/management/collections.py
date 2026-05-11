@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import warnings as py_warnings
 from collections import defaultdict
@@ -47,7 +48,6 @@ from ..utils.lancedb_query_utils import _safe_count_rows, list_table_names
 from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
-from ..version_management.cascade_cleaner import cleanup_document_cascade
 from .collection_manager import delete_collection_metadata_sync
 
 logger = logging.getLogger(__name__)
@@ -331,7 +331,7 @@ def _list_table_names(conn: DBConnection, warnings: List[str]) -> List[str]:
     )
 
     try:
-        names = list_table_names(conn)
+        names: List[str] = list_table_names(conn)
     except Exception as exc:  # noqa: BLE001 - convert to warning
         message = f"Failed to list LanceDB tables: {exc}"
         logger.warning(message)
@@ -644,8 +644,6 @@ async def list_collections(
             doc_id_value: Any,
             file_id_value: Any,
         ) -> None:
-            import os
-
             normalized_doc_id = _normalize_optional_identifier(doc_id_value)
             normalized_file_id = _normalize_optional_identifier(file_id_value)
             display_name = None
@@ -1209,13 +1207,37 @@ def delete_collection(
         )
         doc_ids = sorted({r.doc_id for r in doc_records})
 
-        # Delete all data using storage abstraction
-        deleted_counts = vector_store.delete_collection_data(
-            collection_name=collection,
-            user_id=user_id,
-            is_admin=is_admin,
-            warnings_out=warnings,
-        )
+        deleted_counts: Dict[str, int] = {}
+
+        def _merge_deleted_counts(counts: Dict[str, int]) -> None:
+            for key, value in dict(counts).items():
+                deleted_count = int(value)
+                if deleted_count <= 0:
+                    continue
+                table_name = str(key)
+                deleted_counts[table_name] = (
+                    deleted_counts.get(table_name, 0) + deleted_count
+                )
+
+        if is_admin:
+            _merge_deleted_counts(
+                vector_store.delete_collection_data(
+                    collection_name=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    warnings_out=warnings,
+                )
+            )
+        else:
+            for doc_id in doc_ids:
+                _merge_deleted_counts(
+                    vector_store.delete_document_data(
+                        collection_name=collection,
+                        doc_id=doc_id,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                )
 
         # Clear ingestion status for all documents
         for doc_id in doc_ids:
@@ -1284,10 +1306,17 @@ def delete_collection(
         status = "success"
     elif affected or metadata_cleanup_total > 0:
         status = "partial_success"
+    elif deleted_counts and not warnings:
+        status = "success"
+    elif deleted_counts:
+        status = "partial_success"
     else:
         status = "error"
 
-    summary = f"Deleted collection '{collection}'."
+    if affected:
+        summary = f"Deleted {len(affected)} documents from collection '{collection}'."
+    else:
+        summary = f"Deleted orphaned artifacts from collection '{collection}'."
     logger.info(
         "Deleted collection '%s' - %s vector rows across %s tables, %s metadata/config rows",
         collection,
@@ -1381,14 +1410,12 @@ def delete_document(
         authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
 
     try:
-        # Use cascade cleanup to delete all related data
-        counts = cleanup_document_cascade(
-            collection=collection,
+        vector_store = get_vector_index_store()
+        counts = vector_store.delete_document_data(
+            collection_name=collection,
             doc_id=doc_id,
             user_id=user_id,
             is_admin=is_admin,
-            preview_only=False,
-            confirm=True,
         )
         clear_ingestion_status(
             collection,

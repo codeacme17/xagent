@@ -345,57 +345,20 @@ def test_vector_store_rename_collection_data_updates_expected_tables(
 
 
 @patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.cascade_delete"
+)
+@patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
 )
-def test_delete_collection_data_raises_when_any_table_delete_fails(
+def test_delete_collection_data_delegates_to_cascade_delete(
     mock_get_connection: Mock,
+    mock_cascade_delete: Mock,
 ) -> None:
-    """Collection deletes should preserve partial cleanup counts and warnings."""
+    """delete_collection_data should route collection deletes through cascade_delete."""
 
     mock_conn = Mock()
     mock_get_connection.return_value = mock_conn
-    mock_conn.table_names.return_value = [
-        "documents",
-        "parses",
-        "chunks",
-        "embeddings_text_embedding_v4",
-    ]
-    mock_conn.list_tables.return_value = [
-        "documents",
-        "parses",
-        "chunks",
-        "embeddings_text_embedding_v4",
-    ]
-
-    def _build_table(
-        *, before: int, after: int = 0, delete_side_effect: Exception | None = None
-    ):
-        table = Mock()
-        schema = Mock(names=["collection", "doc_id", "user_id", "file_id"])
-        field = Mock()
-        field.type = "int64"
-        schema.field.return_value = field
-        table.schema = schema
-        if delete_side_effect is None:
-            table.count_rows.side_effect = [before, after]
-        else:
-            table.count_rows.return_value = before
-            table.delete.side_effect = delete_side_effect
-        return table
-
-    documents_table = _build_table(before=1)
-    parses_table = _build_table(
-        before=1, delete_side_effect=RuntimeError("parse delete failed")
-    )
-    chunks_table = _build_table(before=0)
-    embeddings_table = _build_table(before=2)
-    tables = {
-        "documents": documents_table,
-        "parses": parses_table,
-        "chunks": chunks_table,
-        "embeddings_text_embedding_v4": embeddings_table,
-    }
-    mock_conn.open_table.side_effect = lambda name: tables[name]
+    mock_cascade_delete.return_value = {"documents": 1, "parses": 1}
 
     store = LanceDBVectorIndexStore()
     warnings: List[str] = []
@@ -404,11 +367,18 @@ def test_delete_collection_data_raises_when_any_table_delete_fails(
         "demo", user_id=1, is_admin=False, warnings_out=warnings
     )
 
-    assert deleted_counts == {"documents": 1, "embeddings_text_embedding_v4": 2}
-    assert warnings == ["Failed to delete from 'parses': parse delete failed"]
-    documents_table.delete.assert_called_once()
-    parses_table.delete.assert_called_once()
-    embeddings_table.delete.assert_called_once()
+    mock_cascade_delete.assert_called_once()
+    called = mock_cascade_delete.call_args.kwargs
+    assert called["target"] == "collection"
+    assert called["collection"] == "demo"
+    assert called["user_id"] == 1
+    assert called["is_admin"] is False
+    assert called["preview_only"] is False
+    assert called["confirm"] is True
+    assert called["conn"] is mock_conn
+
+    assert deleted_counts == {"documents": 1, "parses": 1}
+    assert warnings == []
 
 
 # --- Upsert Fallback Tests ---

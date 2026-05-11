@@ -584,6 +584,8 @@ def test_cascade_delete_collection_without_user_id_column_compatible(
     filt = table.delete.call_args[0][0]
     assert "collection == 'c_legacy'" in filt
     assert "user_id ==" not in filt
+    assert "user_id IS NULL" not in filt
+    assert "user_id IS NOT NULL" not in filt
 
 
 @patch(
@@ -613,6 +615,8 @@ def test_cascade_delete_document_without_user_id_column_compatible(
     assert "collection == 'c_legacy'" in filt
     assert "doc_id == 'd_legacy'" in filt
     assert "user_id ==" not in filt
+    assert "user_id IS NULL" not in filt
+    assert "user_id IS NOT NULL" not in filt
 
 
 @patch(

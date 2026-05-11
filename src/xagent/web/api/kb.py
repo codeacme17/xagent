@@ -6,7 +6,10 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import shutil
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
@@ -118,6 +121,9 @@ _PDF_ONLY_PARSE_METHODS = {
     ParseMethod.PDFPLUMBER,
     ParseMethod.PYMUPDF,
 }
+# lock_key -> (lock, active waiter/holder count)
+_WEB_FILE_LOCKS: Dict[str, tuple[threading.Lock, int]] = {}
+_WEB_FILE_LOCKS_GUARD = threading.Lock()
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -461,6 +467,292 @@ def _rollback_failed_cloud_ingestion(
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
+
+
+def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
+    """Clean up orphaned temporary files from interrupted atomic replacements.
+
+    Removes files matching patterns like:
+    - *.tmp-replace (old pattern)
+    - .*.tmp (new NamedTemporaryFile pattern)
+
+    Args:
+        upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
+
+    Returns:
+        Number of files cleaned up.
+    """
+    from ..config import get_uploads_dir
+
+    base_dir = upload_dir or get_uploads_dir()
+    if not base_dir.exists():
+        return 0
+
+    cleaned_count = 0
+    now = time.time()
+
+    # Walk through uploads directory and clean up temp files older than 1 hour
+    # to avoid deleting files that might still be in use
+    for root, dirs, files in os.walk(base_dir):
+        for filename in files:
+            file_path = Path(root) / filename
+
+            # Check for old temp file pattern (*.tmp-replace)
+            if filename.endswith(".tmp-replace"):
+                file_age = now - file_path.stat().st_mtime
+                if file_age > 3600:  # 1 hour
+                    try:
+                        file_path.unlink()
+                        cleaned_count += 1
+                        logger.debug("Cleaned up orphaned temp file: %s", file_path)
+                    except OSError as e:
+                        logger.warning(
+                            "Failed to clean up orphaned temp file %s: %s", file_path, e
+                        )
+
+            # Check for new temp file pattern (.*.tmp from NamedTemporaryFile)
+            # Pattern: filename.XXXXXX.tmp where X is random hex
+            if filename.endswith(".tmp") and "." in filename[:-4]:
+                # Verify it looks like our temp pattern (has multiple extensions)
+                parts = filename.split(".")
+                if len(parts) >= 3 and parts[-1] == "tmp":
+                    file_age = now - file_path.stat().st_mtime
+                    if file_age > 3600:  # 1 hour
+                        try:
+                            file_path.unlink()
+                            cleaned_count += 1
+                            logger.debug("Cleaned up orphaned temp file: %s", file_path)
+                        except OSError as e:
+                            logger.warning(
+                                "Failed to clean up orphaned temp file %s: %s",
+                                file_path,
+                                e,
+                            )
+
+    if cleaned_count > 0:
+        logger.info("Cleaned up %d orphaned temporary file(s)", cleaned_count)
+
+    return cleaned_count
+
+
+def _get_file_sha256(file_path: Path) -> str:
+    """Compute SHA256 hash for a local file."""
+    hash_obj = hashlib.sha256()
+    with file_path.open("rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            hash_obj.update(chunk)
+    return hash_obj.hexdigest()
+
+
+def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
+    """Atomically replace target file with source file content.
+
+    Uses a temporary file in the same directory as the target to ensure
+    atomic replacement via os.replace(). The temp file is automatically
+    cleaned up on success, and will be cleaned up by the OS on crash
+    (on most systems) or on next startup via cleanup logic.
+    """
+    import tempfile
+
+    # Ensure target directory exists
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a temp file in the same directory as target (required for atomic replace)
+    # delete=False so we can use it for replace() and clean up manually
+    with tempfile.NamedTemporaryFile(
+        dir=target_path.parent,
+        prefix=f"{target_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+        # Copy to temp file first
+        shutil.copy2(source_path, tmp_path)
+
+    # Atomic replace - this is atomic on POSIX systems
+    tmp_path.replace(target_path)
+
+
+def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
+    """Clear ingestion run markers so changed file can be re-indexed."""
+    try:
+        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_documents_table,
+            ensure_ingestion_runs_table,
+        )
+        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
+        from ...core.tools.core.RAG_tools.utils.string_utils import (
+            escape_lancedb_string,
+        )
+        from ...providers.vector_store.lancedb import get_connection_from_env
+
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        ensure_ingestion_runs_table(conn)
+        documents_table = None
+        ingestion_runs_table = None
+        try:
+            documents_table = conn.open_table("documents")
+            ingestion_runs_table = conn.open_table("ingestion_runs")
+
+            safe_file_id = escape_lancedb_string(file_id)
+            rows = query_to_list(
+                documents_table.search()
+                .where(f"file_id = '{safe_file_id}'")
+                .select(["collection", "doc_id"])
+                .limit(-1)
+            )
+            for row in rows:
+                collection = str(row.get("collection") or "").strip()
+                doc_id = str(row.get("doc_id") or "").strip()
+                if not collection or not doc_id:
+                    continue
+                safe_collection = escape_lancedb_string(collection)
+                safe_doc_id = escape_lancedb_string(doc_id)
+                ingestion_runs_table.delete(
+                    f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
+                )
+        finally:
+            _safe_close_table(documents_table)
+            _safe_close_table(ingestion_runs_table)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to mark uploaded file for re-index: file_id=%s, error=%s",
+            file_id,
+            exc,
+            exc_info=True,
+        )
+        return False
+
+
+def _refresh_existing_file_if_changed(
+    existing_record: Any,
+    temp_file_path: Path,
+    db_session: Session,
+    user_id: int,
+    url: str,
+    filename: str,
+    url_hash: str,
+    processed_urls: Dict[str, str],
+    context: str,
+) -> Optional[FileHandlerResult]:
+    """Refresh existing file if content has changed.
+
+    This function:
+    1. Compares file hashes to detect content changes
+    2. If changed, marks for reindex FIRST (before any file modification)
+    3. If mark succeeds, atomically replaces the file and updates DB record
+    4. If mark fails, returns existing file without refresh (stale but consistent)
+
+    Args:
+        existing_record: The UploadedFile record from database
+        temp_file_path: Path to the new temporary file
+        db_session: Database session for updates
+        user_id: User ID for record ownership
+        url: Source URL (for logging)
+        filename: Filename for the record
+        url_hash: Hash key for processed_urls cache
+        processed_urls: Cache dict to update with new file_id
+        context: Context string for logging (e.g., "in-memory cache", "cross-session")
+
+    Returns:
+        FileHandlerResult when the existing file remains usable or was refreshed.
+        Returns None only when the existing file path no longer exists and the
+        caller should continue with normal new-file handling.
+    """
+    existing_path = Path(str(existing_record.storage_path))
+    if not existing_path.exists():
+        return None
+
+    old_hash = _get_file_sha256(existing_path)
+    new_hash = _get_file_sha256(temp_file_path)
+
+    if old_hash == new_hash:
+        # Content unchanged - return existing file
+        return FileHandlerResult(
+            file_path=str(existing_record.storage_path),
+            file_id=str(existing_record.file_id),
+        )
+
+    # Content changed - first try to mark for reindex BEFORE modifying file
+    if not _mark_uploaded_file_for_reindex(str(existing_record.file_id)):
+        logger.warning(
+            "Failed to mark file for reindex, skipping file refresh to avoid inconsistent state: "
+            "url=%s, file_id=%s, context=%s",
+            url,
+            existing_record.file_id,
+            context,
+        )
+        # Return existing file without refreshing (stale embeddings but consistent state)
+        return FileHandlerResult(
+            file_path=str(existing_record.storage_path),
+            file_id=str(existing_record.file_id),
+        )
+
+    # Mark succeeded - now atomically replace the file
+    _atomic_replace_file(temp_file_path, existing_path)
+    file_record = _upsert_uploaded_file_record(
+        db_session,
+        user_id=user_id,
+        filename=filename,
+        storage_path=existing_path,
+        mime_type="text/markdown",
+        file_size=existing_path.stat().st_size,
+    )
+    processed_urls[url_hash] = str(file_record.file_id)
+
+    logger.info(
+        "Marked changed web file as PENDING_REINDEX and refreshed content: url=%s, file_id=%s, context=%s",
+        url,
+        file_record.file_id,
+        context,
+    )
+
+    return FileHandlerResult(
+        file_path=str(existing_record.storage_path),
+        file_id=str(existing_record.file_id),
+    )
+
+
+class _WebFileLock:
+    """Per-key in-process lock for web ingestion file operations."""
+
+    def __init__(self, lock_key: str) -> None:
+        self._lock_key = lock_key
+        self._lock: Optional[threading.Lock] = None
+
+    def __enter__(self) -> "_WebFileLock":
+        with _WEB_FILE_LOCKS_GUARD:
+            lock_entry = _WEB_FILE_LOCKS.get(self._lock_key)
+            if lock_entry is None:
+                lock = threading.Lock()
+                _WEB_FILE_LOCKS[self._lock_key] = (lock, 1)
+            else:
+                lock, ref_count = lock_entry
+                _WEB_FILE_LOCKS[self._lock_key] = (lock, ref_count + 1)
+            self._lock = lock
+        # Acquire the per-key lock outside the global guard to avoid
+        # blocking other threads from accessing the registry for different keys.
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._lock is not None:
+            self._lock.release()
+        with _WEB_FILE_LOCKS_GUARD:
+            lock_entry = _WEB_FILE_LOCKS.get(self._lock_key)
+            if lock_entry is None:
+                return
+            lock, ref_count = lock_entry
+            if ref_count <= 1:
+                _WEB_FILE_LOCKS.pop(self._lock_key, None)
+                return
+            _WEB_FILE_LOCKS[self._lock_key] = (lock, ref_count - 1)
 
 
 def handle_kb_exceptions(func: T) -> T:
@@ -2014,27 +2306,36 @@ async def ingest_web(
                 sanitize_path_component(title, "filename") if title else "untitled"
             )
             filename = f"{url_hash}_{safe_title}.md"
+            lock_key = f"{int(_user.id)}:{url_hash}"
 
-            # Check if we've already processed this URL (in-memory cache)
-            if url_hash in _processed_urls:
-                existing_file_id = _processed_urls[url_hash]
-                logger.info(
-                    "Reusing existing UploadedFile record for web ingestion: url=%s, file_id=%s",
-                    url,
-                    existing_file_id,
-                )
-                # Query the database to get the storage path
-                existing_record = (
-                    db_session.query(UploadedFile)
-                    .filter(UploadedFile.file_id == existing_file_id)
-                    .first()
-                )
-                if existing_record:
-                    return FileHandlerResult(
-                        file_path=str(existing_record.storage_path),
-                        file_id=str(existing_record.file_id),
+            with _WebFileLock(lock_key):
+                # Check if we've already processed this URL (in-memory cache)
+                if url_hash in _processed_urls:
+                    existing_file_id = _processed_urls[url_hash]
+                    logger.info(
+                        "Reusing existing UploadedFile record for web ingestion: url=%s, file_id=%s",
+                        url,
+                        existing_file_id,
                     )
-                else:
+                    existing_record = (
+                        db_session.query(UploadedFile)
+                        .filter(UploadedFile.file_id == existing_file_id)
+                        .first()
+                    )
+                    if existing_record:
+                        result = _refresh_existing_file_if_changed(
+                            existing_record=existing_record,
+                            temp_file_path=temp_file_path,
+                            db_session=db_session,
+                            user_id=int(_user.id),
+                            url=url,
+                            filename=filename,
+                            url_hash=url_hash,
+                            processed_urls=_processed_urls,
+                            context="in-memory cache",
+                        )
+                        if result is not None:
+                            return result
                     # Cached file_id was deleted from DB, fall through to recreate
                     logger.warning(
                         "Cached file_id %s not found in DB (record was deleted), will create new record for url=%s",
@@ -2042,88 +2343,112 @@ async def ingest_web(
                         url,
                     )
 
-            # Check database for existing file with same URL hash (cross-session deduplication)
-            existing_record = (
-                db_session.query(UploadedFile)
-                .filter(
-                    UploadedFile.user_id == int(_user.id),
-                    UploadedFile.filename == filename,
-                )
-                .first()
-            )
-
-            if existing_record:
-                logger.info(
-                    "Found existing UploadedFile record from previous session: url=%s, file_id=%s",
-                    url,
-                    existing_record.file_id,
-                )
-                _processed_urls[url_hash] = str(existing_record.file_id)
-                return FileHandlerResult(
-                    file_path=str(existing_record.storage_path),
-                    file_id=str(existing_record.file_id),
+                # Check database for existing file with same URL hash (cross-session deduplication)
+                existing_record = (
+                    db_session.query(UploadedFile)
+                    .filter(
+                        UploadedFile.user_id == int(_user.id),
+                        UploadedFile.filename == filename,
+                    )
+                    .first()
                 )
 
-            # Generate persistent file path
-            persistent_file = get_upload_path(
-                filename,
-                user_id=int(_user.id),
-                collection=collection_name,
-                collection_is_sanitized=True,
-            )
+                if existing_record:
+                    result = _refresh_existing_file_if_changed(
+                        existing_record=existing_record,
+                        temp_file_path=temp_file_path,
+                        db_session=db_session,
+                        user_id=int(_user.id),
+                        url=url,
+                        filename=filename,
+                        url_hash=url_hash,
+                        processed_urls=_processed_urls,
+                        context="cross-session",
+                    )
+                    if result is not None:
+                        # File existed and was handled (either unchanged or refreshed)
+                        _processed_urls[url_hash] = str(existing_record.file_id)
+                        logger.info(
+                            "Found existing UploadedFile record from previous session: url=%s, file_id=%s",
+                            url,
+                            existing_record.file_id,
+                        )
+                        return result
 
-            # Ensure directory exists
-            persistent_file.parent.mkdir(parents=True, exist_ok=True)
+                    # result is None means file doesn't exist - recreate it
+                    existing_path = Path(str(existing_record.storage_path))
+                    existing_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(temp_file_path, existing_path)
+                    file_record = _upsert_uploaded_file_record(
+                        db_session,
+                        user_id=int(_user.id),
+                        filename=filename,
+                        storage_path=existing_path,
+                        mime_type="text/markdown",
+                        file_size=existing_path.stat().st_size,
+                    )
+                    _processed_urls[url_hash] = str(file_record.file_id)
+                    logger.info(
+                        "Recreated missing persistent file for existing UploadedFile record: url=%s, file_id=%s",
+                        url,
+                        file_record.file_id,
+                    )
+                    return FileHandlerResult(
+                        file_path=str(existing_record.storage_path),
+                        file_id=str(existing_record.file_id),
+                    )
 
-            try:
-                # Copy file to persistent location
-                shutil.copy2(temp_file_path, persistent_file)
-                logger.info(
-                    "Copied web ingestion file from %s to %s",
-                    temp_file_path,
-                    persistent_file,
-                )
-
-                # Create UploadedFile record
-                file_record = _upsert_uploaded_file_record(
-                    db_session,
-                    user_id=int(_user.id),
-                    filename=filename,
-                    storage_path=persistent_file,
-                    mime_type="text/markdown",
-                    file_size=persistent_file.stat().st_size,
-                )
-
-                logger.info(
-                    "Created UploadedFile record for web ingestion: file_id=%s, filename=%s, url=%s",
-                    file_record.file_id,
+                persistent_file = get_upload_path(
                     filename,
-                    url,
+                    user_id=int(_user.id),
+                    collection=collection_name,
+                    collection_is_sanitized=True,
                 )
+                persistent_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Track this URL to prevent duplicates
-                _processed_urls[url_hash] = str(file_record.file_id)
+                try:
+                    shutil.copy2(temp_file_path, persistent_file)
+                    logger.info(
+                        "Copied web ingestion file from %s to %s",
+                        temp_file_path,
+                        persistent_file,
+                    )
 
-                return FileHandlerResult(
-                    file_path=str(persistent_file),
-                    file_id=str(file_record.file_id),
-                )
-            except Exception:
-                # Clean up orphaned persistent file if upsert failed
-                if persistent_file.exists():
-                    try:
-                        persistent_file.unlink()
-                        logger.warning(
-                            "Cleaned up orphaned persistent file due to upsert failure: %s",
-                            persistent_file,
-                        )
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            "Failed to clean up orphaned persistent file %s: %s",
-                            persistent_file,
-                            cleanup_error,
-                        )
-                raise
+                    file_record = _upsert_uploaded_file_record(
+                        db_session,
+                        user_id=int(_user.id),
+                        filename=filename,
+                        storage_path=persistent_file,
+                        mime_type="text/markdown",
+                        file_size=persistent_file.stat().st_size,
+                    )
+                    logger.info(
+                        "Created UploadedFile record for web ingestion: file_id=%s, filename=%s, url=%s",
+                        file_record.file_id,
+                        filename,
+                        url,
+                    )
+
+                    _processed_urls[url_hash] = str(file_record.file_id)
+                    return FileHandlerResult(
+                        file_path=str(persistent_file),
+                        file_id=str(file_record.file_id),
+                    )
+                except Exception:
+                    if persistent_file.exists():
+                        try:
+                            persistent_file.unlink()
+                            logger.warning(
+                                "Cleaned up orphaned persistent file due to upsert failure: %s",
+                                persistent_file,
+                            )
+                        except Exception as cleanup_error:
+                            logger.warning(
+                                "Failed to clean up orphaned persistent file %s: %s",
+                                persistent_file,
+                                cleanup_error,
+                            )
+                    raise
 
         # Create a wrapper that creates a dedicated DB session for the executor thread
         # This avoids sharing the request thread's session across thread boundaries,
@@ -2361,27 +2686,9 @@ def _perform_kb_collection_delete(
 
         _check_can_delete_collection(safe_collection, user_id, is_admin)
 
-        physical_cleanup = delete_collection_physical_dir(
-            user_id=user_id,
-            collection_name=safe_collection,
+        collection_dir = get_upload_path(
+            "", user_id=user_id, collection=safe_collection
         )
-        physical_cleanup_status = physical_cleanup.status
-        physical_cleanup_error = physical_cleanup.error
-        collection_dir = physical_cleanup.collection_dir
-        if physical_cleanup_status == "failed":
-            if (
-                physical_cleanup_error
-                == "Another operation is in progress; please try again later."
-            ):
-                raise HTTPException(status_code=409, detail=physical_cleanup_error)
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Failed to delete collection: cannot move physical files. "
-                    f"Error: {physical_cleanup_error}. "
-                    "Please ensure the directory is not in use and you have proper permissions."
-                ),
-            )
 
         vector_store = get_vector_index_store()
         collection_records = vector_store.list_document_records(
@@ -2400,6 +2707,15 @@ def _perform_kb_collection_delete(
         # Re-check right before vector deletion to reduce TOCTTOU window.
         _check_can_delete_collection(safe_collection, user_id, is_admin)
         result = delete_collection(safe_collection, user_id, is_admin)
+
+        physical_cleanup = delete_collection_physical_dir(
+            user_id=user_id,
+            collection_name=safe_collection,
+        )
+        physical_cleanup_status = physical_cleanup.status
+        physical_cleanup_error = physical_cleanup.error
+        if physical_cleanup.collection_dir is not None:
+            collection_dir = physical_cleanup.collection_dir
 
         if result.status == "error":
             cleanup_warnings = list(result.warnings) if result.warnings else []
@@ -2434,13 +2750,21 @@ def _perform_kb_collection_delete(
             )
             if file_id
         }
-        deleted_uploaded_files = delete_collection_uploaded_files(
-            db,
-            user_id=user_id,
-            collection_file_ids=collection_file_ids,
-            remaining_file_ids=remaining_file_ids,
-            collection_dir=collection_dir,
-        )
+        deleted_uploaded_files = 0
+        if physical_cleanup_status in {"success", "not_found"}:
+            deleted_uploaded_files = delete_collection_uploaded_files(
+                db,
+                user_id=user_id,
+                collection_file_ids=collection_file_ids,
+                remaining_file_ids=remaining_file_ids,
+                collection_dir=collection_dir,
+            )
+        else:
+            logger.warning(
+                "Preserving UploadedFile records for collection %s because physical cleanup status is %s",
+                safe_collection,
+                physical_cleanup_status,
+            )
         if deleted_uploaded_files:
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
@@ -2538,14 +2862,6 @@ async def delete_collection_api(
         bool(_user.is_admin),
         db,
     )
-    if result.status in ("success", "partial_success"):
-        try:
-            from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-            metadata_store = get_metadata_store()
-            await metadata_store.delete_collection(collection_name)
-        except Exception as exc:
-            logger.debug("Failed to delete collection metadata: %s", exc)
     return result
 
 
@@ -2592,15 +2908,6 @@ async def batch_delete_collections_api(
                 result = _perform_kb_collection_delete(name, user_id, is_admin, db)
                 if result.status in ("success", "partial_success"):
                     deleted.append(name)
-                    try:
-                        from ...core.tools.core.RAG_tools.storage.factory import (
-                            get_metadata_store,
-                        )
-
-                        metadata_store = get_metadata_store()
-                        await metadata_store.delete_collection(name)
-                    except Exception as exc:
-                        logger.debug("Failed to delete collection metadata: %s", exc)
                 else:
                     failed.append(
                         BatchDeleteFailureItem(

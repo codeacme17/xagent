@@ -1168,21 +1168,42 @@ async def test_ensure_collection_access_returns_404_when_collection_absent_globa
     assert mock_list.await_count == 2
 
 
-def test_kb_delete_physical_cleanup_failure_aborts_operation(test_env, temp_uploads):
-    """Test that physical cleanup (move-to-trash) failure aborts database deletion."""
-    app, headers, user, _ = test_env
+def test_kb_delete_physical_cleanup_failure_preserves_uploaded_file_records(
+    test_env, temp_uploads
+):
+    """Physical cleanup failure should preserve UploadedFile rows for retry."""
+    app, headers, user, session_local = test_env
     client = TestClient(app)
+    from xagent.web.services.kb_collection_service import CollectionPhysicalDeleteResult
 
     collection_name = "kb_to_delete_fail"
 
     # Pre-create the collection directory
     coll_dir = temp_uploads / f"user_{user.id}" / collection_name
     coll_dir.mkdir(parents=True, exist_ok=True)
-    (coll_dir / "some_file.txt").write_text("data")
+    file_path = coll_dir / "some_file.txt"
+    file_path.write_text("data")
 
-    # Mock delete_collection to return success (database deletion would succeed)
+    db = session_local()
+    upload = UploadedFile(
+        user_id=user.id,
+        filename=file_path.name,
+        storage_path=str(file_path),
+        mime_type="text/plain",
+        file_size=file_path.stat().st_size,
+    )
+    db.add(upload)
+    db.commit()
+    db.refresh(upload)
+    file_id = upload.file_id
+    db.close()
+
     with (
-        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch("xagent.web.api.kb._check_can_delete_collection"),
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_physical_dir"
+        ) as mock_physical_delete,
         patch("xagent.web.api.kb.delete_collection") as mock_delete,
         patch(
             "xagent.web.services.kb_collection_service.move_collection_dir_to_trash"
@@ -1199,21 +1220,34 @@ def test_kb_delete_physical_cleanup_failure_aborts_operation(test_env, temp_uplo
             affected_documents=[],
             deleted_counts={},
         )
-
-        # Simulate move-to-trash failure (delete now uses rename-to-trash, not rmtree)
+        mock_get_vector_store.return_value.list_document_records.side_effect = [
+            [
+                DocumentRecord(
+                    doc_id="doc-1", file_id=file_id, source_path=str(file_path)
+                )
+            ],
+            [],
+        ]
+        mock_physical_delete.return_value = CollectionPhysicalDeleteResult(
+            status="failed",
+            error="Permission denied",
+            collection_dir=coll_dir,
+        )
         mock_move_to_trash.side_effect = PermissionError("Permission denied")
 
-        # Attempt to delete collection
         response = client.delete(
             f"/api/kb/collections/{collection_name}", headers=headers
         )
 
-        # Should fail with 500 (physical move failed, operation aborted)
-        assert response.status_code == 500
-        assert "cannot move physical files" in response.json()["detail"].lower()
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial_success"
 
-        # Verify directory still exists (operation was aborted)
-        assert coll_dir.exists()
+    # Physical file remains, so SQL metadata must remain for retry cleanup.
+    db = session_local()
+    remaining = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+    db.close()
+    assert remaining is not None
+    assert coll_dir.exists()
 
 
 def test_kb_delete_returns_physical_cleanup_status(test_env, temp_uploads):

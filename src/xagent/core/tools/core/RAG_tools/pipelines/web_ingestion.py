@@ -204,14 +204,13 @@ async def run_web_ingestion(
                             final_file_id,
                         )
                     except Exception as e:
-                        logger.warning(
-                            "File handler failed for %s: %s. Using temporary file instead.",
-                            crawl_result.url,
-                            e,
+                        logger.exception("File handler failed for %s", crawl_result.url)
+                        failure_message = (
+                            f"File persistence failed for {crawl_result.url}: {e}"
                         )
-                        final_file_path = temp_file
-                        final_file_id = None
-                        copied_persistent_file = None
+                        failed_urls[crawl_result.url] = failure_message
+                        warnings.append(failure_message)
+                        continue
 
                 try:
                     # Ingest the file

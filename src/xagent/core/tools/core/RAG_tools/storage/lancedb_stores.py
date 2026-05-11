@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
@@ -469,7 +470,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             uri = getattr(sync_conn, "uri", None)
             if uri is None:
                 # Fallback: use LANCEDB_DIR env var
-                import os
 
                 uri = os.getenv("LANCEDB_DIR", "./data/lancedb")
             self._async_conn = await lancedb.connect_async(uri)  # type: ignore[attr-defined]
@@ -705,68 +705,46 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
-        from ..LanceDB.schema_manager import (
-            ensure_chunks_table,
-            ensure_documents_table,
-            ensure_parses_table,
-        )
-
-        deleted_counts: Dict[str, int] = {}
-        failed_tables: List[str] = []
         conn = self._get_connection()
-        filter_expr = self.build_filter_expression(
-            build_filter_from_dict({"collection": collection_name}),
+        from ..version_management.cascade_cleaner import cascade_delete
+
+        counts = cascade_delete(
+            target="collection",
+            collection=collection_name,
             user_id=user_id,
             is_admin=is_admin,
+            preview_only=False,
+            confirm=True,
+            conn=conn,
         )
-        if not filter_expr:
-            return deleted_counts
-
-        # Ensure tables exist before attempting deletion
-        ensure_documents_table(conn)
-        ensure_parses_table(conn)
-        ensure_chunks_table(conn)
-
-        # Delete from core tables (use cached handles; do NOT close them)
-        for table_name in ["documents", "parses", "chunks"]:
-            try:
-                table = self._get_table(table_name)
-                original_count = table.count_rows(filter_expr)
-                table.delete(filter_expr)
-                deleted_count = original_count - table.count_rows(filter_expr)
-                if deleted_count > 0:
-                    deleted_counts[table_name] = deleted_count
-            except Exception as exc:  # noqa: BLE001
-                warning = f"Failed to delete from '{table_name}': {exc}"
-                logger.warning(warning)
-                failed_tables.append(warning)
-
-        # Delete embeddings data (use cached handles; do NOT close them)
-        for table_name in self.list_table_names():
-            if not table_name.startswith("embeddings_"):
-                continue
-            try:
-                table = self._get_table(table_name)
-                original_count = table.count_rows(filter_expr)
-                table.delete(filter_expr)
-                deleted_count = original_count - table.count_rows(filter_expr)
-                if deleted_count > 0:
-                    deleted_counts[table_name] = deleted_count
-            except Exception as exc:  # noqa: BLE001
-                warning = f"Failed to delete from '{table_name}': {exc}"
-                logger.warning(warning)
-                failed_tables.append(warning)
-
-        if warnings_out is not None:
-            try:
-                warnings_out.extend(failed_tables)
-            except AttributeError:
-                for warning in failed_tables:
-                    warnings_out.append(warning)
-
-        # Clear cache so subsequent reads see the deletion and fd is released
+        # Ensure subsequent reads don't observe stale cached table handles.
         self.invalidate_table_cache()
-        return deleted_counts
+        return counts
+
+    def delete_document_data(
+        self,
+        collection_name: str,
+        doc_id: str,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> Dict[str, int]:
+        """Delete all vector-side data for a document."""
+        conn = self._get_connection()
+        from ..version_management.cascade_cleaner import cascade_delete
+
+        counts = cascade_delete(
+            target="document",
+            collection=collection_name,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=False,
+            confirm=True,
+            conn=conn,
+        )
+        # Ensure subsequent reads don't observe stale cached table handles.
+        self.invalidate_table_cache()
+        return counts
 
     def _count_collections_fast(
         self,

@@ -459,9 +459,29 @@ class VectorIndexStore(ABC):
 
         Args:
             collection_name: Name of the collection to delete.
-            user_id: User ID for multi-tenancy filtering.
-            is_admin: Whether the caller has admin privileges.
+            user_id: User ID for tenant-scoped deletion.
+            is_admin: Whether the caller can delete across tenants.
             warnings_out: Optional list to append best-effort deletion warnings to.
+
+        Returns:
+            Dictionary mapping table names to deleted row counts.
+        """
+
+    @abstractmethod
+    def delete_document_data(
+        self,
+        collection_name: str,
+        doc_id: str,
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> Dict[str, int]:
+        """Delete all vector-side data for a document.
+
+        Args:
+            collection_name: Name of the collection.
+            doc_id: Document identifier.
+            user_id: User ID for tenant-scoped deletion.
+            is_admin: Whether the caller can delete across tenants.
 
         Returns:
             Dictionary mapping table names to deleted row counts.

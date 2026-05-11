@@ -97,14 +97,14 @@ async def test_handle_kb_exceptions_maps_unknown_errors_to_500() -> None:
     assert exc_info.value.detail.startswith("服务器内部错误:")
 
 
-# --- delete_collection_api metadata cleanup Tests ---
+# --- delete_collection_api metadata delegation Tests ---
 
 _FACTORY_PATH = "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store"
 
 
 @pytest.mark.asyncio
-async def test_delete_collection_api_cleans_metadata_cache() -> None:
-    """After successful deletion, metadata_store.delete_collection() should be called."""
+async def test_delete_collection_api_does_not_call_metadata_store_on_success() -> None:
+    """API layer should delegate metadata cleanup to management layer."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from xagent.web.api.kb import delete_collection_api
@@ -148,14 +148,14 @@ async def test_delete_collection_api_cleans_metadata_cache() -> None:
             db=mock_db,
         )
 
-    mock_metadata_store.delete_collection.assert_awaited_once_with(
-        "test_collection_abc"
-    )
+    mock_metadata_store.delete_collection.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_delete_collection_api_metadata_error_not_fatal() -> None:
-    """If metadata_store.delete_collection() fails, the API should still return success."""
+async def test_delete_collection_api_success_not_affected_by_metadata_store_mock() -> (
+    None
+):
+    """Even if metadata store is mocked to fail, API success path should not touch it."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from xagent.web.api.kb import delete_collection_api
@@ -203,6 +203,7 @@ async def test_delete_collection_api_metadata_error_not_fatal() -> None:
 
     # Should not raise — error is logged but swallowed
     assert result.status == "success"
+    mock_metadata_store.delete_collection.assert_not_awaited()
 
 
 @pytest.mark.asyncio

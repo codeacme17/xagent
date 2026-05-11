@@ -73,7 +73,7 @@ def mock_crawl_results():
     return [
         MagicMock(
             url="https://example.com/page1",
-            title="Example Page 1",
+            title="Example_Page_1",
             content_markdown="# Example Page 1\n\nThis is test content for page 1.",
             status="success",
             depth=0,
@@ -82,7 +82,7 @@ def mock_crawl_results():
         ),
         MagicMock(
             url="https://example.com/page2",
-            title="Example Page 2",
+            title="Example_Page_2",
             content_markdown="## Example Page 2\n\nThis is test content for page 2.",
             status="success",
             depth=0,
@@ -308,7 +308,7 @@ class TestKBWebIngestionE2E:
         mixed_results = [
             MagicMock(
                 url="https://example.com/page1",
-                title="Success Page",
+                title="Success_Page",
                 content_markdown="# Success\nContent",
                 status="success",
                 depth=0,
@@ -317,7 +317,7 @@ class TestKBWebIngestionE2E:
             ),
             MagicMock(
                 url="https://example.com/page2",
-                title="Failed Page",
+                title="Failed_Page",
                 content_markdown="",
                 status="error",
                 depth=0,

@@ -489,6 +489,85 @@ async def startup_event() -> None:
     else:
         logger.info("Skipping background metadata rebuild (test environment)")
 
+    # Reconcile uploaded_files when auto migration is enabled.
+    # Keep this under the same migration toggle for consistent startup behavior.
+    # Run in background after app starts serving to avoid blocking startup.
+    if auto_migrate:
+
+        async def run_uploaded_file_reconcile_background() -> None:
+            from .services.kb_file_service import reconcile_uploaded_files
+
+            pending_migration_task = _migration_task
+            if pending_migration_task and not pending_migration_task.done():
+                try:
+                    await pending_migration_task
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Documents table backfill did not complete before uploaded files reconcile: %s",
+                        e,
+                    )
+
+            try:
+                from ..migrations.lancedb.backfill_uploaded_file_links import (
+                    backfill_all as backfill_uploaded_file_links,
+                )
+
+                link_result = await asyncio.to_thread(
+                    backfill_uploaded_file_links, dry_run=False
+                )
+                logger.info("Uploaded file links backfill completed: %s", link_result)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Uploaded file links backfill failed before reconcile: %s",
+                    e,
+                    exc_info=True,
+                )
+
+            def _run_uploaded_file_reconcile() -> None:
+                from .models.database import get_session_local
+
+                session_local = get_session_local()
+                db = session_local()
+                try:
+                    result = reconcile_uploaded_files(
+                        db,
+                        user_id=-1,
+                        is_admin=True,
+                        stale_ttl_hours=24 * 7,
+                        delete_stale=False,
+                    )
+                    logger.info("Uploaded files reconcile completed: %s", result)
+                finally:
+                    db.close()
+
+            try:
+                await asyncio.to_thread(_run_uploaded_file_reconcile)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Uploaded files reconcile failed: %s", e)
+
+        # Start background task without awaiting
+        asyncio.create_task(run_uploaded_file_reconcile_background())
+        logger.info("Started background uploaded files reconcile task")
+
+        # Clean up orphaned temporary files from interrupted atomic replacements
+        try:
+            from .api.kb import cleanup_orphaned_temp_files
+
+            def _run_temp_file_cleanup() -> int:
+                return cleanup_orphaned_temp_files()
+
+            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
+            if cleaned_count > 0:
+                logger.info(
+                    "Startup cleanup: removed %d orphaned temporary file(s)",
+                    cleaned_count,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Temporary file cleanup skipped due to error: %s",
+                e,
+            )
+
     # Warmup sandbox manager
     from .sandbox_manager import get_sandbox_manager
 

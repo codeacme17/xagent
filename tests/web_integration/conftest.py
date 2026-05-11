@@ -147,7 +147,7 @@ def mock_rag_pipeline(
 
 
 @pytest.fixture(scope="function")
-def test_env():
+def test_env(monkeypatch: pytest.MonkeyPatch):
     """Setup test database and app for E2E tests."""
     temp_db_fd, temp_db_path = tempfile.mkstemp(suffix=".db")
     os.close(temp_db_fd)
@@ -161,6 +161,14 @@ def test_env():
             yield db
         finally:
             db.close()
+
+    # Web ingestion runs file persistence inside run_in_executor; it opens sessions via
+    # get_session_local(), which reads module globals—not dependency_overrides[get_db].
+    # Align executor-thread sessions with the same test factory used by FastAPI Depends.
+    monkeypatch.setattr(
+        "xagent.web.api.kb.get_session_local",
+        lambda: TestingSessionLocal,
+    )
 
     app = FastAPI()
     app.include_router(kb_router)

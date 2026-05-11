@@ -562,10 +562,10 @@ class TestWebIngestionFileHandler:
                 assert call_kwargs["source_path"] == "/fake/persistent/path.md"
 
     @pytest.mark.asyncio
-    async def test_file_handler_failure_fallback_to_temp_file(
+    async def test_file_handler_failure_does_not_fallback_to_temp_file(
         self, crawl_config, ingestion_config
     ):
-        """Test that if file_handler fails, it falls back to temporary file."""
+        """Test that file_handler failures do not ingest temporary files."""
         mock_crawl_results = [
             MagicMock(
                 url="https://example.com/page1",
@@ -610,7 +610,6 @@ class TestWebIngestionFileHandler:
                 "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_document_ingestion",
                 return_value=mock_ingestion_result,
             ) as mock_ingest:
-                # Should not raise exception, should fall back to temp file
                 result = await run_web_ingestion(
                     collection="test_collection",
                     crawl_config=crawl_config,
@@ -618,16 +617,12 @@ class TestWebIngestionFileHandler:
                     file_handler=failing_file_handler,
                 )
 
-                # Verify ingestion still succeeded
-                assert result.status == "success"
-                assert result.documents_created == 1
+                assert result.status == "error"
+                assert result.documents_created == 0
+                assert result.pages_failed == 1
+                assert "https://example.com/page1" in result.failed_urls
 
-                # Verify run_document_ingestion was called with temp file (no file_id)
-                mock_ingest.assert_called_once()
-                call_kwargs = mock_ingest.call_args[1]
-                assert call_kwargs["file_id"] is None
-                # source_path should be the temporary file path
-                assert "xagent_web_ingest" in call_kwargs["source_path"]
+                mock_ingest.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_omitted_scope_falls_back_to_context(
