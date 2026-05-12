@@ -127,6 +127,31 @@ def create_default_llm() -> Optional[BaseLLM]:
         return None
 
 
+def _build_allowed_external_dirs(
+    user_id: Optional[int], *, only_existing: bool = False
+) -> list[str]:
+    """Build the allowed_external_dirs list for AgentService / tool
+    workspace_config.
+
+    Without this whitelist, file tools (read_file, read_csv_file,
+    list_files, ...) restrict themselves to the per-task workspace dir
+    and reject every uploaded file with "outside the allowed directory".
+
+    The list always contains:
+      - the user's upload directory ``<uploads>/user_<id>``
+        (when ``only_existing`` is True, only if that directory exists)
+      - any directories returned by ``get_external_upload_dirs()`` (used
+        for shared knowledge bases configured at the deployment level)
+    """
+    dirs: list[str] = []
+    if user_id is not None:
+        user_upload_dir = get_uploads_dir() / f"user_{user_id}"
+        if not only_existing or user_upload_dir.exists():
+            dirs.append(str(user_upload_dir))
+    dirs.extend([str(d) for d in get_external_upload_dirs()])
+    return dirs
+
+
 async def create_default_tools(
     db: Session,
     request: Any = None,
@@ -149,6 +174,10 @@ async def create_default_tools(
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
 
+    # Build allowed external directories so file tools can reach the user's
+    # uploads (see _build_allowed_external_dirs docstring).
+    allowed_external_dirs = _build_allowed_external_dirs(int(user.id))
+
     tool_config = WebToolConfig(
         db=db,
         request=request,
@@ -159,6 +188,7 @@ async def create_default_tools(
         workspace_config={
             "base_dir": str(get_uploads_dir() / f"user_{user.id}"),
             "task_id": task_id,
+            "allowed_external_dirs": allowed_external_dirs,
         },
         include_mcp_tools=bool(
             allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
@@ -813,14 +843,8 @@ class AgentServiceManager:
                         ]
 
                     # Build allowed external directories (user's upload directory for knowledge base files)
-                    allowed_external_dirs = []
-                    if user and user.id:
-                        user_upload_dir = get_uploads_dir() / f"user_{user.id}"
-                        allowed_external_dirs.append(str(user_upload_dir))
-
-                    # Add configured external upload directories (for knowledge base files from other projects)
-                    allowed_external_dirs.extend(
-                        [str(d) for d in get_external_upload_dirs()]
+                    allowed_external_dirs = _build_allowed_external_dirs(
+                        int(user.id) if user and user.id else None
                     )
 
                     # Create AgentService first (this creates the workspace)
@@ -1022,23 +1046,11 @@ class AgentServiceManager:
             )
         workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
 
-        # Build allowed external directories (user's upload directory for knowledge base files)
-        allowed_external_dirs = []
-        if user_id:
-            user_upload_dir = get_uploads_dir() / f"user_{user_id}"
-            if user_upload_dir.exists():
-                allowed_external_dirs.append(str(user_upload_dir))
-                logger.info(
-                    f"Added user upload directory to allowed external dirs: {user_upload_dir}"
-                )
-
-        # Add configured external upload directories (for knowledge base files from other projects)
-        external_upload_dirs = get_external_upload_dirs()
-        allowed_external_dirs.extend([str(d) for d in external_upload_dirs])
-        if external_upload_dirs:
-            logger.info(
-                f"Added {len(external_upload_dirs)} external upload directories from config"
-            )
+        # Build allowed external directories (user's upload directory for knowledge base files).
+        # Use only_existing=True here because cleanup runs against on-disk state.
+        allowed_external_dirs = _build_allowed_external_dirs(
+            user_id, only_existing=True
+        )
 
         for workspace_id, base_dir in workspace_ids:
             workspace = TaskWorkspace(
@@ -1113,12 +1125,8 @@ class AgentServiceManager:
                 database_type = self._infer_database_type(database_url)
 
                 # Build allowed external directories
-                allowed_external_dirs = []
-                if user and user.id:
-                    user_upload_dir = get_uploads_dir() / f"user_{user.id}"
-                    allowed_external_dirs.append(str(user_upload_dir))
-                allowed_external_dirs.extend(
-                    [str(d) for d in get_external_upload_dirs()]
+                allowed_external_dirs = _build_allowed_external_dirs(
+                    int(user.id) if user and user.id else None
                 )
 
                 # Create AgentService with Text2SQL agent type
@@ -1328,12 +1336,8 @@ class AgentServiceManager:
                     task_compact_llm = None
 
                 # Build allowed external directories
-                allowed_external_dirs = []
-                if user_id is not None:
-                    user_upload_dir = get_uploads_dir() / f"user_{user_id}"
-                    allowed_external_dirs.append(str(user_upload_dir))
-                allowed_external_dirs.extend(
-                    [str(d) for d in get_external_upload_dirs()]
+                allowed_external_dirs = _build_allowed_external_dirs(
+                    int(user_id) if user_id is not None else None
                 )
 
                 # Create agent with basic configuration

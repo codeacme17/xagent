@@ -328,13 +328,18 @@ class ToolFactory:
                     base_dir=workspace_config.get("base_dir") or str(get_uploads_dir()),
                 )
 
-            # Real task - create actual workspace
+            # Real task - create actual workspace.
+            # IMPORTANT: forward `allowed_external_dirs` so that file tools can
+            # access files outside the per-task workspace directory (e.g. the
+            # user's upload directory). Otherwise read_file/read_csv_file will
+            # reject every uploaded file as "outside the allowed directory".
             from ....workspace import WorkspaceManager
 
             workspace_manager = WorkspaceManager()
             workspace = workspace_manager.get_or_create_workspace(
                 workspace_config.get("base_dir") or str(get_uploads_dir()),
                 task_id or "default",
+                allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
             )
             return workspace
         except Exception as e:

@@ -15,15 +15,15 @@ Generate PowerPoint presentations using JavaScript code with the pptxgenjs libra
 2. **NEVER create custom color variables** like `const colorAccent = "0078D7"`
 3. **NEVER use hardcoded hex values** in your code - always reference `theme.xxx`
 4. **ALWAYS include the `#` prefix** in hex colors (e.g., `#EF4444` not `EF4444`)
-5. **Slide 0 MUST use `theme.cover`** - first slide is the cover with dark/high-contrast background
+5. **Slide 0 (first slide) MUST also be created via `const slide = pres.addSlide()`** and use `theme.cover` - first slide is the cover with dark/high-contrast background
 6. **Slides 1+ MUST use `theme.content`** - all other slides use light/readable background
 
 **WRONG:**
 ```javascript
 const colorAccent = "0078D7";  // ❌ WRONG - custom color
 slide1.addText("Title", { color: "363636" });  // ❌ WRONG - hardcoded hex
-pres.addSlide();
-pres.background = { color: theme.cover.background };  // ❌ WRONG - cover on non-first slide
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };  // ❌ WRONG - cover on non-first slide
 ```
 
 **CORRECT:**
@@ -43,14 +43,15 @@ const theme = {
     text: '#0A0F1C'
   }
 };
-// Slide 0 (first slide, no addSlide) - use theme.cover
-pres.background = { color: theme.cover.background };
-pres.addText("Title", { color: theme.cover.title });
+// Slide 0 (cover) — pptxgenjs requires addSlide() for the FIRST slide too
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText("Title", { color: theme.cover.title });
 
-// Slide 1+ (after addSlide) - use theme.content
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText("Content", { color: theme.content.primary });
+// Slide 1+ — call pres.addSlide() to get each new slide
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText("Content", { color: theme.content.primary });
 ```
 
 ---
@@ -73,7 +74,7 @@ pres.addText("Content", { color: theme.content.primary });
    ```
    Then reference colors as `theme.background`, `theme.primary`, etc.
 
-3. **Slide Creation**: Always call `pres.addSlide()` before adding content to a new slide (except the first slide)
+3. **Slide Creation**: ALWAYS call `pres.addSlide()` before adding content to ANY slide, including the FIRST one. Capture its return value: `const slide = pres.addSlide();` then call `slide.addText(...)`, `slide.background = {...}`, `slide.addImage(...)`, etc. Calling `pres.addText(...)` or setting `pres.background` directly on the presentation object will throw `pres.addText is not a function`.
 
 4. **Font Consistency**: Keep font sizes consistent: titles 40-56pt, subtitles 24-32pt, body text 16-20pt
 
@@ -250,16 +251,17 @@ const theme = {
 const pres = new PptxGenJS();
 
 // Slide 0: Cover (use theme.cover)
-pres.background = { color: theme.cover.background };
-pres.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
 
 // Slide 1+: Content (use theme.content)
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
 ['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
 });
 ```
 
@@ -292,16 +294,17 @@ const theme = {
 const pres = new PptxGenJS();
 
 // Slide 0: Cover slide (use theme.cover)
-pres.background = { color: theme.cover.background };
-pres.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
 
 // Slide 1: Content slide (use theme.content)
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
 ['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
 });
 
 pres.writeFile({ fileName: 'my_presentation.pptx' });
@@ -334,16 +337,17 @@ const theme = {
 };
 
 // Slide 0: Cover (dark background, white title)
-pres.background = { color: theme.cover.background };
-pres.addText('Annual Report 2024', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('Annual Report 2024', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
 
 // Slide 1: Content (light background, readable)
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
 ['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
 });
 
 pres.writeFile({ fileName: 'strategy.pptx' });
@@ -372,9 +376,9 @@ const theme = {
 };
 
 // Content slide
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('System Architecture', { x: 1, y: 0.8, fontSize: 48, bold: true, color: theme.content.primary });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.content.background };
+slide1.addText('System Architecture', { x: 1, y: 0.8, fontSize: 48, bold: true, color: theme.content.primary });
 
 const bullets = [
   'Microservices architecture',
@@ -383,7 +387,7 @@ const bullets = [
 ];
 
 bullets.forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+  slide1.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
 });
 
 pres.writeFile({ fileName: 'technical.pptx' });
@@ -413,9 +417,9 @@ const theme = {
 };
 
 // Content slide with metrics
-pres.addSlide();
-pres.background = { color: theme.content.background };
-pres.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.content.primary });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.content.background };
+slide1.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.content.primary });
 
 const metrics = [
   { label: 'Revenue', value: '$1.5M', color: theme.content.success },
@@ -426,29 +430,8 @@ const metrics = [
 metrics.forEach((metric, i) => {
   const x = 1 + (i % 3) * 3;
   const y = 2.5 + Math.floor(i / 3) * 2;
-  pres.addText(metric.label, { x, y: y, fontSize: 16, color: theme.content.secondary });
-  pres.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
-});
-
-pres.writeFile({ fileName: 'metrics.pptx' });
-```
-};
-
-pres.background = { color: theme.background };
-
-pres.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.primary });
-
-const metrics = [
-  { label: 'Revenue', value: '$1.5M', color: theme.success },
-  { label: 'Growth', value: '+25%', color: theme.accent },
-  { label: 'Customers', value: '86', color: theme.warning }
-];
-
-metrics.forEach((metric, i) => {
-  const x = 1 + (i % 3) * 3;
-  const y = 2.5 + Math.floor(i / 3) * 2;
-  pres.addText(metric.label, { x, y: y, fontSize: 16, color: theme.secondary });
-  pres.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
+  slide1.addText(metric.label, { x, y: y, fontSize: 16, color: theme.content.secondary });
+  slide1.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
 });
 
 pres.writeFile({ fileName: 'metrics.pptx' });
@@ -467,12 +450,13 @@ const theme = {
   text: '#111111'
 };
 
-pres.background = { color: theme.background };
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.background };
 
-pres.addText('Our Journey', { x: 1, y: 0.8, fontSize: 56, bold: true, color: theme.primary });
+slide1.addText('Our Journey', { x: 1, y: 0.8, fontSize: 56, bold: true, color: theme.primary });
 
 ['Founded in 2020', 'Team of 10', 'Bootstrapped'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2.5 + i * 0.8, fontSize: 20, color: theme.text });
+  slide1.addText(text, { x: 1, y: 2.5 + i * 0.8, fontSize: 20, color: theme.text });
 });
 
 pres.writeFile({ fileName: 'minimal.pptx' });
@@ -493,24 +477,25 @@ const theme = {
 };
 
 // Slide 1: Title
-pres.background = { color: theme.background };
-pres.addText('Strategic Vision 2025', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.primary });
-pres.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.secondary });
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.background };
+slide1.addText('Strategic Vision 2025', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.primary });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.secondary });
 
 // Slide 2: Content
-pres.addSlide();
-pres.background = { color: theme.background };
-pres.addText('Key Initiatives', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.background };
+slide2.addText('Key Initiatives', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
 ['AI Platform Launch', 'Market Expansion', 'Team Growth'].forEach((text, i) => {
-  pres.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.text, bullet: true });
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.text, bullet: true });
 });
 
 // Slide 3: Metrics
-pres.addSlide();
-pres.background = { color: theme.background };
-pres.addText('Performance Targets', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
-pres.addText('Revenue: $5M', { x: 1, y: 2.5, fontSize: 28, color: theme.accent });
-pres.addText('Growth: 150%', { x: 5, y: 2.5, fontSize: 28, color: theme.highlight });
+const slide3 = pres.addSlide();
+slide3.background = { color: theme.background };
+slide3.addText('Performance Targets', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
+slide3.addText('Revenue: $5M', { x: 1, y: 2.5, fontSize: 28, color: theme.accent });
+slide3.addText('Growth: 150%', { x: 5, y: 2.5, fontSize: 28, color: theme.highlight });
 
 pres.writeFile({ fileName: 'strategy.pptx' });
 ```
@@ -524,18 +509,18 @@ const pres = new PptxGenJS();
 const fs = require('fs');
 
 // Slide with image
-pres.addSlide();
-pres.addText('Revenue Chart', { x: 0.5, y: 0.8, fontSize: 40, bold: true, color: theme.content.primary });
+const slide1 = pres.addSlide();
+slide1.addText('Revenue Chart', { x: 0.5, y: 0.8, fontSize: 40, bold: true, color: theme.content.primary });
 
 // Check if image exists
 if (fs.existsSync('revenue_chart.png')) {
   // GOOD: Specify both w and h to control exact dimensions
-  pres.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
+  slide1.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
 
   // BETTER: Use sizing: 'contain' to fit within bounds while maintaining aspect ratio
-  // pres.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 4.5 } });
+  // slide1.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 4.5 } });
 } else {
-  pres.addText('Image not available: revenue_chart.png', { x: 1, y: 3, fontSize: 18, color: theme.content.secondary || theme.content.warning });
+  slide1.addText('Image not available: revenue_chart.png', { x: 1, y: 3, fontSize: 18, color: theme.content.secondary || theme.content.warning });
 }
 
 pres.writeFile({ fileName: 'with_image.pptx' });
@@ -552,19 +537,21 @@ pres.writeFile({ fileName: 'with_image.pptx' });
 **WRONG - May overflow slide:**
 ```javascript
 // ❌ Only width - height depends on aspect ratio, may exceed slide bounds
-pres.addImage({ path: 'chart.png', x: 1, y: 2, w: 9 });
+const slide1 = pres.addSlide();
+slide1.addImage({ path: 'chart.png', x: 1, y: 2, w: 9 });
 
 // ❌ Only height - width may exceed slide width
-pres.addImage({ path: 'photo.png', x: 1, y: 1, h: 6 });
+slide1.addImage({ path: 'photo.png', x: 1, y: 1, h: 6 });
 ```
 
 **CORRECT - Stay within bounds:**
 ```javascript
 // ✅ Both w and h specified
-pres.addImage({ path: 'chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
+const slide1 = pres.addSlide();
+slide1.addImage({ path: 'chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
 
 // ✅ Using contain with max bounds
-pres.addImage({ path: 'photo.png', x: 0.5, y: 1, sizing: { type: 'contain', w: 9, h: 6 } });
+slide1.addImage({ path: 'photo.png', x: 0.5, y: 1, sizing: { type: 'contain', w: 9, h: 6 } });
 ```
 
 **Important Notes:**

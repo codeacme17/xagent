@@ -1072,6 +1072,11 @@ class AgentService:
                 workspace_config = {
                     "base_dir": self.workspace.base_dir,
                     "task_id": self.workspace.id,
+                    # Forward the whitelist so file tools created from this
+                    # default config can still access the user's upload dir.
+                    "allowed_external_dirs": [
+                        str(d) for d in self.workspace.allowed_external_dirs
+                    ],
                 }
 
             return DefaultToolConfig(workspace_config)
