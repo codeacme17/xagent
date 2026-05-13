@@ -128,11 +128,40 @@ class LanceDBMetadataStore(MetadataStore):
 
         table = conn.open_table("collection_metadata")
         try:
-            safe_name = escape_lancedb_string(collection.name)
-            existing = table.search().where(f"name = '{safe_name}'").to_arrow()
-            if len(existing) > 0:
-                table.delete(f"name = '{safe_name}'")
-            table.add([data])
+            table.merge_insert(
+                ["name"]
+            ).when_matched_update_all().when_not_matched_insert_all().execute([data])
+        finally:
+            _safe_close_table(table)
+
+    async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        if not collections:
+            return
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        rows_by_name = OrderedDict()
+        for collection in collections:
+            if not collection.name:
+                continue
+            data = collection.to_storage()
+            data["updated_at"] = data.get("updated_at") or now
+            rows_by_name[collection.name] = data
+
+        if not rows_by_name:
+            return
+
+        table = conn.open_table("collection_metadata")
+        try:
+            table.merge_insert(
+                ["name"]
+            ).when_matched_update_all().when_not_matched_insert_all().execute(
+                list(rows_by_name.values())
+            )
         finally:
             _safe_close_table(table)
 

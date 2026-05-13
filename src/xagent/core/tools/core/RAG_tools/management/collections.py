@@ -12,7 +12,7 @@ import os
 import re
 import warnings as py_warnings
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import pyarrow as pa  # type: ignore
@@ -593,6 +593,7 @@ async def list_collections(
         vector_store = get_vector_index_store()
         metadata_collections: List[CollectionInfo] = []
         metadata_collection_names: Set[str] = set()
+        metadata_collections_by_name: Dict[str, CollectionInfo] = {}
         metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
         metadata_processed_documents_by_name: Dict[str, int] = {}
         try:
@@ -604,6 +605,11 @@ async def list_collections(
             )
             metadata_collection_names = {
                 collection.name
+                for collection in metadata_collections
+                if collection.name
+            }
+            metadata_collections_by_name = {
+                collection.name: collection
                 for collection in metadata_collections
                 if collection.name
             }
@@ -751,14 +757,82 @@ async def list_collections(
                     "Metadata cache unavailable, falling back to realtime: %s", exc
                 )
 
+        def _build_collection_info(
+            collection_name: str,
+            *,
+            metadata_info: Optional[CollectionInfo],
+            ingestion_config: Optional[IngestionConfig],
+            processed_documents: int,
+            timestamp_now: Optional[datetime] = None,
+        ) -> CollectionInfo:
+            collection_kwargs: Dict[str, Any] = {
+                "name": collection_name,
+                "embedding_model_id": (
+                    metadata_info.embedding_model_id if metadata_info else None
+                ),
+                "embedding_dimension": (
+                    metadata_info.embedding_dimension if metadata_info else None
+                ),
+                "documents": stats[collection_name]["documents"],
+                "parses": stats[collection_name]["parses"],
+                "chunks": stats[collection_name]["chunks"],
+                "embeddings": stats[collection_name]["embeddings"],
+                "processed_documents": processed_documents,
+                "document_names": sorted(document_names.get(collection_name, set())),
+                "document_metadata": sorted(
+                    document_metadata.get(collection_name, []),
+                    key=lambda item: (
+                        item.filename,
+                        item.file_id or "",
+                        item.doc_id or "",
+                    ),
+                ),
+                "ingestion_config": ingestion_config,
+                "owners": sorted(owners.get(collection_name, set())),
+                "schema_version": (
+                    metadata_info.schema_version if metadata_info else "1.0.0"
+                ),
+                "collection_locked": (
+                    metadata_info.collection_locked if metadata_info else False
+                ),
+                "allow_mixed_parse_methods": (
+                    metadata_info.allow_mixed_parse_methods if metadata_info else False
+                ),
+                "skip_config_validation": (
+                    metadata_info.skip_config_validation if metadata_info else False
+                ),
+                "extra_metadata": (
+                    dict(metadata_info.extra_metadata) if metadata_info else {}
+                ),
+            }
+            if metadata_info is not None:
+                collection_kwargs["created_at"] = metadata_info.created_at
+                collection_kwargs["updated_at"] = (
+                    timestamp_now
+                    if timestamp_now is not None
+                    else metadata_info.updated_at
+                )
+                collection_kwargs["last_accessed_at"] = (
+                    timestamp_now
+                    if timestamp_now is not None
+                    else metadata_info.last_accessed_at
+                )
+            elif timestamp_now is not None:
+                collection_kwargs["created_at"] = timestamp_now
+                collection_kwargs["updated_at"] = timestamp_now
+                collection_kwargs["last_accessed_at"] = timestamp_now
+            return CollectionInfo(**collection_kwargs)
+
         # Fallback to realtime aggregation for missing collections or cache failure
         used_realtime = False
+        realtime_timestamp: Optional[datetime] = None
         if (
             force_realtime
             or not stats
             or any(key not in stats for key in collection_keys)
         ):
             used_realtime = True
+            realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
             realtime_stats = vector_store.aggregate_collection_stats(
                 user_id=user_id,
                 is_admin=is_admin,
@@ -778,29 +852,30 @@ async def list_collections(
                         }
 
         # Async write stats back to metadata cache for next request
-        if used_realtime:
+        if used_realtime and is_admin:
             try:
                 metadata_store = get_metadata_store()
+                refreshed_infos: Dict[str, CollectionInfo] = {}
                 for collection in collection_keys:
-                    info = CollectionInfo(
-                        name=collection,
-                        documents=stats[collection]["documents"],
-                        parses=stats[collection]["parses"],
-                        chunks=stats[collection]["chunks"],
-                        embeddings=stats[collection]["embeddings"],
-                        processed_documents=stats[collection]["parses"],
-                        document_names=sorted(document_names.get(collection, set())),
-                        document_metadata=sorted(
-                            document_metadata.get(collection, []),
-                            key=lambda item: (
-                                item.filename,
-                                item.file_id or "",
-                                item.doc_id or "",
-                            ),
-                        ),
-                        owners=sorted(owners.get(collection, set())),
+                    existing_metadata_info = metadata_collections_by_name.get(
+                        collection
                     )
-                    await metadata_store.save_collection(info)
+                    info = _build_collection_info(
+                        collection,
+                        metadata_info=existing_metadata_info,
+                        ingestion_config=(
+                            existing_metadata_info.ingestion_config
+                            if existing_metadata_info
+                            else None
+                        ),
+                        processed_documents=stats[collection]["parses"],
+                        timestamp_now=realtime_timestamp,
+                    )
+                    refreshed_infos[collection] = info
+                await metadata_store.save_collections(list(refreshed_infos.values()))
+                metadata_collections_by_name.update(refreshed_infos)
+                for collection in refreshed_infos:
+                    metadata_collection_names.add(collection)
             except Exception as exc:
                 logger.debug("Failed to cache collection metadata: %s", exc)
         collection_keys = sorted(
@@ -829,32 +904,22 @@ async def list_collections(
                 if key not in stats[collection]:
                     stats[collection][key] = 0
 
-        collections = [
-            CollectionInfo(
-                name=collection,
-                documents=stats[collection]["documents"],
-                parses=stats[collection]["parses"],
-                chunks=stats[collection]["chunks"],
-                embeddings=stats[collection]["embeddings"],
-                processed_documents=(
-                    stats[collection]["parses"]
-                    if stats[collection]["parses"] > 0
-                    else metadata_processed_documents_by_name.get(collection, 0)
-                ),
-                document_names=sorted(document_names[collection]),
-                document_metadata=sorted(
-                    document_metadata[collection],
-                    key=lambda item: (
-                        item.filename,
-                        item.file_id or "",
-                        item.doc_id or "",
+        collections = []
+        for collection in collection_keys:
+            metadata_info = metadata_collections_by_name.get(collection)
+            collections.append(
+                _build_collection_info(
+                    collection,
+                    metadata_info=metadata_info,
+                    ingestion_config=collection_configs.get(collection),
+                    processed_documents=(
+                        stats[collection]["parses"]
+                        if stats[collection]["parses"] > 0
+                        else metadata_processed_documents_by_name.get(collection, 0)
                     ),
-                ),
-                ingestion_config=collection_configs.get(collection),
-                owners=sorted(owners.get(collection, set())),
+                    timestamp_now=realtime_timestamp if used_realtime else None,
+                )
             )
-            for collection in collection_keys
-        ]
 
         message = f"Found {len(collections)} collections"
         logger.info(message)

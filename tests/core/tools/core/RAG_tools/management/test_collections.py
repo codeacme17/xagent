@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -744,6 +744,44 @@ async def test_list_collections_cache_filled_by_subsequent_call(
 
 
 @pytest.mark.asyncio
+async def test_list_collections_preserves_cached_collection_timestamps(
+    temp_lancedb_dir: str,
+) -> None:
+    """Cached collection timestamps should remain stable across list calls."""
+    collection = "timestamp_cache_test"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+            }
+        ]
+    )
+
+    first_result = await list_collections(
+        user_id=None, is_admin=True, force_realtime=True
+    )
+    assert first_result.status == "success"
+    first_info = next(c for c in first_result.collections if c.name == collection)
+
+    second_result = await list_collections(user_id=None, is_admin=True)
+    assert second_result.status == "success"
+    second_info = next(c for c in second_result.collections if c.name == collection)
+
+    assert second_info.created_at == first_info.created_at
+    assert second_info.updated_at == first_info.updated_at
+    assert second_info.last_accessed_at == first_info.last_accessed_at
+
+
+@pytest.mark.asyncio
 async def test_list_collections_cache_miss_uses_realtime(
     temp_lancedb_dir: str,
 ) -> None:
@@ -770,8 +808,48 @@ async def test_list_collections_cache_miss_uses_realtime(
     assert result.status == "success"
     assert result.total_count >= 1
 
-    names = [c.name for c in result.collections]
-    assert collection in names
+    info = next(c for c in result.collections if c.name == collection)
+    assert info.created_at is not None
+    assert info.updated_at is not None
+    assert info.last_accessed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_list_collections_non_admin_realtime_does_not_overwrite_global_metadata(
+    temp_lancedb_dir: str,
+) -> None:
+    """Tenant-scoped realtime refresh should not write filtered stats to global metadata."""
+    collection = "tenant_realtime_test"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-1",
+                "source_path": "/path/doc.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "Doc",
+                "language": "en",
+                "user_id": 1,
+            }
+        ]
+    )
+
+    store = get_metadata_store()
+    original_save_collection = store.save_collection
+    save_collection_mock = AsyncMock()
+    store.save_collection = save_collection_mock
+    try:
+        result = await list_collections(user_id=1, is_admin=False, force_realtime=True)
+    finally:
+        store.save_collection = original_save_collection
+
+    assert result.status == "success"
+    assert any(info.name == collection for info in result.collections)
+    save_collection_mock.assert_not_awaited()
 
 
 # --- delete_collection metadata cleanup Tests ---
