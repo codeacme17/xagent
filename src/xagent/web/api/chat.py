@@ -13,8 +13,10 @@ from ...config import get_external_upload_dirs, get_uploads_dir
 from ...core.agent.service import AgentService
 from ...core.agent.trace import Tracer
 from ...core.model.chat.basic.base import BaseLLM
+from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
+from ...core.model.providers import is_placeholder_api_key
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent
@@ -55,16 +57,19 @@ def create_default_llm() -> Optional[BaseLLM]:
         # For Zhipu: don't allow empty string API key (use truthy check)
         openai_api_key = os.getenv("OPENAI_API_KEY")
         zhipu_api_key = os.getenv("ZHIPU_API_KEY")
+        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 
         # Similarly for base_url: prefer OPENAI_BASE_URL if it exists (even if empty string)
         # Only fallback to ZHIPU_BASE_URL if OPENAI_BASE_URL is None
         openai_base_url = os.getenv("OPENAI_BASE_URL")
         zhipu_base_url = os.getenv("ZHIPU_BASE_URL")
+        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL")
 
         # For model_name: prefer OPENAI_MODEL if it exists (even if empty string)
         # Only fallback to ZHIPU_MODEL_NAME if OPENAI_MODEL is None
         openai_model = os.getenv("OPENAI_MODEL")
         zhipu_model = os.getenv("ZHIPU_MODEL_NAME")
+        deepseek_model = os.getenv("DEEPSEEK_MODEL_NAME")
 
         # Check if Zhipu
         zhipu_models = {
@@ -108,17 +113,26 @@ def create_default_llm() -> Optional[BaseLLM]:
                     "Zhipu API key not found in environment variables. Set ZHIPU_API_KEY to enable Zhipu LLM functionality."
                 )
                 return None
-        elif openai_api_key is not None:
+        elif openai_api_key is not None and (
+            openai_api_key == "" or not is_placeholder_api_key(openai_api_key)
+        ):
             logger.info(f"Using OpenAI LLM with model: {openai_model}")
             return OpenAILLM(
                 model_name=openai_model or "gpt-4o-mini",
                 base_url=openai_base_url,
                 api_key=openai_api_key,
             )
+        elif deepseek_api_key and not is_placeholder_api_key(deepseek_api_key):
+            logger.info(f"Using DeepSeek LLM with model: {deepseek_model}")
+            return DeepSeekLLM(
+                model_name=deepseek_model or "deepseek-v4-flash",
+                base_url=deepseek_base_url,
+                api_key=deepseek_api_key,
+            )
 
         # No LLM available - AgentService will run without DAG pattern
         logger.error(
-            "No API key found in environment variables. Set OPENAI_API_KEY or ZHIPU_API_KEY to enable LLM functionality."
+            "No API key found in environment variables. Set OPENAI_API_KEY, ZHIPU_API_KEY, or DEEPSEEK_API_KEY to enable LLM functionality."
         )
         return None
 

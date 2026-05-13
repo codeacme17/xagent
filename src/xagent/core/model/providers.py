@@ -13,6 +13,7 @@ _PROVIDER_ALIASES: dict[str, str] = {
 # Provider default base URLs used when callers omit an explicit base URL.
 _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com",
     "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
     # Opencode / models.dev naming
@@ -27,6 +28,10 @@ _DEFAULT_BASE_URL_BY_PROVIDER: dict[str, str] = {
 }
 
 _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
+    "deepseek": (
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ),
     "alibaba-coding-plan": (
         "glm-4.7",
         "glm-5",
@@ -62,6 +67,12 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "OpenAI API compatible models",
         "requires_base_url": False,
         "compatibility": "openai_compatible",
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "description": "DeepSeek v4 models with tool calling and thinking mode",
+        "requires_base_url": False,
     },
     {
         "id": "claude",
@@ -157,6 +168,17 @@ def _normalize_provider(provider: str) -> str:
 def canonical_provider_name(provider: str) -> str:
     normalized = _normalize_provider(provider)
     return _PROVIDER_ALIASES.get(normalized, normalized)
+
+
+def is_placeholder_api_key(api_key: Optional[str]) -> bool:
+    if api_key is None:
+        return True
+
+    normalized = api_key.strip().strip("\"'")
+    if not normalized:
+        return True
+
+    return normalized.startswith("your-") and normalized.endswith("-key")
 
 
 def default_base_url_for_provider(provider: str) -> Optional[str]:

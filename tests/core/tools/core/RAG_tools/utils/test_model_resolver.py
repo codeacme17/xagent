@@ -351,7 +351,12 @@ class TestResolveLLMAdapter:
         monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
 
         # Clear env vars
-        for key in ["OPENAI_API_KEY", "OPENAI_MODEL_NAME", "ZHIPU_API_KEY"]:
+        for key in [
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL_NAME",
+            "ZHIPU_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ]:
             monkeypatch.delenv(key, raising=False)
 
         cfg, adapter = model_resolver.resolve_llm_adapter(
@@ -391,7 +396,7 @@ class TestResolveLLMAdapter:
         monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
 
         # Clear env vars
-        for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY"]:
+        for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY", "DEEPSEEK_API_KEY"]:
             monkeypatch.delenv(key, raising=False)
 
         with pytest.raises(RagCoreException):
@@ -467,6 +472,59 @@ class TestResolveLLMAdapter:
         )
         # Should return None on type conversion error
         assert result is None
+
+    def test_create_llm_from_env_supports_deepseek(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DeepSeek env vars should be usable as the LLM fallback provider."""
+
+        for key in (
+            "OPENAI_API_KEY",
+            "ZHIPU_API_KEY",
+            "DEEPSEEK_TEMPERATURE",
+            "DEEPSEEK_MAX_TOKENS",
+            "DEEPSEEK_TIMEOUT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-pro")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+        result = model_resolver._create_llm_from_env()
+
+        assert result is not None
+        assert result.model_provider == "deepseek"
+        assert result.model_name == "deepseek-v4-pro"
+        assert result.api_key == "deepseek-key"
+        assert result.base_url == "https://api.deepseek.com"
+        assert result.abilities == ["chat", "tool_calling", "thinking_mode"]
+
+    def test_create_llm_from_env_openai_placeholder_does_not_block_deepseek(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenAI example.env placeholders should not prevent DeepSeek fallback."""
+
+        for key in (
+            "ZHIPU_API_KEY",
+            "OPENAI_MODEL_NAME",
+            "OPENAI_BASE_URL",
+            "DEEPSEEK_TEMPERATURE",
+            "DEEPSEEK_MAX_TOKENS",
+            "DEEPSEEK_TIMEOUT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        monkeypatch.setenv("OPENAI_API_KEY", "your-openai-api-key")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
+
+        result = model_resolver._create_llm_from_env()
+
+        assert result is not None
+        assert result.model_provider == "deepseek"
+        assert result.model_name == "deepseek-v4-flash"
+        assert result.api_key == "deepseek-key"
 
     def test_resolve_llm_with_langchain_adapter(
         self, monkeypatch: pytest.MonkeyPatch

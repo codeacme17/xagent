@@ -609,3 +609,119 @@ class TestModelAPI:
 
         assert default_response.status_code == 200
         assert default_response.json()["config_type"] == "embedding"
+
+    def test_list_supported_providers_includes_deepseek(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        deepseek = next(
+            (provider for provider in providers if provider["id"] == "deepseek"),
+            None,
+        )
+        assert deepseek is not None
+        assert deepseek["name"] == "DeepSeek"
+        assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_fetch_deepseek_provider_models_returns_curated_v4_models(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/deepseek/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        assert [model["id"] for model in data["models"]] == [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+        ]
+        assert data["models"][0]["abilities"] == [
+            "chat",
+            "tool_calling",
+            "thinking_mode",
+        ]
+
+    def test_create_deepseek_rejects_legacy_alias(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "legacy-deepseek-chat",
+                "category": "llm",
+                "model_provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "api_key": "test-api-key",
+                "abilities": ["chat", "tool_calling", "thinking_mode"],
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "Unsupported DeepSeek model" in response.json()["detail"]
+
+    def test_update_deepseek_rejects_legacy_alias(
+        self, test_db, regular_user, regular_headers
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "valid-deepseek",
+                "category": "llm",
+                "model_provider": "deepseek",
+                "model_name": "deepseek-v4-flash",
+                "api_key": "test-api-key",
+                "abilities": ["chat", "tool_calling", "thinking_mode"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+
+        response = client.put(
+            "/api/models/valid-deepseek",
+            json={"model_name": "deepseek-reasoner"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "Unsupported DeepSeek model" in response.json()["detail"]
+
+    def test_test_connection_deepseek_disables_thinking(
+        self, test_db, regular_user, regular_headers
+    ):
+        mock_llm = Mock()
+        mock_llm.chat = AsyncMock(
+            return_value={"type": "text", "content": "ok", "raw": {}}
+        )
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=mock_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "deepseek",
+                    "model_name": "deepseek-v4-flash",
+                    "api_key": "test-api-key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        mock_llm.chat.assert_awaited_once_with(
+            [{"role": "user", "content": "Hello"}],
+            max_tokens=1,
+            thinking={"type": "disabled"},
+        )

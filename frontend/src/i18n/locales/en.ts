@@ -1633,6 +1633,9 @@ Build when you need.`
       openai: {
         description: "Access GPT-4o, GPT-4 Turbo, and DALL-E 3 models. Industry standard for reasoning and creativity.",
       },
+      deepseek: {
+        description: "DeepSeek v4 models with native tool calling and configurable thinking mode.",
+      },
       "minimax-coding-plan": {
         description: "MiniMax Coding Plan endpoint (Anthropic-compatible, minimax.io).",
       },

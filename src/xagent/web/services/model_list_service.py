@@ -34,6 +34,15 @@ async def fetch_openai_models(
     return await OpenAILLM.list_available_models(api_key, base_url)
 
 
+async def fetch_deepseek_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return DeepSeek v4 curated model list."""
+    from ...core.model.chat.basic.deepseek import DeepSeekLLM
+
+    return await DeepSeekLLM.list_available_models(api_key, base_url)
+
+
 async def fetch_zhipu_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -159,6 +168,7 @@ async def fetch_kimi_for_coding_models(
 # Provider registry mapping provider names to their fetch functions
 PROVIDER_FETCHERS: Dict[str, Any] = {
     "openai": fetch_openai_models,
+    "deepseek": fetch_deepseek_models,
     "dashscope": fetch_openai_models,
     "zhipu": fetch_zhipu_models,
     "claude": fetch_claude_models,

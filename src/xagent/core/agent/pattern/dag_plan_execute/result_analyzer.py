@@ -757,34 +757,45 @@ STORAGE THRESHOLD: Be extremely conservative. Default to should_store = false un
             usage = {}
 
             # Prefer output_config over response_format for structured output
+            llm_params = {}
             if "output_config" in kwargs:
-                # Use output_config (better for Gemini with complex schemas)
                 output_config = kwargs.pop("output_config")
-                async for chunk in self.llm.stream_chat(
-                    messages=cleaned_messages,
-                    output_config=output_config,
-                    **kwargs,
-                ):
-                    if chunk.is_token():
-                        full_content += chunk.delta
-                    elif chunk.is_usage():
-                        usage = chunk.usage
-                    elif chunk.is_error():
-                        raise RuntimeError(f"LLM stream error: {chunk.content}")
+                if self.llm.supports_json_schema_response_format:
+                    # Use output_config for providers with schema support.
+                    llm_params["output_config"] = output_config
+                elif self.llm.supports_json_object_response_format:
+                    # Providers such as DeepSeek only support JSON object mode;
+                    # the prompt still carries the target schema/example.
+                    llm_params["response_format"] = {"type": "json_object"}
+                    cleaned_messages = [
+                        *cleaned_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: Return exactly one valid JSON object. "
+                                "Follow the requested schema/example from the prompt. "
+                                "Do not return an array, string, markdown, or schema "
+                                "description."
+                            ),
+                        },
+                    ]
             else:
                 # Fallback to response_format
-                response_format = kwargs.pop("response_format", {"type": "json_object"})
-                async for chunk in self.llm.stream_chat(
-                    messages=cleaned_messages,
-                    response_format=response_format,
-                    **kwargs,
-                ):
-                    if chunk.is_token():
-                        full_content += chunk.delta
-                    elif chunk.is_usage():
-                        usage = chunk.usage
-                    elif chunk.is_error():
-                        raise RuntimeError(f"LLM stream error: {chunk.content}")
+                llm_params["response_format"] = kwargs.pop(
+                    "response_format", {"type": "json_object"}
+                )
+
+            async for chunk in self.llm.stream_chat(
+                messages=cleaned_messages,
+                **llm_params,
+                **kwargs,
+            ):
+                if chunk.is_token():
+                    full_content += chunk.delta
+                elif chunk.is_usage():
+                    usage = chunk.usage
+                elif chunk.is_error():
+                    raise RuntimeError(f"LLM stream error: {chunk.content}")
 
             # Record token usage
             if usage:

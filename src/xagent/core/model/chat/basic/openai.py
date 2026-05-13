@@ -110,6 +110,8 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
+        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+
         # Prepare the completion parameters
         completion_params = {
             "model": self._model_name,
@@ -162,8 +164,6 @@ class OpenAILLM(BaseLLM):
 
         # Handle thinking mode using extra_body as specified in the requirements
         # Only add enable_thinking if the client supports this parameter (e.g., standard OpenAI)
-        extra_body = {}
-
         # Check if this is a thinking-only model (only supports thinking_mode, not chat)
         is_thinking_only = (
             "thinking_mode" in self.abilities and "chat" not in self.abilities
@@ -256,11 +256,15 @@ class OpenAILLM(BaseLLM):
                             }
                         )
 
-                return {
+                result = {
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": resp.model_dump(),
                 }
+                if hasattr(message, "reasoning_content") and message.reasoning_content:
+                    result["reasoning_content"] = message.reasoning_content
+                    result["reasoning"] = message.reasoning_content
+                return result
 
             # Handle text content
             content = message.content
@@ -272,11 +276,15 @@ class OpenAILLM(BaseLLM):
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
 
-            return {
+            result = {
                 "type": "text",
                 "content": content,
                 "raw": resp.model_dump(),
             }
+            if hasattr(message, "reasoning_content") and message.reasoning_content:
+                result["reasoning_content"] = message.reasoning_content
+                result["reasoning"] = message.reasoning_content
+            return result
 
         try:
             # Make the API call
@@ -306,7 +314,7 @@ class OpenAILLM(BaseLLM):
                             "Model returned non-JSON content with response_format while thinking was enabled. "
                             "Retrying with thinking disabled."
                         )
-                        extra_body = {"enable_thinking": False}
+                        extra_body = self._disable_thinking_extra_body(extra_body)
                         response = await _make_api_call()
                         result = _process_response(response)
 
@@ -377,6 +385,32 @@ class OpenAILLM(BaseLLM):
             bool: True for standard OpenAI, can be overridden in subclasses
         """
         return True
+
+    def _disable_thinking_extra_body(
+        self, extra_body: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Return provider-specific extra_body for disabling thinking."""
+        updated_extra_body = dict(extra_body or {})
+        if self.supports_enable_thinking_param:
+            updated_extra_body["enable_thinking"] = False
+        return updated_extra_body
+
+    def _attach_reasoning_content_to_raw(
+        self, raw_payload: Any, reasoning_content: str
+    ) -> Any:
+        """Attach accumulated reasoning content to a raw payload when possible."""
+        if not reasoning_content:
+            return raw_payload
+
+        if hasattr(raw_payload, "model_dump"):
+            raw_payload = raw_payload.model_dump()
+
+        if isinstance(raw_payload, dict):
+            raw_payload = dict(raw_payload)
+            raw_payload["reasoning_content"] = reasoning_content
+            raw_payload["reasoning"] = reasoning_content
+
+        return raw_payload
 
     async def vision_chat(
         self,
@@ -671,6 +705,8 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
+        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+
         # Prepare completion parameters
         completion_params = {
             "model": self._model_name,
@@ -724,7 +760,6 @@ class OpenAILLM(BaseLLM):
                 completion_params["output_config"] = output_config
 
         # Handle thinking mode
-        extra_body = {}
         is_thinking_only = (
             "thinking_mode" in self.abilities and "chat" not in self.abilities
         )
@@ -793,6 +828,7 @@ class OpenAILLM(BaseLLM):
 
             # Accumulate tool calls (across multiple chunks)
             accumulated_tool_calls: Dict[str, Dict] = {}
+            accumulated_reasoning_content = ""
             last_raw_chunk = None  # Track last raw chunk for usage extraction
             usage_received = False
 
@@ -825,7 +861,16 @@ class OpenAILLM(BaseLLM):
                 last_raw_chunk = raw_chunk
 
                 # Parse chunk
-                chunk = self._parse_stream_chunk(raw_chunk, accumulated_tool_calls)
+                if hasattr(raw_chunk, "choices") and raw_chunk.choices:
+                    delta = raw_chunk.choices[0].delta
+                    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                        accumulated_reasoning_content += delta.reasoning_content
+
+                chunk = self._parse_stream_chunk(
+                    raw_chunk,
+                    accumulated_tool_calls,
+                    accumulated_reasoning_content,
+                )
                 if chunk:
                     if chunk.is_usage():
                         usage_received = True
@@ -904,7 +949,10 @@ class OpenAILLM(BaseLLM):
             raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
 
     def _parse_stream_chunk(
-        self, raw_chunk: Any, accumulated_tool_calls: Dict
+        self,
+        raw_chunk: Any,
+        accumulated_tool_calls: Dict,
+        accumulated_reasoning_content: str = "",
     ) -> Optional[StreamChunk]:
         """
         Parse OpenAI streaming chunk
@@ -948,7 +996,9 @@ class OpenAILLM(BaseLLM):
                 type=ChunkType.TOKEN,
                 content=delta.content,
                 delta=delta.content,
-                raw=raw_chunk,
+                raw=self._attach_reasoning_content_to_raw(
+                    raw_chunk, accumulated_reasoning_content
+                ),
             )
 
         # Handle tool calls
@@ -1008,7 +1058,9 @@ class OpenAILLM(BaseLLM):
                 return StreamChunk(
                     type=ChunkType.TOOL_CALL,
                     tool_calls=tool_calls_list,
-                    raw=raw_chunk,
+                    raw=self._attach_reasoning_content_to_raw(
+                        raw_chunk, accumulated_reasoning_content
+                    ),
                 )
 
         # Check finish reason
@@ -1033,13 +1085,17 @@ class OpenAILLM(BaseLLM):
                     type=ChunkType.TOOL_CALL,
                     tool_calls=tool_calls_list,
                     finish_reason=choice.finish_reason,
-                    raw=raw_chunk,
+                    raw=self._attach_reasoning_content_to_raw(
+                        raw_chunk, accumulated_reasoning_content
+                    ),
                 )
 
             return StreamChunk(
                 type=ChunkType.END,
                 finish_reason=choice.finish_reason,
-                raw=raw_chunk,
+                raw=self._attach_reasoning_content_to_raw(
+                    raw_chunk, accumulated_reasoning_content
+                ),
             )
 
         return None

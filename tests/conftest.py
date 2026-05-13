@@ -593,10 +593,10 @@ def modelhub():
         )
         deepseek_model = ChatModelConfig(
             id="deepseek",
-            model_provider="openai",
-            model_name="deepseek-chat",
+            model_provider="deepseek",
+            model_name="deepseek-v4-flash",
             api_key=os.getenv("DEEPSEEK_API_KEY", "test_key"),
-            base_url="https://api.deepseek.com/v1",
+            base_url="https://api.deepseek.com",
         )
         # Add embedding model for embedding node tests
         embedding_model = EmbeddingModelConfig(

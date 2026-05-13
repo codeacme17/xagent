@@ -7,6 +7,13 @@ import pytest
 from xagent.web.api.chat import create_default_llm
 
 
+@pytest.fixture(autouse=True)
+def clear_deepseek_env(monkeypatch):
+    """Keep DeepSeek env vars from example.env from affecting non-DeepSeek tests."""
+    for key in ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL_NAME"):
+        monkeypatch.delenv(key, raising=False)
+
+
 class TestCreateDefaultLLM:
     """Test cases for create_default_llm function with strict separation."""
 
@@ -433,6 +440,100 @@ class TestCreateDefaultLLM:
                 # OpenAILLM should not be called
                 mock_openai_llm.assert_not_called()
 
+            assert result is None
+
+    def test_deepseek_with_valid_api_key(self, monkeypatch):
+        """Test DeepSeek LLM creation with valid API key."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "valid-deepseek-api-key")
+        monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-pro")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("OPENAI_MODEL", raising=False)
+        monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+        monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
+        monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
+
+        with patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm:
+            mock_deepseek_llm.return_value = None
+
+            result = create_default_llm()
+
+            mock_deepseek_llm.assert_called_once_with(
+                model_name="deepseek-v4-pro",
+                base_url="https://api.deepseek.com",
+                api_key="valid-deepseek-api-key",
+            )
+            assert result is None
+
+    def test_deepseek_placeholder_api_key_is_ignored(self, monkeypatch):
+        """DeepSeek example.env placeholders should not enable env fallback."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "your-deepseek-api-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("OPENAI_MODEL", raising=False)
+        monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+        monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
+        monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
+
+        with patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm:
+            result = create_default_llm()
+
+        mock_deepseek_llm.assert_not_called()
+        assert result is None
+
+    def test_openai_placeholder_does_not_block_deepseek(self, monkeypatch):
+        """OpenAI example.env placeholder should not prevent DeepSeek fallback."""
+        monkeypatch.setenv("OPENAI_API_KEY", "your-openai-api-key")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "valid-deepseek-api-key")
+        monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
+        monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+        monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
+        monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+
+        with (
+            patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm,
+            patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm,
+        ):
+            mock_openai_llm.return_value = None
+            mock_deepseek_llm.return_value = None
+
+            result = create_default_llm()
+
+        mock_openai_llm.assert_not_called()
+        mock_deepseek_llm.assert_called_once_with(
+            model_name="deepseek-v4-flash",
+            base_url=None,
+            api_key="valid-deepseek-api-key",
+        )
+        assert result is None
+
+    def test_openai_and_deepseek_both_exist_openai_used(self, monkeypatch):
+        """When both keys exist and Zhipu is not selected, preserve OpenAI priority."""
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-api-key")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-api-key")
+        monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
+        monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+        monkeypatch.delenv("ZHIPU_BASE_URL", raising=False)
+        monkeypatch.delenv("ZHIPU_MODEL_NAME", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+
+        with (
+            patch("xagent.web.api.chat.DeepSeekLLM") as mock_deepseek_llm,
+            patch("xagent.web.api.chat.OpenAILLM") as mock_openai_llm,
+        ):
+            mock_openai_llm.return_value = None
+            mock_deepseek_llm.return_value = None
+
+            result = create_default_llm()
+
+            mock_openai_llm.assert_called_once()
+            mock_deepseek_llm.assert_not_called()
             assert result is None
 
 

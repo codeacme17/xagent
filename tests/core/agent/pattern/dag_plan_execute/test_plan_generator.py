@@ -10,6 +10,7 @@ import pytest
 from tests.utils.mock_llm import MockLLM
 from xagent.core.agent.pattern.dag_plan_execute.plan_generator import PlanGenerator
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
 class MockLLMForTest(BaseLLM):
@@ -63,6 +64,36 @@ class MockLLMForTest(BaseLLM):
             },
             indent=2,
         )
+
+
+class CaptureStreamLLM(BaseLLM):
+    def __init__(self, *, supports_json_schema: bool):
+        self.calls = []
+        self._supports_json_schema = supports_json_schema
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["chat"]
+
+    @property
+    def model_name(self) -> str:
+        return "capture_stream_llm"
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        return False
+
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        return self._supports_json_schema
+
+    async def chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        return "{}"
+
+    async def stream_chat(self, messages: List[Dict[str, str]], **kwargs):
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, content="{}", delta="{}")
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
 
 class TestPlanGenerator:
@@ -122,6 +153,39 @@ class TestPlanGenerator:
         assert steps[1]["difficulty"] == "easy"
         # task_name is optional, may be None if not provided
         assert task_name is None  # This example doesn't include task_name
+
+    @pytest.mark.asyncio
+    async def test_call_llm_with_retry_keeps_output_config_for_schema_provider(self):
+        llm = CaptureStreamLLM(supports_json_schema=True)
+        generator = PlanGenerator(llm)
+        output_config = {"format": {"type": "json_schema", "schema": {}}}
+
+        await generator._call_llm_with_retry(
+            messages=[{"role": "user", "content": "Return a plan"}],
+            output_config=output_config,
+        )
+
+        assert llm.calls[0]["kwargs"]["output_config"] == output_config
+        assert "response_format" not in llm.calls[0]["kwargs"]
+        assert "SYSTEM REMINDER" not in llm.calls[0]["messages"][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_call_llm_with_retry_uses_json_object_without_schema_support(self):
+        llm = CaptureStreamLLM(supports_json_schema=False)
+        generator = PlanGenerator(llm)
+
+        await generator._call_llm_with_retry(
+            messages=[{"role": "user", "content": "Return a plan"}],
+            output_config={"format": {"type": "json_schema", "schema": {}}},
+        )
+
+        assert llm.calls[0]["kwargs"]["response_format"] == {"type": "json_object"}
+        assert "output_config" not in llm.calls[0]["kwargs"]
+        assert (
+            "Return exactly one valid JSON object"
+            in llm.calls[0]["messages"][-1]["content"]
+        )
+        assert "requested schema/example" in llm.calls[0]["messages"][-1]["content"]
 
     def test_parse_invalid_array_format(self, plan_generator):
         """测试解析无效的数组格式（应该失败）"""

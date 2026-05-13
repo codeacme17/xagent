@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ...core.model.chat.basic.adapter import create_base_llm
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.claude import ClaudeLLM
+from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.gemini import GeminiLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
@@ -18,6 +19,7 @@ from ...core.model.model import (
     ModelConfig,
     RerankModelConfig,
 )
+from ...core.model.providers import is_placeholder_api_key
 from ..models.model import Model
 from ..models.user import UserDefaultModel, UserModel
 
@@ -860,7 +862,7 @@ def create_llm_from_env() -> Optional[BaseLLM]:
     """
     # Try OpenAI first
     openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
+    if openai_key and not is_placeholder_api_key(openai_key):
         try:
             model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
             base_url = os.getenv("OPENAI_BASE_URL")
@@ -885,6 +887,20 @@ def create_llm_from_env() -> Optional[BaseLLM]:
             )
         except Exception as e:
             logger.error(f"Error creating Zhipu LLM from env: {e}")
+
+    # Try DeepSeek
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    if deepseek_key and not is_placeholder_api_key(deepseek_key):
+        try:
+            model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
+            base_url = os.getenv("DEEPSEEK_BASE_URL")
+            return DeepSeekLLM(
+                model_name=model_name,
+                api_key=deepseek_key,
+                base_url=base_url,
+            )
+        except Exception as e:
+            logger.error(f"Error creating DeepSeek LLM from env: {e}")
 
     # Try Gemini
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")

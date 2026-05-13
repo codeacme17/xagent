@@ -321,7 +321,12 @@ class TestResolveLLMAdapter:
         monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
 
         # Clear env vars to ensure hub is used
-        for key in ["OPENAI_API_KEY", "OPENAI_MODEL_NAME", "ZHIPU_API_KEY"]:
+        for key in [
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL_NAME",
+            "ZHIPU_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ]:
             monkeypatch.delenv(key, raising=False)
 
         cfg, adapter = model_resolver.resolve_llm_adapter(
@@ -361,7 +366,7 @@ class TestResolveLLMAdapter:
         monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
 
         # Clear env vars
-        for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY"]:
+        for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY", "DEEPSEEK_API_KEY"]:
             monkeypatch.delenv(key, raising=False)
 
         with pytest.raises(RagCoreException):

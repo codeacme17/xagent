@@ -1633,6 +1633,9 @@ Build when you need.`
       openai: {
         description: "访问 GPT-4o、GPT-4 Turbo 和 DALL-E 3 模型。推理和创造力的行业标准。",
       },
+      deepseek: {
+        description: "DeepSeek v4 模型，支持原生工具调用与可配置思考模式。",
+      },
       "minimax-coding-plan": {
         description: "MiniMax Coding Plan 端点（Anthropic 兼容，minimax.io）。",
       },

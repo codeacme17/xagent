@@ -1473,8 +1473,26 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             # If not, fall back to response_format for simple JSON mode
             llm_params = {}
             if "output_config" in kwargs:
-                # Use output_config for structured outputs with JSON schema
-                llm_params["output_config"] = kwargs.pop("output_config")
+                output_config = kwargs.pop("output_config")
+                if self.llm.supports_json_schema_response_format:
+                    # Use output_config for structured outputs with JSON schema.
+                    llm_params["output_config"] = output_config
+                elif self.llm.supports_json_object_response_format:
+                    # Providers such as DeepSeek only support JSON object mode;
+                    # the prompt still carries the target schema/example.
+                    llm_params["response_format"] = {"type": "json_object"}
+                    cleaned_messages = [
+                        *cleaned_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "SYSTEM REMINDER: Return exactly one valid JSON object. "
+                                "Follow the requested schema/example from the prompt. "
+                                "Do not return an array, string, markdown, or schema "
+                                "description."
+                            ),
+                        },
+                    ]
             else:
                 # Fall back to simple JSON object mode
                 llm_params["response_format"] = {"type": "json_object"}

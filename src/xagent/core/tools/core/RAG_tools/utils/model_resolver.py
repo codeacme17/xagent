@@ -26,6 +26,7 @@ from xagent.core.model.model import (
     ModelConfig,
     RerankModelConfig,
 )
+from xagent.core.model.providers import is_placeholder_api_key
 from xagent.core.model.rerank.adapter import create_rerank_adapter
 from xagent.core.model.rerank.base import BaseRerank
 from xagent.core.model.storage.db.adapter import SQLAlchemyModelHub
@@ -570,6 +571,7 @@ def _create_llm_config_from_provider_env(
     timeout_sec: Optional[float] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    abilities: Optional[list[str]] = None,
 ) -> Optional[ChatModelConfig]:
     """Create LLM config from environment variables for a specific provider.
 
@@ -588,7 +590,7 @@ def _create_llm_config_from_provider_env(
         ChatModelConfig if provider is configured, None otherwise
     """
     provider_key = os.getenv(f"{env_prefix}_API_KEY")
-    if not provider_key:
+    if not provider_key or is_placeholder_api_key(provider_key):
         return None
 
     try:
@@ -621,7 +623,7 @@ def _create_llm_config_from_provider_env(
             default_temperature=final_temperature,
             default_max_tokens=final_max_tokens,
             timeout=final_timeout,
-            abilities=["chat"],
+            abilities=abilities or ["chat"],
         )
     except (ValueError, TypeError) as e:
         logger.warning("Failed to create %s config from env: %s", provider_name, e)
@@ -667,6 +669,22 @@ def _create_llm_from_env(
     )
     if zhipu_config:
         return zhipu_config
+
+    # Try DeepSeek
+    deepseek_config = _create_llm_config_from_provider_env(
+        "DEEPSEEK",
+        "deepseek",
+        "deepseek-v4-flash",
+        model_name=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        timeout_sec=timeout_sec,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    if deepseek_config:
+        return deepseek_config
 
     return None
 

@@ -49,6 +49,26 @@ class BaseLLM(ABC):
         """
         pass
 
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        """
+        Check if this LLM supports OpenAI-style json_schema response_format.
+
+        Defaults to True to preserve existing provider behavior. Providers that
+        are OpenAI-compatible at the transport layer but do not support
+        json_schema, such as DeepSeek, should override this.
+        """
+        return True
+
+    @property
+    def supports_json_object_response_format(self) -> bool:
+        """
+        Check if this LLM supports JSON object response_format mode.
+
+        Defaults to True to preserve existing structured-output routing.
+        """
+        return True
+
     def has_ability(self, ability: str) -> bool:
         """
         Check if this LLM implementation supports a specific ability.

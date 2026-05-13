@@ -1,7 +1,7 @@
 """Model adapter"""
 
 import os
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union, cast
 
 from langchain.tools import BaseTool
 from langchain_community.chat_models import ChatZhipuAI
@@ -11,7 +11,12 @@ from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
 from ...model import ChatModelConfig, ModelConfig
 from ...retry import ExponentialBackoff, RetryStrategy, create_retry_wrapper
-from ..providers import provider_compatibility_for_provider
+from ..providers import (
+    canonical_provider_name,
+    default_base_url_for_provider,
+    provider_compatibility_for_provider,
+)
+from .basic.deepseek import resolve_deepseek_api_key
 from .error import retry_on
 
 
@@ -21,6 +26,7 @@ class ChatModelRetryWrapper(Runnable):
         model: BaseChatModel,
         strategy: RetryStrategy,
         max_retries: int = 10,
+        default_extra_body: Optional[dict[str, Any]] = None,
     ):
         self._retry_wrapper = create_retry_wrapper(
             model,
@@ -33,6 +39,7 @@ class ChatModelRetryWrapper(Runnable):
         self.model = model
         self.strategy = strategy
         self.max_retries = max_retries
+        self.default_extra_body = default_extra_body
 
     def invoke(
         self,
@@ -59,14 +66,23 @@ class ChatModelRetryWrapper(Runnable):
         tool_choice: Optional[Union[str]] = None,
         **kwargs: Any,
     ) -> Runnable:
-        model = self.model.bind_tools(tools)
-        return create_retry_wrapper(
-            model,
-            Runnable,  # type: ignore[type-abstract]
-            retry_methods={"invoke", "ainvoke"},
-            strategy=self.strategy,
-            max_retries=self.max_retries,
-            retry_on=retry_on,
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        model: Any = self.model
+        if self.default_extra_body:
+            model = model.bind(extra_body=self.default_extra_body)
+        bound_model = model.bind_tools(tools, **kwargs)
+        return cast(
+            Runnable,
+            create_retry_wrapper(
+                bound_model,
+                Runnable,
+                retry_methods={"invoke", "ainvoke"},
+                strategy=self.strategy,
+                max_retries=self.max_retries,
+                retry_on=retry_on,
+            ),
         )
 
     def with_structured_output(
@@ -76,14 +92,24 @@ class ChatModelRetryWrapper(Runnable):
         include_raw: bool = False,
         **kwargs: Any,
     ) -> Runnable:  # noqa: UP006
-        model = self.model.with_structured_output(schema)
-        return create_retry_wrapper(
-            model,
-            Runnable,  # type: ignore[type-abstract]
-            retry_methods={"invoke", "ainvoke"},
-            strategy=self.strategy,
-            max_retries=self.max_retries,
-            retry_on=retry_on,
+        model: Any = self.model
+        if self.default_extra_body:
+            model = model.bind(extra_body=self.default_extra_body)
+        structured_model = model.with_structured_output(
+            schema,
+            include_raw=include_raw,
+            **kwargs,
+        )
+        return cast(
+            Runnable,
+            create_retry_wrapper(
+                structured_model,
+                Runnable,
+                retry_methods={"invoke", "ainvoke"},
+                strategy=self.strategy,
+                max_retries=self.max_retries,
+                retry_on=retry_on,
+            ),
         )
 
 
@@ -99,9 +125,19 @@ def create_base_chat_model(
 
     temp = temperature if temperature is not None else model.default_temperature
 
-    compatibility = provider_compatibility_for_provider(model.model_provider)
+    provider = canonical_provider_name(model.model_provider)
+    compatibility = provider_compatibility_for_provider(provider)
 
-    if model.model_provider == "openai" or compatibility == "openai_compatible":
+    if provider == "deepseek":
+        return ChatOpenAI(
+            model=model.model_name,
+            temperature=temp,
+            max_tokens=model.default_max_tokens,
+            api_key=resolve_deepseek_api_key(model.api_key),
+            base_url=model.base_url or default_base_url_for_provider("deepseek"),
+            timeout=model.timeout,
+        )
+    if provider == "openai" or compatibility == "openai_compatible":
         return ChatOpenAI(
             model=model.model_name,
             temperature=temp,
@@ -110,7 +146,7 @@ def create_base_chat_model(
             base_url=model.base_url,
             timeout=model.timeout,
         )
-    elif model.model_provider == "zhipu":
+    elif provider == "zhipu":
         return ChatZhipuAI(
             model=model.model_name,
             temperature=temp,
@@ -118,7 +154,7 @@ def create_base_chat_model(
             api_key=model.api_key,
             api_base=model.base_url,
         )
-    elif model.model_provider == "azure_openai":
+    elif provider == "azure_openai":
         api_version = os.getenv("OPENAI_API_VERSION", "2024-08-01-preview")
         return AzureChatOpenAI(
             deployment_name=model.model_name,
@@ -138,4 +174,15 @@ def create_base_chat_model_with_retry(
 ) -> ChatModelRetryWrapper:
     chat_model = create_base_chat_model(model, temperature)
     strategy = ExponentialBackoff()
-    return ChatModelRetryWrapper(chat_model, strategy, max_retries=model.max_retries)
+    default_extra_body = (
+        {"thinking": {"type": "disabled"}}
+        if isinstance(model, ChatModelConfig)
+        and canonical_provider_name(model.model_provider) == "deepseek"
+        else None
+    )
+    return ChatModelRetryWrapper(
+        chat_model,
+        strategy,
+        max_retries=model.max_retries,
+        default_extra_body=default_extra_body,
+    )

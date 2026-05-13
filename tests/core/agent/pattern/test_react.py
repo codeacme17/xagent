@@ -107,6 +107,12 @@ class MockReActLLM(BaseLLM):
             yield StreamChunk(type=ChunkType.END, finish_reason="stop")
 
 
+class MockJsonObjectOnlyLLM(MockReActLLM):
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        return False
+
+
 class MockCalculatorTool(Tool):
     @property
     def metadata(self) -> ToolMetadata:
@@ -327,6 +333,48 @@ async def test_react_normalizes_registered_tool_name_action_type():
 
 
 @pytest.mark.asyncio
+async def test_react_uses_json_schema_response_format_by_default():
+    """Providers keep the existing json_schema structured-output path by default."""
+    llm = MockReActLLM(
+        [
+            '{"type": "final_answer", "reasoning": "Done", "answer": "Done", "success": true, "error": null}'
+        ]
+    )
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Complete the task"}]
+    )
+
+    assert action.type == "final_answer"
+    response_format = llm.calls[0]["kwargs"]["response_format"]
+    assert response_format["type"] == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_react_uses_json_object_for_schema_unsupported_provider():
+    """Providers without json_schema support use documented JSON object mode."""
+    llm = MockJsonObjectOnlyLLM(
+        [
+            '{"type": "final_answer", "reasoning": "Done", "answer": "Done", "success": true, "error": null}'
+        ]
+    )
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Complete the task"}]
+    )
+
+    assert action.type == "final_answer"
+    response_format = llm.calls[0]["kwargs"]["response_format"]
+    assert response_format == {"type": "json_object"}
+    assert (
+        "Return exactly one valid JSON object"
+        in llm.calls[0]["messages"][-1]["content"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_react_raises_for_non_string_action_type():
     """Non-string first-phase JSON types should raise instead of becoming final text."""
     responses = [
@@ -424,15 +472,77 @@ async def test_react_raises_for_empty_action_array():
 
 
 @pytest.mark.asyncio
-async def test_react_raises_when_action_array_has_no_dict():
-    """A first-phase JSON array without any dict item should raise."""
+async def test_react_accepts_single_action_type_in_array():
+    """DeepSeek may return only the selected ReAct action type in an array."""
     llm = MockReActLLM(['["tool_call"]'])
     pattern = ReActPattern(llm, max_iterations=3)
 
-    with pytest.raises(PatternExecutionError, match="No ReAct action object found"):
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "LLM returned only the ReAct action type"
+
+
+@pytest.mark.asyncio
+async def test_react_accepts_action_key_value_pair_list():
+    """DeepSeek may return JSON as key-value pairs instead of an object."""
+    llm = MockReActLLM(['[["type", "tool_call"], ["reasoning", "Need a tool"]]'])
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "Need a tool"
+
+
+@pytest.mark.asyncio
+async def test_react_accepts_flat_action_key_value_pair_list():
+    """DeepSeek may return a flat key-value list instead of an object."""
+    llm = MockReActLLM(['["type", "tool_call", "reasoning", "Need a tool"]'])
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "Need a tool"
+
+
+@pytest.mark.asyncio
+async def test_react_accepts_nested_action_key_value_pair_list():
+    """DeepSeek may wrap key-value pair JSON in another list."""
+    llm = MockReActLLM(['[[["type", "tool_call"], ["reasoning", "Need a tool"]]]'])
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    action = await pattern._get_action_from_llm(
+        [{"role": "user", "content": "Create an FAQ agent"}]
+    )
+
+    assert action.type == "tool_call"
+    assert action.reasoning == "Need a tool"
+
+
+@pytest.mark.asyncio
+async def test_react_raises_when_action_array_has_no_action_object_or_type():
+    """A first-phase JSON array without a dict or action type should raise."""
+    response = '["not an action"]'
+    llm = MockReActLLM([response])
+    pattern = ReActPattern(llm, max_iterations=3)
+
+    with pytest.raises(
+        PatternExecutionError, match="No ReAct action object found"
+    ) as exc_info:
         await pattern._get_action_from_llm(
             [{"role": "user", "content": "Create an FAQ agent"}]
         )
+
+    assert exc_info.value.context["response_preview"] == response
+    assert exc_info.value.context["json_object_count"] == 1
 
 
 @pytest.mark.asyncio

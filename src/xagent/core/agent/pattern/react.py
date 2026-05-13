@@ -1446,9 +1446,13 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
         # Get tool schemas
         tool_schemas = self.tool_registry.get_tool_schemas()
 
-        # First call: Request JSON output format with strict schema constraint
-        # Use centralized schema from Action class
-        chat_kwargs["response_format"] = Action.get_decision_schema()
+        # First call: request the strongest structured-output mode supported by
+        # the provider. DeepSeek only supports json_object, while OpenAI keeps
+        # the stricter json_schema path.
+        if self.llm.supports_json_schema_response_format:
+            chat_kwargs["response_format"] = Action.get_decision_schema()
+        elif self.llm.supports_json_object_response_format:
+            chat_kwargs["response_format"] = {"type": "json_object"}
 
         # Disable thinking mode if supported
         if (
@@ -1524,6 +1528,22 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
 
         try:
             # Clean messages before sending to LLM
+            response_format = chat_kwargs.get("response_format")
+            if (
+                isinstance(response_format, dict)
+                and response_format.get("type") == "json_object"
+            ):
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "SYSTEM REMINDER: Return exactly one valid JSON object. "
+                            "Do not return an array, string, markdown, or schema "
+                            "description."
+                        ),
+                    },
+                ]
             cleaned_messages = clean_messages(messages)
             chat_kwargs["messages"] = cleaned_messages
 
@@ -1908,6 +1928,10 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             return action_data
 
         if isinstance(action_data, list):
+            recovered = self._recover_action_dict_from_json_list(action_data)
+            if recovered is not None:
+                return recovered
+
             for i, item in enumerate(action_data):
                 if isinstance(item, dict):
                     logger.info(
@@ -1933,6 +1957,61 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
             message=f"Expected ReAct action JSON object, got {type(action_data).__name__}",
             context={"response_preview": response[:500] if response else None},
         )
+
+    def _recover_action_dict_from_json_list(self, value: list[Any]) -> Optional[dict]:
+        """Recover an action dict from list-shaped JSON without accepting text."""
+        if not value:
+            return None
+
+        if len(value) == 1 and value[0] in ("tool_call", "final_answer"):
+            logger.info(f"First call: Recovered action type from JSON list: {value[0]}")
+            return {
+                "type": value[0],
+                "reasoning": "LLM returned only the ReAct action type",
+            }
+
+        if (
+            len(value) % 2 == 0
+            and all(isinstance(value[i], str) for i in range(0, len(value), 2))
+            and "type" in value
+        ):
+            recovered = {
+                value[i]: value[i + 1]
+                for i in range(0, len(value), 2)
+                if isinstance(value[i], str)
+            }
+            if isinstance(recovered.get("type"), str):
+                logger.info(
+                    "First call: Recovered action object from flat JSON key-value list"
+                )
+                return recovered
+
+        if all(
+            isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        ):
+            recovered = {item[0]: item[1] for item in value}
+            if isinstance(recovered.get("type"), str):
+                logger.info(
+                    "First call: Recovered action object from JSON key-value list"
+                )
+                return recovered
+
+        for i, item in enumerate(value):
+            if isinstance(item, dict):
+                logger.info(
+                    f"First call: Selected JSON object {i} from list (type: {item.get('type', 'UNKNOWN')})"
+                )
+                return item
+            if isinstance(item, list):
+                nested_recovered = self._recover_action_dict_from_json_list(item)
+                if nested_recovered is not None:
+                    logger.info(
+                        f"First call: Recovered action object from nested JSON list item {i}"
+                    )
+                    return nested_recovered
+
+        return None
 
     def _normalize_first_phase_action_dict(self, data: dict) -> dict:
         """Normalize first-phase action JSON before parsing it as an Action.

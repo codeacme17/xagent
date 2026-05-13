@@ -9,13 +9,17 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from xagent.core.model.chat.basic.deepseek import DEEPSEEK_SUPPORTED_MODELS
 from xagent.core.model.model import (
     ChatModelConfig,
     EmbeddingModelConfig,
     ImageModelConfig,
     ModelConfig,
 )
-from xagent.core.model.providers import default_base_url_for_provider
+from xagent.core.model.providers import (
+    canonical_provider_name,
+    default_base_url_for_provider,
+)
 from xagent.core.utils.security import redact_sensitive_text
 
 from ..auth_dependencies import get_current_user
@@ -194,6 +198,20 @@ def _validate_requested_abilities(
         )
 
 
+def _validate_provider_model_name(provider: str, model_name: str) -> None:
+    """Validate provider-specific curated model names before saving."""
+
+    if canonical_provider_name(provider) != "deepseek":
+        return
+
+    if model_name not in DEEPSEEK_SUPPORTED_MODELS:
+        supported = ", ".join(DEEPSEEK_SUPPORTED_MODELS)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported DeepSeek model '{model_name}'. Supported models: {supported}",
+        )
+
+
 async def _validate_provider_model_listing(
     provider: str,
     model_name: str,
@@ -277,13 +295,15 @@ async def create_model(
             detail="Only administrators can share models with all users",
         )
 
-    base_url = model.base_url or default_base_url_for_provider(model.model_provider)
+    model_provider = canonical_provider_name(model.model_provider)
+    base_url = model.base_url or default_base_url_for_provider(model_provider)
+    _validate_provider_model_name(model_provider, model.model_name)
 
     if model.category == "llm":
         config: ModelConfig = ChatModelConfig(
             id=model.model_id,
             model_name=model.model_name,
-            model_provider=model.model_provider,
+            model_provider=model_provider,
             base_url=base_url,
             api_key=model.api_key or "",
             default_temperature=model.temperature,
@@ -295,7 +315,7 @@ async def create_model(
         config = EmbeddingModelConfig(
             id=model.model_id,
             model_name=model.model_name,
-            model_provider=model.model_provider,
+            model_provider=model_provider,
             base_url=base_url,
             api_key=model.api_key or "",
             timeout=180.0,
@@ -307,7 +327,7 @@ async def create_model(
         config = ImageModelConfig(
             id=model.model_id,
             model_name=model.model_name,
-            model_provider=model.model_provider,
+            model_provider=model_provider,
             base_url=base_url,
             api_key=model.api_key or "",
             default_temperature=model.temperature,
@@ -321,7 +341,7 @@ async def create_model(
         config = SpeechModelConfig(
             id=model.model_id,
             model_name=model.model_name,
-            model_provider=model.model_provider,
+            model_provider=model_provider,
             base_url=base_url,
             api_key=model.api_key or "",
             timeout=180.0,
@@ -677,11 +697,8 @@ async def test_model_connection(
     start_time = time.time()
     timeout_seconds = 10.0
     try:
-        from xagent.core.model.providers import default_base_url_for_provider
-
-        base_url = request.base_url or default_base_url_for_provider(
-            request.model_provider
-        )
+        provider = canonical_provider_name(request.model_provider)
+        base_url = request.base_url or default_base_url_for_provider(provider)
 
         if request.category == "llm":
             # For some reasoning models (like o1, o3, claude reasoning variants), temperature might be deprecated
@@ -694,10 +711,11 @@ async def test_model_connection(
                 or "thinking" in model_name_lower
                 or "reasoner" in model_name_lower
             )
+            is_deepseek_model = provider == "deepseek"
 
             config_kwargs: dict[str, Any] = {
                 "id": "test-model",
-                "model_provider": request.model_provider,
+                "model_provider": provider,
                 "model_name": request.model_name,
                 "api_key": request.api_key,
                 "base_url": base_url,
@@ -716,6 +734,8 @@ async def test_model_connection(
             # Claude models and OpenAI o1/o3 handle max_tokens differently or deprecate temperature
             if is_reasoning_model:
                 chat_kwargs = {}  # let the adapter handle defaults
+            if is_deepseek_model:
+                chat_kwargs["thinking"] = {"type": "disabled"}
 
             await asyncio.wait_for(
                 llm.chat([{"role": "user", "content": "Hello"}], **chat_kwargs),
@@ -725,7 +745,7 @@ async def test_model_connection(
         elif request.category == "embedding":
             embedding_config = EmbeddingModelConfig(
                 id="test-model",
-                model_provider=request.model_provider,
+                model_provider=provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
                 base_url=base_url,
@@ -741,7 +761,7 @@ async def test_model_connection(
         elif request.category == "image":
             image_config = ImageModelConfig(
                 id="test-model",
-                model_provider=request.model_provider,
+                model_provider=provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
                 base_url=base_url,
@@ -750,7 +770,7 @@ async def test_model_connection(
             create_image_model(image_config)
             await asyncio.wait_for(
                 _validate_provider_model_listing(
-                    provider=request.model_provider,
+                    provider=provider,
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
@@ -760,7 +780,7 @@ async def test_model_connection(
             )
 
         elif request.category == "speech":
-            if request.model_provider.lower().strip() != "xinference":
+            if provider != "xinference":
                 raise ValueError(
                     f"Unsupported speech provider for testing: {request.model_provider}"
                 )
@@ -768,7 +788,7 @@ async def test_model_connection(
             requested_abilities = request.abilities or ["asr"]
             await asyncio.wait_for(
                 _validate_provider_model_listing(
-                    provider=request.model_provider,
+                    provider=provider,
                     model_name=request.model_name,
                     api_key=request.api_key,
                     base_url=base_url,
@@ -941,6 +961,12 @@ async def get_available_model_providers() -> dict:
                 "name": "Zhipu AI",
                 "description": "Zhipu AI models",
                 "examples": ["glm-4", "glm-4-air", "glm-3-turbo"],
+            },
+            {
+                "type": "deepseek",
+                "name": "DeepSeek",
+                "description": "DeepSeek v4 models with tool calling and thinking mode",
+                "examples": ["deepseek-v4-flash", "deepseek-v4-pro"],
             },
         ]
     }
@@ -1759,6 +1785,14 @@ async def update_model(
 
     # Update model configuration in-place
     update_data = model_update.model_dump(exclude_unset=True)
+    if "model_provider" in update_data:
+        update_data["model_provider"] = canonical_provider_name(
+            update_data["model_provider"]
+        )
+    effective_provider = update_data.get("model_provider", db_model.model_provider)
+    effective_model_name = update_data.get("model_name", db_model.model_name)
+    _validate_provider_model_name(effective_provider, effective_model_name)
+
     for field, value in update_data.items():
         # Don't update api_key with empty string
         if field == "api_key" and value == "":

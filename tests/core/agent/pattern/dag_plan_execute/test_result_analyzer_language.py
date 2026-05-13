@@ -7,6 +7,7 @@ import pytest
 from xagent.core.agent.pattern.dag_plan_execute.result_analyzer import ResultAnalyzer
 from xagent.core.agent.trace import Tracer
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
 class MockLLM(BaseLLM):
@@ -34,6 +35,71 @@ class MockLLM(BaseLLM):
             self.call_count += 1
             return response
         return '{"achieved": true, "reason": "Default response"}'
+
+
+class CaptureStreamLLM(BaseLLM):
+    def __init__(self, *, supports_json_schema: bool):
+        self.calls = []
+        self._supports_json_schema = supports_json_schema
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        return False
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["chat"]
+
+    @property
+    def model_name(self) -> str:
+        return "capture_stream_llm"
+
+    @property
+    def supports_json_schema_response_format(self) -> bool:
+        return self._supports_json_schema
+
+    async def chat(self, messages: list[dict[str, str]], **kwargs) -> str:
+        return "{}"
+
+    async def stream_chat(self, messages: list[dict[str, str]], **kwargs):
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, content="{}", delta="{}")
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_result_analyzer_keeps_output_config_for_schema_provider():
+    llm = CaptureStreamLLM(supports_json_schema=True)
+    analyzer = ResultAnalyzer(llm, Tracer())
+    output_config = {"format": {"type": "json_schema", "schema": {}}}
+
+    await analyzer._call_llm_with_retry(
+        messages=[{"role": "user", "content": "Analyze"}],
+        output_config=output_config,
+    )
+
+    assert llm.calls[0]["kwargs"]["output_config"] == output_config
+    assert "response_format" not in llm.calls[0]["kwargs"]
+    assert "SYSTEM REMINDER" not in llm.calls[0]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_result_analyzer_uses_json_object_without_schema_support():
+    llm = CaptureStreamLLM(supports_json_schema=False)
+    analyzer = ResultAnalyzer(llm, Tracer())
+
+    await analyzer._call_llm_with_retry(
+        messages=[{"role": "user", "content": "Analyze"}],
+        output_config={"format": {"type": "json_schema", "schema": {}}},
+    )
+
+    assert llm.calls[0]["kwargs"]["response_format"] == {"type": "json_object"}
+    assert "output_config" not in llm.calls[0]["kwargs"]
+    assert (
+        "Return exactly one valid JSON object"
+        in llm.calls[0]["messages"][-1]["content"]
+    )
+    assert "requested schema/example" in llm.calls[0]["messages"][-1]["content"]
 
 
 @pytest.mark.asyncio

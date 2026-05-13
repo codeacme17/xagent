@@ -3,7 +3,11 @@
 import pytest
 
 from xagent.core.model import ChatModelConfig
-from xagent.core.model.chat.langchain import create_base_chat_model
+from xagent.core.model.chat.langchain import (
+    ChatModelRetryWrapper,
+    create_base_chat_model,
+    create_base_chat_model_with_retry,
+)
 
 
 class TestAzureOpenAILangChainAdapter:
@@ -169,3 +173,85 @@ class TestAzureOpenAILangChainAdapter:
         # When None is passed, AzureChatOpenAI will use its own defaults
         assert "temperature" in call_kwargs
         assert "max_tokens" in call_kwargs
+
+    def test_create_deepseek_chat_model(self, mocker):
+        """Test that DeepSeek uses ChatOpenAI with the DeepSeek default base URL."""
+        mock_chat_openai = mocker.patch("xagent.core.model.chat.langchain.ChatOpenAI")
+
+        config = ChatModelConfig(
+            id="test_deepseek_model",
+            model_provider="deepseek",
+            model_name="deepseek-v4-flash",
+            api_key="test-api-key",
+            timeout=20.0,
+        )
+
+        create_base_chat_model(config, 0.3)
+
+        call_kwargs = mock_chat_openai.call_args[1]
+        assert call_kwargs["model"] == "deepseek-v4-flash"
+        assert call_kwargs["api_key"] == "test-api-key"
+        assert call_kwargs["base_url"] == "https://api.deepseek.com"
+        assert call_kwargs["temperature"] == 0.3
+        assert call_kwargs["timeout"] == 20.0
+
+    def test_create_deepseek_chat_model_uses_env_key_fallback(
+        self, mocker, monkeypatch
+    ):
+        """DeepSeek LangChain adapter should share DeepSeek key fallback logic."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-compatible-key")
+        mock_chat_openai = mocker.patch("xagent.core.model.chat.langchain.ChatOpenAI")
+
+        config = ChatModelConfig(
+            id="test_deepseek_model",
+            model_provider="deepseek",
+            model_name="deepseek-v4-flash",
+            api_key="",
+        )
+
+        create_base_chat_model(config, None)
+
+        call_kwargs = mock_chat_openai.call_args[1]
+        assert call_kwargs["api_key"] == "env-deepseek-key"
+
+    def test_deepseek_retry_wrapper_disables_thinking_for_langchain_helpers(
+        self, mocker
+    ):
+        """DeepSeek LangChain helper paths should disable thinking mode."""
+        mock_chat_openai = mocker.patch("xagent.core.model.chat.langchain.ChatOpenAI")
+        mock_model = mocker.Mock()
+        mock_bound_model = mocker.Mock()
+        mock_tool_runnable = mocker.Mock()
+        mock_structured_runnable = mocker.Mock()
+        mock_chat_openai.return_value = mock_model
+        mock_model.bind.return_value = mock_bound_model
+        mock_bound_model.bind_tools.return_value = mock_tool_runnable
+        mock_bound_model.with_structured_output.return_value = mock_structured_runnable
+        mocker.patch(
+            "xagent.core.model.chat.langchain.create_retry_wrapper",
+            side_effect=lambda model, *_args, **_kwargs: model,
+        )
+
+        config = ChatModelConfig(
+            id="test_deepseek_model",
+            model_provider="deepseek",
+            model_name="deepseek-v4-flash",
+            api_key="test-api-key",
+        )
+
+        wrapper = create_base_chat_model_with_retry(config, None)
+
+        assert isinstance(wrapper, ChatModelRetryWrapper)
+        wrapper.bind_tools([{"type": "function"}], tool_choice="auto")
+        mock_model.bind.assert_called_with(
+            extra_body={"thinking": {"type": "disabled"}}
+        )
+        mock_bound_model.bind_tools.assert_called_once_with(
+            [{"type": "function"}], tool_choice="auto"
+        )
+
+        wrapper.with_structured_output({"type": "object"}, include_raw=True)
+        mock_bound_model.with_structured_output.assert_called_once_with(
+            {"type": "object"}, include_raw=True
+        )

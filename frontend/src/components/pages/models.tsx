@@ -97,6 +97,11 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
     category: ["llm", "embedding"],
     defaultBaseUrl: "https://api.openai.com/v1",
   },
+  deepseek: {
+    icon: <img src="/deepseek.svg" alt="DeepSeek" className="w-6 h-6" />,
+    category: ["llm"],
+    defaultBaseUrl: "https://api.deepseek.com",
+  },
   "minimax-coding-plan": {
     icon: <img src="/minimax.svg" alt="MiniMax" className="w-6 h-6" />,
     category: ["llm"],

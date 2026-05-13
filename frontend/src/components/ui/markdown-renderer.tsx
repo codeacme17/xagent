@@ -145,6 +145,20 @@ function AgentCardContainer({
   )
 }
 
+function containsAgentCardElement(children: React.ReactNode): boolean {
+  return React.Children.toArray(children).some((child) => {
+    if (!React.isValidElement(child)) {
+      return false
+    }
+
+    if (child.props?.['data-agent-card-wrapper']) {
+      return true
+    }
+
+    return containsAgentCardElement(child.props?.children)
+  })
+}
+
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -231,6 +245,17 @@ function MarkdownFileImage({
 export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
   const components = React.useMemo<Components>(
     () => ({
+      p({ node: _node, children, ...props }) {
+        if (containsAgentCardElement(children)) {
+          return (
+            <div className="my-4" {...props}>
+              {children}
+            </div>
+          )
+        }
+
+        return <p {...props}>{children}</p>
+      },
       a({ node: _node, href, title, children, ...props }) {
         if (href && href.startsWith('file:')) {
           const filePath = href.replace(/^file:/, '')
@@ -274,7 +299,8 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
           // Wrap in div to ensure it appears on its own line
           return React.createElement('div', {
             className: 'my-2',
-            key: `agent-${agentId}-wrapper`
+            key: `agent-${agentId}-wrapper`,
+            'data-agent-card-wrapper': true,
           }, React.createElement(AgentCardContainer, {
             key: `agent-${agentId}`,
             agentId: agentId,
@@ -307,7 +333,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
         return <img src={src || ''} alt={alt || ''} title={title || alt || ''} {...props} />
       }
     }),
-    [onFileClick]
+    [onFileClick, onAgentClick]
   )
 
   return (

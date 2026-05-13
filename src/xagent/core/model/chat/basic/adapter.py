@@ -2,11 +2,12 @@ import os
 
 from ....model import ChatModelConfig, ModelConfig
 from ....retry import create_retry_wrapper
-from ...providers import provider_compatibility_for_provider
+from ...providers import canonical_provider_name, provider_compatibility_for_provider
 from ..error import retry_on
 from .azure_openai import AzureOpenAILLM
 from .base import BaseLLM
 from .claude import ClaudeLLM
+from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
 from .xinference import XinferenceLLM
@@ -20,10 +21,12 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
 
-    compatibility = provider_compatibility_for_provider(model.model_provider)
+    provider = canonical_provider_name(model.model_provider)
+    compatibility = provider_compatibility_for_provider(provider)
+    llm: BaseLLM
 
-    if model.model_provider == "openai" or compatibility == "openai_compatible":
-        llm: BaseLLM = OpenAILLM(
+    if provider == "deepseek":
+        llm = DeepSeekLLM(
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,
@@ -32,7 +35,17 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider == "claude" or compatibility == "claude_compatible":
+    elif provider == "openai" or compatibility == "openai_compatible":
+        llm = OpenAILLM(
+            model_name=model.model_name,
+            api_key=model.api_key,
+            base_url=model.base_url,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            timeout=model.timeout,
+            abilities=model.abilities,
+        )
+    elif provider == "claude" or compatibility == "claude_compatible":
         llm = ClaudeLLM(
             model_name=model.model_name,
             api_key=model.api_key,
@@ -42,7 +55,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider == "azure_openai":
+    elif provider == "azure_openai":
         llm = AzureOpenAILLM(
             model_name=model.model_name,
             azure_endpoint=model.base_url,  # Reuse base_url as azure_endpoint
@@ -53,7 +66,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider == "zhipu":
+    elif provider == "zhipu":
         llm = ZhipuLLM(
             model_name=model.model_name,
             api_key=model.api_key,
@@ -63,7 +76,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider == "gemini":
+    elif provider == "gemini":
         llm = GeminiLLM(
             model_name=model.model_name,
             api_key=model.api_key,
@@ -73,7 +86,7 @@ def create_base_llm(model: ModelConfig) -> BaseLLM:
             timeout=model.timeout,
             abilities=model.abilities,
         )
-    elif model.model_provider == "xinference":
+    elif provider == "xinference":
         llm = XinferenceLLM(
             model_name=model.model_name,
             base_url=model.base_url,
