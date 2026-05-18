@@ -854,21 +854,29 @@ async def execute_task_background(
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
-                # If task current status is PAUSED, don't overwrite
+                # Caller is responsible for the lease lifecycle (acquire +
+                # release); this function only writes ``status``. The
+                # orchestrator's ``_schedule_bg`` wraps the call in
+                # acquire/release; chat.py and WS continuation paths
+                # acquire and release the lease directly themselves.
+                #
+                # Previously this branch called
+                # ``release_current_runner_task_lease(status=...)``, which
+                # bundled status update with lease release in one UPDATE
+                # filtered on ``runner_id == get_runner_id()``. That hid a
+                # bug for callers that never acquired the lease: the
+                # filter didn't match, so status was silently never
+                # written either (a quiet "stuck RUNNING" outcome).
                 if result.get("status") == "waiting_for_user":
-                    release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.WAITING_FOR_USER
-                    )
-                    db_new.refresh(task_updated)
+                    task_updated.status = TaskStatus.WAITING_FOR_USER
+                    db_new.commit()
                     waiting_for_control = True
                     logger.info(
                         f"Updated task {task_id} status to WAITING_FOR_USER for v2 control state"
                     )
                 elif result.get("status") == "interrupted":
-                    release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.PAUSED
-                    )
-                    db_new.refresh(task_updated)
+                    task_updated.status = TaskStatus.PAUSED
+                    db_new.commit()
                     waiting_for_control = True
                     logger.info(
                         f"Updated task {task_id} status to PAUSED for v2 interrupt state"
@@ -878,14 +886,10 @@ async def execute_task_background(
                     TaskStatus.WAITING_FOR_USER,
                 }:
                     if result.get("success", False):
-                        release_current_runner_task_lease(
-                            db_new, task_id, status=TaskStatus.COMPLETED
-                        )
+                        task_updated.status = TaskStatus.COMPLETED
                     else:
-                        release_current_runner_task_lease(
-                            db_new, task_id, status=TaskStatus.FAILED
-                        )
-                    db_new.refresh(task_updated)
+                        task_updated.status = TaskStatus.FAILED
+                    db_new.commit()
                     logger.info(
                         f"Updated task {task_id} status to {task_updated.status.value}"
                     )
@@ -1843,7 +1847,6 @@ async def handle_chat_message(
         try:
             from ..services.chat_history_service import (
                 load_task_transcript,
-                persist_user_message,
             )
             from ..services.task_execution_context_service import (
                 load_task_execution_recovery_state,
@@ -2088,12 +2091,17 @@ async def handle_chat_message(
                         make_agent_outbound_handler(task_id)
                     )
 
-                persisted_user_message = persist_user_message(
-                    db,
-                    task_id=task_id,
-                    user_id=int(user.id),
-                    content=display_user_message,
-                )
+                # NOTE: the user message is persisted inside
+                # ``TaskTurnOrchestrator.begin_turn`` below as part of
+                # the atomic transition (claim + persist + schedule
+                # commit together). We previously persisted it inline
+                # here and had to best-effort-delete on schedule
+                # rejection; that's now handled by begin_turn's
+                # transactional rollback. ``persisted_user_message`` is
+                # populated after begin_turn returns by reading back
+                # the latest user-role message — needed for the
+                # transcript-history slice below.
+                persisted_user_message = None
 
                 # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
                 # If so, use continuation mechanism; otherwise execute normally
@@ -2348,25 +2356,105 @@ async def handle_chat_message(
                             f"Confirmed: Task {task_id} was completed/failed, forcing fresh execution"
                         )
 
-                    # Create background task execution, don't block WebSocket message loop
-                    bg_task = asyncio.create_task(
-                        execute_task_background(
-                            task_id=task_id,
-                            user_message=display_user_message,
-                            context=context,
-                            agent_manager=get_agent_manager(),
-                            user=user,
-                            task=task,
-                            db=db,
-                            force_fresh_execution=force_fresh_execution,
-                            llm_user_message=user_message_for_llm,
-                        )
+                    # WS builds the display/execution payload here and
+                    # delegates the full new-turn transition to the
+                    # shared orchestrator. ``begin_turn`` owns the
+                    # atomic claim (status flip + input set + terminal-
+                    # field reset), the transcript persist, the
+                    # single-commit transaction, and the lease-aware bg
+                    # schedule -- so WS and /v1 SDK use one turn-
+                    # lifecycle state machine.
+                    from ..models.chat_message import TaskChatMessage
+                    from ..services.task_orchestrator import (
+                        TaskTurnError,
+                        TaskTurnOrchestrator,
+                        TaskTurnPayload,
+                        TurnKind,
                     )
 
-                    # Register background task, ensure only one task executes at a time
-                    background_task_manager.register_task(task_id, bg_task)
+                    payload = TaskTurnPayload(
+                        transcript_message=display_user_message,
+                        execution_message=user_message_for_llm,
+                    )
+                    # WS path only has two legal entries into begin_turn:
+                    #   PENDING                  → CREATE, no force_fresh
+                    #   COMPLETED / FAILED       → APPEND, force_fresh=True
+                    # PAUSED / WAITING_FOR_USER / RUNNING should have been
+                    # intercepted by the continuation path above. Reaching
+                    # this branch with any of them is an upstream-dispatch
+                    # bug; surface it as an agent_error rather than
+                    # silently letting begin_turn 409 on the wrong status.
+                    if task.status == TaskStatus.PENDING:
+                        turn_kind = TurnKind.CREATE
+                        turn_force_fresh = False
+                    elif task.status in (
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                    ):
+                        turn_kind = TurnKind.APPEND
+                        turn_force_fresh = True  # WS always re-engages fresh
+                    else:
+                        logger.error(
+                            f"WS schedule reached for task {task_id} with "
+                            f"unexpected status={task.status}; expected "
+                            "PENDING or terminal. Continuation path should "
+                            "have intercepted."
+                        )
+                        await manager.broadcast_to_task(
+                            {
+                                "type": "agent_error",
+                                "message": ("Internal dispatch error; please retry."),
+                                "timestamp": datetime.now(timezone.utc).timestamp(),
+                            },
+                            task_id,
+                        )
+                        return
 
-                    logger.info(f"Task {task_id} started in background")
+                    try:
+                        await TaskTurnOrchestrator.begin_turn(
+                            task=task,
+                            payload=payload,
+                            user=user,
+                            db=db,
+                            kind=turn_kind,
+                            force_fresh=turn_force_fresh,
+                            context=context,
+                        )
+                        logger.info(f"Task {task_id} started in background")
+                        # Fetch the message begin_turn just persisted so the
+                        # transcript-history slice below can use its id.
+                        persisted_user_message = (
+                            db.query(TaskChatMessage)
+                            .filter(
+                                TaskChatMessage.task_id == task_id,
+                                TaskChatMessage.role == "user",
+                            )
+                            .order_by(TaskChatMessage.id.desc())
+                            .first()
+                        )
+                    except TaskTurnError as busy_err:
+                        # begin_turn's atomic transaction rolls back on
+                        # bg_inflight / busy — neither the status flip
+                        # nor the user message persists, so no transcript
+                        # cleanup is needed here. The rejected-turn-leaves-
+                        # no-side-effect contract makes the previous
+                        # best-effort delete unnecessary.
+                        logger.warning(
+                            f"Refused to schedule bg for task {task_id}: "
+                            f"{busy_err.reason}"
+                        )
+                        await manager.broadcast_to_task(
+                            {
+                                "type": "agent_error",
+                                "message": (
+                                    "Task is currently busy; please wait for "
+                                    "the previous turn to finish before sending "
+                                    "another message."
+                                ),
+                                "timestamp": datetime.now(timezone.utc).timestamp(),
+                            },
+                            task_id,
+                        )
 
             finally:
                 db.close()

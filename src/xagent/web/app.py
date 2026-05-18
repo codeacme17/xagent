@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from contextlib import suppress
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -31,6 +32,8 @@ from .api.skills import router as skills_router
 from .api.system import system_router
 from .api.templates import router as templates_router
 from .api.tools import tools_router
+from .api.v1 import v1_router
+from .api.v1.errors import V1ApiError, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .dynamic_memory_store import get_memory_store
@@ -71,11 +74,40 @@ async def health_check() -> dict[str, str]:
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Handle request validation errors, especially those containing binary data"""
+    """Handle request validation errors, especially those containing binary data.
+
+    Path-aware response shape so the SDK envelope contract holds:
+
+      - ``/v1/*``: rewrite to ``{"error": {"code": "invalid_input",
+        "message": "..."}}`` so SDK clients can switch on
+        ``body.error.code`` for 422 the same way they do for 401/404/409.
+        FastAPI raises ``RequestValidationError`` before the endpoint
+        runs, so the v1 endpoints themselves never see this -- the
+        handler is the only place to translate.
+      - ``/api/*`` and other paths: keep the existing
+        ``{"detail": [sanitized_errors]}`` shape that the web UI and
+        in-house clients already parse.
+    """
     import traceback
 
     logger.error(f"Validation error in {request.url}: {str(exc)}")
     logger.error(f"Traceback: {traceback.format_exc()}")
+
+    if request.url.path.startswith("/v1/"):
+        # Take the first validation error as the human message; full
+        # list isn't echoed to keep the response surface small and
+        # avoid leaking internal field path patterns. Server log above
+        # has the full detail for debugging.
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        msg = first.get("msg") or "Invalid request body"
+        loc = ".".join(str(p) for p in first.get("loc", []) if p not in (None, "body"))
+        if loc:
+            msg = f"{msg} ({loc})"
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "invalid_input", "message": msg}},
+        )
 
     # Sanitize error details to remove binary data and non-serializable objects
     sanitized_errors = []
@@ -112,14 +144,52 @@ async def validation_exception_handler(
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception) -> None:
-    """Global exception handler, ensuring all errors are recorded"""
+async def global_exception_handler(request: Request, exc: Exception) -> Any:
+    """Global exception handler.
+
+    For ``/v1/*`` paths (the SDK surface) we MUST return the stable
+    ``{"error": {"code", "message"}}`` envelope -- anything else
+    violates the contract documented in web/api/v1/errors.py and would
+    confuse SDK clients that key off ``body.error.code``.
+
+    For non-``/v1/*`` paths the original behavior is preserved: log
+    the traceback and re-raise so FastAPI's default ``{"detail": ...}``
+    handler runs (matching what /api/* callers and the web UI already
+    expect).
+    """
     import traceback
 
-    logger.error(f"Unhandled exception in {request.url}: {str(exc)}")
+    logger.error(f"Unhandled exception in {request.url}: {exc}")
     logger.error(f"Traceback: {traceback.format_exc()}")
-    # Re-raise the exception, let FastAPI handle it
+
+    if request.url.path.startswith("/v1/"):
+        # Sanitize: never echo str(exc) -- it can leak SQL error
+        # wording, table names, or storage backend identity. The full
+        # traceback already went to the server log above.
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error.",
+                }
+            },
+        )
+
+    # Non-/v1/* paths: original behavior unchanged. Re-raise so
+    # FastAPI's default exception handling produces the {"detail": ...}
+    # response the web UI / legacy clients depend on.
     raise exc
+
+
+# /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope
+# distinct from FastAPI's default {"detail": "..."} shape used by /api/*.
+# Typed V1ApiError raises pass through this handler so endpoints can
+# choose their own HTTP status (401 / 404 / 409 / 429).
+# See web/api/v1/errors.py for the contract.
+app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 
 
 # Add CORS middleware
@@ -165,6 +235,9 @@ app.include_router(templates_router)
 app.include_router(agents_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
+# Public SDK surface, mounted under /v1. Auth via xag_* API key,
+# error envelope {"error": {"code", "message"}}. See web/api/v1/.
+app.include_router(v1_router)
 
 
 # initial database and skill manager

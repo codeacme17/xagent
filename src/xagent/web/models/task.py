@@ -130,6 +130,43 @@ class Task(Base):  # type: ignore
     llm_calls = Column(Integer, default=0)
     token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
 
+    # ----- SDK surface fields (read/written by /v1/* endpoints) -----
+    # The four columns below are populated by SDK-driven task lifecycles
+    # (see web/api/v1/tasks.py). Legacy task creation paths
+    # (chat.py / websocket.py / widget.py) intentionally leave them at
+    # their defaults: legacy consumers don't read these, and SDK
+    # consumers only see tasks they themselves created.
+
+    # Latest-turn user input as plaintext. Updated each time the SDK
+    # appends a message via POST /v1/chat/tasks/{id}/messages.
+    input = Column(Text, nullable=True)
+
+    # Latest-turn assistant output as plaintext, written when the
+    # background execution finishes a turn successfully.
+    output = Column(Text, nullable=True)
+
+    # Last failure reason when status transitions to FAILED.
+    error_message = Column(Text, nullable=True)
+
+    # Call origin classifier: 'internal' (web UI / WS / legacy),
+    # 'sdk' (POST /v1/chat/tasks), 'widget' (embedded chat widget).
+    # Default 'internal' so legacy code paths -- which never specify
+    # this field on Task(...) -- are auto-classified correctly. Both
+    # ``default`` (Python-level, fires on ORM INSERT) and
+    # ``server_default`` (DB-level DDL, fires for raw SQL INSERT and
+    # for any future ALTER ADD COLUMN against this Column) are set so
+    # the schema produced by ``Base.metadata.create_all()`` (used by
+    # dev/test init_db) stays identical to what alembic produces in
+    # production. Indexed for adoption-metrics queries
+    # (SELECT count(*) FROM tasks WHERE source='sdk' AND created_at>...).
+    source = Column(
+        String(20),
+        default="internal",
+        server_default="internal",
+        nullable=True,
+        index=True,
+    )
+
     @property
     def execution_mode_enum(self) -> ExecutionMode:
         """Get execution_mode as enum with fallback"""

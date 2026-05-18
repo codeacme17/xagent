@@ -1,0 +1,278 @@
+"""Pydantic request/response models for the ``/v1/chat/tasks/*`` SDK endpoints.
+
+Kept in one module because the shapes are small, cross-referential
+(CreateTask / AppendMessage both nest the same ``MessageBody``), and
+will all be regenerated as TypeScript / Python SDK types from the
+OpenAPI schema together.
+
+Design notes:
+
+  - ``MessageBody.role`` is currently fixed to ``"user"`` (SDK callers
+    only push user input on this surface). We accept it as a field
+    rather than hard-coding for forward-compatibility with future
+    system / function message roles, but reject anything else at
+    validation time.
+
+  - ``metadata`` is a free-form passthrough dict the SaaS caller can
+    use to round-trip its own correlation IDs (trace_id, request_id,
+    etc). We don't interpret it server-side in Phase 1 but persist
+    enough of the SDK call shape to support future debugging.
+
+  - Timestamps are tz-aware ``datetime`` so SDK clients deserialize
+    into proper datetimes (``datetime.fromisoformat`` works on both
+    PG ``timestamptz`` and the ISO 8601 the FastAPI default
+    serializer emits).
+"""
+
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class MessageBody(BaseModel):
+    """One chat message in the SDK request body.
+
+    Currently the SDK surface only accepts ``role='user'`` -- the SDK
+    is for SaaS clients pushing user input, not for replaying
+    transcripts. Future-proofed as a string so we don't have to break
+    the wire shape when adding ``system`` / ``function`` later.
+    """
+
+    role: Literal["user"] = Field(
+        default="user",
+        description=(
+            "Currently must be 'user'. Reserved as a field for future "
+            "expansion (system / function roles) without breaking the "
+            "wire shape."
+        ),
+    )
+    content: str = Field(
+        ...,
+        min_length=1,
+        description="The user's message text. Must be non-empty.",
+    )
+
+
+class CreateTaskRequest(BaseModel):
+    """Body for ``POST /v1/chat/tasks``.
+
+    ``agent_id`` is required and must match the agent bound to the
+    presented API key; the server enforces ``body.agent_id ==
+    authed.agent.id`` and returns 404 ``agent_not_found`` on mismatch.
+    """
+
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Target agent's primary key. Must match the agent the "
+            "presented API key is bound to."
+        ),
+    )
+    message: MessageBody = Field(..., description="First user message of the task.")
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Free-form correlation data the SDK caller can pass through "
+            "(trace_id, request_id, etc). Not interpreted server-side "
+            "in Phase 1."
+        ),
+    )
+
+
+class CreateTaskResponse(BaseModel):
+    """``POST /v1/chat/tasks`` -> 202 Accepted response.
+
+    The task has been persisted and queued for background execution;
+    callers poll ``GET /v1/chat/tasks/{task_id}`` to observe the
+    transition pending -> running -> completed/failed.
+    """
+
+    task_id: int = Field(..., description="Newly created task primary key.")
+    agent_id: int = Field(..., description="Agent the task is bound to.")
+    status: str = Field(
+        ...,
+        description=(
+            "Initial status, always 'pending' in the 202 response. "
+            "Use GET /v1/chat/tasks/{task_id} to observe later transitions."
+        ),
+    )
+    created_at: datetime = Field(..., description="UTC creation timestamp.")
+
+
+class AppendMessageRequest(BaseModel):
+    """Body for ``POST /v1/chat/tasks/{task_id}/messages``.
+
+    Same shape as :class:`CreateTaskRequest` minus the lack of a
+    ``metadata`` field by default -- callers append a new user
+    message to an existing task. ``agent_id`` is required again
+    (consistent with the SDK contract: every write carries the
+    agent_id explicitly for forward-compat with multi-agent keys).
+    """
+
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Target agent's primary key. Must match the agent the "
+            "presented API key is bound to and the task's agent_id."
+        ),
+    )
+    message: MessageBody = Field(..., description="Next user message in the task.")
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Free-form correlation data passed through unchanged.",
+    )
+
+
+class AppendMessageResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/messages`` -> 202 Accepted response.
+
+    The new user message has been persisted and the next turn queued
+    for background execution; callers poll the same way they would
+    after the initial POST /v1/chat/tasks.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    agent_id: int = Field(..., description="Agent the task is bound to.")
+    status: str = Field(
+        ...,
+        description="Initial status of the new turn, always 'pending'.",
+    )
+    accepted_at: datetime = Field(
+        ...,
+        description=(
+            "UTC timestamp when the server accepted the message and "
+            "scheduled background execution. Not the message's stored "
+            "created_at (which may differ slightly due to DB clock)."
+        ),
+    )
+
+
+class TaskInfoResponse(BaseModel):
+    """``GET /v1/chat/tasks/{task_id}`` response.
+
+    Returns a snapshot of the task's current state from the ``tasks``
+    row. ``input`` / ``output`` / ``error`` reflect the **latest** turn
+    only -- full transcript history is queryable via the ``/steps``
+    endpoint's ``message`` type steps.
+    """
+
+    task_id: int
+    agent_id: int
+    status: str = Field(
+        ...,
+        description="One of: pending / running / paused / completed / failed.",
+    )
+    input: Optional[str] = Field(
+        None,
+        description="Latest-turn user input. Null if no message yet recorded.",
+    )
+    output: Optional[str] = Field(
+        None,
+        description=(
+            "Latest-turn assistant output. Populated when status reaches "
+            "'completed'; null while running or pending."
+        ),
+    )
+    error: Optional[str] = Field(
+        None,
+        description="Last failure reason when status='failed'.",
+    )
+    created_at: datetime
+    completed_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "UTC timestamp when the task reached a terminal state "
+            "(completed or failed). Null while still running."
+        ),
+    )
+
+
+# ``PublicStep.type`` is the public surface for what was internally one
+# of ~32 trace event types. Restricted to four stable values so SDK
+# clients can switch on the type without keeping up with internal
+# trace-event churn. See ``web/api/v1/_step_mapping.py`` for the full
+# internal->public mapping table.
+PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
+
+# ``running`` means a start event was seen with no matching end (the
+# task is still mid-step at the time of the GET). ``completed`` /
+# ``failed`` reflect the end event's success flag.
+PublicStepStatus = Literal["running", "completed", "failed"]
+
+
+class PublicStep(BaseModel):
+    """One step on the public SDK timeline.
+
+    Type-specific shape of the ``data`` dict:
+
+      - ``thinking``: ``{"phase": "planning" | "step" | "action"}``
+      - ``tool_call``: ``{"name": str, "args": Any,
+                          "result"?: Any, "error"?: str}``
+      - ``agent_delegation``: ``{"sub_agent_name": str,
+                                  "input"?: Any, "output"?: Any}``
+      - ``message``: ``{"role": "user" | "assistant", "content": str}``
+
+    The exact keys are documented but the values are intentionally
+    typed as ``Any`` because tools and agents can return arbitrary
+    JSON. SDK clients should treat unknown keys as forward-compat
+    extensions and ignore them.
+    """
+
+    id: str = Field(
+        ...,
+        description=(
+            "Stable identifier for this step within the task. Includes "
+            "a type prefix (e.g. 'tool_call:abc123') so SDK clients "
+            "can dedupe across re-polls."
+        ),
+    )
+    type: PublicStepType = Field(
+        ...,
+        description=(
+            "One of: thinking, tool_call, agent_delegation, message. "
+            "Other internal event types are not surfaced on this "
+            "endpoint."
+        ),
+    )
+    status: PublicStepStatus = Field(
+        ...,
+        description=(
+            "running while the corresponding end event has not yet "
+            "fired (i.e. the SDK polled mid-step), completed on a "
+            "normal end event, failed when the end event carries "
+            "success=false."
+        ),
+    )
+    started_at: datetime = Field(
+        ...,
+        description="UTC timestamp of the start event for this step.",
+    )
+    completed_at: Optional[datetime] = Field(
+        None,
+        description=("UTC timestamp of the end event. Null while status is 'running'."),
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Type-specific payload. See class docstring for the keys "
+            "expected per step type."
+        ),
+    )
+
+
+class StepsResponse(BaseModel):
+    """``GET /v1/chat/tasks/{task_id}/steps`` response body.
+
+    Steps are returned in monotonic ``started_at`` order. The endpoint
+    is a polling primitive: each call returns the full known history
+    so far (including any still-running steps as ``status='running'``)
+    so SDK clients can resume after a network blip without state.
+    """
+
+    task_id: int = Field(..., description="The task these steps belong to.")
+    agent_id: int = Field(..., description="The task's agent.")
+    steps: List[PublicStep] = Field(
+        default_factory=list,
+        description="Public-timeline steps in started_at ascending order.",
+    )
