@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 from pathlib import Path
 from types import ModuleType
@@ -512,7 +513,7 @@ def _pptx_fallback_html(path: Path) -> HTMLResponse:
     </head>
     <body>
     """
-    html_content += f"<h1>📊 {path.name}</h1>"
+    html_content += f"<h1>📊 {html.escape(path.name)}</h1>"
     total_slides = len(prs.slides)
     for slide_num, slide in enumerate(prs.slides, 1):
         slide_text: list[str] = []
@@ -521,19 +522,19 @@ def _pptx_fallback_html(path: Path) -> HTMLResponse:
             if shape_text:
                 txt = str(shape_text).strip()
                 if txt:
-                    slide_text.append(txt)
+                    slide_text.append(html.escape(txt))
             elif getattr(shape, "has_table", False):
                 for row in shape.table.rows:
                     for cell in row.cells:
                         cell_text = cell.text_frame.text.strip()
                         if cell_text:
-                            slide_text.append(cell_text)
+                            slide_text.append(html.escape(cell_text))
         notes_html = ""
         if getattr(slide, "has_notes_slide", False):
             notes_frame = getattr(slide.notes_slide, "notes_text_frame", None)
             notes = getattr(notes_frame, "text", "").strip() if notes_frame else ""
             if notes:
-                notes_html = f'<div class="notes">[Notes] {notes}</div>'
+                notes_html = f'<div class="notes">[Notes] {html.escape(notes)}</div>'
         if slide_text or notes_html:
             body_html = "<br>".join(slide_text)
             html_content += f"""

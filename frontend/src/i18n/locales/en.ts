@@ -1067,6 +1067,7 @@ Build when you need.`
     previewDialog: {
       buttons: {
         download: "Download",
+        open: "Open",
         openInNewWindow: "Open in New Window",
       },
       loading: "Loading file content...",

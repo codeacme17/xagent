@@ -1067,6 +1067,7 @@ Build when you need.`
     previewDialog: {
       buttons: {
         download: "下载",
+        open: "打开",
         openInNewWindow: "新窗口打开",
       },
       loading: "加载文件内容...",

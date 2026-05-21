@@ -16,12 +16,13 @@ import {
   Shield,
   MessageSquare,
 } from 'lucide-react';
-import { cn, getApiUrl, getFilePublicPreviewUrl } from '@/lib/utils';
+import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
 import { useI18n } from '@/contexts/i18n-context';
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
+import { InlineFilePreview } from '@/components/file/inline-file-preview';
 
 // Types
 interface ToolArgs {
@@ -43,6 +44,7 @@ interface ToolArtifact {
   type?: string;
   file_id?: string;
   filename?: string;
+  mime_type?: string;
   preview_url?: string;
   display?: string;
 }
@@ -487,35 +489,28 @@ const CopyButton = ({ text, title }: { text: string, title?: string }) => {
   );
 };
 
-const getArtifactPreviewUrl = (artifact: ToolArtifact) => {
-  const apiUrl = getApiUrl();
-  if (artifact.preview_url) {
-    if (/^https?:\/\//.test(artifact.preview_url)) {
-      return artifact.preview_url;
-    }
-    return `${apiUrl}${artifact.preview_url.startsWith('/') ? '' : '/'}${artifact.preview_url}`;
-  }
-  if (artifact.file_id) {
-    return getFilePublicPreviewUrl(artifact.file_id, apiUrl);
-  }
-  return '';
-};
-
-const ToolArtifactsDisplay = ({ artifacts }: { artifacts?: ToolArtifact[] }) => {
-  const imageArtifacts = (artifacts || []).filter(
-    artifact => artifact?.type === 'image' && (artifact.preview_url || artifact.file_id)
+const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolArtifact[]; onFileClick?: (filePath: string, fileName: string) => void; t: (key: string) => string }) => {
+  const displayArtifacts = (artifacts || []).filter(
+    artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
   );
 
-  if (imageArtifacts.length === 0) return null;
+  if (displayArtifacts.length === 0) return null;
 
   return (
     <div className="mt-4 grid gap-3">
-      {imageArtifacts.map((artifact, index) => (
-        <img
+      {displayArtifacts.map((artifact, index) => (
+        <InlineFilePreview
           key={`${artifact.file_id || artifact.preview_url || index}`}
-          src={getArtifactPreviewUrl(artifact)}
-          alt={artifact.filename || 'generated image'}
-          className="max-w-full rounded-lg border border-border/50 bg-muted/20"
+          source={{
+            fileId: artifact.file_id,
+            previewUrl: artifact.preview_url,
+            filename: artifact.filename,
+            mimeType: artifact.mime_type,
+            type: artifact.type,
+          }}
+          openLabel={t('files.previewDialog.buttons.open')}
+          loadErrorText={t('files.previewDialog.errors.loadFailed')}
+          onFileClick={onFileClick}
         />
       ))}
     </div>
@@ -524,7 +519,7 @@ const ToolArtifactsDisplay = ({ artifacts }: { artifacts?: ToolArtifact[] }) => 
 
 const ToolOutputDisplay = ({ action, isRunning, t, onFileClick, onAgentClick }: { action: StepAction, isRunning: boolean, t: any, onFileClick?: (filePath: string, fileName: string) => void, onAgentClick?: (agentId: string, agentName: string) => void }) => (
   <>
-    <ToolArtifactsDisplay artifacts={action.data.artifacts} />
+    <ToolArtifactsDisplay artifacts={action.data.artifacts} onFileClick={onFileClick} t={t} />
     {action.data.output !== undefined && action.data.output !== '' && (
       <div className="mt-4 flex flex-col gap-1.5">
         <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">

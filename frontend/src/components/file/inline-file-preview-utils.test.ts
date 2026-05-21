@@ -1,0 +1,99 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  getInlineFilePreviewKind,
+  getInlineFilePreviewUrl,
+  getPreviewUrlTrust,
+} from './inline-file-preview-utils'
+
+describe('inline-file-preview-utils', () => {
+  it('prefers explicit artifact type when resolving preview kind', () => {
+    expect(
+      getInlineFilePreviewKind({
+        type: 'presentation',
+        filename: 'unknown.bin',
+        mimeType: 'application/octet-stream',
+      })
+    ).toBe('presentation')
+  })
+
+  it('falls back to mime type and filename extension when resolving preview kind', () => {
+    expect(
+      getInlineFilePreviewKind({
+        filename: 'report',
+        mimeType:
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      })
+    ).toBe('document')
+    expect(getInlineFilePreviewKind({ filename: 'data.xlsx' })).toBe('spreadsheet')
+    expect(getInlineFilePreviewKind({ filename: 'chart.png' })).toBe('image')
+  })
+
+  it('builds public preview URLs from file ids and preserves absolute preview URLs', () => {
+    expect(
+      getInlineFilePreviewUrl(
+        { fileId: 'slides-file-id', filename: 'slides.pptx' },
+        'http://api.local'
+      )
+    ).toBe('http://api.local/api/files/public/preview/slides-file-id')
+
+    expect(
+      getInlineFilePreviewUrl(
+        {
+          previewUrl: 'https://cdn.example.com/report.docx',
+          filename: 'report.docx',
+        },
+        'http://api.local'
+      )
+    ).toBe('https://cdn.example.com/report.docx')
+  })
+
+  it('prefers file-id preview URLs over external preview URLs', () => {
+    expect(
+      getInlineFilePreviewUrl(
+        {
+          fileId: 'doc-file-id',
+          previewUrl: 'https://cdn.example.com/report.docx',
+          filename: 'report.docx',
+        },
+        'http://api.local'
+      )
+    ).toBe('http://api.local/api/files/public/preview/doc-file-id')
+  })
+
+  it('classifies file-id and API preview URLs as trusted', () => {
+    expect(
+      getPreviewUrlTrust(
+        { fileId: 'slides-file-id', filename: 'slides.pptx' },
+        'http://api.local'
+      )
+    ).toEqual({ isExternal: false, isTrusted: true })
+
+    expect(
+      getPreviewUrlTrust(
+        { previewUrl: '/api/files/public/preview/slides-file-id' },
+        'http://api.local'
+      )
+    ).toEqual({ isExternal: false, isTrusted: true })
+
+    expect(
+      getPreviewUrlTrust(
+        { previewUrl: 'http://api.local/api/files/public/preview/slides-file-id' },
+        'http://api.local'
+      )
+    ).toEqual({ isExternal: false, isTrusted: true })
+  })
+
+  it('classifies cross-origin preview URLs as external and untrusted', () => {
+    expect(
+      getPreviewUrlTrust(
+        { previewUrl: 'https://cdn.example.com/report.docx' },
+        'http://api.local'
+      )
+    ).toEqual({
+      domain: 'cdn.example.com',
+      isExternal: true,
+      isTrusted: false,
+    })
+  })
+})
