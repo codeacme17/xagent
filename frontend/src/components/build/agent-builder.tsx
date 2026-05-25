@@ -11,8 +11,8 @@ import { Switch } from "@/components/ui/switch"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
-import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl, getWsUrl } from "@/lib/utils"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { getApiUrl, getUploadApiUrl, getWsUrl } from "@/lib/utils"
 import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
@@ -41,6 +41,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { extractBuildPreviewResponse } from "@/lib/chat-response"
 
 interface KnowledgeBase {
   name: string
@@ -95,6 +96,7 @@ interface Message {
   content: string | React.ReactNode
   traceEvents?: any[]
   timestamp?: number
+  interactions?: any[]
 }
 
 interface AgentBuilderProps {
@@ -450,9 +452,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 return prev
               })
             } else if (message.type === 'task_completed') {
-              const completionText = typeof message.result === 'string'
-                ? message.result
-                : message.result?.content || ""
+              const { message: completionText, interactions } = extractBuildPreviewResponse(message)
               const interruptedByPause =
                 message.success === false &&
                 completionText === "ReActPattern interrupted."
@@ -469,7 +469,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 if (lastMsg && lastMsg.role === 'assistant') {
                   newMessages[newMessages.length - 1] = {
                     ...lastMsg,
-                    content: completionText || message.output || "Preview completed"
+                    content: completionText || "Preview completed",
+                    interactions: interactions ?? lastMsg.interactions,
                   }
                   return newMessages
                 }
@@ -858,12 +859,19 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
-  const handleSendMessage = async (content: string, _config?: any) => {
+  const handleSendMessage = async (
+    content: string,
+    _config?: any,
+    interactionFiles?: File[],
+    metadata?: { url?: string }
+  ) => {
+    const outgoingFiles = interactionFiles ?? files
+
     // Construct UI message with files if present
     let uiContent: React.ReactNode = content
-    if (files.length > 0) {
+    if (outgoingFiles.length > 0) {
       // Create object URLs for local preview
-      const fileInfos = files.map(f => ({
+      const fileInfos = outgoingFiles.map(f => ({
         name: f.name,
         size: f.size,
         type: f.type,
@@ -914,20 +922,61 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
       // Process files if any
       let processedFiles: any[] = []
-      if (files.length > 0) {
-        // Files are already uploaded by ChatInput component
-        processedFiles = files.map(f => ({
-          file_id: (f as any).file_id,
-          name: f.name,
-          size: f.size,
-          type: f.type || ''
-        }))
+      if (outgoingFiles.length > 0) {
+        const existingFiles = outgoingFiles
+          .filter((f) => typeof (f as any).file_id === "string")
+          .map((f) => ({
+            file_id: (f as any).file_id,
+            name: f.name,
+            size: f.size,
+            type: f.type || ''
+          }))
+
+        processedFiles = [...existingFiles]
+
+        const filesToUpload = outgoingFiles.filter((f) => typeof (f as any).file_id !== "string")
+        if (filesToUpload.length > 0) {
+          const formData = new FormData()
+          filesToUpload.forEach((file) => formData.append("files", file))
+          formData.append("task_type", "task")
+
+          const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+            method: "POST",
+            body: formData,
+          })
+          const parsedUploadResponse = await parseApiResponse(uploadResponse)
+
+          if (!uploadResponse.ok || !isJsonRecord(parsedUploadResponse.data)) {
+            throw new Error(getUploadErrorMessage(uploadResponse, parsedUploadResponse, {
+              generic: t("builds.preview.errors.requestFailed"),
+              ...UPLOAD_ERROR_MESSAGES,
+            }))
+          }
+
+          const uploadData = parsedUploadResponse.data
+          if (uploadData.success && Array.isArray(uploadData.files)) {
+            processedFiles = processedFiles.concat(
+              uploadData.files
+                .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
+                  isJsonRecord(file) && typeof file.file_id === "string"
+                ))
+                .map((file) => ({
+                  file_id: file.file_id,
+                  name: typeof file.filename === "string" ? file.filename : "",
+                  size: typeof file.file_size === "number" ? file.file_size : 0,
+                  type: typeof file.mime_type === "string" ? file.mime_type : "",
+                }))
+            )
+          }
+        }
       }
 
       // Ensure message is not empty for backend
       let backendMessage = content
       if (!backendMessage.trim() && processedFiles.length > 0) {
         backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
+      } else if (metadata?.url) {
+        backendMessage += `\n\n[System Note: The user has provided the website URL: ${metadata.url}. Do not ask for the URL again. Before deciding whether to create a new knowledge base, you MUST first call \`list_knowledge_bases\` to check whether a relevant knowledge base for this website/domain already exists. Only if no relevant knowledge base exists should you call \`create_knowledge_base_from_url\`, then create/update the agent with that knowledge base.]`
       }
 
       // Add selected MCP servers back into tool_categories
@@ -950,7 +999,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         files: processedFiles
       }))
 
-      setFiles([])
+      if (interactionFiles === undefined) {
+        setFiles([])
+      }
 
     } catch (error) {
       console.error("Preview failed:", error)
@@ -961,6 +1012,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }])
       setIsChatLoading(false)
     }
+  }
+
+  const handlePreviewInteractionSend = async (content: string, interactionFiles?: File[], metadata?: { url?: string }) => {
+    await handleSendMessage(content, undefined, interactionFiles, metadata)
   }
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2072,6 +2127,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 showProcessView={true}
                 timestamp={msg.timestamp}
                 taskStatus={index === messages.length - 1 && msg.role === 'assistant' ? taskStatus : undefined}
+                interactions={msg.interactions}
+                onSendInteraction={handlePreviewInteractionSend}
               />
             ))}
           </div>
