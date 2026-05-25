@@ -1,7 +1,8 @@
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 from fastapi import HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from xagent.web.models.agent import Agent, AgentStatus
@@ -184,6 +185,36 @@ def ensure_agent_access(
             )
         return agent
     raise HTTPException(status_code=403, detail="Access denied to agent")
+
+
+def list_accessible_published_agents(
+    db: Session,
+    user: User,
+    *,
+    purpose: str = "workforce_select",
+    exclude_agent_ids: Iterable[int] | None = None,
+) -> list[Agent]:
+    excluded = set(exclude_agent_ids or [])
+    query = db.query(Agent).filter(cast(Any, Agent.status) == AgentStatus.PUBLISHED)
+
+    if not user.is_admin:
+        visible_agent_ids = get_visible_agent_ids(db, user, purpose)
+        if visible_agent_ids is None:
+            query = query.filter(Agent.user_id == int(user.id))
+        elif visible_agent_ids:
+            query = query.filter(
+                or_(
+                    Agent.user_id == int(user.id),
+                    Agent.id.in_(visible_agent_ids),
+                )
+            )
+        else:
+            query = query.filter(Agent.user_id == int(user.id))
+
+    if excluded:
+        query = query.filter(Agent.id.notin_(excluded))
+
+    return [agent for agent in query.order_by(Agent.id.asc()).all()]
 
 
 def ensure_workforce_agent_run_access(

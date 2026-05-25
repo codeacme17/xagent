@@ -142,9 +142,51 @@ class AgentStore:
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
         status: AgentStatus = AgentStatus.DRAFT,
+        published_at: datetime | None = None,
         widget_enabled: bool = True,
         allowed_domains: list[str] | None = None,
     ) -> Agent:
+        agent = self.add_agent(
+            user_id=user_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            execution_mode=execution_mode,
+            models=models,
+            knowledge_bases=knowledge_bases,
+            skills=skills,
+            tool_categories=tool_categories,
+            suggested_prompts=suggested_prompts,
+            status=status,
+            published_at=published_at,
+            widget_enabled=widget_enabled,
+            allowed_domains=allowed_domains,
+        )
+        self.db.commit()
+        self.db.refresh(agent)
+        invalidate_agent_cache(user_id, int(agent.id))
+        return agent
+
+    def add_agent(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None = None,
+        models: dict[str, Any] | None = None,
+        knowledge_bases: list[str] | None = None,
+        skills: list[str] | None = None,
+        tool_categories: list[str] | None = None,
+        suggested_prompts: list[str] | None = None,
+        status: AgentStatus = AgentStatus.DRAFT,
+        published_at: datetime | None = None,
+        widget_enabled: bool = True,
+        allowed_domains: list[str] | None = None,
+    ) -> Agent:
+        if status == AgentStatus.PUBLISHED and published_at is None:
+            published_at = datetime.now(timezone.utc)
         agent = Agent(
             user_id=user_id,
             name=name,
@@ -157,13 +199,12 @@ class AgentStore:
             tool_categories=tool_categories or [],
             suggested_prompts=suggested_prompts or [],
             status=status,
+            published_at=published_at,
             widget_enabled=widget_enabled,
             allowed_domains=allowed_domains or [],
         )
         self.db.add(agent)
-        self.db.commit()
-        self.db.refresh(agent)
-        invalidate_agent_cache(user_id, int(agent.id))
+        self.db.flush()
         return agent
 
     def update_agent_fields(
