@@ -425,7 +425,7 @@ type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
-  | { type: "SET_CURRENT_TASK"; payload: Task }
+  | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
@@ -920,7 +920,7 @@ interface AppContextType {
   clearMessages: () => void
   isConnected: boolean
   connectionError: Error | null
-  setTaskId: (taskId: number | null) => void
+  setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   openFilePreview: (fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => void
   switchFilePreview: (index: number) => void
@@ -3774,6 +3774,37 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
+    const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
+    if (!state.taskId && targetTaskId) {
+      setPendingMessage({ message, files, targetTaskId })
+
+      if (!isDuplicateMessage(message, 'user-message', config?.force)) {
+        let content: React.ReactNode = message
+        if (files && files.length > 0) {
+          content = (
+            <div className="space-y-2">
+              <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
+              <FileAttachment
+                files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))}
+                variant="user-message"
+              />
+            </div>
+          )
+        }
+
+        dispatch({
+          type: "ADD_MESSAGE",
+          payload: {
+            id: generateMessageId("msg-user-optimistic"),
+            role: "user",
+            content,
+            timestamp: Date.now().toString(),
+          }
+        })
+      }
+      return
+    }
+
     if (!state.taskId) {
       // Create a new task via API
       try {
@@ -4075,7 +4106,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     dispatch({ type: "CLEAR_MESSAGES" })
   }, [])
 
-  const setTaskId = useCallback((taskId: number | null) => {
+  const setTaskId = useCallback((taskId: number | null, options?: { navigate?: boolean }) => {
     // Only reset historical data request flag when changing to a different task
     if (taskId !== stateRef.current.taskId) {
       if (taskId) {
@@ -4093,11 +4124,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       dispatch({ type: "SET_STEPS", payload: [] })
     }
 
-    // Update URL to use dynamic route for task detail page
-    if (taskId) {
-      router.push(`/task/${taskId}`)
-    } else {
-      router.push('/task')
+    if (options?.navigate !== false) {
+      // Update URL to use dynamic route for task detail page
+      if (taskId) {
+        router.push(`/task/${taskId}`)
+      } else {
+        router.push('/task')
+      }
     }
 
     dispatch({ type: "SET_TASK_ID", payload: taskId })
