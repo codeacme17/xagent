@@ -542,6 +542,11 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert [message["role"] for message in llm.calls[0]["messages"]].count(
         "system"
     ) == 1
+    first_call_roles = [message["role"] for message in llm.calls[0]["messages"]]
+    assert not any(
+        current == previous == "user"
+        for previous, current in zip(first_call_roles, first_call_roles[1:])
+    )
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert llm.calls[0]["messages"][-1]["role"] == "user"
     assert "must include a complete non-empty answer field" in decision_prompt
@@ -1216,19 +1221,75 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
 
 
 @pytest.mark.asyncio
-async def test_auto_pattern_missing_decision_tool_call_fails() -> None:
-    llm = FakeLLM(["not a tool call"])
+async def test_auto_pattern_retries_missing_decision_tool_call() -> None:
+    llm = FakeLLM(
+        [
+            "not a tool call",
+            decision_tool_response(
+                "final_answer",
+                "Greeting only.",
+                answer="Complete answer after retry.",
+            ),
+        ]
+    )
     pattern = AutoPattern()
     context = ExecutionContext()
     context.add_user_message("Continue")
 
-    with pytest.raises(ValueError, match=DECISION_TOOL_NAME):
-        await pattern.run(
-            context=context,
-            tools=[],
-            llm=llm,
-            runtime=PatternRuntime(),
-        )
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=PatternRuntime(),
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "Complete answer after retry."
+    assert len(llm.calls) == 2
+    retry_roles = [message["role"] for message in llm.calls[1]["messages"]]
+    assert not any(
+        current == previous == "user"
+        for previous, current in zip(retry_roles, retry_roles[1:])
+    )
+    retry_message = llm.calls[1]["messages"][-1]["content"]
+    assert f"did not call the required {DECISION_TOOL_NAME} tool" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_missing_decision_tool_call_fails() -> None:
+    llm = FakeLLM(["not a tool call", {"tool_calls": []}])
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.add_user_message("Continue")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "missing_required_tool_call"
+    assert result["required_tool_name"] == DECISION_TOOL_NAME
+    assert result["attempts"] == 2
+    assert result["error"] == (
+        "Auto routing failed because the model did not return the required "
+        "decision tool call. Please retry."
+    )
+    assert "AutoPattern decision requires" not in result["error"]
+    assert pattern.last_result == result
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "auto_decision_failed"
+    assert runtime.last_checkpoint["metadata"]["failure_reason"] == (
+        "missing_required_tool_call"
+    )
+    assert runtime.last_checkpoint["metadata"]["required_tool_name"] == (
+        DECISION_TOOL_NAME
+    )
+    assert runtime.last_checkpoint["metadata"]["attempts"] == 2
 
 
 @pytest.mark.asyncio
