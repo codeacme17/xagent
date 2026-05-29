@@ -58,6 +58,7 @@ const zh = {
     deploy: "部署",
     agentDev: "Agent 构建与部署",
     task: "任务",
+    workforces: "Workforces",
     history: "全部任务",
     search: "搜索任务",
     templates: "模板",
@@ -2851,7 +2852,12 @@ Build when you need.`
     queryPrefix: "查询:",
     pathPrefix: "路径:",
     bashPrefix: "Bash命令:",
-    searchPrefix: "搜索:"
+    searchPrefix: "搜索:",
+    workforceDelegation: "Workforce 委派",
+    delegateToWorker: "委派给 {worker}",
+    workerReturned: "Worker 已返回结果",
+    workerFailed: "Worker 执行失败",
+    unknownWorker: "未知 Worker"
   },
   deploy_agent: {
     title: "部署 Agent",
@@ -3050,11 +3056,14 @@ Build when you need.`
     },
     run: {
       testTitle: "测试 Workforce",
-      placeholder: "描述你希望 manager 协调完成的任务。"
+      placeholder: "描述你希望 manager 协调完成的任务。",
+      inactiveDisabled: "请先发布这个 Workforce 再运行。",
+      archivedDisabled: "已归档的 Workforce 不能运行。"
     },
     builder: {
       chatTitle: "Builder 对话",
       chatDescription: "描述你想要的 workforce 修改，builder 会生成可检查的 patch。",
+      archivedReadOnly: "已归档的 Workforce 是只读的，不能生成或应用 Builder 修改。",
       emptyPrompt: "可以这样开始：添加 Research Agent worker 来负责竞品调研。",
       roleBuilder: "Builder",
       roleYou: "你",

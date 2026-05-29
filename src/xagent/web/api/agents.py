@@ -18,7 +18,7 @@ from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ...core.utils.api_key import generate_api_key
 from ..auth_dependencies import get_current_user
-from ..models.agent import Agent
+from ..models.agent import Agent, AgentOrigin
 from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_db
 from ..models.model import Model as DBModel
@@ -313,7 +313,11 @@ def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> A
     """
     agent = (
         db.query(Agent)
-        .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+        .filter(
+            Agent.id == agent_id,
+            Agent.user_id == current_user.id,
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
         .first()
     )
     if not agent:
