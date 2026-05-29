@@ -7,11 +7,13 @@ Tests theme configuration, validation, and core functionality.
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from xagent.core.tools.core.pptx_tool import (
     THEME_CONFIGS,
+    PresentationGenerator,
     _preset_to_config,
     _validate_theme_config,
     add_slide_pptx,
@@ -74,6 +76,45 @@ class TestThemeConfiguration:
         assert config["typography"]["body_size"] == 20
         assert config["spacing"]["side_margin"] == 0.9
         assert config["visual_weight"]["divider_opacity"] == 0.12
+
+
+class TestPresentationGeneratorRuntime:
+    """Test runtime behavior for pptxgenjs resolution."""
+
+    def test_generate_preserves_existing_node_path(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("NODE_PATH", "/opt/xagent/frontend/node_modules")
+
+        completed_process = type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "generated", "stderr": ""},
+        )()
+        observed_node_paths: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["npm", "root", "-g"]:
+                return type(
+                    "CompletedProcess",
+                    (),
+                    {"stdout": "/usr/lib/node_modules\n"},
+                )()
+
+            observed_node_paths.append(kwargs["env"]["NODE_PATH"])
+            output_arg = cmd[1]
+            Path(output_arg).parent.joinpath("generated.pptx").write_text("pptx")
+            return completed_process
+
+        generator = PresentationGenerator()
+        generator.create("Deck")
+
+        with patch("shutil.which", return_value="/usr/bin/node"):
+            with patch("subprocess.run", side_effect=fake_run):
+                result = generator.generate(str(tmp_path / "deck.pptx"))
+
+        assert result["success"] is True
+        assert observed_node_paths == [
+            "/opt/xagent/frontend/node_modules:/usr/lib/node_modules"
+        ]
 
 
 class TestThemeValidation:

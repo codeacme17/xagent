@@ -158,6 +158,10 @@ expanded inside the backend container.
 
 ### Backend
 
+Backend image dependencies are resolved from the committed `pyproject.toml` and
+`uv.lock` during the Docker build. Keep `uv.lock` up to date before publishing;
+the backend image build runs `uv sync --locked` for reproducible installs.
+
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
@@ -181,6 +185,10 @@ docker buildx build \
 Images are published to Docker Hub under the `xprobe` organization:
 - Backend: `xprobe/xagent-backend:latest`
 - Frontend: `xprobe/xagent-frontend:latest`
+
+Manual GitHub Container Registry publishing is also available through the GitHub Actions workflow:
+- Backend: `ghcr.io/<owner>/xagent-backend`
+- Frontend: `ghcr.io/<owner>/xagent-frontend`
 
 ### Publish to Docker Hub
 
@@ -243,6 +251,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.fron
 ### Automatic Publishing (GitHub Actions)
 
 Images are automatically published to Docker Hub when you create a GitHub release.
+You can also run the same workflow manually and optionally publish to GHCR.
 
 **Setup (one-time):**
 
@@ -270,6 +279,17 @@ GitHub Actions will:
 - Build backend and frontend images
 - Tag with version (e.g., `v1.0.0`, `v1.0`, `v1`, `latest`)
 - Push to Docker Hub
+
+### Manual GHCR Publish
+
+1. Open the `Publish Docker Images` or `Nightly Build` workflow in GitHub Actions.
+2. Run it manually with `push_to_ghcr=true`.
+3. Leave `push_to_dockerhub=false` if you only want GHCR.
+
+GitHub Actions will:
+- Log in to GHCR with `GITHUB_TOKEN`
+- Build backend and frontend images
+- Push to `ghcr.io/<owner>/xagent-backend` and `ghcr.io/<owner>/xagent-frontend`
 
 **Workflow file:** `.github/workflows/docker-publish.yml`
 

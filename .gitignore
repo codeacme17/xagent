@@ -221,9 +221,6 @@ src/xagent/web/uploads/
 examples/test_data.*
 examples/*.html
 
-# UV.lock
-uv.lock
-
 # filelock artifacts from tests (mock paths like <MagicMock ...>.lock)
 *MagicMock*.lock
 

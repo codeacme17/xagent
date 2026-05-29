@@ -1093,18 +1093,19 @@ class PresentationGenerator:
                 f"Please install Node.js or add it to PATH."
             )
 
-        # Find global node_modules path for NODE_PATH
+        # Keep container-provided node_modules first, then fall back to global modules.
         npm_root = subprocess.run(
             ["npm", "root", "-g"],
             capture_output=True,
             text=True,
             check=True,
         ).stdout.strip()
-        logger.debug(f"Using Node.js at: {node_path}, NODE_PATH: {npm_root}")
 
-        # Prepare environment with NODE_PATH
         env = os.environ.copy()
-        env["NODE_PATH"] = npm_root
+        existing_node_path = env.get("NODE_PATH", "")
+        node_paths = [path for path in [existing_node_path, npm_root] if path]
+        env["NODE_PATH"] = os.pathsep.join(dict.fromkeys(node_paths))
+        logger.debug(f"Using Node.js at: {node_path}, NODE_PATH: {env['NODE_PATH']}")
 
         # Build JavaScript with theme configuration
         js_script = self._build_js_script(str(output_file), self.theme_config)
