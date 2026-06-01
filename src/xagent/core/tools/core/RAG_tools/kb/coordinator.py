@@ -21,6 +21,7 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 
 T = TypeVar("T")
@@ -38,6 +39,7 @@ class KBCoordinator:
         storage_shim: KBStorageShimCompatibilityFacade | None = None,
         file_compatibility: KBFileCompatibilityFacade | None = None,
         management_facade: KBCoreManagementCompatibilityFacade | None = None,
+        parse_display_compatibility: KBParseDisplayCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -47,6 +49,10 @@ class KBCoordinator:
         self._file_compatibility = file_compatibility or KBFileCompatibilityFacade()
         self._management = management_facade or KBCoreManagementCompatibilityFacade(
             coordinator=self
+        )
+        self._parse_display_compatibility = (
+            parse_display_compatibility
+            or KBParseDisplayCompatibilityFacade(coordinator=self)
         )
 
     @property
@@ -68,6 +74,16 @@ class KBCoordinator:
     def management(self) -> KBCoreManagementCompatibilityFacade:
         """Return the core management compatibility facade."""
         return self._management
+
+    @property
+    def parse_display_compatibility(self) -> KBParseDisplayCompatibilityFacade:
+        """Return the parse display compatibility facade."""
+        return self._parse_display_compatibility
+
+    @property
+    def parse_display(self) -> KBParseDisplayCompatibilityFacade:
+        """Backward-friendly short alias for the parse display facade."""
+        return self._parse_display_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

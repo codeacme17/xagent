@@ -16,6 +16,7 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "KBCoreManagementCompatibilityFacade",
     "KBCoordinator",
     "KBFileCompatibilityFacade",
+    "KBParseDisplayCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
     "KBUserScope",

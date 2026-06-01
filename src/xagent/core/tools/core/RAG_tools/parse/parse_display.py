@@ -6,7 +6,7 @@ from the database for display purposes.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..core.exceptions import DatabaseOperationError, DocumentNotFoundError
 from ..core.schemas import (
@@ -15,9 +15,19 @@ from ..core.schemas import (
     ParsedTableDisplay,
     ParsedTextSegmentDisplay,
 )
-from ..storage.factory import get_vector_index_store
+
+if TYPE_CHECKING:
+    from ..kb import KBParseDisplayCompatibilityFacade
+    from ..storage.contracts import VectorIndexStore
 
 logger = logging.getLogger(__name__)
+
+
+def _get_parse_display_compatibility_facade() -> "KBParseDisplayCompatibilityFacade":
+    """Return the coordinator-owned parse display compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().parse_display_compatibility
 
 
 def reconstruct_parse_result_from_db(
@@ -42,8 +52,30 @@ def reconstruct_parse_result_from_db(
         Tuple of (elements, parse_hash)
         elements is a list of dictionaries with 'type', 'text'/'html', and 'metadata' keys.
     """
+    return _get_parse_display_compatibility_facade().reconstruct_parse_result_from_db(
+        collection,
+        doc_id,
+        parse_hash=parse_hash,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _reconstruct_parse_result_from_db_impl(
+    collection: str,
+    doc_id: str,
+    parse_hash: Optional[str] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    *,
+    vector_store: Optional["VectorIndexStore"] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Implementation for reconstruct_parse_result_from_db."""
     try:
-        vector_store = get_vector_index_store()
+        if vector_store is None:
+            from ..storage.factory import get_vector_index_store
+
+            vector_store = get_vector_index_store()
 
         # Build base filter expression
         query_filters: Dict[str, Any] = {
@@ -154,6 +186,19 @@ def paginate_parse_results(
     Returns:
         Tuple of (paginated_elements, pagination_info)
     """
+    return _get_parse_display_compatibility_facade().paginate_parse_results(
+        elements,
+        page=page,
+        page_size=page_size,
+    )
+
+
+def _paginate_parse_results_impl(
+    elements: List[Dict[str, Any]],
+    page: int = 1,
+    page_size: int = 20,
+) -> Tuple[List[ParsedElementDisplay], Dict[str, Any]]:
+    """Implementation for paginate_parse_results."""
     # Validate inputs
     if page < 1:
         page = 1
