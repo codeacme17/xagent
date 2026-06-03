@@ -10,11 +10,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
     get_file_storage_startup_sync_enabled,
+    get_session_secret,
     get_uploads_dir,
 )
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
@@ -422,6 +424,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 current_dir = os.path.dirname(os.path.abspath(__file__))

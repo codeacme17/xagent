@@ -35,6 +35,21 @@ jobs:
           # Use python -m uv to be safe
           python3 -m uv --version || uv --version
 
+      - name: Check uv lockfile
+        shell: bash
+        run: |
+          set -e
+          if python3 -m uv --version >/dev/null 2>&1; then
+            _UV="python3 -m uv"
+          else
+            _UV="uv"
+          fi
+
+          if ! $_UV lock --check; then
+            echo "::error::uv.lock is out of date. Run 'uv lock' and commit the updated lockfile."
+            exit 1
+          fi
+
       - name: Create virtual environment (if not exists)
         shell: bash
         run: |

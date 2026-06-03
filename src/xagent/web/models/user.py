@@ -63,6 +63,9 @@ class User(Base):  # type: ignore
     oauth_accounts = relationship(
         "UserOAuth", back_populates="user", cascade="all, delete-orphan"
     )
+    identities = relationship(
+        "UserIdentity", back_populates="user", cascade="all, delete-orphan"
+    )
     channels = relationship(
         "UserChannel", back_populates="user", cascade="all, delete-orphan"
     )

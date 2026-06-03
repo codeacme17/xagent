@@ -1272,3 +1272,8 @@ def oauth_callback(
         )
 
     return generic_oauth_callback(provider, request, db, db_provider)
+
+
+from .oidc_google import router as google_oidc_router  # noqa: E402
+
+auth_router.include_router(google_oidc_router)

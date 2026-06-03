@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { getApiUrl } from "@/lib/utils"
@@ -22,13 +22,14 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
-import { AUTH_CACHE_KEY } from "@/lib/auth-cache"
+import { storeAuthTokenPayload } from "@/lib/auth-cache"
 
 export function LoginPage() {
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [isGoogleConfigured, setIsGoogleConfigured] = useState<boolean | null>(null)
   const [error, setError] = useState("")
   const [formData, setFormData] = useState({
     identifier: "",
@@ -38,6 +39,35 @@ export function LoginPage() {
   const { isLoading: isStatusLoading, registrationEnabled } = useSetupStatus({
     redirectToSetupIfNeeded: true,
   })
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const oidcError = params.get("oidc_error")
+    if (oidcError) {
+      const translatedError = t(`login.oidc_errors.${oidcError}`)
+      setError(
+        translatedError === `login.oidc_errors.${oidcError}`
+          ? t("login.alerts.google_failed")
+          : translatedError
+      )
+    }
+
+    const checkGoogleStatus = async () => {
+      try {
+        const response = await fetch(`${getApiUrl()}/api/auth/oidc/google/status`)
+        if (!response.ok) {
+          setIsGoogleConfigured(false)
+          return
+        }
+        const data = await response.json()
+        setIsGoogleConfigured(Boolean(data.configured))
+      } catch {
+        setIsGoogleConfigured(false)
+      }
+    }
+
+    void checkGoogleStatus()
+  }, [t])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -55,26 +85,7 @@ export function LoginPage() {
 
       if (response.ok) {
         const data = await response.json()
-        const userData = {
-          id: data.user.id,
-          username: data.user.username,
-          email: data.user.email,
-          is_admin: data.user.is_admin,
-        }
-
-        // Store token in localStorage using the same keys as AuthContext
-        localStorage.setItem("auth_token", data.access_token)
-        localStorage.setItem("auth_user", JSON.stringify(userData))
-
-        // Also update the new cache format
-        localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
-          user: userData,
-          token: data.access_token,
-          refreshToken: data.refresh_token,
-          expiresAt: Date.now() + (data.expires_in || 1800) * 1000, // 30 minutes default
-          refreshExpiresAt: Date.now() + (data.refresh_expires_in || 604800) * 1000, // 7 days default
-          timestamp: Date.now()
-        }))
+        storeAuthTokenPayload(data)
 
         // Redirect to home on success
         window.location.href = "/"
@@ -96,6 +107,10 @@ export function LoginPage() {
     }))
     // Clear error when user starts typing
     if (error) setError("")
+  }
+
+  const handleGoogleLogin = () => {
+    window.location.href = `${getApiUrl()}/api/auth/oidc/google/login`
   }
 
   const features = [
@@ -233,6 +248,30 @@ export function LoginPage() {
             )}
           </Button>
         </form>
+
+        {isGoogleConfigured !== null ? (
+          <div className="mt-5 space-y-5">
+            <div className="flex items-center gap-3">
+              <div className="h-px flex-1 bg-[#E2E8F3]" />
+              <span className="text-xs text-[#7B8496]">{t("common.or")}</span>
+              <div className="h-px flex-1 bg-[#E2E8F3]" />
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleGoogleLogin}
+              disabled={!isGoogleConfigured}
+              className="h-12 w-full gap-2 rounded-[14px] border-[#E2E8F3] bg-white text-[#171A2F] hover:bg-[#F7F9FC] disabled:opacity-60"
+            >
+              <span className="grid h-4 w-4 place-items-center text-sm font-semibold">
+                G
+              </span>
+              {isGoogleConfigured
+                ? t("login.google.continue")
+                : t("login.google.unavailable")}
+            </Button>
+          </div>
+        ) : null}
       </AuthFormCard>
     </AuthPageShell>
   )

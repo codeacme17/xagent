@@ -516,3 +516,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ {args.db.upper()} test FAILED: {e}")
         raise
+    except pytest.skip.Exception as e:
+        print(f"{args.db.upper()} test SKIPPED: {e.msg}")

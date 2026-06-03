@@ -4,6 +4,7 @@ export const AUTH_PUBLIC_PATHS = [
   "/setup",
   "/forgot-password",
   "/reset-password",
+  "/auth/oidc/callback",
 ] as const
 
 export function isAuthPublicPath(pathname: string | null): boolean {

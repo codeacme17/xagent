@@ -83,6 +83,13 @@ SMTP_USE_TLS = "XAGENT_SMTP_USE_TLS"
 SMTP_USE_SSL = "XAGENT_SMTP_USE_SSL"
 SMTP_FROM_EMAIL = "XAGENT_SMTP_FROM_EMAIL"
 SMTP_FROM_NAME = "XAGENT_SMTP_FROM_NAME"
+GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
+GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
+GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
+FRONTEND_URL = "XAGENT_FRONTEND_URL"
+OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
+OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
+SESSION_SECRET = "XAGENT_SESSION_SECRET"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -382,6 +389,50 @@ def get_background_job_sweep_interval_seconds() -> int:
         300,
         minimum=30,
     )
+
+
+def get_google_oidc_client_id() -> str | None:
+    """Return the configured Google OIDC client ID, if any."""
+    value = os.getenv(GOOGLE_OIDC_CLIENT_ID)
+    return value.strip() if value and value.strip() else None
+
+
+def get_google_oidc_client_secret() -> str | None:
+    """Return the configured Google OIDC client secret, if any."""
+    value = os.getenv(GOOGLE_OIDC_CLIENT_SECRET)
+    return value.strip() if value and value.strip() else None
+
+
+def get_google_oidc_redirect_uri() -> str | None:
+    """Return the configured Google OIDC callback URI, if any."""
+    value = os.getenv(GOOGLE_OIDC_REDIRECT_URI)
+    return value.strip() if value and value.strip() else None
+
+
+def get_frontend_url() -> str:
+    """Return the public frontend origin used after browser auth callbacks."""
+    value = os.getenv(FRONTEND_URL)
+    if value and value.strip():
+        return value.strip().rstrip("/")
+    return "http://localhost:3000"
+
+
+def get_oidc_login_ttl_seconds() -> int:
+    """Return the short-lived OIDC login transaction TTL."""
+    return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)
+
+
+def get_oidc_exchange_ttl_seconds() -> int:
+    """Return the short-lived OIDC frontend exchange-code TTL."""
+    return _get_positive_int_env(OIDC_EXCHANGE_TTL_SECONDS, 120)
+
+
+def get_session_secret() -> str:
+    """Return the Starlette session secret used by browser OAuth flows."""
+    value = os.getenv(SESSION_SECRET)
+    if value and value.strip():
+        return value.strip()
+    return os.getenv("XAGENT_JWT_SECRET", "your-secret-key-change-in-production")
 
 
 def get_web_dir() -> Path:

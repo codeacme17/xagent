@@ -8,6 +8,7 @@ from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
 from .model import Model
 from .oauth_provider import OAuthProvider
+from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp
 from .sandbox import SandboxInfo, SandboxSnapshot
 from .system_setting import SystemSetting
@@ -18,6 +19,7 @@ from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
 from .user_api_key import UserApiKey
 from .user_channel import UserChannel
+from .user_identity import UserIdentity
 from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
@@ -32,6 +34,7 @@ __all__ = [
     "UserApiKey",
     "UserOAuth",
     "UserChannel",
+    "UserIdentity",
     "Model",
     "MCPServer",
     "UserMCPServer",
@@ -55,6 +58,7 @@ __all__ = [
     "SandboxInfo",
     "SandboxSnapshot",
     "OAuthProvider",
+    "OidcConsumedToken",
     "PublicMCPApp",
     "Workforce",
     "WorkforceAgent",
