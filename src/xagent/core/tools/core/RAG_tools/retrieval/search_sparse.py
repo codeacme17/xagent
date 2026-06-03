@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from typing import Any, Dict, Iterable, List, Optional, Set, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
 
 import pandas as pd
 import pyarrow as pa  # type: ignore
@@ -22,10 +22,48 @@ from ..storage.factory import (
 from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.metadata_utils import deserialize_metadata
 
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
+
 logger = logging.getLogger(__name__)
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def search_sparse(
+    collection: str,
+    model_tag: str,
+    query_text: str,
+    *,
+    top_k: int,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> SparseSearchResponse:
+    """Performs sparse (Full-Text Search) retrieval on the specified collection."""
+    return _get_legacy_step_compatibility_facade().search_sparse(
+        collection=collection,
+        model_tag=model_tag,
+        query_text=query_text,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _search_sparse_impl(
     collection: str,
     model_tag: str,
     query_text: str,
@@ -345,6 +383,34 @@ def _build_sparse_response(
 
 
 async def search_sparse_async(
+    collection: str,
+    model_tag: str,
+    query_text: str,
+    *,
+    top_k: int,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> SparseSearchResponse:
+    """Perform sparse retrieval using async vector store abstraction."""
+    return await _get_legacy_step_compatibility_facade().search_sparse_async(
+        collection=collection,
+        model_tag=model_tag,
+        query_text=query_text,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _search_sparse_async_impl(
     collection: str,
     model_tag: str,
     query_text: str,

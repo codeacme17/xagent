@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -33,10 +33,41 @@ from ..core.schemas import (
 from ..storage.factory import get_vector_index_store
 from ..utils.hash_utils import compute_parse_hash, get_parse_params_whitelist
 
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
+
 logger = logging.getLogger(__name__)
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def parse_document(
+    collection: str,
+    doc_id: str,
+    parse_method: ParseMethod,
+    params: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    progress_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Parse a document using the specified method."""
+    return _get_legacy_step_compatibility_facade().parse_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_method=parse_method,
+        params=params,
+        user_id=user_id,
+        is_admin=is_admin,
+        progress_callback=progress_callback,
+    )
+
+
+def _parse_document_impl(
     collection: str,
     doc_id: str,
     parse_method: ParseMethod,

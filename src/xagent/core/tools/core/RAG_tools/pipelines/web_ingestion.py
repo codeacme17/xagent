@@ -4,13 +4,12 @@ Crawls a website and imports all discovered pages into the knowledge base.
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import tempfile
 from contextvars import copy_context
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, TypedDict
+from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 from ..core.schemas import (
     CrawlResult,
@@ -25,6 +24,9 @@ from ..utils.string_utils import sanitize_for_doc_id
 from ..utils.user_scope import resolve_user_scope
 from ..web_crawler import WebCrawler
 from .document_ingestion import run_document_ingestion
+
+if TYPE_CHECKING:
+    from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,13 @@ def _looks_like_crawler_block(error: str) -> bool:
     return any(marker in normalized_error for marker in _CRAWLER_BLOCK_ERROR_MARKERS)
 
 
+def _get_pipeline_compatibility_facade() -> "KBPipelineCompatibilityFacade":
+    """Return the coordinator-owned pipeline compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().pipeline_compatibility
+
+
 async def run_web_ingestion(
     collection: str,
     crawl_config: WebCrawlConfig,
@@ -76,6 +85,29 @@ async def run_web_ingestion(
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
     file_handler: Optional[Callable[[Path, str, str, str], FileHandlerResult]] = None,
+) -> WebIngestionResult:
+    """Crawl a website and ingest all pages into the knowledge base."""
+    return await _get_pipeline_compatibility_facade().run_web_ingestion(
+        collection=collection,
+        crawl_config=crawl_config,
+        ingestion_config=ingestion_config,
+        progress_callback=progress_callback,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_handler=file_handler,
+    )
+
+
+async def _run_web_ingestion_impl(
+    collection: str,
+    crawl_config: WebCrawlConfig,
+    *,
+    ingestion_config: Optional[IngestionConfig] = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_handler: Optional[Callable[[Path, str, str, str], FileHandlerResult]] = None,
+    pipeline_facade: Optional["KBPipelineCompatibilityFacade"] = None,
 ) -> WebIngestionResult:
     """Crawl a website and ingest all pages into the knowledge base.
 
@@ -115,6 +147,7 @@ async def run_web_ingestion(
 
     # Normalize ingestion config
     ing_cfg = coerce_ingestion_config(ingestion_config)
+    pipeline_facade = pipeline_facade or _get_pipeline_compatibility_facade()
 
     logger.info(
         "Starting web ingestion: collection=%s, start_url=%s",
@@ -168,151 +201,212 @@ async def run_web_ingestion(
     # Create temporary directory for markdown files
     with tempfile.TemporaryDirectory(prefix="xagent_web_ingest_") as temp_dir:
         documents_created = 0
+        successful_page_ingestions = 0
         total_chunks = 0
         total_embeddings = 0
 
-        # Copy context once before the loop to avoid repeated ContextVar copying.
-        # The request-scoped user context remains constant throughout the request.
-        # NOTE: This copies ALL ContextVars (tracing IDs, request IDs, etc.).
         loop = asyncio.get_event_loop()
-        request_context = copy_context()
 
         for i, crawl_result in enumerate(crawl_results):
             if crawl_result.status != "success":
                 continue
 
-            # Progress callback
-            if progress_callback:
-                progress_callback(
-                    f"Ingesting page {i + 1}/{len(crawl_results)}: {crawl_result.url}",
-                    i + 1,
-                    len(crawl_results),
-                )
-
-            try:
-                # Save crawled content to temporary markdown file
-                filename = sanitize_for_doc_id(crawl_result.title or f"page_{i + 1}")
-                temp_file = Path(temp_dir) / f"{filename}.md"
-
-                with open(temp_file, "w", encoding="utf-8") as f:
-                    # Add metadata header
-                    f.write(f"# {crawl_result.title or 'Untitled'}\n\n")
-                    f.write(f"**Source:** {crawl_result.url}\n\n")
-                    f.write(f"**Crawled:** {crawl_result.timestamp.isoformat()}\n\n")
-                    f.write("---\n\n")
-                    f.write(crawl_result.content_markdown)
-
-                logger.debug("Saved %s to %s", crawl_result.url, temp_file)
-
-                # Call file_handler if provided (for persistent storage and UploadedFile record)
-                final_file_path = temp_file
-                final_file_id = None
-                copied_persistent_file = None
-
-                if file_handler:
-                    try:
-                        file_info = file_handler(
-                            temp_file,
-                            crawl_result.title or f"page_{i + 1}",
-                            collection,
-                            crawl_result.url,
-                        )
-                        final_file_path = Path(file_info.get("file_path", temp_file))
-                        final_file_id = file_info.get("file_id")
-
-                        # Track if we successfully copied a persistent file for cleanup
-                        if final_file_path != temp_file and final_file_path.exists():
-                            copied_persistent_file = final_file_path
-
-                        logger.debug(
-                            "File handler returned: path=%s, file_id=%s",
-                            final_file_path,
-                            final_file_id,
-                        )
-                    except Exception as e:
-                        logger.exception("File handler failed for %s", crawl_result.url)
-                        failure_message = (
-                            f"File persistence failed for {crawl_result.url}: {e}"
-                        )
-                        failed_urls[crawl_result.url] = failure_message
-                        warnings.append(failure_message)
-                        continue
+            page_title = crawl_result.title or f"page_{i + 1}"
+            with pipeline_facade.web_page_operation(
+                collection=collection,
+                url=crawl_result.url,
+                title=page_title,
+            ) as page_operation:
+                # Progress callback
+                if progress_callback:
+                    progress_callback(
+                        f"Ingesting page {i + 1}/{len(crawl_results)}: {crawl_result.url}",
+                        i + 1,
+                        len(crawl_results),
+                    )
 
                 try:
-                    # Ingest the file
-                    progress_manager = get_progress_manager()
+                    # Save crawled content to temporary markdown file
+                    filename = sanitize_for_doc_id(page_title)
+                    temp_file = Path(temp_dir) / f"{filename}.md"
 
-                    def _ingest_file() -> IngestionResult:
-                        return run_document_ingestion(
-                            collection=collection,
-                            source_path=str(final_file_path),
-                            file_id=final_file_id,
-                            ingestion_config=ing_cfg,
-                            progress_manager=progress_manager,
-                            user_id=user_id,
-                            is_admin=is_admin,
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        # Add metadata header
+                        f.write(f"# {page_title}\n\n")
+                        f.write(f"**Source:** {crawl_result.url}\n\n")
+                        f.write(
+                            f"**Crawled:** {crawl_result.timestamp.isoformat()}\n\n"
                         )
+                        f.write("---\n\n")
+                        f.write(crawl_result.content_markdown)
 
-                    # Run ingestion in thread pool while preserving ContextVar user scope
-                    # NOTE: request_context was copied before the loop to avoid repeated copying.
-                    # Modifications made in the thread pool won't propagate back to the main request context.
-                    # This is acceptable for user scope (read-only) but observability systems should
-                    # be aware that child span updates may be lost.
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                    logger.debug("Saved %s to %s", crawl_result.url, temp_file)
+
+                    # Call file_handler if provided (for persistent storage and UploadedFile record)
+                    final_file_path = temp_file
+                    final_file_id = None
+                    copied_persistent_file = None
+
+                    if file_handler:
+                        try:
+                            file_info = file_handler(
+                                temp_file,
+                                page_title,
+                                collection,
+                                crawl_result.url,
+                            )
+                            if not file_info:
+                                raise ValueError(
+                                    "File handler returned no file information"
+                                )
+                            final_file_path = Path(
+                                file_info.get("file_path") or temp_file
+                            )
+                            final_file_id = file_info.get("file_id")
+
+                            if final_file_path != temp_file or final_file_id:
+                                pipeline_facade.record_web_page_file_side_effect(
+                                    page_operation,
+                                    collection=collection,
+                                    url=crawl_result.url,
+                                    file_path=str(final_file_path),
+                                    file_id=final_file_id,
+                                )
+
+                            # Track if we successfully copied a persistent file for cleanup
+                            if (
+                                final_file_path != temp_file
+                                and final_file_path.exists()
+                            ):
+                                copied_persistent_file = final_file_path
+
+                            logger.debug(
+                                "File handler returned: path=%s, file_id=%s",
+                                final_file_path,
+                                final_file_id,
+                            )
+                        except Exception as e:
+                            logger.exception(
+                                "File handler failed for %s", crawl_result.url
+                            )
+                            failure_message = (
+                                f"File persistence failed for {crawl_result.url}: {e}"
+                            )
+                            failed_urls[crawl_result.url] = failure_message
+                            warnings.append(failure_message)
+                            pipeline_facade.record_web_page_file_side_effect(
+                                page_operation,
+                                collection=collection,
+                                url=crawl_result.url,
+                                file_path=None,
+                                file_id=None,
+                                reason="file_handler_failed",
+                            )
+                            pipeline_facade.finish_web_page_operation(
+                                page_operation,
+                                status="error",
+                                message=failure_message,
+                                side_effects_may_remain=True,
+                            )
+                            continue
+
+                    try:
+                        # Ingest the file
+                        progress_manager = get_progress_manager()
+
+                        def _ingest_file() -> IngestionResult:
+                            return run_document_ingestion(
+                                collection=collection,
+                                source_path=str(final_file_path),
+                                file_id=final_file_id,
+                                ingestion_config=ing_cfg,
+                                progress_manager=progress_manager,
+                                user_id=user_id,
+                                is_admin=is_admin,
+                            )
+
+                        # Copy the current ContextVars after the page child operation is active.
+                        # This preserves user scope and lets document ingestion record into the same child.
+                        request_context = copy_context()
                         ingest_result: IngestionResult = await loop.run_in_executor(
-                            executor, lambda: request_context.run(_ingest_file)
+                            None, lambda: request_context.run(_ingest_file)
                         )
 
-                    # Track statistics
-                    if ingest_result.status == "success":
-                        documents_created += 1
-                        total_chunks += ingest_result.chunk_count
-                        total_embeddings += ingest_result.embedding_count
-                        logger.info(
-                            "Ingested %s: %s chunks, %s embeddings",
-                            crawl_result.url,
-                            ingest_result.chunk_count,
-                            ingest_result.embedding_count,
+                        # Track statistics
+                        if ingest_result.status == "success":
+                            documents_created += 1
+                            successful_page_ingestions += 1
+                            total_chunks += ingest_result.chunk_count
+                            total_embeddings += ingest_result.embedding_count
+                            logger.info(
+                                "Ingested %s: %s chunks, %s embeddings",
+                                crawl_result.url,
+                                ingest_result.chunk_count,
+                                ingest_result.embedding_count,
+                            )
+                            pipeline_facade.finish_web_page_operation(
+                                page_operation,
+                                status="success",
+                                message=ingest_result.message,
+                            )
+                            # Only clear temp file reference on success
+                            copied_persistent_file = None
+                        else:
+                            # Non-success ingestion (e.g., embedding failed) without exception.
+                            # Keep file and DB record for potential retry scenarios.
+                            # Note: This accumulates files on persistent failures.
+                            # TODO: Add periodic cleanup for orphaned files from persistent failures.
+                            failed_urls[crawl_result.url] = ingest_result.message
+                            msg = (
+                                f"Partial ingestion for {crawl_result.url}: "
+                                f"{ingest_result.message}"
+                            )
+                            warnings.append(msg)
+                            pipeline_facade.finish_web_page_operation(
+                                page_operation,
+                                status=ingest_result.status,
+                                message=ingest_result.message,
+                            )
+
+                    except Exception as e:
+                        logger.exception("Failed to ingest %s", crawl_result.url)
+                        failed_urls[crawl_result.url] = str(e)
+                        failure_message = (
+                            f"Failed to ingest {crawl_result.url}: {str(e)}"
                         )
-                        # Only clear temp file reference on success
+                        warnings.append(failure_message)
+
+                        # Clean up copied persistent file on ingestion failure
+                        if copied_persistent_file and copied_persistent_file.exists():
+                            try:
+                                copied_persistent_file.unlink()
+                                logger.info(
+                                    "Cleaned up persistent file due to ingestion failure: %s",
+                                    copied_persistent_file,
+                                )
+                            except Exception as cleanup_error:
+                                logger.warning(
+                                    "Failed to clean up persistent file %s: %s",
+                                    copied_persistent_file,
+                                    cleanup_error,
+                                )
                         copied_persistent_file = None
-                    else:
-                        # Non-success ingestion (e.g., embedding failed) without exception.
-                        # Keep file and DB record for potential retry scenarios.
-                        # Note: This accumulates files on persistent failures.
-                        # TODO: Add periodic cleanup for orphaned files from persistent failures.
-                        failed_urls[crawl_result.url] = ingest_result.message
-                        msg = (
-                            f"Partial ingestion for {crawl_result.url}: "
-                            f"{ingest_result.message}"
+                        pipeline_facade.finish_web_page_operation(
+                            page_operation,
+                            status="error",
+                            message=failure_message,
                         )
-                        warnings.append(msg)
 
                 except Exception as e:
                     logger.exception("Failed to ingest %s", crawl_result.url)
                     failed_urls[crawl_result.url] = str(e)
-                    warnings.append(f"Failed to ingest {crawl_result.url}: {str(e)}")
-
-                    # Clean up copied persistent file on ingestion failure
-                    if copied_persistent_file and copied_persistent_file.exists():
-                        try:
-                            copied_persistent_file.unlink()
-                            logger.info(
-                                "Cleaned up persistent file due to ingestion failure: %s",
-                                copied_persistent_file,
-                            )
-                        except Exception as cleanup_error:
-                            logger.warning(
-                                "Failed to clean up persistent file %s: %s",
-                                copied_persistent_file,
-                                cleanup_error,
-                            )
-                    copied_persistent_file = None
-
-            except Exception as e:
-                logger.exception("Failed to ingest %s", crawl_result.url)
-                failed_urls[crawl_result.url] = str(e)
-                warnings.append(f"Failed to ingest {crawl_result.url}: {str(e)}")
+                    failure_message = f"Failed to ingest {crawl_result.url}: {str(e)}"
+                    warnings.append(failure_message)
+                    pipeline_facade.finish_web_page_operation(
+                        page_operation,
+                        status="error",
+                        message=failure_message,
+                    )
 
     # Step 3: Compile results
     elapsed_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
@@ -327,7 +421,8 @@ async def run_web_ingestion(
     # - "success": No failures (empty results are successful)
     total_failures = pages_failed
 
-    if documents_created == 0 and total_failures > 0:
+    has_successful_ingestion = successful_page_ingestions > 0
+    if not has_successful_ingestion and total_failures > 0:
         status = "error"
     elif total_failures > 0:
         status = "partial"

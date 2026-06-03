@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
@@ -60,6 +60,9 @@ from ..vector_storage.vector_manager import (
     read_chunks_for_embedding,
     write_vectors_to_db,
 )
+
+if TYPE_CHECKING:
+    from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +186,40 @@ def _log_pending_chunks_text_stats(label: str, chunks: List[ChunkForEmbedding]) 
     )
 
 
+def _get_pipeline_compatibility_facade() -> "KBPipelineCompatibilityFacade":
+    """Return the coordinator-owned pipeline compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().pipeline_compatibility
+
+
 def run_document_ingestion(
+    collection: str,
+    source_path: str,
+    *,
+    ingestion_config: Optional[IngestionConfigInput] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Public entrypoint for LangGraph-compatible ingestion tooling."""
+    return _get_pipeline_compatibility_facade().run_document_ingestion(
+        collection=collection,
+        source_path=source_path,
+        ingestion_config=ingestion_config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+def _run_document_ingestion_impl(
     collection: str,
     source_path: str,
     *,
@@ -486,6 +522,32 @@ def _handle_ingestion_error(
 
 
 def process_document(
+    collection: str,
+    source_path: str,
+    *,
+    config: Optional[IngestionConfig] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Execute the full ingestion pipeline for a document."""
+    return _get_pipeline_compatibility_facade().process_document(
+        collection=collection,
+        source_path=source_path,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+def _process_document_impl(
     collection: str,
     source_path: str,
     *,

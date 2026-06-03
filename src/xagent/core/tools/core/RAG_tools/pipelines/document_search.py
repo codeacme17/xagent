@@ -5,7 +5,18 @@ from __future__ import annotations
 import logging
 import numbers
 import os
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import requests
 
@@ -33,6 +44,9 @@ from ..retrieval.search_sparse import search_sparse
 from ..utils.config_utils import coerce_search_config
 from ..utils.model_resolver import resolve_embedding_adapter, resolve_rerank_adapter
 from ..utils.user_scope import resolve_user_scope
+
+if TYPE_CHECKING:
+    from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +468,13 @@ def _execute_sparse_search(
 SearchConfigInput = Union[SearchConfig, Mapping[str, Any]]
 
 
+def _get_pipeline_compatibility_facade() -> "KBPipelineCompatibilityFacade":
+    """Return the coordinator-owned pipeline compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().pipeline_compatibility
+
+
 def _handle_search_error(
     exc: Exception,
     current_step: str,
@@ -476,6 +497,26 @@ def _handle_search_error(
 
 
 def search_documents(
+    collection: str,
+    query_text: str,
+    *,
+    config: Optional[SearchConfig] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> SearchPipelineResult:
+    """Execute the document search pipeline end-to-end."""
+    return _get_pipeline_compatibility_facade().search_documents(
+        collection=collection,
+        query_text=query_text,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _search_documents_impl(
     collection: str,
     query_text: str,
     *,
@@ -720,6 +761,26 @@ def search_documents(
 
 
 def run_document_search(
+    collection: str,
+    query_text: str,
+    *,
+    config: Optional[SearchConfigInput] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> SearchPipelineResult:
+    """Public entrypoint for LangGraph-compatible tooling."""
+    return _get_pipeline_compatibility_facade().run_document_search(
+        collection=collection,
+        query_text=query_text,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _run_document_search_impl(
     collection: str,
     query_text: str,
     *,

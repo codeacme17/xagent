@@ -8,7 +8,7 @@ Phase 1A Option C: Provides both sync and async search functions.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.exceptions import DocumentValidationError
 from ..core.schemas import (
@@ -20,10 +20,48 @@ from ..core.schemas import (
 from ..vector_storage.vector_manager import validate_query_vector
 from .search_engine import search_dense_engine
 
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
+
 logger = logging.getLogger(__name__)
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def search_dense(
+    collection: str,
+    model_tag: str,
+    query_vector: List[float],
+    *,
+    top_k: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> DenseSearchResponse:
+    """Execute dense vector search for RAG retrieval."""
+    return _get_legacy_step_compatibility_facade().search_dense(
+        collection=collection,
+        model_tag=model_tag,
+        query_vector=query_vector,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+def _search_dense_impl(
     collection: str,
     model_tag: str,
     query_vector: List[float],
@@ -167,6 +205,34 @@ def search_dense(
 
 
 async def search_dense_async(
+    collection: str,
+    model_tag: str,
+    query_vector: List[float],
+    *,
+    top_k: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+    readonly: bool = False,
+    nprobes: Optional[int] = None,
+    refine_factor: Optional[int] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> DenseSearchResponse:
+    """Execute dense vector search using async vector store abstraction."""
+    return await _get_legacy_step_compatibility_facade().search_dense_async(
+        collection=collection,
+        model_tag=model_tag,
+        query_vector=query_vector,
+        top_k=top_k,
+        filters=filters,
+        readonly=readonly,
+        nprobes=nprobes,
+        refine_factor=refine_factor,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
+async def _search_dense_async_impl(
     collection: str,
     model_tag: str,
     query_vector: List[float],

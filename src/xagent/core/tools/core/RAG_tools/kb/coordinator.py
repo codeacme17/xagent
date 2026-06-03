@@ -12,6 +12,7 @@ from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
 from .file_compatibility import KBFileCompatibilityFacade
+from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
 from .maintenance_compatibility import KBMaintenanceCompatibilityFacade
 from .management_facade import KBCoreManagementCompatibilityFacade
 from .models import (
@@ -22,7 +23,9 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .operation_compatibility import KBOperationCompatibilityFacade
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
+from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 from .vector_storage_compatibility import KBVectorStorageCompatibilityFacade
@@ -50,6 +53,9 @@ class KBCoordinator:
             KBRetrievalHelperCompatibilityFacade | None
         ) = None,
         vector_storage_compatibility: KBVectorStorageCompatibilityFacade | None = None,
+        operation_compatibility: KBOperationCompatibilityFacade | None = None,
+        pipeline_compatibility: KBPipelineCompatibilityFacade | None = None,
+        legacy_step_compatibility: KBLegacyStepCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -78,6 +84,16 @@ class KBCoordinator:
         self._vector_storage_compatibility = (
             vector_storage_compatibility
             or KBVectorStorageCompatibilityFacade(coordinator=self)
+        )
+        self._operation_compatibility = (
+            operation_compatibility or KBOperationCompatibilityFacade()
+        )
+        self._pipeline_compatibility = (
+            pipeline_compatibility or KBPipelineCompatibilityFacade(coordinator=self)
+        )
+        self._legacy_step_compatibility = (
+            legacy_step_compatibility
+            or KBLegacyStepCompatibilityFacade(coordinator=self)
         )
 
     @property
@@ -149,6 +165,36 @@ class KBCoordinator:
     def vector_storage(self) -> KBVectorStorageCompatibilityFacade:
         """Backward-friendly short alias for the vector storage facade."""
         return self._vector_storage_compatibility
+
+    @property
+    def operation_compatibility(self) -> KBOperationCompatibilityFacade:
+        """Return the rollback-aware operation compatibility facade."""
+        return self._operation_compatibility
+
+    @property
+    def operations(self) -> KBOperationCompatibilityFacade:
+        """Backward-friendly short alias for the operation facade."""
+        return self._operation_compatibility
+
+    @property
+    def pipeline_compatibility(self) -> KBPipelineCompatibilityFacade:
+        """Return the high-level pipeline compatibility facade."""
+        return self._pipeline_compatibility
+
+    @property
+    def pipeline(self) -> KBPipelineCompatibilityFacade:
+        """Backward-friendly short alias for the pipeline facade."""
+        return self._pipeline_compatibility
+
+    @property
+    def legacy_step_compatibility(self) -> KBLegacyStepCompatibilityFacade:
+        """Return the legacy step helper compatibility facade."""
+        return self._legacy_step_compatibility
+
+    @property
+    def legacy_steps(self) -> KBLegacyStepCompatibilityFacade:
+        """Backward-friendly short alias for the legacy step facade."""
+        return self._legacy_step_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

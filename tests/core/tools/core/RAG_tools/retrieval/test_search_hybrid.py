@@ -309,14 +309,14 @@ class TestSearchHybrid:
 
     @pytest.fixture
     def mock_sub_searches(self) -> Generator[Tuple[Mock, Mock], None, None]:
-        """Fixture to mock search_dense and search_sparse functions."""
+        """Fixture to mock dense and sparse implementation functions."""
         search_hybrid_module = self._patch_search_hybrid_module()
 
         mock_dense = Mock()
         mock_sparse = Mock()
         with (
-            patch.object(search_hybrid_module, "search_dense", new=mock_dense),
-            patch.object(search_hybrid_module, "search_sparse", new=mock_sparse),
+            patch.object(search_hybrid_module, "_search_dense_impl", new=mock_dense),
+            patch.object(search_hybrid_module, "_search_sparse_impl", new=mock_sparse),
         ):
             yield mock_dense, mock_sparse
 

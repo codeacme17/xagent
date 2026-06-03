@@ -76,19 +76,21 @@ def test_run_document_ingestion_omitted_scope_falls_back_to_context(
 ) -> None:
     """Document ingestion entrypoint should use request scope when args are omitted."""
     captured: dict[str, Any] = {}
+    expected_result = object()
 
     def _fake_process_document(*args: Any, **kwargs: Any) -> object:
         captured.update(kwargs)
-        return object()
+        return expected_result
 
     monkeypatch.setattr(document_ingestion, "process_document", _fake_process_document)
 
     with user_scope_context(user_id=42, is_admin=True):
-        document_ingestion.run_document_ingestion(
+        result = document_ingestion.run_document_ingestion(
             collection="ctx_collection",
             source_path="/tmp/source.md",
         )
 
+    assert result is expected_result
     assert captured["user_id"] == 42
     assert captured["is_admin"] is True
 

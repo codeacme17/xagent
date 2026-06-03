@@ -7,6 +7,7 @@ from .coordinator import (
     reset_kb_coordinator_for_tests,
 )
 from .file_compatibility import KBFileCompatibilityFacade
+from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
 from .maintenance_compatibility import (
     CollectionConfigSnapshot,
     CollectionRollbackMaintenanceResult,
@@ -21,7 +22,16 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .operation_compatibility import (
+    CompensationStep,
+    KBOperationCompatibilityFacade,
+    KBOperationOutcome,
+    PersistencePolicy,
+    RollbackStatus,
+    SideEffectPlane,
+)
 from .parse_display_compatibility import KBParseDisplayCompatibilityFacade
+from .pipeline_compatibility import KBPipelineCompatibilityFacade
 from .retrieval_compatibility import KBRetrievalHelperCompatibilityFacade
 from .storage_shim import KBStorageShimCompatibilityFacade
 from .vector_storage_compatibility import (
@@ -46,11 +56,16 @@ __all__ = [
     "KBCoreManagementCompatibilityFacade",
     "KBCoordinator",
     "KBFileCompatibilityFacade",
+    "KBLegacyStepCompatibilityFacade",
+    "CompensationStep",
     "KBMainPointerSnapshot",
     "KBMaintenanceCompatibilityFacade",
+    "KBOperationCompatibilityFacade",
+    "KBOperationOutcome",
     "KBVersionCandidateCleanupSnapshot",
     "KBVersionCandidateRollbackResult",
     "KBParseDisplayCompatibilityFacade",
+    "KBPipelineCompatibilityFacade",
     "KBRetrievalHelperCompatibilityFacade",
     "KBStorageShimCompatibilityFacade",
     "KBStorageBackend",
@@ -59,6 +74,9 @@ __all__ = [
     "KBUserScope",
     "KBVersionCompatibilityFacade",
     "LanceDBCollectionHandle",
+    "PersistencePolicy",
+    "RollbackStatus",
+    "SideEffectPlane",
     "get_kb_coordinator",
     "reset_kb_coordinator_for_tests",
 ]

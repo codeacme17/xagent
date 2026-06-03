@@ -12,7 +12,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import pandas as pd
 
@@ -29,6 +29,9 @@ from ..utils.string_utils import (
     generate_deterministic_doc_id,
 )
 
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +39,37 @@ logger = logging.getLogger(__name__)
 # Internally constructs Pydantic request and delegates to _register_document.
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def register_document(
+    collection: str,
+    source_path: str,
+    file_type: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    uploaded_at: Optional[str] = None,
+    user_id: Optional[int] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Register a document into the LanceDB system."""
+    return _get_legacy_step_compatibility_facade().register_document(
+        collection=collection,
+        source_path=source_path,
+        file_type=file_type,
+        doc_id=doc_id,
+        uploaded_at=uploaded_at,
+        user_id=user_id,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+    )
+
+
+def _register_document_public_impl(
     collection: str,
     source_path: str,
     file_type: Optional[str] = None,
@@ -216,6 +249,13 @@ def _register_document(request: RegisterDocumentRequest) -> RegisterDocumentResp
 
 
 def get_document(db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
+    """Retrieve a document record from LanceDB using abstraction layer."""
+    return _get_legacy_step_compatibility_facade().get_document(
+        db_dir, collection, doc_id
+    )
+
+
+def _get_document_impl(db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
     """Retrieve a document record from LanceDB using abstraction layer.
 
 
@@ -254,6 +294,15 @@ def get_document(db_dir: str, collection: str, doc_id: str) -> Optional[Any]:
 
 
 def list_documents(
+    db_dir: str, collection: str, limit: int = 100
+) -> list[Dict[str, Any]]:
+    """List documents in the collection using abstraction layer."""
+    return _get_legacy_step_compatibility_facade().list_documents(
+        db_dir, collection, limit
+    )
+
+
+def _list_documents_impl(
     db_dir: str, collection: str, limit: int = 100
 ) -> list[Dict[str, Any]]:
     """List documents in the collection using abstraction layer.

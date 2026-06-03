@@ -7,7 +7,7 @@ document chunking using various chunking strategies.
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -32,6 +32,9 @@ from .chunk_strategies import (
     apply_recursive_strategy,
     attach_media_context,
 )
+
+if TYPE_CHECKING:
+    from ..kb import KBLegacyStepCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +68,55 @@ def _create_spreadsheet_row_chunks(
     return chunks
 
 
+def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
+    """Return the coordinator-owned legacy step compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().legacy_step_compatibility
+
+
 def chunk_document(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    chunk_strategy: ChunkStrategy = ChunkStrategy.RECURSIVE,
+    chunk_size: Optional[int] = 1000,
+    chunk_overlap: int = 200,
+    headers_to_split_on: Optional[List[Tuple[str, str]]] = None,
+    separators: Optional[List[str]] = None,
+    use_token_count: bool = False,
+    tiktoken_encoding: str = DEFAULT_TIKTOKEN_ENCODING,
+    enable_protected_content: bool = True,
+    protected_patterns: Optional[List[str]] = None,
+    table_context_size: int = DEFAULT_TABLE_CONTEXT_SIZE,
+    image_context_size: int = DEFAULT_IMAGE_CONTEXT_SIZE,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Chunk parsed paragraphs and write to chunks table."""
+    return _get_legacy_step_compatibility_facade().chunk_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        chunk_strategy=chunk_strategy,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        headers_to_split_on=headers_to_split_on,
+        separators=separators,
+        use_token_count=use_token_count,
+        tiktoken_encoding=tiktoken_encoding,
+        enable_protected_content=enable_protected_content,
+        protected_patterns=protected_patterns,
+        table_context_size=table_context_size,
+        image_context_size=image_context_size,
+        user_id=user_id,
+        is_admin=is_admin,
+        **kwargs,
+    )
+
+
+def _chunk_document_impl(
     collection: str,
     doc_id: str,
     parse_hash: str,
@@ -577,6 +628,27 @@ def chunk_recursive(
     separators: Optional[List[str]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Chunk document using recursive character splitting strategy."""
+    return _get_legacy_step_compatibility_facade().chunk_recursive(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=separators,
+        **kwargs,
+    )
+
+
+def _chunk_recursive_impl(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    chunk_size: Optional[int] = 1000,
+    chunk_overlap: int = 200,
+    separators: Optional[List[str]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     """
     Chunk document using recursive character splitting strategy.
 
@@ -591,7 +663,7 @@ def chunk_recursive(
     Returns:
         Dictionary containing chunk results and statistics
     """
-    return chunk_document(
+    return _chunk_document_impl(
         collection=collection,
         doc_id=doc_id,
         parse_hash=parse_hash,
@@ -604,6 +676,29 @@ def chunk_recursive(
 
 
 def chunk_markdown(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    chunk_size: Optional[int] = 1200,
+    chunk_overlap: int = 200,
+    headers_to_split_on: Optional[List[Tuple[str, str]]] = None,
+    separators: Optional[List[str]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Chunk document using markdown header-based strategy."""
+    return _get_legacy_step_compatibility_facade().chunk_markdown(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        headers_to_split_on=headers_to_split_on,
+        separators=separators,
+        **kwargs,
+    )
+
+
+def _chunk_markdown_impl(
     collection: str,
     doc_id: str,
     parse_hash: str,
@@ -628,7 +723,7 @@ def chunk_markdown(
     Returns:
         Dictionary containing chunk results and statistics
     """
-    return chunk_document(
+    return _chunk_document_impl(
         collection=collection,
         doc_id=doc_id,
         parse_hash=parse_hash,
@@ -649,6 +744,25 @@ def chunk_fixed_size(
     chunk_overlap: int = 0,
     **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Chunk document using fixed size strategy."""
+    return _get_legacy_step_compatibility_facade().chunk_fixed_size(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        **kwargs,
+    )
+
+
+def _chunk_fixed_size_impl(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    chunk_size: Optional[int] = 1000,
+    chunk_overlap: int = 0,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     """
     Chunk document using fixed size strategy.
 
@@ -662,7 +776,7 @@ def chunk_fixed_size(
     Returns:
         Dictionary containing chunk results and statistics
     """
-    return chunk_document(
+    return _chunk_document_impl(
         collection=collection,
         doc_id=doc_id,
         parse_hash=parse_hash,
