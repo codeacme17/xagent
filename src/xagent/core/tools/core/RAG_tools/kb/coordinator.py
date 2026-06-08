@@ -10,6 +10,7 @@ from typing import Any, Optional, TypeVar
 
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
+from .api_compatibility import KBApiCompatibilityFacade
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
@@ -58,6 +59,7 @@ class KBCoordinator:
         pipeline_compatibility: KBPipelineCompatibilityFacade | None = None,
         legacy_step_compatibility: KBLegacyStepCompatibilityFacade | None = None,
         tool_compatibility: KBToolCompatibilityFacade | None = None,
+        api_compatibility: KBApiCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
@@ -98,6 +100,9 @@ class KBCoordinator:
             or KBLegacyStepCompatibilityFacade(coordinator=self)
         )
         self._tool_compatibility = tool_compatibility or KBToolCompatibilityFacade(
+            coordinator=self
+        )
+        self._api_compatibility = api_compatibility or KBApiCompatibilityFacade(
             coordinator=self
         )
 
@@ -210,6 +215,16 @@ class KBCoordinator:
     def tools(self) -> KBToolCompatibilityFacade:
         """Backward-friendly short alias for the tool facade."""
         return self._tool_compatibility
+
+    @property
+    def api_compatibility(self) -> KBApiCompatibilityFacade:
+        """Return the API route compatibility facade."""
+        return self._api_compatibility
+
+    @property
+    def api(self) -> KBApiCompatibilityFacade:
+        """Backward-friendly short alias for the API facade."""
+        return self._api_compatibility
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""

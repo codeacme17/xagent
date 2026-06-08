@@ -952,7 +952,7 @@ class TestAPIMultiTenancy:
         "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
         return_value=set(),
     )
-    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
     @patch("xagent.web.api.kb.delete_collection_uploaded_files")
     @patch("xagent.web.api.kb.delete_collection_physical_dir")
     @patch("xagent.web.api.kb.delete_collection")
@@ -1007,7 +1007,13 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
-        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+        with patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
+            return_value=mock_get_vector_store.return_value,
+        ):
+            result = await delete_collection_api(
+                "team", _user=mock_user, db=MagicMock()
+            )
 
         mock_delete_collection.assert_called_once_with("team", 999, True)
         assert mock_delete_collection_physical_dir.call_args_list == [
@@ -1033,9 +1039,11 @@ class TestAPIMultiTenancy:
         assert result.status == "success"
 
     @pytest.mark.asyncio
-    @patch("xagent.web.api.kb.get_ingestion_status_store")
-    @patch("xagent.web.api.kb.get_metadata_store")
-    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+    )
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store")
     @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
     @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch(
@@ -1140,9 +1148,11 @@ class TestAPIMultiTenancy:
         assert result["status"] == "partial_success"
 
     @pytest.mark.asyncio
-    @patch("xagent.web.api.kb.get_ingestion_status_store")
-    @patch("xagent.web.api.kb.get_metadata_store")
-    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_ingestion_status_store"
+    )
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store")
     @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
     @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
     @patch("xagent.web.api.kb.rename_collection_storage")
@@ -1230,7 +1240,7 @@ class TestAPIMultiTenancy:
         "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
         return_value=set(),
     )
-    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
     @patch("xagent.web.api.kb.delete_collection_uploaded_files")
     @patch("xagent.web.api.kb.delete_collection_physical_dir")
     @patch("xagent.web.api.kb.delete_collection")
@@ -1275,7 +1285,13 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
-        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+        with patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
+            return_value=mock_get_vector_store.return_value,
+        ):
+            result = await delete_collection_api(
+                "team", _user=mock_user, db=MagicMock()
+            )
 
         mock_delete_collection_physical_dir.assert_called_once_with(
             user_id=101,
@@ -1297,7 +1313,7 @@ class TestAPIMultiTenancy:
         "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
         return_value={101},
     )
-    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store")
     @patch("xagent.web.api.kb.delete_collection_uploaded_files")
     @patch("xagent.web.api.kb.delete_collection_physical_dir")
     @patch("xagent.web.api.kb.delete_collection")
@@ -1340,7 +1356,13 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
-        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+        with patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
+            return_value=mock_get_vector_store.return_value,
+        ):
+            result = await delete_collection_api(
+                "team", _user=mock_user, db=MagicMock()
+            )
 
         mock_delete_collection_physical_dir.assert_called_once_with(
             user_id=101,
