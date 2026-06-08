@@ -65,6 +65,8 @@ const en = {
     templates: "Templates",
     channels: "Channels",
     more: "More",
+    menu: "Navigation menu",
+    openMenu: "Open navigation",
     sections: {
       agentDevelopment: "Agent Development",
       resources: "Resources",

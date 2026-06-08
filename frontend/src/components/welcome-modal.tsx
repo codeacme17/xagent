@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { useRouter } from "next/navigation";
 import { useI18n } from "@/contexts/i18n-context";
 import { getBrandingFromEnv } from "@/lib/branding";
@@ -40,9 +40,9 @@ export function WelcomeModal() {
                     <span className="mb-3 text-[11px] font-bold uppercase tracking-[0.2em] text-primary sm:mb-4">
                         {t("dashboard.welcome.title", { appName: branding.appName.toUpperCase() })}
                     </span>
-                    <h2 className="mb-3 text-2xl font-extrabold tracking-tight text-foreground sm:text-3xl md:text-4xl">
+                    <DialogTitle className="mb-3 text-2xl font-extrabold tracking-tight text-foreground sm:text-3xl md:text-4xl">
                         {t("dashboard.welcome.heading")}
-                    </h2>
+                    </DialogTitle>
                     <p className="text-[14px] text-muted-foreground sm:text-[15px]">
                         {t("dashboard.welcome.subtitle")}
                     </p>

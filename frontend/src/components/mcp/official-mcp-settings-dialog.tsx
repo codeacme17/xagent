@@ -1,5 +1,5 @@
 import React from "react"
-import { Dialog, DialogContent } from "@/components/ui/dialog"
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
 import { Settings, Unlink, Plus } from "lucide-react"
@@ -159,9 +159,9 @@ export function OfficialMcpSettingsDialog({
             )}
           </div>
 
-          <h2 className="text-2xl font-bold text-slate-900 mb-3 tracking-tight">
+          <DialogTitle className="text-2xl font-bold text-slate-900 mb-3 tracking-tight">
             {app.name}
-          </h2>
+          </DialogTitle>
 
           {isGloballyConnected && app.connected_account && (
             <div className="mb-4 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-100 text-blue-700 text-sm font-medium">

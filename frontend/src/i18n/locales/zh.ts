@@ -65,6 +65,8 @@ const zh = {
     templates: "模板",
     channels: "渠道",
     more: "更多",
+    menu: "导航菜单",
+    openMenu: "打开导航",
     sections: {
       agentDevelopment: "Agent 开发",
       resources: "资源",

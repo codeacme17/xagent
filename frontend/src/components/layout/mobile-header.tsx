@@ -7,15 +7,18 @@ import { Menu } from "lucide-react"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { Sidebar } from "@/components/layout/sidebar"
 import { Button } from "@/components/ui/button"
+import { useI18n } from "@/contexts/i18n-context"
 import {
   Sheet,
   SheetContent,
+  SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet"
 
 export function MobileHeader() {
   const pathname = usePathname()
   const branding = getBrandingFromEnv()
+  const { t } = useI18n()
   const [isMenuOpen, setIsMenuOpen] = useState(false)
 
   useEffect(() => {
@@ -38,10 +41,11 @@ export function MobileHeader() {
         <SheetTrigger asChild>
           <Button variant="ghost" size="icon" className="h-10 w-10">
             <Menu className="h-5 w-5" />
-            <span className="sr-only">Open navigation</span>
+            <span className="sr-only">{t("nav.openMenu")}</span>
           </Button>
         </SheetTrigger>
         <SheetContent side="left" className="w-[85vw] max-w-sm p-0">
+          <SheetTitle className="sr-only">{t("nav.menu")}</SheetTitle>
           <Sidebar className="w-full border-r-0" allowCollapse={false} />
         </SheetContent>
       </Sheet>

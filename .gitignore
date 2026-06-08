@@ -67,6 +67,10 @@ db.sqlite3-journal
 xagent_web.db
 xagent.db
 
+# xagent local data directory
+/.xagent_data/
+.xagent_data/
+
 # Test workspace directories
 test_workspace/
 test-task/
