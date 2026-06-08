@@ -128,6 +128,8 @@ class V1AgentSummary(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: list[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
 
 
 class V1AgentResponse(BaseModel):
@@ -149,6 +151,8 @@ class V1AgentResponse(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: list[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
 
 
 class V1AgentCreateResponse(BaseModel):

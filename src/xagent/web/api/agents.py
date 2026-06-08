@@ -2,7 +2,9 @@
 
 import logging
 import os
+import secrets
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -112,6 +114,8 @@ class AgentResponse(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: List[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
 
 
 class AgentListItem(BaseModel):
@@ -126,11 +130,22 @@ class AgentListItem(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: List[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
     access: str = "owner"
     readonly: bool = False
     can_edit: bool = True
     can_publish: bool = True
     can_delete: bool = True
+
+
+class AgentShareLinkResponse(BaseModel):
+    """Owner-only share link state, including the raw token."""
+
+    agent_id: int
+    share_enabled: bool
+    share_token: Optional[str]
+    share_updated_at: Optional[str]
 
 
 class PublishResponse(BaseModel):
@@ -161,6 +176,31 @@ KB_PRIORITY_PROMPT = (
     "information, you may then use your own knowledge to answer, but clearly "
     "indicate that the answer is not from the knowledge base."
 )
+
+
+def _ensure_shareable_agent(agent: Agent | None) -> Agent:
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status.value != "published":
+        raise HTTPException(
+            status_code=400, detail="Only published agents can be shared"
+        )
+    return agent
+
+
+def _new_share_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _serialize_share_link_response(agent: Agent) -> AgentShareLinkResponse:
+    return AgentShareLinkResponse(
+        agent_id=int(agent.id),
+        share_enabled=bool(agent.share_enabled),
+        share_token=agent.share_token,
+        share_updated_at=agent.share_updated_at.isoformat()
+        if agent.share_updated_at
+        else None,
+    )
 
 
 def enhance_system_prompt_with_kb(
@@ -672,6 +712,121 @@ async def unpublish_agent(
         raise
     except Exception as e:
         logger.error(f"Failed to unpublish agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def get_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Return the current owner-only share link state for an agent."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get share link for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def enable_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Create or re-enable a share link for a published agent."""
+    try:
+        store = AgentStore(db)
+        agent = _ensure_shareable_agent(
+            store.get_owned_agent(int(current_user.id), agent_id)
+        )
+        now = datetime.now(timezone.utc)
+        updates: dict[str, Any] = {
+            "share_enabled": True,
+            "share_updated_at": now,
+        }
+        if not agent.share_token:
+            updates["share_token"] = _new_share_token()
+        updated_agent = store.update_agent_fields(
+            int(current_user.id), agent_id, updates
+        )
+        if updated_agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(updated_agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to enable share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/share-link/rotate", response_model=AgentShareLinkResponse)
+async def rotate_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Rotate the public share link for a published agent."""
+    try:
+        store = AgentStore(db)
+        _ensure_shareable_agent(store.get_owned_agent(int(current_user.id), agent_id))
+        agent = store.update_agent_fields(
+            int(current_user.id),
+            agent_id,
+            {
+                "share_enabled": True,
+                "share_token": _new_share_token(),
+                "share_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to rotate share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def disable_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Disable and revoke the public share link for an agent."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent = store.update_agent_fields(
+            int(current_user.id),
+            agent_id,
+            {
+                "share_enabled": False,
+                "share_token": None,
+                "share_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to disable share link for agent {agent_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
