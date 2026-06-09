@@ -19,8 +19,8 @@ from .models import KBStorageBackend
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
+    KBOperationOutcome,
     PersistencePolicy,
-    RollbackStatus,
     SideEffectPlane,
 )
 
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .storage_shim import KBStorageShimCompatibilityFacade
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
+WEB_ROLLBACK_COMPENSATED_PLANES_KEY = "compensated_side_effect_planes"
 
 
 class KBPipelineCompatibilityFacade:
@@ -200,7 +201,8 @@ class KBPipelineCompatibilityFacade:
                     is_admin=is_admin,
                 )
                 self.ensure_collection_backend_binding(collection)
-                self._finish_document_ingestion_outcome(operation, result)
+                if self._should_finish_document_ingestion_operation(operation):
+                    self._finish_document_ingestion_outcome(operation, result)
                 return result
 
     def run_document_ingestion(
@@ -251,7 +253,8 @@ class KBPipelineCompatibilityFacade:
                         is_admin=is_admin,
                     )
                     self.ensure_collection_backend_binding(collection)
-                    self._finish_document_ingestion_outcome(operation, result)
+                    if self._should_finish_document_ingestion_operation(operation):
+                        self._finish_document_ingestion_outcome(operation, result)
                 elif operation is None:
                     self.ensure_collection_backend_binding(collection)
                 return result
@@ -331,7 +334,17 @@ class KBPipelineCompatibilityFacade:
                     pipeline_facade=self,
                 )
                 await self.ensure_collection_backend_binding_async(collection)
-                self._record_web_ingestion_outcome(operation, result)
+                outcome = self._record_web_ingestion_outcome(operation, result)
+                if (
+                    outcome is not None
+                    and result.side_effects_may_remain
+                    != outcome.side_effects_may_remain
+                ):
+                    result = result.model_copy(
+                        update={
+                            "side_effects_may_remain": outcome.side_effects_may_remain
+                        }
+                    )
                 return result
 
     @contextmanager
@@ -373,20 +386,73 @@ class KBPipelineCompatibilityFacade:
         file_path: Optional[str],
         file_id: Optional[str],
         reason: str = "file_handler",
+        extra_payload: Optional[Mapping[str, Any]] = None,
+        compensation: Optional[Callable[[], None]] = None,
     ) -> None:
         if operation is None:
             return
+        payload = {
+            "collection": collection,
+            "url": url,
+            "file_path": file_path,
+            "file_id": file_id,
+            "reason": reason,
+        }
+        if extra_payload:
+            payload.update(dict(extra_payload))
         operation.record_side_effect(
             name="cleanup_web_page_persistence",
             plane=SideEffectPlane.FILE,
-            payload={
-                "collection": collection,
-                "url": url,
-                "file_path": file_path,
-                "file_id": file_id,
-                "reason": reason,
-            },
+            payload=payload,
             idempotency_key=f"file:{collection}:{file_id or file_path or url}",
+            compensation=compensation,
+        )
+
+    @staticmethod
+    def _compensated_side_effect_planes(
+        payload: Optional[Mapping[str, Any]],
+    ) -> set[SideEffectPlane]:
+        if not payload:
+            return set()
+
+        raw_planes = payload.get(WEB_ROLLBACK_COMPENSATED_PLANES_KEY)
+        if not isinstance(raw_planes, (list, tuple, set)):
+            return set()
+
+        planes: set[SideEffectPlane] = set()
+        for raw_plane in raw_planes:
+            try:
+                planes.add(SideEffectPlane(raw_plane))
+            except (TypeError, ValueError):
+                continue
+        return planes
+
+    def mark_web_page_compensation_coverage(
+        self,
+        operation: KBOperation | None,
+        *,
+        extra_payload: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        """Mark side effects covered by a successful web rollback callback."""
+        if operation is None or operation.outcome is not None:
+            return 0
+
+        planes = self._compensated_side_effect_planes(extra_payload)
+        if not planes:
+            return 0
+
+        return operation.mark_compensated_steps(planes=planes)
+
+    @staticmethod
+    def compensate_web_page_file_side_effect(
+        operation: KBOperation | None,
+    ) -> tuple[BaseException, ...]:
+        """Execute registered web-file compensation callbacks for a page."""
+        if operation is None or operation.outcome is not None:
+            return ()
+        return operation.execute_compensations(
+            step_names={"cleanup_web_page_persistence"},
+            planes={SideEffectPlane.FILE},
         )
 
     @staticmethod
@@ -403,14 +469,12 @@ class KBPipelineCompatibilityFacade:
             side_effects_may_remain = (
                 status != "success" and operation.has_side_effects()
             )
-        rollback_status = (
-            RollbackStatus.NOT_NEEDED
-            if status == "success" or not side_effects_may_remain
-            else RollbackStatus.INCOMPLETE
-        )
         operation.finish(
             status=status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={"message": message},
         )
@@ -526,6 +590,19 @@ class KBPipelineCompatibilityFacade:
             )
 
     @staticmethod
+    def _should_finish_document_ingestion_operation(
+        operation: KBOperation | None,
+    ) -> bool:
+        if operation is None:
+            return False
+        if operation.operation_type == "document_ingestion":
+            return True
+        return (
+            operation.operation_type == "web_page_ingestion"
+            and "url" not in operation.details
+        )
+
+    @staticmethod
     def _finish_document_ingestion_outcome(
         operation: KBOperation | None,
         result: IngestionResult,
@@ -535,14 +612,12 @@ class KBPipelineCompatibilityFacade:
         side_effects_may_remain = (
             result.status != "success" and operation.has_side_effects()
         )
-        rollback_status = (
-            RollbackStatus.NOT_NEEDED
-            if result.status == "success" or not side_effects_may_remain
-            else RollbackStatus.INCOMPLETE
-        )
         operation.finish(
             status=result.status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                result.status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={"message": result.message},
         )
@@ -551,39 +626,30 @@ class KBPipelineCompatibilityFacade:
         self,
         operation: KBOperation | None,
         result: WebIngestionResult,
-    ) -> None:
-        if operation is None or operation.outcome is not None:
-            return
+    ) -> KBOperationOutcome | None:
+        if operation is None:
+            return None
+        if operation.outcome is not None:
+            return operation.outcome
 
         child_side_effects_may_remain = any(
             child.side_effects_may_remain for child in operation.child_outcomes
         )
-        successful_child_count = sum(
-            1 for child in operation.child_outcomes if child.status == "success"
-        )
-        failed_child_count = sum(
-            1 for child in operation.child_outcomes if child.status != "success"
-        )
+        own_side_effects_may_remain = bool(operation.uncompensated_steps())
 
         if result.status == "success":
-            rollback_status = RollbackStatus.NOT_NEEDED
             side_effects_may_remain = False
-        elif successful_child_count > 0 and failed_child_count > 0:
-            rollback_status = RollbackStatus.SKIPPED_BY_POLICY
-            side_effects_may_remain = child_side_effects_may_remain
         else:
             side_effects_may_remain = (
-                child_side_effects_may_remain or operation.has_side_effects()
-            )
-            rollback_status = (
-                RollbackStatus.INCOMPLETE
-                if side_effects_may_remain
-                else RollbackStatus.NOT_NEEDED
+                child_side_effects_may_remain or own_side_effects_may_remain
             )
 
-        operation.finish(
+        return operation.finish(
             status=result.status,
-            rollback_status=rollback_status,
+            rollback_status=operation.infer_rollback_status(
+                result.status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
             side_effects_may_remain=side_effects_may_remain,
             details={
                 "documents_created": result.documents_created,

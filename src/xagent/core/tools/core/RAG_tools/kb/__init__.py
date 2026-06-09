@@ -3,6 +3,7 @@
 from .api_compatibility import (
     KBApiCompatibilityFacade,
     KBApiFailedIngestCleanupDecision,
+    KBApiFailedIngestRollbackResult,
     KBApiOperationResult,
 )
 from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
@@ -55,6 +56,7 @@ __all__ = [
     "KBAccessMode",
     "KBApiCompatibilityFacade",
     "KBApiFailedIngestCleanupDecision",
+    "KBApiFailedIngestRollbackResult",
     "KBApiOperationResult",
     "KBBackendCapabilities",
     "KBCollectionContext",

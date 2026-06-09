@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 from uuid import uuid4
 
 
@@ -72,6 +73,13 @@ class KBOperationOutcome:
         return tuple(reversed(self.compensation_steps))
 
 
+def _close_awaitable_if_possible(value: Any) -> None:
+    """Close coroutine-like objects that cannot be awaited by a sync caller."""
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
 class KBOperation:
     """Mutable operation builder stored only in the current execution context."""
 
@@ -96,6 +104,9 @@ class KBOperation:
         self.warnings: list[str] = []
         self.side_effects_may_remain = False
         self._idempotency_keys: set[str] = set()
+        self._compensation_callbacks: dict[str, Callable[[], None]] = {}
+        self._completed_compensation_keys: set[str] = set()
+        self._compensation_attempted = False
         self._outcome: KBOperationOutcome | None = None
 
     @property
@@ -110,6 +121,32 @@ class KBOperation:
             for child in self.child_outcomes
         )
 
+    def uncompensated_steps(self) -> tuple[CompensationStep, ...]:
+        """Return own side effects not covered by successful compensation."""
+        return tuple(
+            step
+            for step in self.compensation_steps
+            if (
+                step.idempotency_key is None
+                or step.idempotency_key not in self._completed_compensation_keys
+            )
+        )
+
+    def has_uncompensated_side_effects(self) -> bool:
+        """Return whether any recorded side effect still lacks compensation."""
+        if self.uncompensated_steps():
+            return True
+        return any(
+            child.side_effects_may_remain
+            or child.rollback_status is RollbackStatus.INCOMPLETE
+            for child in self.child_outcomes
+        )
+
+    @property
+    def compensation_attempted(self) -> bool:
+        """Return whether this operation attempted executable compensation."""
+        return self._compensation_attempted
+
     def update_details(self, **details: Any) -> None:
         """Merge operation metadata captured during execution."""
         self.details.update(details)
@@ -121,14 +158,19 @@ class KBOperation:
         plane: SideEffectPlane,
         payload: Optional[Mapping[str, Any]] = None,
         idempotency_key: Optional[str] = None,
+        compensation: Optional[Callable[[], None]] = None,
     ) -> None:
         """Register an idempotent compensation boundary for one side effect."""
         step_payload = dict(payload or {})
         dedupe_key = idempotency_key or f"{plane.value}:{name}:{step_payload!r}"
         if dedupe_key in self._idempotency_keys:
+            if compensation is not None:
+                self._compensation_callbacks.setdefault(dedupe_key, compensation)
             return
 
         self._idempotency_keys.add(dedupe_key)
+        if compensation is not None:
+            self._compensation_callbacks[dedupe_key] = compensation
         self.compensation_steps.append(
             CompensationStep(
                 name=name,
@@ -141,6 +183,82 @@ class KBOperation:
     def add_child_outcome(self, outcome: KBOperationOutcome) -> None:
         """Attach a finalized child operation outcome."""
         self.child_outcomes.append(outcome)
+
+    def mark_compensated_steps(
+        self,
+        *,
+        step_names: Optional[set[str]] = None,
+        planes: Optional[set[SideEffectPlane]] = None,
+    ) -> int:
+        """Mark steps covered by a broader successful compensation callback."""
+        if step_names is None and planes is None:
+            return 0
+
+        completed = 0
+        for step in self.compensation_steps:
+            if step_names is not None and step.name not in step_names:
+                continue
+            if planes is not None and step.plane not in planes:
+                continue
+            if step.idempotency_key is None:
+                continue
+            if step.idempotency_key in self._completed_compensation_keys:
+                continue
+
+            self._completed_compensation_keys.add(step.idempotency_key)
+            completed += 1
+
+        if completed:
+            self.side_effects_may_remain = self.has_uncompensated_side_effects()
+        return completed
+
+    def execute_compensations(
+        self,
+        *,
+        step_names: Optional[set[str]] = None,
+        planes: Optional[set[SideEffectPlane]] = None,
+    ) -> tuple[BaseException, ...]:
+        """Execute registered compensation callbacks in LIFO order.
+
+        Callbacks are kept outside the immutable outcome so public result shapes
+        stay serializable. Successful callbacks are not re-run, while failed
+        callbacks remain retryable because the idempotency key stays registered.
+        """
+        errors: list[BaseException] = []
+        attempted = False
+        for step in reversed(self.compensation_steps):
+            if step_names is not None and step.name not in step_names:
+                continue
+            if planes is not None and step.plane not in planes:
+                continue
+            if step.idempotency_key is None:
+                continue
+            if step.idempotency_key in self._completed_compensation_keys:
+                continue
+
+            callback = self._compensation_callbacks.get(step.idempotency_key)
+            if callback is None:
+                continue
+
+            self._compensation_attempted = True
+            attempted = True
+            try:
+                result = cast(Callable[[], Any], callback)()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "Async compensation callback is not supported in synchronous "
+                        f"execute_compensations for step {step.name}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - preserve retryability
+                errors.append(exc)
+                self.warnings.append(f"{step.name}: {_format_exception_warning(exc)}")
+            else:
+                self._completed_compensation_keys.add(step.idempotency_key)
+
+        if attempted:
+            self.side_effects_may_remain = bool(errors)
+        return tuple(errors)
 
     def finish(
         self,
@@ -157,11 +275,16 @@ class KBOperation:
         if warnings:
             self.warnings.extend(warnings)
 
+        inferred_side_effects_may_remain = self._infer_side_effects_may_remain(status)
         if side_effects_may_remain is None:
-            side_effects_may_remain = self._infer_side_effects_may_remain(status)
+            side_effects_may_remain = inferred_side_effects_may_remain
+        elif status != "success":
+            side_effects_may_remain = (
+                side_effects_may_remain or inferred_side_effects_may_remain
+            )
 
         if rollback_status is None:
-            rollback_status = self._infer_rollback_status(
+            rollback_status = self.infer_rollback_status(
                 status,
                 side_effects_may_remain=side_effects_may_remain,
             )
@@ -185,14 +308,15 @@ class KBOperation:
     def _infer_side_effects_may_remain(self, status: str) -> bool:
         if status == "success":
             return False
-        return self.has_side_effects()
+        return self.has_uncompensated_side_effects()
 
-    def _infer_rollback_status(
+    def infer_rollback_status(
         self,
         status: str,
         *,
         side_effects_may_remain: bool,
     ) -> RollbackStatus:
+        """Infer rollback status from current compensation and child state."""
         if status == "success":
             return RollbackStatus.NOT_NEEDED
 
@@ -208,7 +332,16 @@ class KBOperation:
         ):
             return RollbackStatus.SKIPPED_BY_POLICY
 
-        if side_effects_may_remain:
+        if side_effects_may_remain or self.has_uncompensated_side_effects():
+            return RollbackStatus.INCOMPLETE
+        if self._compensation_attempted and self.has_side_effects():
+            return RollbackStatus.COMPLETE
+        if any(
+            child.rollback_status is RollbackStatus.COMPLETE
+            for child in self.child_outcomes
+        ):
+            return RollbackStatus.COMPLETE
+        if self.has_side_effects():
             return RollbackStatus.INCOMPLETE
         return RollbackStatus.NOT_NEEDED
 
@@ -278,11 +411,6 @@ class KBOperationCompatibilityFacade:
             if operation.outcome is None:
                 operation.finish(
                     status="error",
-                    rollback_status=(
-                        RollbackStatus.INCOMPLETE
-                        if operation.has_side_effects()
-                        else RollbackStatus.NOT_NEEDED
-                    ),
                     side_effects_may_remain=operation.has_side_effects(),
                     warnings=(_format_exception_warning(exc),),
                 )

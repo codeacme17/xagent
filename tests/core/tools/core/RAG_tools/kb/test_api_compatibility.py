@@ -14,6 +14,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     WebIngestionResult,
 )
 from xagent.core.tools.core.RAG_tools.kb import (
+    CompensationStep,
     KBApiCompatibilityFacade,
     KBApiOperationResult,
     KBCoordinator,
@@ -21,6 +22,7 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBOperationOutcome,
     PersistencePolicy,
     RollbackStatus,
+    SideEffectPlane,
     get_kb_coordinator,
     reset_kb_coordinator_for_tests,
 )
@@ -244,6 +246,163 @@ def test_api_operation_result_consumes_new_operation_outcome() -> None:
     completed_rollback = facade.with_rollback_complete(api_result, True)
     cleanup_after_rollback = facade.failed_ingest_cleanup_decision(completed_rollback)
     assert cleanup_after_rollback.side_effects_may_remain is False
+    assert completed_rollback.operation_outcome is not None
+    assert (
+        completed_rollback.operation_outcome.rollback_status is RollbackStatus.COMPLETE
+    )
+    assert completed_rollback.operation_outcome.side_effects_may_remain is False
+
+
+def test_api_rollback_failure_updates_operation_outcome_incomplete() -> None:
+    incomplete_outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    facade = KBApiCompatibilityFacade()
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="failed"),
+        operation_outcome=incomplete_outcome,
+    )
+
+    failed_rollback = facade.with_rollback_complete(api_result, False)
+
+    assert failed_rollback.rollback_complete is False
+    assert failed_rollback.operation_outcome is not None
+    assert (
+        failed_rollback.operation_outcome.rollback_status is RollbackStatus.INCOMPLETE
+    )
+    assert failed_rollback.operation_outcome.side_effects_may_remain is True
+
+
+def test_run_failed_ingest_rollback_marks_successful_compensation_complete() -> None:
+    facade = KBApiCompatibilityFacade()
+    incomplete_outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="failed"),
+        operation_outcome=incomplete_outcome,
+    )
+
+    rollback_result = facade.run_failed_ingest_rollback(api_result, lambda: None)
+
+    assert rollback_result.rollback_complete is True
+    assert rollback_result.error is None
+    assert rollback_result.operation_result.rollback_complete is True
+    assert rollback_result.operation_result.operation_outcome is not None
+    assert (
+        rollback_result.operation_result.operation_outcome.rollback_status
+        is RollbackStatus.COMPLETE
+    )
+    assert (
+        rollback_result.operation_result.operation_outcome.side_effects_may_remain
+        is False
+    )
+
+
+def test_run_failed_ingest_rollback_marks_failed_compensation_incomplete() -> None:
+    facade = KBApiCompatibilityFacade()
+    outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="failed"),
+        operation_outcome=outcome,
+    )
+    error = RuntimeError("rollback failed")
+
+    rollback_result = facade.run_failed_ingest_rollback(
+        api_result,
+        lambda: (_ for _ in ()).throw(error),
+    )
+
+    assert rollback_result.rollback_complete is False
+    assert rollback_result.error is error
+    assert rollback_result.operation_result.rollback_complete is False
+    assert rollback_result.operation_result.operation_outcome is not None
+    assert (
+        rollback_result.operation_result.operation_outcome.rollback_status
+        is RollbackStatus.INCOMPLETE
+    )
+    assert (
+        rollback_result.operation_result.operation_outcome.side_effects_may_remain
+        is True
+    )
+
+
+def test_run_failed_ingest_rollback_closes_awaitable_result(recwarn) -> None:
+    facade = KBApiCompatibilityFacade()
+    outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="error",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        side_effects_may_remain=True,
+    )
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="error", message="failed"),
+        operation_outcome=outcome,
+    )
+
+    async def rollback() -> None:
+        return None
+
+    rollback_result = facade.run_failed_ingest_rollback(api_result, rollback)
+
+    assert rollback_result.rollback_complete is False
+    assert isinstance(rollback_result.error, TypeError)
+    assert "run_failed_ingest_rollback_async" in str(rollback_result.error)
+    assert not any("was never awaited" in str(item.message) for item in recwarn)
+
+
+def test_run_failed_ingest_rollback_can_compensate_successful_operation() -> None:
+    facade = KBApiCompatibilityFacade()
+    outcome = KBOperationOutcome(
+        operation_id="op-1",
+        operation_type="document_ingestion",
+        collection="demo",
+        status="success",
+        rollback_status=RollbackStatus.NOT_NEEDED,
+        persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        compensation_steps=(
+            CompensationStep(
+                name="remove_registered_document",
+                plane=SideEffectPlane.DOCUMENT,
+            ),
+        ),
+    )
+    api_result = KBApiOperationResult(
+        result=IngestionResult(status="success", message="ok"),
+        operation_outcome=outcome,
+    )
+
+    rollback_result = facade.run_failed_ingest_rollback(api_result, lambda: None)
+
+    assert rollback_result.operation_result.rollback_complete is True
+    assert rollback_result.operation_result.operation_outcome is not None
+    assert (
+        rollback_result.operation_result.operation_outcome.rollback_status
+        is RollbackStatus.COMPLETE
+    )
 
 
 def test_run_with_operation_outcome_rebinds_storage_context() -> None:

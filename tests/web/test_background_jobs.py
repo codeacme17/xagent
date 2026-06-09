@@ -600,7 +600,7 @@ def test_kb_document_job_existing_collection_failure_restores_previous_config(
         )
         monkeypatch.setattr(
             "xagent.web.jobs.kb_tasks._rollback_failed_staged_document_ingestion",
-            lambda *args, **kwargs: None,
+            lambda *args, **kwargs: kwargs["api_result"],
         )
 
         with pytest.raises(BackgroundJobHandlerError):

@@ -1140,6 +1140,70 @@ class TestWebIngestionFileHandler:
         assert any("rollback_on_failure failed" in item for item in result.warnings)
 
     @pytest.mark.asyncio
+    async def test_async_file_handler_rollback_is_reported_as_failure(
+        self, crawl_config, ingestion_config, recwarn
+    ):
+        """Async rollback callbacks should not be silently marked successful."""
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content="Content 1",
+                content_markdown="# Page 1\n\nContent 1",
+                status="success",
+            )
+        ]
+        failed_ingestion = IngestionResult(
+            status="error",
+            doc_id="doc1",
+            parse_hash="hash1",
+            message="embedding failed",
+        )
+        events: list[str] = []
+
+        async def rollback(_result=None):
+            events.append("rollback")
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {
+                "file_path": str(temp_file_path),
+                "file_id": "file-1",
+                "rollback_on_failure": rollback,
+            }
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                return_value=failed_ingestion,
+            ):
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        assert events == []
+        assert result.status == "error"
+        assert result.side_effects_may_remain is True
+        assert any(
+            "Async rollback_on_failure callback is not supported" in item
+            for item in result.warnings
+        )
+        assert not any("was never awaited" in str(item.message) for item in recwarn)
+
+    @pytest.mark.asyncio
     async def test_file_handler_commit_runs_on_ingestion_success(
         self, crawl_config, ingestion_config
     ):

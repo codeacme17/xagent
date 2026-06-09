@@ -30,7 +30,11 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from .models import KBStorageBackend
-from .operation_compatibility import KBOperationOutcome, RollbackStatus
+from .operation_compatibility import (
+    KBOperationOutcome,
+    RollbackStatus,
+    _close_awaitable_if_possible,
+)
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
@@ -67,6 +71,19 @@ class KBApiFailedIngestCleanupDecision:
 
     successful_documents: int = 0
     side_effects_may_remain: bool = False
+
+
+@dataclass(frozen=True)
+class KBApiFailedIngestRollbackResult(Generic[T_Result]):
+    """Result of executing API-level rollback for a failed ingest operation."""
+
+    operation_result: KBApiOperationResult[T_Result]
+    error: Exception | None = None
+
+    @property
+    def rollback_complete(self) -> bool:
+        """Return whether the rollback callback completed without an exception."""
+        return self.error is None
 
 
 class KBApiCompatibilityFacade:
@@ -204,9 +221,102 @@ class KBApiCompatibilityFacade:
     def with_rollback_complete(
         operation_result: KBApiOperationResult[T_Result],
         rollback_complete: bool,
+        *,
+        force: bool = False,
     ) -> KBApiOperationResult[T_Result]:
         """Record whether API-level compensation completed after a failed operation."""
-        return replace(operation_result, rollback_complete=rollback_complete)
+        outcome = operation_result.operation_outcome
+        if outcome is None or (outcome.status == "success" and not force):
+            return replace(operation_result, rollback_complete=rollback_complete)
+
+        rollback_status: RollbackStatus
+        if rollback_complete:
+            if outcome.rollback_status is RollbackStatus.SKIPPED_BY_POLICY:
+                rollback_status = outcome.rollback_status
+            else:
+                rollback_status = (
+                    RollbackStatus.COMPLETE
+                    if (
+                        outcome.compensation_steps
+                        or outcome.child_outcomes
+                        or outcome.rollback_status is RollbackStatus.INCOMPLETE
+                    )
+                    else outcome.rollback_status
+                )
+            side_effects_may_remain = False
+        else:
+            rollback_status = RollbackStatus.INCOMPLETE
+            side_effects_may_remain = True
+
+        return replace(
+            operation_result,
+            operation_outcome=replace(
+                outcome,
+                rollback_status=rollback_status,
+                side_effects_may_remain=side_effects_may_remain,
+            ),
+            rollback_complete=rollback_complete,
+        )
+
+    def run_failed_ingest_rollback(
+        self,
+        operation_result: KBApiOperationResult[T_Result],
+        rollback: Callable[[], Any],
+    ) -> KBApiFailedIngestRollbackResult[T_Result]:
+        """Execute sync failed-ingest rollback and update operation outcome state."""
+        try:
+            with self._storage_context():
+                result = rollback()
+                if inspect.isawaitable(result):
+                    _close_awaitable_if_possible(result)
+                    raise TypeError(
+                        "run_failed_ingest_rollback_async must be used for "
+                        "awaitable rollback callbacks"
+                    )
+        except Exception as exc:
+            return KBApiFailedIngestRollbackResult(
+                operation_result=self.with_rollback_complete(
+                    operation_result,
+                    False,
+                    force=True,
+                ),
+                error=exc,
+            )
+
+        return KBApiFailedIngestRollbackResult(
+            operation_result=self.with_rollback_complete(
+                operation_result,
+                True,
+                force=True,
+            )
+        )
+
+    async def run_failed_ingest_rollback_async(
+        self,
+        operation_result: KBApiOperationResult[T_Result],
+        rollback: Callable[[], Any],
+    ) -> KBApiFailedIngestRollbackResult[T_Result]:
+        """Execute async failed-ingest rollback and update operation outcome state."""
+        try:
+            with self._storage_context():
+                await _maybe_await(rollback())
+        except Exception as exc:
+            return KBApiFailedIngestRollbackResult(
+                operation_result=self.with_rollback_complete(
+                    operation_result,
+                    False,
+                    force=True,
+                ),
+                error=exc,
+            )
+
+        return KBApiFailedIngestRollbackResult(
+            operation_result=self.with_rollback_complete(
+                operation_result,
+                True,
+                force=True,
+            )
+        )
 
     def failed_ingest_cleanup_decision(
         self,

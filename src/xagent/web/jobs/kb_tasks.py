@@ -5,7 +5,7 @@ import hashlib
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
@@ -243,9 +243,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background staged document superseded result",
                 )
                 return _superseded_staged_document_result(payload)
-            if not _rollback_failed_staged_document_ingestion_if_current(
-                db, payload, result, config_snapshot=config_snapshot
-            ):
+            rollback_api_result = _rollback_failed_staged_document_ingestion_if_current(
+                db,
+                payload,
+                result,
+                api_result=api_result,
+                config_snapshot=config_snapshot,
+            )
+            if rollback_api_result is False:
                 _restore_or_cleanup_failed_staged_job_collection_config_if_current(
                     db,
                     payload,
@@ -253,19 +258,20 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document ingest",
                 )
                 return _superseded_staged_document_result(payload)
+            api_result = rollback_api_result
             _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
                 db,
                 payload,
                 api_result=api_result,
                 snapshot=config_snapshot,
                 context="background staged document ingest",
-                rollback_complete=True,
             )
         else:
-            _rollback_failed_document_ingestion(
+            api_result = _rollback_failed_document_ingestion(
                 db,
                 payload,
                 result,
+                api_result=api_result,
                 config_snapshot=config_snapshot,
             )
             _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
@@ -274,7 +280,6 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 api_result=api_result,
                 snapshot=config_snapshot,
                 context="background document ingest",
-                rollback_complete=True,
             )
         raise BackgroundJobHandlerError(
             result.message,
@@ -302,9 +307,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             )
             return _superseded_staged_document_result(payload)
         except Exception as exc:  # noqa: BLE001
-            if not _rollback_failed_staged_document_ingestion_if_current(
-                db, payload, result, config_snapshot=config_snapshot
-            ):
+            rollback_api_result = _rollback_failed_staged_document_ingestion_if_current(
+                db,
+                payload,
+                result,
+                api_result=api_result,
+                config_snapshot=config_snapshot,
+            )
+            if rollback_api_result is False:
                 _restore_or_cleanup_failed_staged_job_collection_config_if_current(
                     db,
                     payload,
@@ -312,6 +322,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                     context="background stale staged document publish rollback",
                 )
                 return _superseded_staged_document_result(payload)
+            api_result = rollback_api_result
             _restore_or_cleanup_failed_job_collection_config_after_api_ingest(
                 db,
                 payload,
@@ -319,7 +330,6 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
                 snapshot=config_snapshot,
                 context="background staged document publish",
                 successful_documents=0,
-                rollback_complete=True,
             )
             raise BackgroundJobHandlerError(
                 f"Document ingestion succeeded but publishing uploaded file failed: {exc}",
@@ -605,10 +615,10 @@ def _rollback_failed_staged_document_ingestion(
     payload: dict[str, Any],
     result: IngestionResult,
     *,
+    api_result: KBApiOperationResult[Any],
     config_snapshot: Any = None,
-) -> None:
+) -> KBApiOperationResult[Any]:
     from ..api.kb import (
-        RollbackFailureError,
         _collection_or_config_existed_before,
         _rollback_failed_cloud_ingestion,
     )
@@ -635,27 +645,31 @@ def _rollback_failed_staged_document_ingestion(
     )
 
     try:
-        asyncio.run(
-            _rollback_failed_cloud_ingestion(
-                db=db,
-                user=user,
-                collection_name=str(payload["collection"]),
-                result=result,
-                file_path=Path(str(payload["source_path"])),
-                file_record=None,
-                collection_existed_before=effective_collection_existed_before,
-                uploaded_file_existed_before=False,
-                file_backup_path=None,
-                had_existing_file=False,
-                embedding_model_id=embedding_model_id,
-            )
+        rollback_execution = _get_api_compatibility_facade().run_failed_ingest_rollback(
+            api_result,
+            lambda: asyncio.run(
+                _rollback_failed_cloud_ingestion(
+                    db=db,
+                    user=user,
+                    collection_name=str(payload["collection"]),
+                    result=result,
+                    file_path=Path(str(payload["source_path"])),
+                    file_record=None,
+                    collection_existed_before=effective_collection_existed_before,
+                    uploaded_file_existed_before=False,
+                    file_backup_path=None,
+                    had_existing_file=False,
+                    embedding_model_id=embedding_model_id,
+                )
+            ),
         )
-    except RollbackFailureError as exc:
-        raise BackgroundJobHandlerError(
-            str(exc),
-            result=result.model_dump(mode="json"),
-            retryable=False,
-        ) from exc
+        if rollback_execution.error is not None:
+            raise BackgroundJobHandlerError(
+                str(rollback_execution.error),
+                result=result.model_dump(mode="json"),
+                retryable=False,
+            ) from rollback_execution.error
+        return rollback_execution.operation_result
     finally:
         _cleanup_staged_document_input(payload)
 
@@ -665,18 +679,19 @@ def _rollback_failed_staged_document_ingestion_if_current(
     payload: dict[str, Any],
     result: IngestionResult,
     *,
+    api_result: KBApiOperationResult[Any],
     config_snapshot: Any = None,
-) -> bool:
+) -> KBApiOperationResult[Any] | Literal[False]:
     if not _is_staged_document_generation_latest(db, payload):
         _cleanup_staged_document_input(payload)
         return False
-    _rollback_failed_staged_document_ingestion(
+    return _rollback_failed_staged_document_ingestion(
         db,
         payload,
         result,
+        api_result=api_result,
         config_snapshot=config_snapshot,
     )
-    return True
 
 
 def _publish_staged_document_ingestion(
@@ -753,10 +768,10 @@ def _rollback_failed_document_ingestion(
     payload: dict[str, Any],
     result: IngestionResult,
     *,
+    api_result: KBApiOperationResult[Any],
     config_snapshot: Any = None,
-) -> None:
+) -> KBApiOperationResult[Any]:
     from ..api.kb import (
-        RollbackFailureError,
         _collection_or_config_existed_before,
         _rollback_failed_ingestion,
     )
@@ -794,8 +809,9 @@ def _rollback_failed_document_ingestion(
         bool(payload.get("collection_existed_before", True)),
         config_snapshot,
     )
-    try:
-        asyncio.run(
+    rollback_execution = _get_api_compatibility_facade().run_failed_ingest_rollback(
+        api_result,
+        lambda: asyncio.run(
             _rollback_failed_ingestion(
                 db=db,
                 user=user,
@@ -810,13 +826,15 @@ def _rollback_failed_document_ingestion(
                 file_backup_path=Path(str(backup_path)) if backup_path else None,
                 had_existing_file=bool(payload.get("had_existing_file", True)),
             )
-        )
-    except RollbackFailureError as exc:
+        ),
+    )
+    if rollback_execution.error is not None:
         raise BackgroundJobHandlerError(
-            str(exc),
+            str(rollback_execution.error),
             result=result.model_dump(mode="json"),
             retryable=False,
-        ) from exc
+        ) from rollback_execution.error
+    return rollback_execution.operation_result
 
 
 def _discard_ingest_backup(payload: dict[str, Any]) -> None:
