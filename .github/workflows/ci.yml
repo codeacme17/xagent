@@ -8,11 +8,147 @@ on:
   push:
     branches: [main]
 
+env:
+  DEEPDOC_CACHE_PATH: .cache/deepdoc
+  DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
+  DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
+  DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  prepare-deepdoc-cache:
+    name: Prepare Deepdoc Cache
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    outputs:
+      cache-hit: ${{ steps.deepdoc-cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Deepdoc cache
+        id: deepdoc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          lookup-only: true
+
+      - name: Ensure uv is available
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Verify Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Save Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Upload Deepdoc cache artifact
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+
   pre-commit:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -86,10 +222,18 @@ jobs:
         env:
           PRE_COMMIT_USE_SYSTEM: true
 
-  pytest:
+  pytest-fast:
+    name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
-    needs: pre-commit
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: web
+            paths: tests/web
+          - name: integration
+            paths: tests/integration
 
     steps:
       - name: Checkout code
@@ -123,11 +267,151 @@ jobs:
           set -e
           python3 -m uv sync --all-extras
 
-      - name: Download Deepdoc models
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Run tests
         shell: bash
         run: |
           set -e
-          python3 -m uv run deepdoc-download-models
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+
+  pytest-fast-deepdoc:
+    name: Pytest Fast Deepdoc (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: prepare-deepdoc-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            paths: >-
+              tests/test_docker_workflow_versions.py
+              tests/agent
+              tests/alembic
+              tests/core
+              tests/migration
+              tests/migrations
+              tests/providers
+              tests/sandbox
+              tests/skills
+              tests/templates
+              tests/utils
+          - name: web-integration
+            paths: tests/web_integration
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Restore Deepdoc cache
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -143,7 +427,127 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests --ignore=tests/e2e -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+
+  pytest-slow:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: prepare-deepdoc-cache
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Restore Deepdoc cache
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
 
       - name: Run slow tests
         shell: bash
@@ -153,7 +557,6 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    needs: pre-commit
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     timeout-minutes: 30
 
@@ -208,7 +611,6 @@ jobs:
 
   frontend-build:
     runs-on: ubuntu-latest
-    needs: pre-commit
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
 
     steps:
@@ -229,3 +631,42 @@ jobs:
       - name: Build frontend
         working-directory: ./frontend
         run: npm run build
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    needs:
+      - prepare-deepdoc-cache
+      - pre-commit
+      - pytest-fast
+      - pytest-fast-deepdoc
+      - pytest-slow
+      - e2e
+      - frontend-build
+
+    steps:
+      - name: Check required jobs
+        shell: bash
+        run: |
+          set -e
+
+          failed=0
+          check_job() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name finished with result: $result"
+              failed=1
+            fi
+          }
+
+          check_job "prepare-deepdoc-cache" "${{ needs['prepare-deepdoc-cache'].result }}"
+          check_job "pre-commit" "${{ needs['pre-commit'].result }}"
+          check_job "pytest-fast" "${{ needs['pytest-fast'].result }}"
+          check_job "pytest-fast-deepdoc" "${{ needs['pytest-fast-deepdoc'].result }}"
+          check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
+          check_job "e2e" "${{ needs.e2e.result }}"
+          check_job "frontend-build" "${{ needs['frontend-build'].result }}"
+
+          exit "$failed"
