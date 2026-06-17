@@ -856,6 +856,6 @@ class TestModelAPI:
         assert response.json()["status"] == "passed"
         mock_llm.chat.assert_awaited_once_with(
             [{"role": "user", "content": "Hello"}],
-            max_tokens=1,
+            max_tokens=16,
             thinking={"type": "disabled"},
         )

@@ -522,8 +522,15 @@ async def test_model_connection(
             config = ChatModelConfig(**config_kwargs)
             llm = create_base_llm(config)
 
-            # Test chat connection with minimal tokens
-            chat_kwargs: dict[str, Any] = {"max_tokens": 1}
+            # Test chat connection with a small but non-trivial token budget.
+            # ``max_tokens=1`` is unsafe for reasoning models that aren't
+            # caught by the name-based heuristic above (e.g. qwen3-thinking
+            # variants advertised as ``qwen3.x_*``): they would consume the
+            # single token in ``reasoning_content`` and return an empty
+            # ``content``, which providers report as an invalid response.
+            # 16 tokens is still cheap and gives reasoning models room to
+            # produce at least the start of an answer.
+            chat_kwargs: dict[str, Any] = {"max_tokens": 16}
 
             # Claude models and OpenAI o1/o3 handle max_tokens differently or deprecate temperature
             if is_reasoning_model:
@@ -739,9 +746,13 @@ async def test_models(
                 )
                 continue
 
-            # Test with a simple message and minimal tokens for speed
+            # Test with a simple message. Use a small but non-trivial token
+            # budget so that reasoning models (e.g. qwen3-thinking,
+            # deepseek-r1) have room to produce at least the start of an
+            # answer instead of getting truncated mid-thought, which would
+            # otherwise surface as "Invalid response" from the provider.
             test_messages = [{"role": "user", "content": test_message}]
-            await llm.chat(test_messages, max_tokens=1)
+            await llm.chat(test_messages, max_tokens=16)
             response_time = time.time() - start_time
 
             test_results.append(

@@ -254,22 +254,58 @@ class XinferenceLLM(BaseLLM):
         if choices:
             choice = choices[0]
             message = choice.get("message", {})
+            reasoning_content = message.get("reasoning_content") or ""
+            finish_reason = choice.get("finish_reason")
 
             # Check for tool calls
             tool_calls = message.get("tool_calls")
             if tool_calls:
-                return {
+                result: Dict[str, Any] = {
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": response_dict,
                 }
+                if reasoning_content:
+                    result["reasoning_content"] = reasoning_content
+                    result["reasoning"] = reasoning_content
+                return result
 
             # Handle text content
             content = message.get("content", "")
             if content:
-                return {
+                result = {
                     "type": "text",
                     "content": content,
+                    "raw": response_dict,
+                }
+                if reasoning_content:
+                    result["reasoning_content"] = reasoning_content
+                    result["reasoning"] = reasoning_content
+                return result
+
+            # Reasoning models (e.g. qwen3-thinking, deepseek-r1) may emit
+            # only ``reasoning_content`` and an empty ``content`` when the
+            # generation is truncated by ``max_tokens`` (finish_reason="length")
+            # before the final answer is produced. Surface the reasoning text
+            # as content so callers (notably the model connection test) do
+            # not treat a truncated-but-otherwise-healthy response as invalid.
+            #
+            # Gate strictly on ``finish_reason == "length"`` and require a
+            # non-whitespace reasoning trace: any other terminal reason
+            # (``"stop"``, ``"content_filter"``, ``None`` …) means the model
+            # claims to be done but produced no final answer, which is a
+            # real failure that callers must see -- promoting the reasoning
+            # trace would silently hide the bug.
+            if (
+                finish_reason == "length"
+                and reasoning_content
+                and reasoning_content.strip()
+            ):
+                return {
+                    "type": "text",
+                    "content": reasoning_content,
+                    "reasoning_content": reasoning_content,
+                    "reasoning": reasoning_content,
                     "raw": response_dict,
                 }
 
