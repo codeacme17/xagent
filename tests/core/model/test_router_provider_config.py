@@ -1,7 +1,36 @@
+import pytest
+
 from xagent.core.model import ChatModelConfig
 from xagent.core.model.chat.basic import router as router_module
 from xagent.core.model.chat.basic.adapter import create_base_llm
+from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+_THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
+_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
+
+
+class _RejectThinkingToolChoiceLLM:
+    def __init__(self) -> None:
+        self.chat_calls: list[dict[str, object]] = []
+        self.stream_calls: list[dict[str, object]] = []
+
+    async def chat(self, _messages, **kwargs):
+        self.chat_calls.append(kwargs)
+        if len(self.chat_calls) == 1:
+            raise RuntimeError(
+                f"OpenAI bad request (400): {_THINKING_TOOL_CHOICE_ERROR}"
+            )
+        return "ok"
+
+    async def stream_chat(self, _messages, **kwargs):
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            raise RuntimeError(
+                f"OpenAI bad request (400): {_THINKING_TOOL_CHOICE_ERROR}"
+            )
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
 
 
 def test_openrouter_auto_returns_router_llm():
@@ -27,6 +56,7 @@ def test_openrouter_non_auto_is_not_router_llm():
     )
     llm = create_base_llm(config)
     assert not isinstance(getattr(llm, "_inner", llm), RouterLLM)
+    assert isinstance(getattr(llm, "_inner", llm), OpenRouterLLM)
 
 
 def test_auto_is_curated_under_openrouter():
@@ -64,6 +94,123 @@ async def test_router_dispatches_chosen_slug_through_downstream_resolver():
     result = await llm._resolve([{"role": "user", "content": "hi"}])
     assert seen["slug"] == "anthropic/claude-opus-4.8"
     assert result == "DOWNSTREAM_LLM"
+
+
+async def test_router_retries_chat_without_thinking_for_tool_choice_error():
+    downstream = _RejectThinkingToolChoiceLLM()
+    selected: list[str] = []
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
+
+    async def fake_select(prompt: str) -> str:
+        selected.append(prompt)
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    result = await llm.chat(
+        [{"role": "user", "content": "hi"}],
+        tool_choice="required",
+        thinking={"type": "disabled", "enable": False},
+    )
+
+    assert result == "ok"
+    assert selected == ["hi"]
+    assert len(downstream.chat_calls) == 2
+    assert downstream.chat_calls[0]["tool_choice"] == "required"
+    assert downstream.chat_calls[0]["thinking"] == {
+        "type": "disabled",
+        "enable": False,
+    }
+    assert downstream.chat_calls[1]["tool_choice"] == "required"
+    assert downstream.chat_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
+    assert "extra_body" not in downstream.chat_calls[1]
+
+
+async def test_router_retries_stream_without_thinking_for_tool_choice_error():
+    downstream = _RejectThinkingToolChoiceLLM()
+    selected: list[str] = []
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
+
+    async def fake_select(prompt: str) -> str:
+        selected.append(prompt)
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "hi"}],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert selected == ["hi"]
+    assert len(downstream.stream_calls) == 2
+    assert downstream.stream_calls[0]["tool_choice"] == "required"
+    assert downstream.stream_calls[0]["thinking"] == {
+        "type": "disabled",
+        "enable": False,
+    }
+    assert downstream.stream_calls[1]["tool_choice"] == "required"
+    assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
+    assert "extra_body" not in downstream.stream_calls[1]
+
+
+async def test_router_retries_stream_without_explicit_thinking_for_tool_choice_error():
+    downstream = _RejectThinkingToolChoiceLLM()
+
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
+
+    async def fake_select(_prompt: str) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "hi"}],
+            tool_choice="required",
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(downstream.stream_calls) == 2
+    assert downstream.stream_calls[0]["tool_choice"] == "required"
+    assert downstream.stream_calls[0]["thinking"] is None
+    assert downstream.stream_calls[1]["tool_choice"] == "required"
+    assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
+    assert "extra_body" not in downstream.stream_calls[1]
+
+
+async def test_router_does_not_retry_unrelated_errors():
+    downstream = _RejectThinkingToolChoiceLLM()
+
+    async def fail_chat(_messages, **kwargs):
+        downstream.chat_calls.append(kwargs)
+        raise RuntimeError("different provider error")
+
+    downstream.chat = fail_chat
+    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
+
+    async def fake_select(_prompt: str) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    llm._select_model = fake_select  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="different provider error"):
+        await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+
+    assert len(downstream.chat_calls) == 1
 
 
 async def test_router_fallback_uses_openrouter_config(monkeypatch):

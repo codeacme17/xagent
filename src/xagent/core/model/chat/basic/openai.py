@@ -7,7 +7,6 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import openai
 from openai import AsyncOpenAI
 
-from .....config import get_openrouter_official_providers_only
 from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
@@ -16,17 +15,6 @@ from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-
-_OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR: dict[str, tuple[str, ...]] = {
-    "anthropic": ("anthropic",),
-    "deepseek": ("deepseek",),
-    "google": ("google-ai-studio", "google-vertex"),
-    "minimax": ("minimax",),
-    "openai": ("openai",),
-    "z-ai": ("z-ai",),
-}
 
 
 def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
@@ -121,12 +109,6 @@ def _is_retryable_stream_transport_error(error: BaseException) -> bool:
     return False
 
 
-def _openrouter_model_author(model_name: str) -> str:
-    model_slug = model_name.strip().split(":", 1)[0]
-    author, separator, _model = model_slug.partition("/")
-    return author.lower() if separator else ""
-
-
 class OpenAILLM(BaseLLM):
     """
     OpenAI LLM client using the official OpenAI SDK.
@@ -184,33 +166,9 @@ class OpenAILLM(BaseLLM):
                 timeout=self.timeout,
             )
 
-    def _is_openrouter_client(self) -> bool:
-        return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
-
-    def _openrouter_official_provider_extra_body(
-        self, extra_body: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Pin OpenRouter-hosted official models to their official provider."""
-        if (
-            not get_openrouter_official_providers_only()
-            or not self._is_openrouter_client()
-            or "provider" in extra_body
-        ):
-            return extra_body
-
-        author = _openrouter_model_author(self._model_name)
-        official_providers = _OPENROUTER_OFFICIAL_PROVIDERS_BY_AUTHOR.get(author)
-        if not official_providers:
-            return extra_body
-
-        return {
-            **extra_body,
-            "provider": {
-                "only": list(official_providers),
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            },
-        }
+    def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        """Hook for OpenAI-compatible subclasses to customize extra_body."""
+        return extra_body
 
     async def chat(
         self,
@@ -248,9 +206,7 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
-        extra_body = self._openrouter_official_provider_extra_body(
-            dict(kwargs.pop("extra_body", {}) or {})
-        )
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
 
         # Prepare the completion parameters
         completion_params = {
@@ -327,12 +283,12 @@ class OpenAILLM(BaseLLM):
                     extra_body["enable_thinking"] = True
                 else:
                     # For non-streaming calls, enable_thinking must be false
-                    extra_body["enable_thinking"] = False
+                    extra_body = self._disable_thinking_extra_body(extra_body)
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
                 # For hybrid models, allow disabling thinking mode
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -627,9 +583,7 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
-        extra_body = self._openrouter_official_provider_extra_body(
-            dict(kwargs.pop("extra_body", {}) or {})
-        )
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
 
         # Prepare the completion parameters
         completion_params = {
@@ -702,19 +656,19 @@ class OpenAILLM(BaseLLM):
                     extra_body["enable_thinking"] = True
                 else:
                     # For non-streaming calls, enable_thinking must be false
-                    extra_body["enable_thinking"] = False
+                    extra_body = self._disable_thinking_extra_body(extra_body)
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
                 # For hybrid models, allow disabling thinking mode
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
         elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
             # For hybrid models with thinking_mode ability, auto-enable thinking mode only for streaming
             if is_streaming:
                 extra_body["enable_thinking"] = True
             else:
                 # For non-streaming calls, enable_thinking must be false
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
 
         try:
             # Make the API call with extra_body if needed
@@ -913,9 +867,7 @@ class OpenAILLM(BaseLLM):
         self._ensure_client()
         assert self._client is not None
 
-        extra_body = self._openrouter_official_provider_extra_body(
-            dict(kwargs.pop("extra_body", {}) or {})
-        )
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
 
         # Prepare completion parameters
         completion_params = {
@@ -984,7 +936,7 @@ class OpenAILLM(BaseLLM):
             elif thinking.get("type") == "disabled" or not thinking.get(
                 "enable", False
             ):
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
         elif self.supports_thinking_mode and "thinking_mode" in self.abilities:
             # For hybrid models with thinking_mode ability
             # If response_format is requested, disable thinking to avoid JSON corruption
@@ -992,7 +944,7 @@ class OpenAILLM(BaseLLM):
                 logger.debug(
                     "Disabling thinking mode for response_format to ensure valid JSON output"
                 )
-                extra_body["enable_thinking"] = False
+                extra_body = self._disable_thinking_extra_body(extra_body)
             else:
                 extra_body["enable_thinking"] = True
 
@@ -1147,7 +1099,7 @@ class OpenAILLM(BaseLLM):
             raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
 
         except openai.BadRequestError as e:
-            logger.error("OpenAI bad request: %s", redact_sensitive_text(str(e)))
+            logger.debug("OpenAI bad request: %s", redact_sensitive_text(str(e)))
             raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
 
         except openai.APIError as e:
