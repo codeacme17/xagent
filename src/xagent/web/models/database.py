@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
 from ...config import get_database_url
+from ...db.sqlite import apply_sqlite_concurrency_pragmas
 
 _SessionLocal: sessionmaker[Session] | None = None
 
@@ -90,6 +91,10 @@ def init_db(db_url: str | None = None) -> None:
             connect_args={"check_same_thread": False},
             poolclass=NullPool,  # SQLite doesn't need connection pooling
         )
+        # WAL + busy_timeout so concurrent writes (e.g. concurrent tool
+        # execution) wait for the lock instead of failing with "database is
+        # locked".
+        apply_sqlite_concurrency_pragmas(_engine)
     else:
         _engine = create_engine(
             database_url,

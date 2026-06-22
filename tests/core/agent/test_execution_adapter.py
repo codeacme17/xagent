@@ -682,6 +682,32 @@ def test_execution_adapter_routes_auto_to_auto() -> None:
     assert pattern.dag_pattern.max_concurrency == 4
 
 
+def test_execution_adapter_passes_tool_concurrency_to_react_children() -> None:
+    # The tool-concurrency config must reach the ReAct child on every route that
+    # can run ReAct: single_call, react, and auto. auto is the default for
+    # standalone non-v1 tasks, so it is the common path for enabling the feature;
+    # it previously built a default ReActPattern() and silently dropped the
+    # config (regression guard).
+    def build_react_child(pattern: str) -> Any:
+        adapter = AgentExecutionAdapter(
+            AgentExecutionConfig(
+                name=pattern,
+                pattern=pattern,
+                llm=FakeLLM([]),
+                tool_parallel_enabled=True,
+                tool_max_concurrency=7,
+                skill_manager=NoSkillManager(),
+            )
+        )
+        built, _ = adapter._build_pattern()
+        return built.react_pattern if pattern == "auto" else built
+
+    for pattern in ("single_call", "react", "auto"):
+        react = build_react_child(pattern)
+        assert react.tool_parallel_enabled is True, pattern
+        assert react.tool_max_concurrency == 7, pattern
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_executes_auto_final_answer() -> None:
     llm = FakeLLM(

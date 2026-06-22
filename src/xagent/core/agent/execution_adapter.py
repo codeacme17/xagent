@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...config import get_tool_max_concurrency, get_tool_parallel_enabled
 from .agent import Agent
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
@@ -28,6 +29,8 @@ class AgentExecutionConfig:
     service_id: str | None = None
     registry: ExecutionRegistry | None = None
     dag_max_concurrency: int = 4
+    tool_parallel_enabled: bool = field(default_factory=get_tool_parallel_enabled)
+    tool_max_concurrency: int = field(default_factory=get_tool_max_concurrency)
     outbound_message_handler: Any | None = None
     conversation_history: list[dict[str, Any]] = field(default_factory=list)
     execution_context_messages: list[dict[str, Any]] = field(default_factory=list)
@@ -245,19 +248,34 @@ class AgentExecutionAdapter:
         if self.config.pattern == "auto":
             return (
                 AutoPattern(
+                    react_pattern=ReActPattern(
+                        tool_parallel_enabled=self.config.tool_parallel_enabled,
+                        tool_max_concurrency=self.config.tool_max_concurrency,
+                    ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
-                    )
+                    ),
                 ),
                 "agent_auto",
             )
         if self.config.pattern == "single_call":
             return (
-                ReActPattern(max_iterations=2, finalize_after_tool_result=True),
+                ReActPattern(
+                    max_iterations=2,
+                    finalize_after_tool_result=True,
+                    tool_parallel_enabled=self.config.tool_parallel_enabled,
+                    tool_max_concurrency=self.config.tool_max_concurrency,
+                ),
                 "agent_single_call",
             )
-        return ReActPattern(), "agent_react"
+        return (
+            ReActPattern(
+                tool_parallel_enabled=self.config.tool_parallel_enabled,
+                tool_max_concurrency=self.config.tool_max_concurrency,
+            ),
+            "agent_react",
+        )
 
     def _initial_messages(self) -> list[dict[str, Any]]:
         return [

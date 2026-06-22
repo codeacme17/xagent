@@ -60,6 +60,8 @@ SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
+TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
 REDIS_URL = "XAGENT_REDIS_URL"
 HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
 HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
@@ -340,6 +342,35 @@ def get_hot_path_task_cache_ttl_seconds() -> int:
 def get_celery_enabled() -> bool:
     """Return whether durable background jobs should be enqueued to Celery."""
     return _get_bool_env(CELERY_ENABLED, False)
+
+
+def get_tool_parallel_enabled() -> bool:
+    """Whether independent tool calls in a ReAct turn run concurrently.
+
+    Priority:
+        1. XAGENT_TOOL_PARALLEL_ENABLED environment variable
+        2. Default ``False`` (serial; byte-for-byte equivalent to before)
+
+    Returns:
+        True if concurrency-safe tool calls in a turn should run as a batch.
+    """
+    return _get_bool_env(TOOL_PARALLEL_ENABLED, False)
+
+
+def get_tool_max_concurrency() -> int:
+    """Maximum concurrent tool calls per ReAct turn batch (Semaphore bound).
+
+    Priority:
+        1. XAGENT_TOOL_MAX_CONCURRENCY environment variable
+        2. Default ``3`` (kept low to limit API rate-limit pressure;
+           per-API throttling is tracked separately)
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The per-batch concurrency cap (>= 1).
+    """
+    return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
 
 
 def get_celery_broker_url() -> str | None:

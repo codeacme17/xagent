@@ -1191,3 +1191,41 @@ class TestGetMaxTracePayloadBytes:
     def test_negative_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(MAX_TRACE_PAYLOAD_BYTES, "-100")
         assert get_max_trace_payload_bytes() == 50_000
+
+
+class TestToolConcurrencyConfig:
+    """Config for in-turn tool concurrency (design §7)."""
+
+    def test_parallel_enabled_default_is_false(self, monkeypatch):
+        from xagent.config import get_tool_parallel_enabled
+
+        monkeypatch.delenv("XAGENT_TOOL_PARALLEL_ENABLED", raising=False)
+        assert get_tool_parallel_enabled() is False
+
+    def test_parallel_enabled_env_override(self, monkeypatch):
+        from xagent.config import get_tool_parallel_enabled
+
+        monkeypatch.setenv("XAGENT_TOOL_PARALLEL_ENABLED", "true")
+        assert get_tool_parallel_enabled() is True
+        monkeypatch.setenv("XAGENT_TOOL_PARALLEL_ENABLED", "0")
+        assert get_tool_parallel_enabled() is False
+
+    def test_max_concurrency_default_is_three(self, monkeypatch):
+        from xagent.config import get_tool_max_concurrency
+
+        monkeypatch.delenv("XAGENT_TOOL_MAX_CONCURRENCY", raising=False)
+        assert get_tool_max_concurrency() == 3
+
+    def test_max_concurrency_env_override(self, monkeypatch):
+        from xagent.config import get_tool_max_concurrency
+
+        monkeypatch.setenv("XAGENT_TOOL_MAX_CONCURRENCY", "8")
+        assert get_tool_max_concurrency() == 8
+
+    def test_max_concurrency_invalid_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_tool_max_concurrency
+
+        monkeypatch.setenv("XAGENT_TOOL_MAX_CONCURRENCY", "not-a-number")
+        assert get_tool_max_concurrency() == 3
+        monkeypatch.setenv("XAGENT_TOOL_MAX_CONCURRENCY", "0")
+        assert get_tool_max_concurrency() == 3

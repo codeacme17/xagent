@@ -17,6 +17,7 @@ from ...config import (
     get_default_sqlite_db_path,
 )
 from ...config import get_storage_root as get_config_storage_root
+from ...db.sqlite import apply_sqlite_concurrency_pragmas
 
 __all__ = [
     "StorageRootManager",
@@ -133,6 +134,9 @@ def create_db_session() -> Session:
     connect_args = {"check_same_thread": False} if "sqlite" in database_url else {}
     # Create database engine
     engine = create_engine(database_url, connect_args=connect_args)
+    # WAL + busy_timeout so concurrent writes wait for the lock instead of
+    # failing with "database is locked" (no-op on non-SQLite engines).
+    apply_sqlite_concurrency_pragmas(engine)
     # Create session factory
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

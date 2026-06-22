@@ -467,8 +467,15 @@ class LangfuseTraceHandler(TraceHandler):
         }
 
     def _action_key(self, event: TraceEvent, data: Any) -> str:
+        category = event.event_type.category.value
+        # Prefer tool_call_id so concurrent same-step / same-name tool calls
+        # each map to a unique key (single-element list), giving exact START
+        # <-> END/ERROR pairing instead of last-in-wins (LIFO) mis-attribution.
+        # Falls back to tool_name for legacy / external events that omit it.
+        if isinstance(data, dict) and data.get("tool_call_id"):
+            return f"{event.step_id}:{category}:{data['tool_call_id']}"
         tool_name = data.get("tool_name") if isinstance(data, dict) else None
-        return f"{event.step_id}:{event.event_type.category.value}:{tool_name or ''}"
+        return f"{event.step_id}:{category}:{tool_name or ''}"
 
     def _error_message(self, data: Any) -> Optional[str]:
         if isinstance(data, dict):

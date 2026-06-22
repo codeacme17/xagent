@@ -32,6 +32,8 @@ class FunctionTool(AbstractBaseTool):
         tags: Optional[list[str]] = None,
         visibility: Optional[ToolVisibility] = None,
         allow_users: Optional[list[str]] = None,
+        read_only: bool = False,
+        concurrency_safe: bool = False,
     ):
         self.func = func
         self._name = name or func.__name__
@@ -41,6 +43,9 @@ class FunctionTool(AbstractBaseTool):
         self._tags = tags or []
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
+        # Concurrent-execution semantics (read by AbstractBaseTool.metadata).
+        self.read_only = read_only
+        self.concurrency_safe = concurrency_safe
 
         self._args_type = self._build_args_model()
         self._return_type = self._build_return_model()

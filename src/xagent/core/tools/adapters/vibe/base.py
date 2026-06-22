@@ -51,6 +51,16 @@ class ToolMetadata(BaseModel):
     # Optional logical group used by generic agent-control heuristics that
     # should treat related tools as one repeated action stream.
     decision_group: Optional[str] = None
+    # Concurrent-execution semantics (consumed by the ReAct in-turn scheduler).
+    # ``read_only`` is the stronger declaration: the tool is guaranteed not to
+    # write the filesystem / DB / any shared state. ``concurrency_safe`` is the
+    # only field the scheduler reads: it is safe to run this tool concurrently
+    # with other concurrency-safe tools in the same turn (idempotent, no
+    # process-global side effects, independent of other tools' results in the
+    # same turn). ``read_only`` implies ``concurrency_safe`` (enforced where the
+    # metadata is constructed).
+    read_only: bool = False
+    concurrency_safe: bool = False
 
 
 @runtime_checkable
@@ -98,6 +108,12 @@ class AbstractBaseTool(ABC, Tool):
             category=getattr(self, "category", ToolCategory.OTHER),
             source_server=getattr(self, "source_server", None),
             decision_group=getattr(self, "decision_group", None),
+            read_only=getattr(self, "read_only", False),
+            # read_only implies concurrency_safe; fall back to the explicit flag.
+            concurrency_safe=(
+                getattr(self, "concurrency_safe", False)
+                or getattr(self, "read_only", False)
+            ),
         )
 
     @abstractmethod

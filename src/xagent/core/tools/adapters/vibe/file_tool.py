@@ -42,6 +42,7 @@ read_file_tool = FileTool(
         "context; use start_line/end_line to inspect a specific 1-based "
         "inclusive line range instead of repeating the same full-file read."
     ),
+    read_only=True,
 )
 write_file_tool = FileTool(
     write_file, name="write_file", description="Write content to file"
@@ -51,25 +52,40 @@ append_file_tool = FileTool(
 )
 delete_file_tool = FileTool(delete_file, name="delete_file", description="Delete file")
 list_files_tool = FileTool(
-    list_files, name="list_files", description="List files in directory"
+    list_files,
+    name="list_files",
+    description="List files in directory",
+    read_only=True,
 )
 create_directory_tool = FileTool(
     create_directory, name="create_directory", description="Create directory"
 )
 file_exists_tool = FileTool(
-    file_exists, name="file_exists", description="Check if file exists"
+    file_exists,
+    name="file_exists",
+    description="Check if file exists",
+    read_only=True,
 )
 get_file_info_tool = FileTool(
-    get_file_info, name="get_file_info", description="Get detailed file information"
+    get_file_info,
+    name="get_file_info",
+    description="Get detailed file information",
+    read_only=True,
 )
 read_json_file_tool = FileTool(
-    read_json_file, name="read_json_file", description="Read JSON file"
+    read_json_file,
+    name="read_json_file",
+    description="Read JSON file",
+    read_only=True,
 )
 write_json_file_tool = FileTool(
     write_json_file, name="write_json_file", description="Write JSON file"
 )
 read_csv_file_tool = FileTool(
-    read_csv_file, name="read_csv_file", description="Read CSV file"
+    read_csv_file,
+    name="read_csv_file",
+    description="Read CSV file",
+    read_only=True,
 )
 write_csv_file_tool = FileTool(
     write_csv_file, name="write_csv_file", description="Write CSV file"

@@ -36,6 +36,7 @@ class WebSearchResult(BaseModel):
 
 class WebSearchTool(AbstractBaseTool):
     category = ToolCategory.WEB_SEARCH
+    read_only = True  # read-only HTTP search ⇒ concurrency-safe
     """Framework wrapper for the pure web search tool"""
 
     def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
