@@ -15,6 +15,11 @@ from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
 )
+
+# ``WebToolConfig`` is referenced as a module-level name in ``run_json_async``
+# so the nested sub-agent's config is constructed via the module attribute
+# (which also keeps it patchable in tests).
+from .....web.tools.config import WebToolConfig
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
@@ -489,7 +494,7 @@ class CreateAgentTool(AbstractBaseTool):
 
     def __init__(
         self,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -498,12 +503,13 @@ class CreateAgentTool(AbstractBaseTool):
         Initialize the create agent tool.
 
         Args:
-            db: Database session for saving the agent
+            session_factory: Callable that returns a new SQLAlchemy session; a
+                fresh session is opened per call and closed in ``finally``.
             user_id: User ID for ownership and model access
             task_id: Task ID for context
             workspace_base_dir: Base directory for workspace files
         """
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id
         if workspace_base_dir is None:
@@ -596,7 +602,7 @@ class CreateAgentTool(AbstractBaseTool):
         return suffix.strip()[:MAX_AGENT_NAME_LENGTH]
 
     def _resolve_available_agent_name(
-        self, requested_name: str
+        self, requested_name: str, db: Any
     ) -> tuple[str, Optional[str]]:
         from .....web.models.agent import Agent
 
@@ -604,7 +610,7 @@ class CreateAgentTool(AbstractBaseTool):
 
         existing_names = {
             name
-            for (name,) in self._db.query(Agent.name)
+            for (name,) in db.query(Agent.name)
             .filter(Agent.user_id == self._user_id)
             .all()
         }
@@ -636,185 +642,189 @@ class CreateAgentTool(AbstractBaseTool):
         """Create a new agent with the given configuration."""
         from .....web.models.agent import AgentStatus
         from .....web.models.user import UserDefaultModel, UserModel
+        from .db_session import tool_session_scope
 
-        try:
-            agent_name = args.get("name", "").strip()
-            agent_description = args.get("description", "").strip()
-            instructions = args.get("instructions", "").strip()
+        with tool_session_scope(self._session_factory) as db:
+            try:
+                agent_name = args.get("name", "").strip()
+                agent_description = args.get("description", "").strip()
+                instructions = args.get("instructions", "").strip()
 
-            if not agent_name:
-                return CreateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message="Error: Agent name is required",
-                ).model_dump()
+                if not agent_name:
+                    return CreateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message="Error: Agent name is required",
+                    ).model_dump()
 
-            if not agent_description:
-                return CreateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message="Error: Agent description is required. Please describe when to use this agent.",
-                ).model_dump()
+                if not agent_description:
+                    return CreateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message="Error: Agent description is required. Please describe when to use this agent.",
+                    ).model_dump()
 
-            if not instructions:
-                return CreateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message="Error: Agent instructions are required",
-                ).model_dump()
+                if not instructions:
+                    return CreateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message="Error: Agent instructions are required",
+                    ).model_dump()
 
-            requested_agent_name = agent_name
-            agent_name, auto_renamed_from = self._resolve_available_agent_name(
-                requested_agent_name
-            )
-
-            # Get user's default model configuration
-            from .....web.models.model import Model as DBModel
-
-            user_defaults = (
-                self._db.query(UserDefaultModel)
-                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.user_id == self._user_id,
-                    DBModel.is_active,
+                requested_agent_name = agent_name
+                agent_name, auto_renamed_from = self._resolve_available_agent_name(
+                    requested_agent_name, db
                 )
-                .all()
-            )
 
-            # Prepare models configuration
-            models_config = {}
-            for default in user_defaults:
-                if default.config_type in [
-                    "general",
-                    "small_fast",
-                    "visual",
-                    "compact",
-                ]:
-                    if default.model:
-                        try:
-                            if not _is_model_visible_to_user(
-                                self._db, default.model.id, self._user_id
-                            ):
-                                continue
-                        except Exception:
-                            pass
-                    models_config[default.config_type] = default.model_id
+                # Get user's default model configuration
+                from .....web.models.model import Model as DBModel
 
-            missing_types = [
-                t
-                for t in ["general", "small_fast", "visual", "compact"]
-                if t not in models_config
-            ]
-            if missing_types:
-                # Fill missing with visible users' shared defaults
-                visible_ids = _get_visible_user_ids(self._db, self._user_id)
-                admin_defaults = (
-                    self._db.query(UserDefaultModel)
-                    .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                user_defaults = (
+                    db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
-                        UserDefaultModel.config_type.in_(missing_types),
-                        UserModel.is_shared.is_(True),
-                        UserDefaultModel.user_id.in_(visible_ids),
+                        UserDefaultModel.user_id == self._user_id,
+                        DBModel.is_active,
                     )
                     .all()
                 )
-                for admin_default in admin_defaults:
-                    if admin_default.config_type not in models_config:
-                        models_config[admin_default.config_type] = (
-                            admin_default.model_id
+
+                # Prepare models configuration
+                models_config = {}
+                for default in user_defaults:
+                    if default.config_type in [
+                        "general",
+                        "small_fast",
+                        "visual",
+                        "compact",
+                    ]:
+                        if default.model:
+                            try:
+                                if not _is_model_visible_to_user(
+                                    db, default.model.id, self._user_id
+                                ):
+                                    continue
+                            except Exception:
+                                pass
+                        models_config[default.config_type] = default.model_id
+
+                missing_types = [
+                    t
+                    for t in ["general", "small_fast", "visual", "compact"]
+                    if t not in models_config
+                ]
+                if missing_types:
+                    # Fill missing with visible users' shared defaults
+                    visible_ids = _get_visible_user_ids(db, self._user_id)
+                    admin_defaults = (
+                        db.query(UserDefaultModel)
+                        .join(
+                            UserModel, UserDefaultModel.model_id == UserModel.model_id
                         )
+                        .filter(
+                            UserDefaultModel.config_type.in_(missing_types),
+                            UserModel.is_shared.is_(True),
+                            UserDefaultModel.user_id.in_(visible_ids),
+                        )
+                        .all()
+                    )
+                    for admin_default in admin_defaults:
+                        if admin_default.config_type not in models_config:
+                            models_config[admin_default.config_type] = (
+                                admin_default.model_id
+                            )
 
-            execution_mode = args.get("execution_mode", "balanced")
-            if execution_mode not in ["flash", "balanced", "think", "auto"]:
-                execution_mode = "balanced"
+                execution_mode = args.get("execution_mode", "balanced")
+                if execution_mode not in ["flash", "balanced", "think", "auto"]:
+                    execution_mode = "balanced"
 
-            knowledge_bases = ensure_list(args.get("knowledge_bases"))
-            missing_kbs = await _missing_knowledge_bases_for_user(
-                knowledge_bases, self._db, self._user_id
-            )
-            if missing_kbs:
+                knowledge_bases = ensure_list(args.get("knowledge_bases"))
+                missing_kbs = await _missing_knowledge_bases_for_user(
+                    knowledge_bases, db, self._user_id
+                )
+                if missing_kbs:
+                    return CreateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message=(
+                            "Error: Knowledge base(s) not found or not visible to this user: "
+                            + ", ".join(missing_kbs)
+                        ),
+                    ).model_dump()
+
+                agent = AgentStore(db).create_agent(
+                    user_id=self._user_id,
+                    name=agent_name,
+                    description=agent_description,
+                    instructions=instructions,
+                    execution_mode=execution_mode,
+                    models=models_config if models_config else None,
+                    knowledge_bases=knowledge_bases,
+                    skills=ensure_list(args.get("skills")),
+                    tool_categories=ensure_list(args.get("tool_categories")),
+                    status=AgentStatus.DRAFT,  # Create as DRAFT, not PUBLISHED
+                    suggested_prompts=[],
+                )
+
+                # Generate the tool name and markdown link
+                tool_name = gen_agent_tool_name(agent.id)
+                markdown_link = f"[{agent_name}](agent://{agent.id})"
+
+                rename_note = ""
+                if auto_renamed_from:
+                    rename_note = (
+                        f"**Auto-renamed:** Requested name '{auto_renamed_from}' was already in use, "
+                        f"so the agent was created as '{agent_name}'.\n\n"
+                    )
+
+                logger.info(
+                    f"Created DRAFT agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}"
+                )
+
+                return CreateAgentToolResult(
+                    agent_id=agent.id,
+                    agent_name=agent_name,
+                    tool_name=tool_name,
+                    markdown_link=markdown_link,
+                    status="success",
+                    message=(
+                        f"✅ Agent created successfully\n\n"
+                        f"{rename_note}"
+                        f"**Agent Details:**\n"
+                        f"- Agent ID: {agent.id}\n"
+                        f"- Agent Name: {agent_name}\n"
+                        f"- Tool Name: {tool_name}\n"
+                        f"- Status: DRAFT (unpublished)\n\n"
+                        f"**How to use this agent:**\n"
+                        f"Include this link in your response: {markdown_link}\n"
+                        f"Or use the tool: {tool_name}\n\n"
+                        f"*The agent is ready to use and will be displayed as a clickable card.*"
+                    ),
+                ).model_dump()
+
+            except Exception as e:
+                error_msg = f"Error creating agent: {str(e)}"
+                logger.error(error_msg, exc_info=True)
                 return CreateAgentToolResult(
                     agent_id=0,
                     agent_name="",
                     tool_name="",
                     markdown_link="",
                     status="error",
-                    message=(
-                        "Error: Knowledge base(s) not found or not visible to this user: "
-                        + ", ".join(missing_kbs)
-                    ),
+                    message=error_msg,
                 ).model_dump()
-
-            agent = AgentStore(self._db).create_agent(
-                user_id=self._user_id,
-                name=agent_name,
-                description=agent_description,
-                instructions=instructions,
-                execution_mode=execution_mode,
-                models=models_config if models_config else None,
-                knowledge_bases=knowledge_bases,
-                skills=ensure_list(args.get("skills")),
-                tool_categories=ensure_list(args.get("tool_categories")),
-                status=AgentStatus.DRAFT,  # Create as DRAFT, not PUBLISHED
-                suggested_prompts=[],
-            )
-
-            # Generate the tool name and markdown link
-            tool_name = gen_agent_tool_name(agent.id)
-            markdown_link = f"[{agent_name}](agent://{agent.id})"
-
-            rename_note = ""
-            if auto_renamed_from:
-                rename_note = (
-                    f"**Auto-renamed:** Requested name '{auto_renamed_from}' was already in use, "
-                    f"so the agent was created as '{agent_name}'.\n\n"
-                )
-
-            logger.info(
-                f"Created DRAFT agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}"
-            )
-
-            return CreateAgentToolResult(
-                agent_id=agent.id,
-                agent_name=agent_name,
-                tool_name=tool_name,
-                markdown_link=markdown_link,
-                status="success",
-                message=(
-                    f"✅ Agent created successfully\n\n"
-                    f"{rename_note}"
-                    f"**Agent Details:**\n"
-                    f"- Agent ID: {agent.id}\n"
-                    f"- Agent Name: {agent_name}\n"
-                    f"- Tool Name: {tool_name}\n"
-                    f"- Status: DRAFT (unpublished)\n\n"
-                    f"**How to use this agent:**\n"
-                    f"Include this link in your response: {markdown_link}\n"
-                    f"Or use the tool: {tool_name}\n\n"
-                    f"*The agent is ready to use and will be displayed as a clickable card.*"
-                ),
-            ).model_dump()
-
-        except Exception as e:
-            error_msg = f"Error creating agent: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            return CreateAgentToolResult(
-                agent_id=0,
-                agent_name="",
-                tool_name="",
-                markdown_link="",
-                status="error",
-                message=error_msg,
-            ).model_dump()
 
 
 class UpdateAgentTool(AbstractBaseTool):
@@ -830,7 +840,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
     def __init__(
         self,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -839,12 +849,13 @@ class UpdateAgentTool(AbstractBaseTool):
         Initialize the update agent tool.
 
         Args:
-            db: Database session for updating the agent
+            session_factory: Callable that returns a new SQLAlchemy session; a
+                fresh session is opened per call and closed in ``finally``.
             user_id: User ID for ownership and access control
             task_id: Task ID for context
             workspace_base_dir: Base directory for workspace files
         """
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id
         if workspace_base_dir is None:
@@ -929,199 +940,201 @@ class UpdateAgentTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Update an existing agent with the given configuration."""
         from .....web.models.agent import Agent, AgentStatus
+        from .db_session import tool_session_scope
 
-        try:
-            agent_id = args.get("agent_id")
+        with tool_session_scope(self._session_factory) as db:
+            try:
+                agent_id = args.get("agent_id")
 
-            if not agent_id:
-                return UpdateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message="Error: Agent ID is required",
-                ).model_dump()
+                if not agent_id:
+                    return UpdateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message="Error: Agent ID is required",
+                    ).model_dump()
 
-            # Find the agent
-            query = self._db.query(Agent).filter(Agent.id == agent_id)
-            query = _apply_owned_agent_tool_filters(
-                query,
-                Agent,
-                user_id=self._user_id,
-            )
-            agent = query.first()
-
-            if not agent:
-                return UpdateAgentToolResult(
-                    agent_id=0,
-                    agent_name="",
-                    tool_name="",
-                    markdown_link="",
-                    status="error",
-                    message=f"Error: Agent with ID {agent_id} not found",
-                ).model_dump()
-
-            if agent.status == AgentStatus.ARCHIVED:
-                return UpdateAgentToolResult(
-                    agent_id=agent_id,
-                    agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.id),
-                    markdown_link=f"[{agent.name}](agent://{agent.id})",
-                    status="error",
-                    message=(
-                        "Error: Archived agents cannot be updated. "
-                        f"This agent is {agent.status.value.upper()}."
-                    ),
-                ).model_dump()
-
-            # Track changes
-            changes = []
-            updates: dict[str, Any] = {}
-
-            # Update name if provided
-            new_name = args.get("name", "").strip() if args.get("name") else None
-            if new_name:
-                # Check for duplicate name (exclude current agent)
-                existing = _apply_owned_agent_tool_filters(
-                    self._db.query(Agent).filter(
-                        Agent.name == new_name,
-                        Agent.id != agent_id,
-                    ),
+                # Find the agent
+                query = db.query(Agent).filter(Agent.id == agent_id)
+                query = _apply_owned_agent_tool_filters(
+                    query,
                     Agent,
                     user_id=self._user_id,
-                ).first()
-                if existing:
+                )
+                agent = query.first()
+
+                if not agent:
                     return UpdateAgentToolResult(
                         agent_id=0,
                         agent_name="",
                         tool_name="",
                         markdown_link="",
                         status="error",
-                        message=f"Error: Agent with name '{new_name}' already exists",
+                        message=f"Error: Agent with ID {agent_id} not found",
                     ).model_dump()
-                updates["name"] = new_name
-                changes.append(f"name → '{new_name}'")
 
-            # Update description if provided
-            new_description = (
-                args.get("description", "").strip() if args.get("description") else None
-            )
-            if new_description:
-                updates["description"] = new_description
-                changes.append("description updated")
-
-            # Update instructions if provided
-            new_instructions = (
-                args.get("instructions", "").strip()
-                if args.get("instructions")
-                else None
-            )
-            if new_instructions:
-                updates["instructions"] = new_instructions
-                changes.append("instructions updated")
-
-            # Update tool_categories if provided
-            new_tool_categories = ensure_list(args.get("tool_categories"))
-            if new_tool_categories is not None:
-                updates["tool_categories"] = new_tool_categories
-                changes.append(f"tool_categories → {new_tool_categories}")
-
-            # Update knowledge_bases if provided
-            new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
-            if new_knowledge_bases is not None:
-                missing_kbs = await _missing_knowledge_bases_for_user(
-                    new_knowledge_bases, self._db, self._user_id
-                )
-                if missing_kbs:
+                if agent.status == AgentStatus.ARCHIVED:
                     return UpdateAgentToolResult(
-                        agent_id=0,
-                        agent_name="",
-                        tool_name="",
-                        markdown_link="",
+                        agent_id=agent_id,
+                        agent_name=agent.name,
+                        tool_name=gen_agent_tool_name(agent.id),
+                        markdown_link=f"[{agent.name}](agent://{agent.id})",
                         status="error",
                         message=(
-                            "Error: Knowledge base(s) not found or not visible to this user: "
-                            + ", ".join(missing_kbs)
+                            "Error: Archived agents cannot be updated. "
+                            f"This agent is {agent.status.value.upper()}."
                         ),
                     ).model_dump()
-                updates["knowledge_bases"] = new_knowledge_bases
-                changes.append(f"knowledge_bases → {new_knowledge_bases}")
 
-            # Update skills if provided
-            new_skills = ensure_list(args.get("skills"))
-            if new_skills is not None:
-                updates["skills"] = new_skills
-                changes.append(f"skills → {new_skills}")
+                # Track changes
+                changes = []
+                updates: dict[str, Any] = {}
 
-            # Update execution_mode if provided
-            new_execution_mode = args.get("execution_mode")
-            if new_execution_mode in ["flash", "balanced", "think", "auto"]:
-                updates["execution_mode"] = new_execution_mode
-                changes.append(f"execution_mode → {new_execution_mode}")
+                # Update name if provided
+                new_name = args.get("name", "").strip() if args.get("name") else None
+                if new_name:
+                    # Check for duplicate name (exclude current agent)
+                    existing = _apply_owned_agent_tool_filters(
+                        db.query(Agent).filter(
+                            Agent.name == new_name,
+                            Agent.id != agent_id,
+                        ),
+                        Agent,
+                        user_id=self._user_id,
+                    ).first()
+                    if existing:
+                        return UpdateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=f"Error: Agent with name '{new_name}' already exists",
+                        ).model_dump()
+                    updates["name"] = new_name
+                    changes.append(f"name → '{new_name}'")
 
-            # Check if there were any changes
-            if not changes:
+                # Update description if provided
+                new_description = (
+                    args.get("description", "").strip()
+                    if args.get("description")
+                    else None
+                )
+                if new_description:
+                    updates["description"] = new_description
+                    changes.append("description updated")
+
+                # Update instructions if provided
+                new_instructions = (
+                    args.get("instructions", "").strip()
+                    if args.get("instructions")
+                    else None
+                )
+                if new_instructions:
+                    updates["instructions"] = new_instructions
+                    changes.append("instructions updated")
+
+                # Update tool_categories if provided
+                new_tool_categories = ensure_list(args.get("tool_categories"))
+                if new_tool_categories is not None:
+                    updates["tool_categories"] = new_tool_categories
+                    changes.append(f"tool_categories → {new_tool_categories}")
+
+                # Update knowledge_bases if provided
+                new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
+                if new_knowledge_bases is not None:
+                    missing_kbs = await _missing_knowledge_bases_for_user(
+                        new_knowledge_bases, db, self._user_id
+                    )
+                    if missing_kbs:
+                        return UpdateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=(
+                                "Error: Knowledge base(s) not found or not visible to this user: "
+                                + ", ".join(missing_kbs)
+                            ),
+                        ).model_dump()
+                    updates["knowledge_bases"] = new_knowledge_bases
+                    changes.append(f"knowledge_bases → {new_knowledge_bases}")
+
+                # Update skills if provided
+                new_skills = ensure_list(args.get("skills"))
+                if new_skills is not None:
+                    updates["skills"] = new_skills
+                    changes.append(f"skills → {new_skills}")
+
+                # Update execution_mode if provided
+                new_execution_mode = args.get("execution_mode")
+                if new_execution_mode in ["flash", "balanced", "think", "auto"]:
+                    updates["execution_mode"] = new_execution_mode
+                    changes.append(f"execution_mode → {new_execution_mode}")
+
+                # Check if there were any changes
+                if not changes:
+                    return UpdateAgentToolResult(
+                        agent_id=agent_id,
+                        agent_name=agent.name,
+                        tool_name=gen_agent_tool_name(agent.id),
+                        markdown_link=f"[{agent.name}](agent://{agent.id})",
+                        status="success",
+                        message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
+                        f"Status: {agent.status.value.upper()}. "
+                        f"All fields were the same or no values were provided.",
+                    ).model_dump()
+
+                agent = (
+                    AgentStore(db).update_agent_fields(self._user_id, agent_id, updates)
+                    or agent
+                )
+
+                # Generate the tool name and markdown link
+                agent_name = str(agent.name)
+                tool_name = gen_agent_tool_name(agent.id)
+                markdown_link = f"[{agent_name}](agent://{agent.id})"
+
+                logger.info(
+                    f"Updated {agent.status.value.upper()} agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
+                )
+
                 return UpdateAgentToolResult(
-                    agent_id=agent_id,
-                    agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.id),
-                    markdown_link=f"[{agent.name}](agent://{agent.id})",
+                    agent_id=agent.id,
+                    agent_name=agent_name,
+                    tool_name=tool_name,
+                    markdown_link=markdown_link,
                     status="success",
-                    message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
-                    f"Status: {agent.status.value.upper()}. "
-                    f"All fields were the same or no values were provided.",
+                    message=(
+                        f"✅ Agent updated successfully\n\n"
+                        f"**Agent Details:**\n"
+                        f"- Agent ID: {agent.id}\n"
+                        f"- Agent Name: {agent.name}\n"
+                        f"- Tool Name: {tool_name}\n"
+                        f"- Status: {agent.status.value.upper()}\n\n"
+                        f"**Changes Applied:**\n"
+                        + "\n".join(f"- {change}" for change in changes)
+                        + f"\n\n**How to use this agent:**\n"
+                        f"Include this link in your response: {markdown_link}\n"
+                        f"Or use the tool: {tool_name}\n\n"
+                        f"*The agent keeps its current publication status and will reflect the updated changes on next execution.*"
+                    ),
                 ).model_dump()
 
-            agent = (
-                AgentStore(self._db).update_agent_fields(
-                    self._user_id, agent_id, updates
-                )
-                or agent
-            )
-
-            # Generate the tool name and markdown link
-            agent_name = str(agent.name)
-            tool_name = gen_agent_tool_name(agent.id)
-            markdown_link = f"[{agent_name}](agent://{agent.id})"
-
-            logger.info(
-                f"Updated {agent.status.value.upper()} agent '{agent_name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
-            )
-
-            return UpdateAgentToolResult(
-                agent_id=agent.id,
-                agent_name=agent_name,
-                tool_name=tool_name,
-                markdown_link=markdown_link,
-                status="success",
-                message=(
-                    f"✅ Agent updated successfully\n\n"
-                    f"**Agent Details:**\n"
-                    f"- Agent ID: {agent.id}\n"
-                    f"- Agent Name: {agent.name}\n"
-                    f"- Tool Name: {tool_name}\n"
-                    f"- Status: {agent.status.value.upper()}\n\n"
-                    f"**Changes Applied:**\n"
-                    + "\n".join(f"- {change}" for change in changes)
-                    + f"\n\n**How to use this agent:**\n"
-                    f"Include this link in your response: {markdown_link}\n"
-                    f"Or use the tool: {tool_name}\n\n"
-                    f"*The agent keeps its current publication status and will reflect the updated changes on next execution.*"
-                ),
-            ).model_dump()
-
-        except Exception as e:
-            error_msg = f"Error updating agent: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            return UpdateAgentToolResult(
-                agent_id=0,
-                agent_name="",
-                tool_name="",
-                markdown_link="",
-                status="error",
-                message=error_msg,
-            ).model_dump()
+            except Exception as e:
+                error_msg = f"Error updating agent: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return UpdateAgentToolResult(
+                    agent_id=0,
+                    agent_name="",
+                    tool_name="",
+                    markdown_link="",
+                    status="error",
+                    message=error_msg,
+                ).model_dump()
 
 
 class ListAgentsTool(AbstractBaseTool):
@@ -1137,7 +1150,7 @@ class ListAgentsTool(AbstractBaseTool):
 
     def __init__(
         self,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -1146,12 +1159,12 @@ class ListAgentsTool(AbstractBaseTool):
         Initialize the list agents tool.
 
         Args:
-            db: Database session for querying agents
+            session_factory: Callable that returns a new database session per call
             user_id: User ID for filtering user's agents
             task_id: Task ID for context
             workspace_base_dir: Base directory for workspace files
         """
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id
         if workspace_base_dir is None:
@@ -1209,6 +1222,7 @@ class ListAgentsTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """List all agents for the current user."""
         from .....web.models.agent import Agent
+        from .db_session import tool_session_scope
 
         try:
             status_filter = args.get("status_filter", "").strip().lower()
@@ -1224,39 +1238,40 @@ class ListAgentsTool(AbstractBaseTool):
                     message=f"Error: Invalid status_filter '{status_filter}'. Must be 'draft', 'published', or 'archived'",
                 ).model_dump()
 
-            # Build query
-            query = _apply_owned_agent_tool_filters(
-                self._db.query(Agent),
-                Agent,
-                user_id=self._user_id,
-            )
-
-            # Apply status filter if provided
-            if status_filter:
-                query = query.filter(Agent.status == status_filter)
-
-            # Order by status (draft first) then by name
-            agents = query.order_by(Agent.status, Agent.name).all()
-
-            # Build agent info list
-            agent_infos = []
-            for agent in agents:
-                tool_name = gen_agent_tool_name(agent.id)
-                markdown_link = f"[{agent.name}](agent://{agent.id})"
-
-                agent_info = AgentInfo(
-                    agent_id=agent.id,
-                    name=agent.name,
-                    description=agent.description or "No description",
-                    status=agent.status.value,
-                    tool_name=tool_name,
-                    markdown_link=markdown_link,
-                    execution_mode=agent.execution_mode or "react",
-                    knowledge_bases=agent.knowledge_bases,
-                    tool_categories=agent.tool_categories,
-                    skills=agent.skills if agent.skills else None,
+            with tool_session_scope(self._session_factory) as db:
+                # Build query
+                query = _apply_owned_agent_tool_filters(
+                    db.query(Agent),
+                    Agent,
+                    user_id=self._user_id,
                 )
-                agent_infos.append(agent_info.model_dump())
+
+                # Apply status filter if provided
+                if status_filter:
+                    query = query.filter(Agent.status == status_filter)
+
+                # Order by status (draft first) then by name
+                agents = query.order_by(Agent.status, Agent.name).all()
+
+                # Build agent info list
+                agent_infos = []
+                for agent in agents:
+                    tool_name = gen_agent_tool_name(agent.id)
+                    markdown_link = f"[{agent.name}](agent://{agent.id})"
+
+                    agent_info = AgentInfo(
+                        agent_id=agent.id,
+                        name=agent.name,
+                        description=agent.description or "No description",
+                        status=agent.status.value,
+                        tool_name=tool_name,
+                        markdown_link=markdown_link,
+                        execution_mode=agent.execution_mode or "react",
+                        knowledge_bases=agent.knowledge_bases,
+                        tool_categories=agent.tool_categories,
+                        skills=agent.skills if agent.skills else None,
+                    )
+                    agent_infos.append(agent_info.model_dump())
 
             total_count = len(agent_infos)
             filter_msg = (
@@ -1304,7 +1319,7 @@ class AgentTool(AbstractBaseTool):
         agent_id: int,
         agent_name: str,
         agent_description: str,
-        db: Any,
+        session_factory: Any,
         user_id: int,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
@@ -1329,7 +1344,8 @@ class AgentTool(AbstractBaseTool):
             agent_id: The database ID of the published agent
             agent_name: Name of the agent
             agent_description: Description of what this agent does
-            db: Database session for loading agent config and models
+            session_factory: Session factory minting short-lived DB sessions
+                for loading agent config and models
             user_id: User ID for model access
             task_id: Task ID for workspace isolation
             workspace_base_dir: Base directory for workspace files
@@ -1354,7 +1370,7 @@ class AgentTool(AbstractBaseTool):
         self._tool_name = tool_name
         self._tool_description = tool_description
         self._extra_system_prompt = extra_system_prompt
-        self._db = db
+        self._session_factory = session_factory
         self._user_id = user_id
         self._task_id = task_id or f"agent_tool_{agent_id}"
         self._parent_task_id = parent_task_id or task_id
@@ -1540,7 +1556,7 @@ class AgentTool(AbstractBaseTool):
         return Path(workspace.resolve_path(raw, default_dir=default_dir))
 
     def _parent_owned_file_outputs(
-        self, file_outputs: Any, workspace: Any
+        self, file_outputs: Any, workspace: Any, db: Any
     ) -> Optional[list[dict[str, Any]]]:
         if not isinstance(file_outputs, list):
             return None
@@ -1582,7 +1598,7 @@ class AgentTool(AbstractBaseTool):
             file_record = None
             if item_file_id:
                 file_record = (
-                    self._db.query(UploadedFile)
+                    db.query(UploadedFile)
                     .filter(
                         UploadedFile.file_id == item_file_id,
                         UploadedFile.user_id == self._user_id,
@@ -1611,7 +1627,7 @@ class AgentTool(AbstractBaseTool):
                     try:
                         registered_file_id = workspace.register_file(
                             str(resolved_path),
-                            db_session=self._db,
+                            db_session=db,
                         )
                     except (FileNotFoundError, ValueError):
                         logger.debug(
@@ -1622,7 +1638,7 @@ class AgentTool(AbstractBaseTool):
                         continue
 
                     file_record = (
-                        self._db.query(UploadedFile)
+                        db.query(UploadedFile)
                         .filter(
                             UploadedFile.file_id == registered_file_id,
                             UploadedFile.user_id == self._user_id,
@@ -1651,60 +1667,92 @@ class AgentTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
         from .....web.models.agent import Agent
-        from .....web.tools.config import WebToolConfig
         from .....web.user_isolated_memory import UserContext
+        from .db_session import tool_session_scope
 
         execution_task_id: Optional[str] = None
         try:
-            # Load agent from database - support both PUBLISHED and DRAFT
-            agent = self._db.query(Agent).filter(
-                Agent.id == self._agent_id,
-                Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
-            )
-            agent = _apply_agent_visibility_filters(
-                agent,
-                Agent,
-                user_id=self._user_id,
-                allowed_agent_ids=self._target_allowed_agent_ids,
-                allow_cross_user_agent_ids=self._target_allow_cross_user_agent_ids,
-            )
-            agent = agent.first() if agent is not None else None
-
-            if not agent:
-                error_msg = f"Error: Agent {self._agent_id} not found"
-                await self._trace_delegation("error", error=error_msg)
-                return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
-
-            # Generate unique task ID for this execution
-            execution_task_id = f"agent_{self._agent_id}_{uuid4().hex[:8]}"
-            await self._trace_delegation("start", execution_task_id=execution_task_id)
-
-            # Resolve models
             from .....core.agent.service import AgentService
             from .....core.memory.in_memory import InMemoryMemoryStore
             from .....web.services.llm_utils import UserAwareModelStorage
 
-            storage = UserAwareModelStorage(self._db)
+            # ---- Phase 1: load agent config + resolve models in a
+            # short-lived session that is CLOSED before the sub-agent runs.
+            # The sub-agent has its own ReAct/DAG loop that may issue
+            # concurrent tool calls; holding the parent session across it is
+            # the core hazard, so we capture everything Phase 2/3 needs into
+            # plain locals while the session is open and never touch the
+            # detached ORM instance afterwards.
             default_llm = None
             fast_llm = None
             vision_llm = None
             compact_llm = None
+            agent_name = ""
+            agent_instructions = None
+            agent_knowledge_bases = None
+            agent_skills = None
+            agent_tool_categories = None
+            agent_models = None
 
-            if agent.models:
-                from .agent_model_resolution import resolve_agent_model_llms
+            with tool_session_scope(self._session_factory) as db:
+                # Load agent from database - support both PUBLISHED and DRAFT
+                agent = db.query(Agent).filter(
+                    Agent.id == self._agent_id,
+                    Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
+                )
+                agent = _apply_agent_visibility_filters(
+                    agent,
+                    Agent,
+                    user_id=self._user_id,
+                    allowed_agent_ids=self._target_allowed_agent_ids,
+                    allow_cross_user_agent_ids=self._target_allow_cross_user_agent_ids,
+                )
+                agent = agent.first() if agent is not None else None
 
-                default_llm, fast_llm, vision_llm, compact_llm = (
-                    resolve_agent_model_llms(
-                        self._db, storage, agent.models, self._user_id
+                if not agent:
+                    error_msg = f"Error: Agent {self._agent_id} not found"
+                    await self._trace_delegation("error", error=error_msg)
+                    return AgentToolResult(response=error_msg).model_dump(
+                        exclude_none=True
                     )
+
+                # Generate unique task ID for this execution
+                execution_task_id = f"agent_{self._agent_id}_{uuid4().hex[:8]}"
+                await self._trace_delegation(
+                    "start", execution_task_id=execution_task_id
                 )
 
+                # Capture agent fields as plain locals before the session
+                # closes (avoid detached-ORM access in Phase 2/3).
+                agent_name = agent.name
+                agent_instructions = agent.instructions
+                agent_knowledge_bases = agent.knowledge_bases
+                agent_skills = agent.skills
+                agent_tool_categories = agent.tool_categories
+                agent_models = agent.models
+
+                # Resolve models
+                storage = UserAwareModelStorage(db)
+
+                if agent_models:
+                    from .agent_model_resolution import resolve_agent_model_llms
+
+                    default_llm, fast_llm, vision_llm, compact_llm = (
+                        resolve_agent_model_llms(
+                            db, storage, agent_models, self._user_id
+                        )
+                    )
+            # ---- Phase 1 session closed here. ----
+
             if not default_llm:
-                error_msg = f"Error: No valid model configured for agent {agent.name}"
+                error_msg = f"Error: No valid model configured for agent {agent_name}"
                 await self._trace_delegation(
                     "error", execution_task_id=execution_task_id, error=error_msg
                 )
                 return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
+
+            # ---- Phase 2: build the child config with the FACTORY (no live
+            # parent session) and run the sub-agent. ----
 
             # Create tool config with allowed collections, skills, and tools
             class MinimalRequest:
@@ -1722,18 +1770,19 @@ class AgentTool(AbstractBaseTool):
             )
 
             tool_selection_spec = ToolSelectionSpec.from_raw(
-                tool_categories=agent.tool_categories,
+                tool_categories=agent_tool_categories,
             )
 
             parent_db_task_id = _coerce_db_task_id(self._parent_task_id)
             tool_config = WebToolConfig(
-                db=self._db,
+                db=None,
+                db_factory=self._session_factory,
                 request=MinimalRequest(self._user_id),
                 user_id=self._user_id,
-                allowed_collections=agent.knowledge_bases
-                if agent.knowledge_bases is not None
+                allowed_collections=agent_knowledge_bases
+                if agent_knowledge_bases is not None
                 else None,
-                allowed_skills=agent.skills,
+                allowed_skills=agent_skills,
                 tool_selection_spec=tool_selection_spec,
                 # Keep MCP config loading aligned with the direct chat path.
                 # _SpecAll still admits MCP at the final filter layer for
@@ -1754,52 +1803,62 @@ class AgentTool(AbstractBaseTool):
                 },
             )
 
-            tracer = self._create_child_execution_tracer(
-                execution_task_id=execution_task_id,
-                agent_name=str(agent.name),
-                parent_db_task_id=parent_db_task_id,
-            )
-
-            # Create agent service
-            memory = InMemoryMemoryStore()
-            agent_service = AgentService(
-                name=agent.name,
-                llm=default_llm,
-                fast_llm=fast_llm,
-                vision_llm=vision_llm,
-                compact_llm=compact_llm,
-                memory=memory,
-                tool_config=tool_config,
-                use_dag_pattern=True,
-                id=execution_task_id,
-                enable_workspace=True,
-                workspace_base_dir=self._workspace_base_dir,
-                task_id=execution_task_id,
-                tracer=tracer,
-            )
-
-            # Build execution context
-            execution_context: dict[str, Any] = {}
-            system_prompts = []
-            if agent.instructions:
-                system_prompts.append(agent.instructions)
-            if self._extra_system_prompt:
-                system_prompts.append(self._extra_system_prompt)
-            if system_prompts:
-                execution_context["system_prompt"] = "\n\n".join(system_prompts)
-
-            # Execute task
-            with UserContext(self._user_id):
-                result = await agent_service.execute_task(
-                    task=args["task"],
-                    context=execution_context if execution_context else None,
-                    task_id=execution_task_id,
+            try:
+                tracer = self._create_child_execution_tracer(
+                    execution_task_id=execution_task_id,
+                    agent_name=str(agent_name),
+                    parent_db_task_id=parent_db_task_id,
                 )
 
+                # Create agent service
+                memory = InMemoryMemoryStore()
+                agent_service = AgentService(
+                    name=agent_name,
+                    llm=default_llm,
+                    fast_llm=fast_llm,
+                    vision_llm=vision_llm,
+                    compact_llm=compact_llm,
+                    memory=memory,
+                    tool_config=tool_config,
+                    use_dag_pattern=True,
+                    id=execution_task_id,
+                    enable_workspace=True,
+                    workspace_base_dir=self._workspace_base_dir,
+                    task_id=execution_task_id,
+                    tracer=tracer,
+                )
+
+                # Build execution context
+                execution_context: dict[str, Any] = {}
+                system_prompts = []
+                if agent_instructions:
+                    system_prompts.append(agent_instructions)
+                if self._extra_system_prompt:
+                    system_prompts.append(self._extra_system_prompt)
+                if system_prompts:
+                    execution_context["system_prompt"] = "\n\n".join(system_prompts)
+
+                # Execute task
+                with UserContext(self._user_id):
+                    result = await agent_service.execute_task(
+                        task=args["task"],
+                        context=execution_context if execution_context else None,
+                        task_id=execution_task_id,
+                    )
+            finally:
+                tool_config.close()
+
+            # ---- Phase 3: post-run file outputs in a fresh short-lived
+            # session. Registering delegated outputs only flushes into the
+            # session, so this owned session commits before closing to make
+            # the parent-owned file records durable (the parent session used
+            # to carry these to the request-level commit).
             output = result.get("output", "No response generated")
-            file_outputs = self._parent_owned_file_outputs(
-                result.get("file_outputs"), agent_service.workspace
-            )
+            with tool_session_scope(self._session_factory) as db:
+                file_outputs = self._parent_owned_file_outputs(
+                    result.get("file_outputs"), agent_service.workspace, db
+                )
+                db.commit()
             file_outputs = file_outputs if isinstance(file_outputs, list) else None
             logger.info(
                 f"Agent tool {self.name} executed successfully, output length: {len(output)}"
@@ -1825,7 +1884,7 @@ class AgentTool(AbstractBaseTool):
 
 
 def get_published_agents_tools(
-    db: Any,
+    session_factory: Any,
     user_id: int,
     task_id: Optional[str] = None,
     workspace_base_dir: Optional[str] = None,
@@ -1844,7 +1903,7 @@ def get_published_agents_tools(
     Get tools for published (and optionally draft) agents.
 
     Args:
-        db: Database session
+        session_factory: Session factory minting short-lived DB sessions
         user_id: User ID for model access
         task_id: Task ID for workspace isolation
         workspace_base_dir: Base directory for workspace files
@@ -1864,6 +1923,7 @@ def get_published_agents_tools(
     """
     from .....config import get_uploads_dir
     from .....web.models.agent import Agent, AgentStatus
+    from .db_session import tool_session_scope
 
     if workspace_base_dir is None:
         workspace_base_dir = str(get_uploads_dir())
@@ -1895,144 +1955,148 @@ def get_published_agents_tools(
         ]
 
     try:
-        if normalized_injected_agent_ids is not None:
-            if not normalized_injected_agent_ids:
-                return []
-            query = db.query(Agent).filter(
-                Agent.status.in_(["published"]),  # type: ignore[attr-defined]
-            )
-            query = _apply_agent_visibility_filters(
-                query,
-                Agent,
-                user_id=user_id,
-                allowed_agent_ids=normalized_injected_agent_ids,
-                allow_cross_user_agent_ids=allow_cross_user_agent_ids,
-            )
-            if query is None:
-                return []
-        elif not enable_global_agent_tools:
-            return []
-        elif include_draft:
-            # Include both PUBLISHED and DRAFT agents
-            query = db.query(Agent).filter(
-                Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
-            )
-            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
-        else:
-            # Only PUBLISHED agents
-            query = db.query(Agent).filter(
-                Agent.status == "published",
-            )
-            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
-
-        # Exclude the active delegation stack to prevent recursive self-calls.
-        if excluded_agent_ids:
-            query = query.filter(Agent.id.notin_(sorted(excluded_agent_ids)))
-
-        agents = query.all()
-
-        # If specific DRAFT agents should be included, add them
-        if draft_agent_ids_to_include:
-            normalized_draft_agent_ids = _normalize_agent_ids(
-                draft_agent_ids_to_include
-            )
-            normalized_draft_agent_ids = [
-                agent_id
-                for agent_id in (normalized_draft_agent_ids or [])
-                if agent_id not in excluded_agent_ids
-            ]
-            draft_agents = _apply_owned_agent_tool_filters(
-                db.query(Agent).filter(
-                    Agent.id.in_(normalized_draft_agent_ids),
-                    Agent.status == "draft",
-                ),
-                Agent,
-                user_id=user_id,
-            ).all()
-            # Merge without duplicates
-            existing_ids = {agent.id for agent in agents}
-            for draft_agent in draft_agents:
-                if draft_agent.id not in existing_ids:
-                    agents.append(draft_agent)
-
-        if normalized_injected_agent_ids is not None:
-            agent_types = "selected PUBLISHED"
-        else:
-            agent_types = "PUBLISHED and DRAFT" if include_draft else "PUBLISHED"
-        logger.info(
-            f"Found {len(agents)} {agent_types} agents (excluded: {sorted(excluded_agent_ids)})"
-        )
-
-        for agent in agents:
-            override = normalized_overrides.get(int(agent.id or 0), {})
-            # Build description
-            description = agent.description or f"Call {agent.name} agent"
-            if agent.instructions:
-                # Add brief instructions to description
-                instructions_preview = agent.instructions[:200]
-                if len(agent.instructions) > 200:
-                    instructions_preview += "..."
-                description += f". Instructions: {instructions_preview}"
-
-            # Add status indicator for draft agents
-            if agent.status == AgentStatus.DRAFT:
-                description = f"[DRAFT] {description}"
-
-            tool_name = _string_override(override, "tool_name")
-            tool_description = _string_override(
-                override, "description", "tool_description"
-            )
-            extra_system_prompt = _string_override(override, "extra_system_prompt")
-            delegation_allowed_agent_ids = (
-                _normalize_agent_ids(override.get("allowed_agent_ids"))
-                if "allowed_agent_ids" in override
-                else None
-            )
-            delegation_agent_tool_overrides = _normalize_agent_tool_overrides(
-                override.get("agent_tool_overrides")
-            )
-            delegation_enable_global_agent_tools = _truthy_bool(
-                override.get("enable_global_agent_tools"), True
-            )
-            delegation_allow_cross_user_agent_ids = _truthy_bool(
-                override.get("allow_cross_user_agent_ids"), False
-            )
-            runtime_metadata = {
-                key: override[key]
-                for key in (
-                    "workforce_run_id",
-                    "workforce_id",
-                    "workforce_name",
-                    "worker_member_id",
-                    "worker_alias",
+        with tool_session_scope(session_factory) as db:
+            if normalized_injected_agent_ids is not None:
+                if not normalized_injected_agent_ids:
+                    return []
+                query = db.query(Agent).filter(
+                    Agent.status.in_(["published"]),  # type: ignore[attr-defined]
                 )
-                if key in override
-            }
+                query = _apply_agent_visibility_filters(
+                    query,
+                    Agent,
+                    user_id=user_id,
+                    allowed_agent_ids=normalized_injected_agent_ids,
+                    allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+                )
+                if query is None:
+                    return []
+            elif not enable_global_agent_tools:
+                return []
+            elif include_draft:
+                # Include both PUBLISHED and DRAFT agents
+                query = db.query(Agent).filter(
+                    Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
+                )
+                query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
+            else:
+                # Only PUBLISHED agents
+                query = db.query(Agent).filter(
+                    Agent.status == "published",
+                )
+                query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
 
-            tool = AgentTool(
-                agent_id=agent.id,
-                agent_name=agent.name,
-                agent_description=tool_description or description,
-                db=db,
-                user_id=user_id,
-                task_id=task_id,
-                workspace_base_dir=workspace_base_dir,
-                tool_name=tool_name,
-                tool_description=tool_description,
-                extra_system_prompt=extra_system_prompt,
-                parent_task_id=parent_task_id,
-                parent_tracer=parent_tracer,
-                agent_call_stack=normalized_call_stack,
-                delegation_allowed_agent_ids=delegation_allowed_agent_ids,
-                agent_tool_overrides=delegation_agent_tool_overrides,
-                enable_global_agent_tools=delegation_enable_global_agent_tools,
-                delegation_allow_cross_user_agent_ids=delegation_allow_cross_user_agent_ids,
-                target_allowed_agent_ids=normalized_injected_agent_ids,
-                target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
-                runtime_metadata=runtime_metadata,
+            # Exclude the active delegation stack to prevent recursive self-calls.
+            if excluded_agent_ids:
+                query = query.filter(Agent.id.notin_(sorted(excluded_agent_ids)))
+
+            agents = query.all()
+
+            # If specific DRAFT agents should be included, add them
+            if draft_agent_ids_to_include:
+                normalized_draft_agent_ids = _normalize_agent_ids(
+                    draft_agent_ids_to_include
+                )
+                normalized_draft_agent_ids = [
+                    agent_id
+                    for agent_id in (normalized_draft_agent_ids or [])
+                    if agent_id not in excluded_agent_ids
+                ]
+                # Skip the query entirely when nothing survives the exclusion
+                # filter, so we never issue an empty ``IN ()`` predicate.
+                if normalized_draft_agent_ids:
+                    draft_agents = _apply_owned_agent_tool_filters(
+                        db.query(Agent).filter(
+                            Agent.id.in_(normalized_draft_agent_ids),
+                            Agent.status == "draft",
+                        ),
+                        Agent,
+                        user_id=user_id,
+                    ).all()
+                    # Merge without duplicates
+                    existing_ids = {agent.id for agent in agents}
+                    for draft_agent in draft_agents:
+                        if draft_agent.id not in existing_ids:
+                            agents.append(draft_agent)
+
+            if normalized_injected_agent_ids is not None:
+                agent_types = "selected PUBLISHED"
+            else:
+                agent_types = "PUBLISHED and DRAFT" if include_draft else "PUBLISHED"
+            logger.info(
+                f"Found {len(agents)} {agent_types} agents (excluded: {sorted(excluded_agent_ids)})"
             )
-            tools.append(tool)
-            logger.debug(f"Created agent tool: {tool.name}")
+
+            for agent in agents:
+                override = normalized_overrides.get(int(agent.id or 0), {})
+                # Build description
+                description = agent.description or f"Call {agent.name} agent"
+                if agent.instructions:
+                    # Add brief instructions to description
+                    instructions_preview = agent.instructions[:200]
+                    if len(agent.instructions) > 200:
+                        instructions_preview += "..."
+                    description += f". Instructions: {instructions_preview}"
+
+                # Add status indicator for draft agents
+                if agent.status == AgentStatus.DRAFT:
+                    description = f"[DRAFT] {description}"
+
+                tool_name = _string_override(override, "tool_name")
+                tool_description = _string_override(
+                    override, "description", "tool_description"
+                )
+                extra_system_prompt = _string_override(override, "extra_system_prompt")
+                delegation_allowed_agent_ids = (
+                    _normalize_agent_ids(override.get("allowed_agent_ids"))
+                    if "allowed_agent_ids" in override
+                    else None
+                )
+                delegation_agent_tool_overrides = _normalize_agent_tool_overrides(
+                    override.get("agent_tool_overrides")
+                )
+                delegation_enable_global_agent_tools = _truthy_bool(
+                    override.get("enable_global_agent_tools"), True
+                )
+                delegation_allow_cross_user_agent_ids = _truthy_bool(
+                    override.get("allow_cross_user_agent_ids"), False
+                )
+                runtime_metadata = {
+                    key: override[key]
+                    for key in (
+                        "workforce_run_id",
+                        "workforce_id",
+                        "workforce_name",
+                        "worker_member_id",
+                        "worker_alias",
+                    )
+                    if key in override
+                }
+
+                tool = AgentTool(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    agent_description=tool_description or description,
+                    session_factory=session_factory,
+                    user_id=user_id,
+                    task_id=task_id,
+                    workspace_base_dir=workspace_base_dir,
+                    tool_name=tool_name,
+                    tool_description=tool_description,
+                    extra_system_prompt=extra_system_prompt,
+                    parent_task_id=parent_task_id,
+                    parent_tracer=parent_tracer,
+                    agent_call_stack=normalized_call_stack,
+                    delegation_allowed_agent_ids=delegation_allowed_agent_ids,
+                    agent_tool_overrides=delegation_agent_tool_overrides,
+                    enable_global_agent_tools=delegation_enable_global_agent_tools,
+                    delegation_allow_cross_user_agent_ids=delegation_allow_cross_user_agent_ids,
+                    target_allowed_agent_ids=normalized_injected_agent_ids,
+                    target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+                    runtime_metadata=runtime_metadata,
+                )
+                tools.append(tool)
+                logger.debug(f"Created agent tool: {tool.name}")
 
     except Exception as e:
         logger.error(f"Failed to load agents as tools: {e}", exc_info=True)
@@ -2071,7 +2135,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
         return []
 
     try:
-        db = config.get_db()
+        session_factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
@@ -2079,7 +2143,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
         excluded_agent_id = config.get_excluded_agent_id() if config else None
 
         return get_published_agents_tools(
-            db=db,
+            session_factory=session_factory,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
@@ -2109,30 +2173,25 @@ async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBase
         return []
 
     try:
-        db = config.get_db()
+        factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
 
         tool = CreateAgentTool(
-            db=db,
+            session_factory=factory,
             user_id=user_id,
             task_id=config.get_task_id(),
-            workspace_base_dir=None,  # Will use get_uploads_dir() default
         )
 
         list_skills_tool = ListAvailableSkillsTool(
-            db=db,
             user_id=user_id,
             task_id=config.get_task_id(),
-            workspace_base_dir=None,
         )
 
         list_categories_tool = ListToolCategoriesTool(
-            db=db,
             user_id=user_id,
             task_id=config.get_task_id(),
-            workspace_base_dir=None,
         )
 
         logger.debug(
@@ -2151,13 +2210,13 @@ async def create_update_agent_tool(config: "WebToolConfig") -> list[AbstractBase
         return []
 
     try:
-        db = config.get_db()
+        factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
 
         tool = UpdateAgentTool(
-            db=db,
+            session_factory=factory,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default
@@ -2176,13 +2235,13 @@ async def create_list_agents_tool(config: "WebToolConfig") -> list[AbstractBaseT
         return []
 
     try:
-        db = config.get_db()
+        factory = config.get_session_factory()
         user_id = config.get_user_id()
         if not user_id:
             return []
 
         tool = ListAgentsTool(
-            db=db,
+            session_factory=factory,
             user_id=user_id,
             task_id=config.get_task_id(),
             workspace_base_dir=None,  # Will use get_uploads_dir() default

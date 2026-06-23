@@ -14,7 +14,10 @@ import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { copyToClipboard } from "@/lib/clipboard"
 import { apiRequest } from "@/lib/api-wrapper"
-type ApiSnippetTab = "curl" | "python"
+import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
+import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
+import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
+import { getBrowserLocationOrigin } from "@/lib/browser-location"
 
 export interface Agent {
   id: number
@@ -63,31 +66,23 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [isLoadingShareLink, setIsLoadingShareLink] = useState(false)
   const [shareLink, setShareLink] = useState<ShareLinkResponse | null>(null)
   const [newDomain, setNewDomain] = useState("")
-  const appOrigin = typeof window !== "undefined" ? window.location.origin : getApiUrl()
+  const [appOrigin, setAppOrigin] = useState("")
   const isPublished = deployAgent?.status === "published"
   const shareEnabled = shareLink?.share_enabled ?? deployAgent?.share_enabled ?? false
   const shareUrl = shareLink?.share_token ? `${appOrigin}/share/${shareLink.share_token}` : ""
 
   const agentId = deployAgent?.id ?? 0
+  const [apiSnippetTarget, setApiSnippetTarget] = useState<ApiSnippetTarget>({
+    baseUrl: "",
+  })
   const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
-    const apiBase =
-      getApiUrl() || (typeof window !== "undefined" ? window.location.origin : "")
-    return {
-      curl: `curl -X POST ${apiBase}/v1/chat/tasks \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "agent_id": ${agentId},
-    "message": { "role": "user", "content": "Hello" }
-  }'`,
-      python: `# pip install "xagent-sdk @ git+https://github.com/xorbitsai/xagent-sdk@v0.3.0#subdirectory=python"
-from xagent_sdk import AgentClient
+    return formatAgentApiSnippets(agentId, apiSnippetTarget)
+  }, [agentId, apiSnippetTarget])
 
-with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
-    result = agent.tasks.run(agent_id=${agentId}, message="Hello")
-    print(result.output)`,
-    }
-  }, [agentId])
+  useEffect(() => {
+    setApiSnippetTarget(getApiSnippetTarget())
+    setAppOrigin(getBrowserLocationOrigin())
+  }, [])
 
   useEffect(() => {
     setShareLink(null)
