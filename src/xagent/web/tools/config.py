@@ -124,6 +124,7 @@ class WebToolConfig(BaseToolConfig):
         self,
         db: Any,
         request: Any,
+        db_factory: Optional[Any] = None,
         user_id: Optional[int] = None,
         is_admin: Optional[bool] = None,
         user: Optional[Any] = None,
@@ -152,7 +153,9 @@ class WebToolConfig(BaseToolConfig):
         # reads ``config.get_tool_selection_spec()``. ``None`` defaults
         # to the ``_SpecAll`` ALL-mode (build every default tool).
         self._tool_selection_spec = tool_selection_spec
-        self.db = db
+        self._live_db = db
+        self._db_factory = db_factory
+        self._lazy_db = None
         self.request = request
         self._user_id = (
             user_id if user_id is not None else self._get_user_id_from_request(request)
@@ -429,9 +432,44 @@ class WebToolConfig(BaseToolConfig):
         """Get current user ID for multi-tenancy."""
         return self._user_id
 
+    def get_session_factory(self) -> Any:
+        """Return the sessionmaker used to mint per-call tool sessions."""
+        if self._db_factory is not None:
+            return self._db_factory
+        from ..models.database import get_session_local
+
+        return get_session_local()
+
+    @property
+    def db(self) -> Any:
+        """Construction-time DB session.
+
+        Request path: the caller-owned live session, returned verbatim.
+        Factory path (nested child config): a lazily-opened, cached session
+        minted from the factory and closed by ``close()``.
+
+        Exposing this as a property keeps every DB-backed config loader that
+        reads ``self.db.query(...)`` working whether the config was built with
+        a live session or with only a factory — without each loader having to
+        route through ``get_db()`` explicitly.
+        """
+        if self._live_db is not None:
+            return self._live_db
+        if self._db_factory is not None:
+            if self._lazy_db is None:
+                self._lazy_db = self._db_factory()
+            return self._lazy_db
+        return None
+
     def get_db(self) -> Any:
-        """Get database session."""
+        """Get database session (see the :attr:`db` property)."""
         return self.db
+
+    def close(self) -> None:
+        """Close the lazily-opened factory session, if any."""
+        if self._lazy_db is not None:
+            self._lazy_db.close()
+            self._lazy_db = None
 
     def is_admin(self) -> bool:
         """Whether current user is admin."""
