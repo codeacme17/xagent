@@ -1,8 +1,18 @@
 """Model resolution helpers for delegated agent tools."""
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 AGENT_MODEL_KEYS = ("general", "small_fast", "visual", "compact")
+
+
+def _coerce_model_db_id(raw_model_id: Any) -> int | None:
+    if raw_model_id in (None, "") or isinstance(raw_model_id, bool):
+        return None
+    try:
+        return int(raw_model_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_agent_model_llms(
@@ -12,15 +22,16 @@ def resolve_agent_model_llms(
     user_id: int,
 ) -> tuple[Any | None, Any | None, Any | None, Any | None]:
     """Resolve delegated-agent model slots with one database lookup."""
-    if not agent_models:
+    if not agent_models or not isinstance(agent_models, Mapping):
         return None, None, None, None
 
     from .....web.models.model import Model as DBModel
 
     model_ids = [
-        agent_models[model_key]
+        coerced_model_id
         for model_key in AGENT_MODEL_KEYS
-        if agent_models.get(model_key)
+        if (coerced_model_id := _coerce_model_db_id(agent_models.get(model_key)))
+        is not None
     ]
     if not model_ids:
         return None, None, None, None

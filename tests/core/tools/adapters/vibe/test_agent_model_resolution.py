@@ -22,6 +22,26 @@ def _create_session() -> tuple[Session, str]:
     return session_local(), temp_db.name
 
 
+def test_resolve_agent_model_llms_ignores_non_mapping_model_config() -> None:
+    db, db_path = _create_session()
+    try:
+        storage = Mock()
+
+        assert resolve_agent_model_llms(db, storage, ["not", "a", "mapping"], 42) == (
+            None,
+            None,
+            None,
+            None,
+        )
+        storage.get_llm_by_name_with_access.assert_not_called()
+    finally:
+        db.close()
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
 def test_resolve_agent_model_llms_batches_configured_model_lookup() -> None:
     db, db_path = _create_session()
     try:
@@ -94,6 +114,78 @@ def test_resolve_agent_model_llms_batches_configured_model_lookup() -> None:
         ]
         assert len(model_selects) == 1
         assert " IN " in model_selects[0].upper()
+    finally:
+        db.close()
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+def test_resolve_agent_model_llms_normalizes_string_ids_for_batch_query() -> None:
+    db, db_path = _create_session()
+    try:
+        models: dict[str, Model] = {}
+        for role in ("general", "small_fast", "visual", "compact"):
+            model = Model(
+                model_id=f"{role}-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name=f"{role}-model",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            models[role] = model
+        db.commit()
+        for model in models.values():
+            db.refresh(model)
+
+        model_select_params: list[tuple[object, ...]] = []
+        engine = db.get_bind()
+
+        def capture_model_select_params(
+            conn,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+        ) -> None:
+            del conn, cursor, context, executemany
+            normalized = " ".join(statement.lower().split())
+            if normalized.startswith("select") and "from models" in normalized:
+                model_select_params.append(tuple(parameters))
+
+        llms_by_model_id = {
+            model.model_id: Mock(name=f"{role}_llm") for role, model in models.items()
+        }
+        storage = Mock()
+        storage.get_llm_by_name_with_access.side_effect = lambda model_id, user_id: (
+            llms_by_model_id[model_id]
+        )
+
+        event.listen(engine, "before_cursor_execute", capture_model_select_params)
+        try:
+            resolved = resolve_agent_model_llms(
+                db,
+                storage,
+                {role: str(model.id) for role, model in models.items()},
+                user_id=42,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_model_select_params)
+
+        assert resolved == (
+            llms_by_model_id["general-model-id"],
+            llms_by_model_id["small_fast-model-id"],
+            llms_by_model_id["visual-model-id"],
+            llms_by_model_id["compact-model-id"],
+        )
+        assert len(model_select_params) == 1
+        assert all(isinstance(param, int) for param in model_select_params[0])
     finally:
         db.close()
         try:
