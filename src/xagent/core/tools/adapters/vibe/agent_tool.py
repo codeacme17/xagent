@@ -1691,51 +1691,13 @@ class AgentTool(AbstractBaseTool):
             compact_llm = None
 
             if agent.models:
-                from .....web.models.model import Model as DBModel
+                from .agent_model_resolution import resolve_agent_model_llms
 
-                if agent.models.get("general"):
-                    general_model = (
-                        self._db.query(DBModel)
-                        .filter(DBModel.id == agent.models["general"])
-                        .first()
+                default_llm, fast_llm, vision_llm, compact_llm = (
+                    resolve_agent_model_llms(
+                        self._db, storage, agent.models, self._user_id
                     )
-                    if general_model:
-                        default_llm = storage.get_llm_by_name_with_access(
-                            str(general_model.model_id), self._user_id
-                        )
-
-                if agent.models.get("small_fast"):
-                    fast_model = (
-                        self._db.query(DBModel)
-                        .filter(DBModel.id == agent.models["small_fast"])
-                        .first()
-                    )
-                    if fast_model:
-                        fast_llm = storage.get_llm_by_name_with_access(
-                            str(fast_model.model_id), self._user_id
-                        )
-
-                if agent.models.get("visual"):
-                    visual_model = (
-                        self._db.query(DBModel)
-                        .filter(DBModel.id == agent.models["visual"])
-                        .first()
-                    )
-                    if visual_model:
-                        vision_llm = storage.get_llm_by_name_with_access(
-                            str(visual_model.model_id), self._user_id
-                        )
-
-                if agent.models.get("compact"):
-                    compact_model = (
-                        self._db.query(DBModel)
-                        .filter(DBModel.id == agent.models["compact"])
-                        .first()
-                    )
-                    if compact_model:
-                        compact_llm = storage.get_llm_by_name_with_access(
-                            str(compact_model.model_id), self._user_id
-                        )
+                )
 
             if not default_llm:
                 error_msg = f"Error: No valid model configured for agent {agent.name}"
