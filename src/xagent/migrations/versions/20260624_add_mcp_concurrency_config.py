@@ -1,7 +1,7 @@
 """add MCP concurrency config
 
 Revision ID: 20260624_add_mcp_concurrency_config
-Revises: 20260616_add_agent_triggers
+Revises: 20260624_backfill_sdk_task_visibility
 Create Date: 2026-06-24 00:00:00.000000
 
 """
@@ -12,7 +12,9 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260624_add_mcp_concurrency_config"
-down_revision: Union[str, tuple[str, str], None] = "20260616_add_agent_triggers"
+down_revision: Union[str, tuple[str, str], None] = (
+    "20260624_backfill_sdk_task_visibility"
+)
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
