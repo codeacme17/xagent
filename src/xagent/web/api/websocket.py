@@ -4584,13 +4584,13 @@ clarification questions as plain assistant text.
 
             # Create only the necessary tools directly (much faster than loading all tools)
             create_agent_tool = CreateAgentTool(
-                db=db,
+                session_factory=get_session_local(),
                 user_id=int(user.id),
                 task_id=builder_task_id,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
             )
             update_agent_tool = UpdateAgentTool(
-                db=db,
+                session_factory=get_session_local(),
                 user_id=int(user.id),
                 task_id=builder_task_id,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),

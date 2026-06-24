@@ -3,7 +3,7 @@
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -243,8 +243,7 @@ def test_runtime_config_preserves_task_llm_when_agent_model_is_unavailable():
             return_value=fake_agent_builder_config,
         ) as load_cfg_mock,
         patch(
-            "xagent.web.services.llm_utils.UserAwareModelStorage."
-            "resolve_llms_from_names",
+            "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names",
             return_value=(task_llm, None, None, None),
         ),
         patch(
@@ -304,8 +303,7 @@ def test_runtime_config_uses_accessible_agent_model_over_task_baseline():
             return_value=fake_agent_builder_config,
         ),
         patch(
-            "xagent.web.services.llm_utils.UserAwareModelStorage."
-            "resolve_llms_from_names",
+            "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names",
             return_value=(task_llm, None, None, None),
         ),
         patch(
@@ -613,14 +611,15 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
             description="normal",
             status=TaskStatus.PENDING,
         )
-        preview_task = Task(
+        sdk_task = Task(
             user_id=user.id,
-            title="preview task",
-            description="preview",
+            title="sdk task",
+            description="sdk",
             status=TaskStatus.PENDING,
+            source="sdk",
             is_visible=False,
         )
-        db.add_all([normal_task, preview_task])
+        db.add_all([normal_task, sdk_task])
         db.commit()
 
         default_response = client.get("/api/chat/tasks", headers=user1_headers)
@@ -636,7 +635,7 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
         assert include_response.status_code == 200
         assert {task["title"] for task in include_response.json()["tasks"]} == {
             "normal task",
-            "preview task",
+            "sdk task",
         }
     finally:
         db.close()
@@ -927,7 +926,7 @@ def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_head
                     build_id=None,
                     event_id="vibe-event",
                     event_type="dag_execute_end",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     data={"ok": True},
                 ),
                 TraceEvent(
@@ -935,7 +934,7 @@ def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_head
                     build_id="builder-session",
                     event_id="build-event",
                     event_type="agent_message",
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=datetime.now(UTC),
                     data={"ok": True},
                 ),
                 TraceMessageBlob(

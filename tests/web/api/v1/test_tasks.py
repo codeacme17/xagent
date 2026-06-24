@@ -14,8 +14,7 @@ real :class:`TraceEvent` rows inserted directly into the test DB to
 drive the mapping.
 """
 
-from datetime import datetime, timezone
-from typing import Tuple
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,7 +36,7 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 # ===== helpers =====
 
 
-def _create_agent_with_key() -> Tuple[int, str]:
+def _create_agent_with_key() -> tuple[int, str]:
     """Create one agent under the admin user + generate its API key.
 
     Returns: (agent_id, full_key)
@@ -97,8 +96,9 @@ def mock_start_task():
 
 
 def test_create_task_happy_path(mock_start_task):
-    """Returns 202 + task_id, writes Task with source='sdk' + input,
-    persists first user message, kicks off background.
+    """Returns 202 + task_id, writes hidden SDK Task + input,
+    persists first user message, kicks off background, and leaves the
+    task readable through the SDK API surface.
     """
     agent_id, full_key = _create_agent_with_key()
 
@@ -129,6 +129,7 @@ def test_create_task_happy_path(mock_start_task):
         assert task is not None
         assert task.agent_id == agent_id
         assert task.source == "sdk"
+        assert task.is_visible is False
         assert task.input == "first user message"
         assert task.status == TaskStatus.RUNNING
 
@@ -143,6 +144,10 @@ def test_create_task_happy_path(mock_start_task):
         assert msgs[0].content == "first user message"
     finally:
         db.close()
+
+    sdk_task = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert sdk_task.status_code == 200, sdk_task.text
+    assert sdk_task.json()["task_id"] == task_id
 
     # Background kickoff was called exactly once for this task. The
     # scheduler receives a ``TaskTurnPayload`` carrying both transcript
@@ -792,7 +797,7 @@ def test_get_steps_returns_mapped_steps_in_order(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
 
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
     # Public step 1: thinking phase=action (react_action_start/end)
     _insert_trace_event(
@@ -946,7 +951,7 @@ def test_get_steps_ignores_worker_build_trace_events(mock_start_task):
         task_id=task_id,
         event_type="tool_execution_start",
         event_id="worker-trace-1",
-        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         step_id="worker-step",
         build_id="agent_123_abcd1234",
         data={
@@ -965,7 +970,7 @@ def test_get_steps_ignores_worker_build_trace_events(mock_start_task):
 def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     _insert_trace_event(
         task_id=task_id,
         event_type="ai_message",

@@ -333,7 +333,7 @@ interface Message {
   interactions?: Interaction[]
 }
 
-interface Task {
+export interface Task {
   id: string
   title: string
   status: TaskStatus
@@ -1425,10 +1425,11 @@ export function AppProvider({
               timestamp: message.timestamp
             })
 
-            // Check if this is a duplicate message
-            // Note: We don't cache messages from WebSocket to prevent blocking subsequent identical messages
-            // This is especially important for historical data loading where we might receive multiple identical messages
-            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, false)
+            // Check if this is a duplicate message.
+            // Use caching so the entry expires after 30s, preventing the
+            // immediate chat/user_message duplicate pair without permanently
+            // blocking subsequent identical messages later in the session.
+            const isDuplicate = isDuplicateMessage(messageContent, 'user-message', false, true)
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,

@@ -18,14 +18,14 @@ from xagent.web.models.user import User
 from xagent.web.tools.config import WebToolConfig
 
 
-def _create_session() -> tuple[Session, str]:
+def _create_session() -> tuple[Session, str, sessionmaker]:
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()
     db_url = f"sqlite:///{temp_db.name}"
     engine = create_engine(db_url)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    return SessionLocal(), temp_db.name
+    return SessionLocal(), temp_db.name, SessionLocal
 
 
 class _Request:
@@ -46,7 +46,7 @@ def test_delegation_config_defaults_are_noop() -> None:
 
 
 def test_web_delegation_config_defaults_are_noop() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         user = User(username="config-owner", password_hash="x", is_admin=False)
         db.add(user)
@@ -73,7 +73,7 @@ def test_web_delegation_config_defaults_are_noop() -> None:
 
 
 def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner", password_hash="x", is_admin=False)
         other_user = User(username="other", password_hash="x", is_admin=False)
@@ -90,7 +90,9 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
         db.add(published_agent)
         db.commit()
 
-        tools_for_other = get_published_agents_tools(db=db, user_id=2)
+        tools_for_other = get_published_agents_tools(
+            session_factory=SessionLocal, user_id=2
+        )
         tool_names = {tool.name for tool in tools_for_other}
 
         assert f"agent_{published_agent.id}" not in tool_names
@@ -105,7 +107,7 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
 
 
 def test_owner_sees_only_own_published_agents_not_drafts() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner2", password_hash="x", is_admin=False)
         db.add(owner)
@@ -125,7 +127,9 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
         db.add_all([published_agent, draft_agent])
         db.commit()
 
-        tools_for_owner = get_published_agents_tools(db=db, user_id=1)
+        tools_for_owner = get_published_agents_tools(
+            session_factory=SessionLocal, user_id=1
+        )
         tool_names = {tool.name for tool in tools_for_owner}
 
         assert f"agent_{published_agent.id}" in tool_names
@@ -141,7 +145,7 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
 
 
 def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner_non_ascii", password_hash="x", is_admin=False)
         db.add(owner)
@@ -157,7 +161,9 @@ def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
         db.commit()
         db.refresh(published_agent)
 
-        tools = get_published_agents_tools(db=db, user_id=owner.id)
+        tools = get_published_agents_tools(
+            session_factory=SessionLocal, user_id=owner.id
+        )
 
         assert {tool.name for tool in tools} == {f"agent_{published_agent.id}"}
     finally:
@@ -171,7 +177,7 @@ def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
 
 
 def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner3", password_hash="x", is_admin=False)
         other_user = User(username="other3", password_hash="x", is_admin=False)
@@ -211,7 +217,7 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
         db.commit()
 
         tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             allowed_agent_ids=[
                 selected_published.id,
@@ -236,7 +242,7 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
 
 
 def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner_cross", password_hash="x", is_admin=False)
         runner = User(username="runner_cross", password_hash="x", is_admin=False)
@@ -255,7 +261,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
         db.refresh(published_agent)
 
         blocked_tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=runner.id,
             allowed_agent_ids=[published_agent.id],
             enable_global_agent_tools=False,
@@ -265,7 +271,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
         }
 
         allowed_tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=runner.id,
             allowed_agent_ids=[published_agent.id],
             enable_global_agent_tools=False,
@@ -284,7 +290,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_tool_execution_enforces_owner_visibility() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="exec_owner", password_hash="x", is_admin=False)
         runner = User(username="exec_runner", password_hash="x", is_admin=False)
@@ -306,7 +312,7 @@ async def test_agent_tool_execution_enforces_owner_visibility() -> None:
             agent_id=published_agent.id,
             agent_name=published_agent.name,
             agent_description="Private worker",
-            db=db,
+            session_factory=SessionLocal,
             user_id=runner.id,
         )
 
@@ -325,7 +331,7 @@ async def test_agent_tool_execution_enforces_owner_visibility() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="allow_owner", password_hash="x", is_admin=False)
         db.add(owner)
@@ -351,7 +357,7 @@ async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
             agent_id=blocked_agent.id,
             agent_name=blocked_agent.name,
             agent_description="Blocked worker",
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             target_allowed_agent_ids=[allowed_agent.id],
         )
@@ -373,7 +379,7 @@ async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
 async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist() -> (
     None
 ):
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="cross_owner", password_hash="x", is_admin=False)
         runner = User(username="cross_runner", password_hash="x", is_admin=False)
@@ -395,7 +401,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
             agent_id=published_agent.id,
             agent_name=published_agent.name,
             agent_description="Cross user worker",
-            db=db,
+            session_factory=SessionLocal,
             user_id=runner.id,
             target_allowed_agent_ids=[published_agent.id],
         )
@@ -410,7 +416,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
             agent_id=published_agent.id,
             agent_name=published_agent.name,
             agent_description="Cross user worker",
-            db=db,
+            session_factory=SessionLocal,
             user_id=runner.id,
             target_allowed_agent_ids=[published_agent.id],
             target_allow_cross_user_agent_ids=True,
@@ -435,7 +441,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
 async def test_delegation_allowed_agent_ids_do_not_block_current_worker_execution() -> (
     None
 ):
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="nested_owner", password_hash="x", is_admin=False)
         db.add(owner)
@@ -452,7 +458,7 @@ async def test_delegation_allowed_agent_ids_do_not_block_current_worker_executio
         db.refresh(worker)
 
         tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             allowed_agent_ids=[worker.id],
             enable_global_agent_tools=False,
@@ -480,7 +486,7 @@ async def test_delegation_allowed_agent_ids_do_not_block_current_worker_executio
 
 
 def test_global_agent_tools_can_be_disabled_without_allowed_workers() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner4", password_hash="x", is_admin=False)
         db.add(owner)
@@ -496,7 +502,7 @@ def test_global_agent_tools_can_be_disabled_without_allowed_workers() -> None:
         db.commit()
 
         tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             enable_global_agent_tools=False,
         )
@@ -513,7 +519,7 @@ def test_global_agent_tools_can_be_disabled_without_allowed_workers() -> None:
 
 
 def test_agent_call_stack_prevents_recursive_agent_tools() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner5", password_hash="x", is_admin=False)
         db.add(owner)
@@ -536,7 +542,7 @@ def test_agent_call_stack_prevents_recursive_agent_tools() -> None:
         db.refresh(other_agent)
 
         tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             agent_call_stack=[active_agent.id],
         )
@@ -555,7 +561,7 @@ def test_agent_call_stack_prevents_recursive_agent_tools() -> None:
 
 
 def test_worker_overrides_inject_selected_agent_tool_metadata() -> None:
-    db, db_path = _create_session()
+    db, db_path, SessionLocal = _create_session()
     try:
         owner = User(username="owner6", password_hash="x", is_admin=False)
         db.add(owner)
@@ -578,7 +584,7 @@ def test_worker_overrides_inject_selected_agent_tool_metadata() -> None:
         db.refresh(worker)
 
         tools = get_published_agents_tools(
-            db=db,
+            session_factory=SessionLocal,
             user_id=owner.id,
             allowed_agent_ids=[worker.id],
             enable_global_agent_tools=False,
