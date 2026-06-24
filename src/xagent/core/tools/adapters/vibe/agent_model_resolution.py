@@ -27,25 +27,22 @@ def resolve_agent_model_llms(
 
     from .....web.models.model import Model as DBModel
 
-    model_ids = [
-        coerced_model_id
+    model_ids_by_key = {
+        model_key: coerced_model_id
         for model_key in AGENT_MODEL_KEYS
         if (coerced_model_id := _coerce_model_db_id(agent_models.get(model_key)))
         is not None
-    ]
+    }
+    model_ids = list(model_ids_by_key.values())
     if not model_ids:
         return None, None, None, None
 
     models_by_id: dict[Any, Any] = {}
     for model in db.query(DBModel).filter(DBModel.id.in_(model_ids)).all():
         models_by_id[model.id] = model
-        models_by_id[str(model.id)] = model
 
     resolved_llms = {}
-    for model_key in AGENT_MODEL_KEYS:
-        model_id = agent_models.get(model_key)
-        if not model_id:
-            continue
+    for model_key, model_id in model_ids_by_key.items():
         model = models_by_id.get(model_id)
         if model:
             resolved_llms[model_key] = storage.get_llm_by_name_with_access(

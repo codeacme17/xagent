@@ -168,11 +168,13 @@ def test_resolve_agent_model_llms_normalizes_string_ids_for_batch_query() -> Non
         )
 
         event.listen(engine, "before_cursor_execute", capture_model_select_params)
+        agent_models = {role: str(model.id) for role, model in models.items()}
+        agent_models["general"] = f"00{models['general'].id}"
         try:
             resolved = resolve_agent_model_llms(
                 db,
                 storage,
-                {role: str(model.id) for role, model in models.items()},
+                agent_models,
                 user_id=42,
             )
         finally:
@@ -186,6 +188,120 @@ def test_resolve_agent_model_llms_normalizes_string_ids_for_batch_query() -> Non
         )
         assert len(model_select_params) == 1
         assert all(isinstance(param, int) for param in model_select_params[0])
+    finally:
+        db.close()
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+def test_resolve_agent_model_llms_skips_invalid_and_falsy_ids_without_query() -> None:
+    db, db_path = _create_session()
+    try:
+        model_select_params: list[tuple[object, ...]] = []
+        engine = db.get_bind()
+
+        def capture_model_select_params(
+            conn,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+        ) -> None:
+            del conn, cursor, context, executemany
+            normalized = " ".join(statement.lower().split())
+            if normalized.startswith("select") and "from models" in normalized:
+                model_select_params.append(tuple(parameters))
+
+        storage = Mock()
+        event.listen(engine, "before_cursor_execute", capture_model_select_params)
+        try:
+            resolved = resolve_agent_model_llms(
+                db,
+                storage,
+                {
+                    "general": None,
+                    "small_fast": "",
+                    "visual": True,
+                    "compact": "not-a-model-id",
+                },
+                user_id=42,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_model_select_params)
+
+        assert resolved == (None, None, None, None)
+        assert model_select_params == []
+        storage.get_llm_by_name_with_access.assert_not_called()
+    finally:
+        db.close()
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+def test_resolve_agent_model_llms_handles_stale_and_partial_model_config() -> None:
+    db, db_path = _create_session()
+    try:
+        model = Model(
+            model_id="general-model-id",
+            category="llm",
+            model_provider="openai",
+            model_name="general-model",
+            api_key="test-api-key",
+            base_url="https://api.openai.com/v1",
+            temperature=0.7,
+            abilities=["chat"],
+        )
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+
+        model_select_params: list[tuple[object, ...]] = []
+        engine = db.get_bind()
+
+        def capture_model_select_params(
+            conn,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+        ) -> None:
+            del conn, cursor, context, executemany
+            normalized = " ".join(statement.lower().split())
+            if normalized.startswith("select") and "from models" in normalized:
+                model_select_params.append(tuple(parameters))
+
+        general_llm = Mock(name="general_llm")
+        storage = Mock()
+        storage.get_llm_by_name_with_access.return_value = general_llm
+        stale_model_id = model.id + 1000
+
+        event.listen(engine, "before_cursor_execute", capture_model_select_params)
+        try:
+            resolved = resolve_agent_model_llms(
+                db,
+                storage,
+                {
+                    "general": model.id,
+                    "small_fast": stale_model_id,
+                },
+                user_id=42,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_model_select_params)
+
+        assert resolved == (general_llm, None, None, None)
+        assert len(model_select_params) == 1
+        assert set(model_select_params[0]) == {model.id, stale_model_id}
+        storage.get_llm_by_name_with_access.assert_called_once_with(
+            model.model_id,
+            42,
+        )
     finally:
         db.close()
         try:
