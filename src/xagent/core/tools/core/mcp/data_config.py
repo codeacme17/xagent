@@ -183,7 +183,7 @@ class MCPServerConfig(BaseModel):
 
     def to_connection(self) -> Dict[str, Any]:
         """Convert configuration to Connection format for MultiServerMCPClient."""
-        connection_config = {"transport": self.transport}
+        connection_config: Dict[str, Any] = {"transport": self.transport}
 
         # Add connection-related fields
         connection_fields = {

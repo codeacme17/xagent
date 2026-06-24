@@ -614,14 +614,14 @@ class WebToolConfig(BaseToolConfig):
 
             for server in servers:
                 # Build config dict from server model
-                config = {
+                config: Dict[str, Any] = {
                     "name": server.name,
                     "transport": server.transport,
                     "description": server.description,
                 }
 
                 # Add transport-specific configuration
-                transport_config = {}
+                transport_config: Dict[str, Any] = {}
 
                 # Handle OAuth credentials
                 if server.transport == "oauth":
@@ -725,16 +725,16 @@ class WebToolConfig(BaseToolConfig):
                                     env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = (
                                         allowed_file_dirs
                                     )
-                                transport_config["env"] = env  # type: ignore
+                                transport_config["env"] = env
                             else:
                                 config["transport"] = "stdio"
                                 transport_config["transport"] = "stdio"
                                 transport_config["command"] = "npx"
-                                transport_config["args"] = [  # type: ignore
+                                transport_config["args"] = [
                                     "-y",
                                     f"@mcp-servers/{str(server.name).lower().replace(' ', '-')}",
                                 ]
-                                transport_config["env"] = {  # type: ignore
+                                transport_config["env"] = {
                                     f"{str(server.name).upper().replace(' ', '_')}_ACCESS_TOKEN": oauth_account.access_token,
                                     "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
                                     "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
