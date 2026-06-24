@@ -44,6 +44,68 @@ def test_mcp_tool_adapter_source_server_defaults_none():
     assert adapter.metadata.source_server is None
 
 
+def test_mcp_tool_adapter_defaults_to_not_concurrency_safe():
+    mcp_tool = SimpleNamespace(
+        name="list_messages",
+        description="List messages",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    assert adapter.metadata.concurrency_safe is False
+
+
+def test_build_mcp_tool_adapter_marks_all_tools_safe_when_server_opts_in():
+    mcp_tool = SimpleNamespace(
+        name="list_messages",
+        description="List messages",
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+    adapter = _build_mcp_tool_adapter(
+        "mail",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        concurrency_safe=True,
+    )
+
+    assert adapter.metadata.concurrency_safe is True
+
+
+def test_build_mcp_tool_adapter_honors_concurrent_tool_allowlist():
+    safe_tool = SimpleNamespace(
+        name="list_messages",
+        description="List messages",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    unsafe_tool = SimpleNamespace(
+        name="delete_message",
+        description="Delete a message",
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+    safe_adapter = _build_mcp_tool_adapter(
+        "mail",
+        {"transport": "stdio", "command": "python", "args": []},
+        safe_tool,
+        concurrency_safe=True,
+        concurrent_tools=["list_messages"],
+    )
+    unsafe_adapter = _build_mcp_tool_adapter(
+        "mail",
+        {"transport": "stdio", "command": "python", "args": []},
+        unsafe_tool,
+        concurrency_safe=True,
+        concurrent_tools=["list_messages"],
+    )
+
+    assert safe_adapter.metadata.concurrency_safe is True
+    assert unsafe_adapter.metadata.concurrency_safe is False
+
+
 def test_build_args_model_handles_optional_array_schema():
     mcp_tool = SimpleNamespace(
         name="gmail_manage_labels",

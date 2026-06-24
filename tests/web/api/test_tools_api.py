@@ -993,6 +993,42 @@ class TestWebToolConfigCustomApi:
 
 class TestWebToolConfigMCPAuth:
     @pytest.mark.asyncio
+    async def test_get_mcp_server_configs_includes_concurrency_config(self):
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        server = MagicMock()
+        server.name = "local"
+        server.transport = "stdio"
+        server.description = "Local MCP"
+        server.command = "npx"
+        server.args = ["-y", "@modelcontextprotocol/server-everything"]
+        server.env = None
+        server.cwd = None
+        server.managed = "external"
+        server.concurrency_safe = True
+        server.concurrent_tools = ["echo", "get_sum"]
+
+        db = MagicMock()
+        db.query.return_value.join.return_value.filter.return_value.all.return_value = [
+            server
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=1,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = await cfg.get_mcp_server_configs()
+
+        assert len(configs) == 1
+        assert configs[0]["name"] == "local"
+        assert configs[0]["config"]["concurrency_safe"] is True
+        assert configs[0]["config"]["concurrent_tools"] == ["echo", "get_sum"]
+
+    @pytest.mark.asyncio
     async def test_get_mcp_server_configs_maps_bearer_auth_to_headers(self):
         from unittest.mock import MagicMock
 

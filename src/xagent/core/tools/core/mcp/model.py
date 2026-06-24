@@ -47,6 +47,8 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         headers = Column(JSON, nullable=True)  # Dict[str, Any]
         timeout = Column(Integer, nullable=True)
         auth = Column(JSON, nullable=True)  # Dict[str, Any]
+        concurrency_safe = Column(Boolean, nullable=False, default=False)
+        concurrent_tools = Column(JSON, nullable=True)  # List[str]
 
         # Container management parameters (internal only)
         docker_url = Column(String(500), nullable=True)
@@ -71,6 +73,17 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
 
         def __repr__(self) -> str:
             return f"<MCPServer(id={self.id}, name='{self.name}', transport='{self.transport}', managed='{self.managed}')>"
+
+        @staticmethod
+        def _normalize_concurrent_tools(value: Any) -> list[str]:
+            """Normalize stored/raw per-tool concurrency allowlists."""
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [item.strip() for item in value.split(",") if item.strip()]
+            if isinstance(value, (list, tuple, set)):
+                return [str(item).strip() for item in value if str(item).strip()]
+            return []
 
         @staticmethod
         def _decrypt_auth_config(auth_value: Any) -> Any:
@@ -179,6 +192,13 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 ] or not isinstance(decrypted_auth, dict):
                     connection["auth"] = decrypted_auth
 
+            connection["concurrency_safe"] = bool(
+                getattr(self, "concurrency_safe", False)
+            )
+            connection["concurrent_tools"] = self._normalize_concurrent_tools(
+                getattr(self, "concurrent_tools", None)
+            )
+
             return connection
 
         def to_config_dict(self) -> Dict[str, Any]:
@@ -208,6 +228,11 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 config["timeout"] = self.timeout
             if getattr(self, "auth", None) is not None:
                 config["auth"] = self._decrypt_auth_config(self.auth)
+
+            config["concurrency_safe"] = bool(getattr(self, "concurrency_safe", False))
+            config["concurrent_tools"] = self._normalize_concurrent_tools(
+                getattr(self, "concurrent_tools", None)
+            )
 
             # Container parameters (internal only)
             if self.managed == "internal":
@@ -265,6 +290,10 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 headers=config.get("headers"),
                 timeout=config.get("timeout"),
                 auth=auth_config,
+                concurrency_safe=bool(config.get("concurrency_safe", False)),
+                concurrent_tools=cls._normalize_concurrent_tools(
+                    config.get("concurrent_tools")
+                ),
                 docker_url=config.get("docker_url"),
                 docker_image=config.get("docker_image"),
                 docker_environment=config.get("docker_environment"),

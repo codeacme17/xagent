@@ -62,6 +62,17 @@ class MCPServerConfig(BaseModel):
     auth: Optional[Dict[str, Any]] = Field(
         None, description="Authentication configuration"
     )
+    concurrency_safe: bool = Field(
+        False,
+        description="Whether this server's MCP tools may run concurrently",
+    )
+    concurrent_tools: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional allowlist of raw MCP tool names that may run concurrently. "
+            "Empty means all tools when concurrency_safe is true."
+        ),
+    )
 
     # --- Container Management Parameters (only for 'internal' type) ---
     docker_url: Optional[str] = Field(None, description="URL to connect docker")
@@ -116,6 +127,18 @@ class MCPServerConfig(BaseModel):
                 f"Must be one of: {', '.join(sorted(valid_transports))}"
             )
         return v
+
+    @field_validator("concurrent_tools", mode="before")
+    @classmethod
+    def normalize_concurrent_tools(cls, v: Any) -> List[str]:
+        """Normalize per-tool concurrency allowlists from API/YAML inputs."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(item).strip() for item in v if str(item).strip()]
+        raise ValueError("concurrent_tools must be a list of tool names")
 
     @model_validator(mode="after")
     def validate_config_consistency(self) -> "MCPServerConfig":
@@ -180,6 +203,9 @@ class MCPServerConfig(BaseModel):
                     connection_config[field_name] = str(value)
                 else:
                     connection_config[field_name] = value
+
+        connection_config["concurrency_safe"] = self.concurrency_safe
+        connection_config["concurrent_tools"] = list(self.concurrent_tools)
 
         return connection_config
 

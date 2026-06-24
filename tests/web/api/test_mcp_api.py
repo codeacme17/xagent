@@ -6,7 +6,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from xagent.web.api.mcp import _db_server_to_response, get_supported_transports
+from xagent.web.api.mcp import (
+    MCPServerCreate,
+    _build_server_config,
+    _db_server_to_response,
+    get_supported_transports,
+)
 from xagent.web.models.mcp import MCPServer
 
 
@@ -33,6 +38,23 @@ class TestMCPServerModel:
         assert connection_dict["args"] == ["server.py"]
         assert connection_dict["env"] == {"API_KEY": "secret"}
         assert connection_dict["cwd"] == "/tmp"
+
+    def test_to_connection_dict_includes_mcp_concurrency_metadata(self):
+        """MCP loader receives scheduling metadata alongside connection fields."""
+        server = MCPServer(
+            name="test_server",
+            transport="stdio",
+            managed="external",
+            command="python",
+            args=["server.py"],
+            concurrency_safe=True,
+            concurrent_tools=["list_messages"],
+        )
+
+        connection_dict = server.to_connection_dict()
+
+        assert connection_dict["concurrency_safe"] is True
+        assert connection_dict["concurrent_tools"] == ["list_messages"]
 
     def test_to_connection_dict_websocket(self):
         """Test to_connection_dict method for WebSocket transport."""
@@ -74,9 +96,27 @@ class TestMCPServerModel:
         assert config["args"] == ["server.py"]
         assert config["env"] == {"KEY": "value"}
         assert config["cwd"] == "/app"
+        assert config["concurrency_safe"] is False
+        assert config["concurrent_tools"] == []
         # Internal-only fields should not be present
         assert "docker_url" not in config
         assert "docker_image" not in config
+
+    def test_to_config_dict_includes_mcp_concurrency_config(self):
+        """MCP config responses include explicit concurrency opt-in settings."""
+        server = MCPServer(
+            name="external_server",
+            transport="stdio",
+            managed="external",
+            command="python",
+            concurrency_safe=True,
+            concurrent_tools=["list_messages"],
+        )
+
+        config = server.to_config_dict()
+
+        assert config["concurrency_safe"] is True
+        assert config["concurrent_tools"] == ["list_messages"]
 
     def test_to_config_dict_internal(self):
         """Test to_config_dict method for internal server."""
@@ -131,6 +171,25 @@ class TestMCPServerModel:
         assert server.args == ["server.py"]
         assert server.env == {"KEY": "value"}
         assert server.cwd == "/app"
+        assert server.concurrency_safe is False
+        assert server.concurrent_tools == []
+
+    def test_from_config_persists_mcp_concurrency_config(self):
+        """MCP concurrency opt-in survives database model construction."""
+        config = {
+            "name": "test_server",
+            "description": "Test server",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "python",
+            "concurrency_safe": True,
+            "concurrent_tools": ["list_messages"],
+        }
+
+        server = MCPServer.from_config(config)
+
+        assert server.concurrency_safe is True
+        assert server.concurrent_tools == ["list_messages"]
 
     def test_from_config_internal(self):
         """Test from_config class method for internal server."""
@@ -277,6 +336,24 @@ class TestMCPApiFunctions:
         assert response.config["auth"]["type"] == "oauth2"
         assert response.config["auth"]["token_type"] == "Bearer"
         assert response.config["auth"]["access_token"] == "********"
+
+    def test_build_server_config_parses_mcp_concurrency_config(self):
+        """API request config accepts the explicit MCP concurrency opt-in."""
+        server_data = MCPServerCreate(
+            name="mail",
+            transport="stdio",
+            description="Mail MCP",
+            config={
+                "command": "python",
+                "concurrency_safe": "true",
+                "concurrent_tools": "list_messages, search_messages",
+            },
+        )
+
+        config = _build_server_config(server_data)
+
+        assert config.concurrency_safe is True
+        assert config.concurrent_tools == ["list_messages", "search_messages"]
 
 
 class TestMCPApiModels:

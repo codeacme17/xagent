@@ -189,6 +189,8 @@ class YamlMCPServerManager:
             "cwd",
             "url",
             "headers",
+            "concurrency_safe",
+            "concurrent_tools",
             "docker_image",
             "docker_url",
             "volumes",

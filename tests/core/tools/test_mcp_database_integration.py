@@ -162,6 +162,25 @@ class TestDatabaseMCPServerManager:
         assert ws_conn["url"] == "ws://localhost:8080/ws"
         assert ws_conn["headers"] == {"Authorization": "Bearer token123"}
 
+    def test_get_connections_includes_mcp_concurrency_config(
+        self, test_db, sample_stdio_config
+    ):
+        """Database-backed MCP tool loading receives scheduler metadata."""
+        manager = DatabaseMCPServerManager(test_db)
+        sample_stdio_config = {
+            **sample_stdio_config,
+            "concurrency_safe": True,
+            "concurrent_tools": ["list_messages"],
+        }
+        config = manager.create_config(**sample_stdio_config)
+        manager.add_server(config)
+
+        connections = manager.get_connections()
+
+        stdio_conn = connections[sample_stdio_config["name"]]
+        assert stdio_conn["concurrency_safe"] is True
+        assert stdio_conn["concurrent_tools"] == ["list_messages"]
+
     def test_get_server(self, test_db, sample_stdio_config):
         """Test getting specific server."""
         manager = DatabaseMCPServerManager(test_db)

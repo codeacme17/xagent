@@ -773,6 +773,13 @@ class WebToolConfig(BaseToolConfig):
                     if merged_headers:
                         transport_config["headers"] = merged_headers
 
+                transport_config["concurrency_safe"] = bool(
+                    getattr(server, "concurrency_safe", False)
+                )
+                transport_config["concurrent_tools"] = list(
+                    getattr(server, "concurrent_tools", None) or []
+                )
+
                 # Add Docker-specific config if managed internally
                 if server.managed == "internal":
                     if server.docker_url:

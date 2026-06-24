@@ -1189,8 +1189,20 @@ class OpenAILLM(BaseLLM):
                             if existing_tc.get("index") == index:
                                 call_id = existing_id
                                 break
-                    else:
-                        # Cannot associate this chunk — skip it
+                    if call_id is None or call_id == "":
+                        if not self._stream_tool_call_has_payload(tool_call):
+                            # Some OpenAI-compatible providers emit empty
+                            # placeholder slots while streaming multiple tool
+                            # calls. They carry no recoverable data and should
+                            # not become a real accumulated call.
+                            continue
+                        if index is None:
+                            # Cannot associate this chunk — skip it
+                            continue
+                        call_id = f"tool_call_{index}"
+
+                if not self._stream_tool_call_has_payload(tool_call):
+                    if call_id not in accumulated_tool_calls:
                         continue
 
                 # Initialize or update accumulated tool call
@@ -1198,7 +1210,7 @@ class OpenAILLM(BaseLLM):
                     accumulated_tool_calls[call_id] = {
                         "index": index,
                         "id": call_id,
-                        "type": getattr(tool_call, "type", "function"),
+                        "type": getattr(tool_call, "type", None) or "function",
                         "function": {
                             "name": "",
                             "arguments": "",
@@ -1268,6 +1280,19 @@ class OpenAILLM(BaseLLM):
             )
 
         return None
+
+    @staticmethod
+    def _stream_tool_call_has_payload(tool_call: Any) -> bool:
+        func = tool_call.function if hasattr(tool_call, "function") else None
+        if func is None:
+            return False
+        name = getattr(func, "name", None)
+        if isinstance(name, str) and name:
+            return True
+        arguments = getattr(func, "arguments", None)
+        if isinstance(arguments, str):
+            return bool(arguments)
+        return arguments is not None
 
     async def close(self) -> None:
         """Close the OpenAI client and cleanup resources."""
