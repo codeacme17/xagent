@@ -1277,7 +1277,7 @@ def load_task_inline_agent_config(task: Any) -> Optional[dict]:
         "instructions": raw.get("instructions"),
         "skills": raw.get("skills") or [],
         "knowledge_bases": raw.get("knowledge_bases") or [],
-        "tool_categories": raw.get("tool_categories") or [],
+        "tool_categories": raw.get("tool_categories"),
         "memory_similarity_threshold": raw.get("memory_similarity_threshold"),
         "is_preview": raw.get("is_preview"),
         "preview_agent_id": raw.get("preview_agent_id"),
@@ -1354,5 +1354,7 @@ def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
         "instructions": agent.instructions,
         "skills": list(agent.skills or []),
         "knowledge_bases": list(agent.knowledge_bases or []),
-        "tool_categories": list(agent.tool_categories or []),
+        "tool_categories": list(agent.tool_categories)
+        if agent.tool_categories is not None
+        else None,
     }
