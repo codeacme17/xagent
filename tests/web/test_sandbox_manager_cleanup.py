@@ -358,6 +358,46 @@ async def test_cleanup_stops_when_config_matches(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_stops_worker_when_base_user_config_matches(
+    manager: SandboxManager, service: AsyncMock, tmp_path: Path
+):
+    """Worker sandbox cleanup should compare against the owner workspace."""
+    uploads = tmp_path / "uploads"
+    user_dir = uploads / "user_6"
+    user_dir.mkdir(parents=True)
+    resolved = str(user_dir.resolve())
+
+    code_volumes = build_code_mount_volumes()
+    sb = _make_sb_info(
+        "user::6::worker::0",
+        image="img:v1",
+        cpus=1,
+        memory=512,
+        volumes=code_volumes + [(resolved, resolved, "rw")],
+    )
+
+    mock_box = AsyncMock()
+    service.list_sandboxes.return_value = [sb]
+    service.get_or_create.return_value = mock_box
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+            clear=True,
+        ),
+        patch("xagent.web.sandbox_manager.get_uploads_dir", return_value=uploads),
+    ):
+        await manager.cleanup()
+
+    service.delete.assert_not_awaited()
+    service.get_or_create.assert_awaited_once_with(
+        "user::6::worker::0", template=sb.template, config=sb.config
+    )
+    mock_box.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_deletes_on_multiple_changes(
     manager: SandboxManager, service: AsyncMock
 ):

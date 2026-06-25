@@ -30,6 +30,8 @@ from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 
 logger = logging.getLogger(__name__)
 
+_WORKER_LIFECYCLE_MARKER = "::worker::"
+
 
 class SandboxLease:
     """Async context manager for one leased sandbox execution slot."""
@@ -125,6 +127,14 @@ class SandboxLeaseProvider:
             )
             self._workers[slot] = worker
             return worker
+
+    async def cleanup_worker_sandboxes(self) -> None:
+        """Delete worker sandboxes while keeping the primary sandbox cached."""
+        await self._manager.delete_worker_sandboxes(
+            self._lifecycle_type,
+            self._lifecycle_id,
+        )
+        self._workers.clear()
 
 
 class SandboxPathMapper:
@@ -232,6 +242,18 @@ class SandboxManager:
             raise ValueError(f"Invalid sandbox name format: {name!r}")
         return parts[0], parts[1]
 
+    @staticmethod
+    def _base_lifecycle_id(lifecycle_id: str) -> str:
+        """Return the owner lifecycle id for primary and worker sandboxes."""
+        return lifecycle_id.split(_WORKER_LIFECYCLE_MARKER, 1)[0]
+
+    @classmethod
+    def _worker_sandbox_prefix(cls, lifecycle_type: str, lifecycle_id: str) -> str:
+        return (
+            cls.make_sandbox_name(lifecycle_type, lifecycle_id)
+            + _WORKER_LIFECYCLE_MARKER
+        )
+
     def _get_sandbox_image_and_config(self) -> tuple[str, SandboxConfig]:
         """Get sandbox image and configuration from centralized config module."""
         image = get_sandbox_image()
@@ -285,7 +307,8 @@ class SandboxManager:
             for raw_dir in workspace_config.get("allowed_external_dirs") or []:
                 paths.append((Path(str(raw_dir)), False))
         elif lifecycle_type == "user":
-            paths.append((get_uploads_dir() / f"user_{lifecycle_id}", True))
+            owner_lifecycle_id = SandboxManager._base_lifecycle_id(lifecycle_id)
+            paths.append((get_uploads_dir() / f"user_{owner_lifecycle_id}", True))
 
         return paths
 
@@ -485,15 +508,61 @@ class SandboxManager:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
         """
+        sandbox_names = await self._find_lifecycle_sandbox_names(
+            lifecycle_type,
+            lifecycle_id,
+            include_primary=True,
+            include_workers=True,
+        )
+        await self._delete_sandbox_names(sandbox_names)
+
+    async def delete_worker_sandboxes(
+        self, lifecycle_type: str, lifecycle_id: str
+    ) -> None:
+        """Delete worker sandboxes for a lifecycle while preserving the primary."""
+        sandbox_names = await self._find_lifecycle_sandbox_names(
+            lifecycle_type,
+            lifecycle_id,
+            include_primary=False,
+            include_workers=True,
+        )
+        await self._delete_sandbox_names(sandbox_names)
+
+    async def _find_lifecycle_sandbox_names(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        include_primary: bool,
+        include_workers: bool,
+    ) -> set[str]:
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
-        worker_prefix = f"{sandbox_name}::worker::"
+        worker_prefix = self._worker_sandbox_prefix(lifecycle_type, lifecycle_id)
         sandbox_names = {
             name
             for name in self._cache
-            if name == sandbox_name or name.startswith(worker_prefix)
+            if (include_primary and name == sandbox_name)
+            or (include_workers and name.startswith(worker_prefix))
         }
-        sandbox_names.add(sandbox_name)
+        if include_primary:
+            sandbox_names.add(sandbox_name)
 
+        try:
+            listed_sandboxes = await self._service.list_sandboxes()
+        except Exception as exc:
+            logger.warning("Failed to list sandboxes for cleanup: %s", exc)
+            return sandbox_names
+
+        for sb in listed_sandboxes or []:
+            name = sb.name
+            if include_primary and name == sandbox_name:
+                sandbox_names.add(name)
+            elif include_workers and name.startswith(worker_prefix):
+                sandbox_names.add(name)
+
+        return sandbox_names
+
+    async def _delete_sandbox_names(self, sandbox_names: set[str]) -> None:
         for name in sorted(sandbox_names):
             try:
                 await self._service.delete(name)

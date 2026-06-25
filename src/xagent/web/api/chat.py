@@ -585,8 +585,65 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._sandboxes: Dict[str, Any] = {}  # lifecycle scope -> Sandbox instance
+        self._sandbox_active_tasks: Dict[str, int] = {}
+        self._sandbox_active_tasks_lock = asyncio.Lock()
         self._default_llm = create_default_llm()
         self.request = request
+
+    def _sandbox_key_for_task(self, task_id: Optional[str]) -> Optional[str]:
+        if task_id is None:
+            return None
+        try:
+            task_key = int(task_id)
+        except (TypeError, ValueError):
+            return None
+
+        owner_id = self._agent_owner_ids.get(task_key)
+        if owner_id is None:
+            return None
+
+        sandbox_key = f"user:{owner_id}"
+        if sandbox_key not in self._sandboxes:
+            return None
+        return sandbox_key
+
+    async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
+        sandbox_key = self._sandbox_key_for_task(task_id)
+        if sandbox_key is None:
+            return None
+
+        async with self._sandbox_active_tasks_lock:
+            self._sandbox_active_tasks[sandbox_key] = (
+                self._sandbox_active_tasks.get(sandbox_key, 0) + 1
+            )
+        return sandbox_key
+
+    async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
+        if sandbox_key is None:
+            return
+
+        provider = None
+        async with self._sandbox_active_tasks_lock:
+            active_count = self._sandbox_active_tasks.get(sandbox_key, 0)
+            if active_count > 1:
+                self._sandbox_active_tasks[sandbox_key] = active_count - 1
+                return
+
+            self._sandbox_active_tasks.pop(sandbox_key, None)
+            provider = self._sandboxes.get(sandbox_key)
+
+        cleanup_workers = getattr(provider, "cleanup_worker_sandboxes", None)
+        if cleanup_workers is None:
+            return
+
+        try:
+            await cleanup_workers()
+        except Exception as exc:
+            logger.warning(
+                "Failed to cleanup sandbox workers for %s: %s",
+                sandbox_key,
+                exc,
+            )
 
     def _get_task_llm_ids(self, task: Task, db: Session) -> List[Optional[str]]:
         """Return internal model_id identifiers for a task (never provider model_name)."""
@@ -1707,6 +1764,7 @@ class AgentServiceManager:
         lease_stop_event = None
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
+        sandbox_task_key = None
         if db_session and tracker_task_id:
             lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:
@@ -1749,6 +1807,7 @@ class AgentServiceManager:
                 )
                 tracker = None
 
+        sandbox_task_key = await self._acquire_sandbox_task(tracker_task_id)
         try:
             logger.info(
                 f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
@@ -1795,6 +1854,7 @@ class AgentServiceManager:
                     logger.error(
                         f"Failed to complete token tracking for task {tracker_task_id}: {e}"
                     )
+            await self._release_sandbox_task(sandbox_task_key)
 
     def _cleanup_workspace_directory(
         self, task_id: int, user_id: Optional[int] = None

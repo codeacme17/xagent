@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
 from xagent.web.sandbox_manager import (
     SandboxManager,
     _create_boxlite_service,
@@ -13,6 +14,15 @@ from xagent.web.sandbox_manager import (
     _create_sandbox_service,
     get_sandbox_manager,
 )
+
+
+def _sandbox_info(name: str, state: str = "running") -> SandboxInfo:
+    return SandboxInfo(
+        name=name,
+        state=state,
+        template=SandboxTemplate(type="image", image="img:v1"),
+        config=SandboxConfig(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -731,6 +741,31 @@ class TestSandboxLeaseProvider:
         assert "user::42" not in manager._cache
         assert "user::42::worker::0" not in manager._cache
         assert "user::42::worker::1" not in manager._cache
+
+    @pytest.mark.asyncio
+    async def test_delete_sandbox_removes_persisted_worker_sandboxes(self):
+        """Delete should include worker sandboxes discovered from the service."""
+        service = AsyncMock()
+        service.delete = AsyncMock()
+        service.list_sandboxes = AsyncMock(
+            return_value=[
+                _sandbox_info("user::42"),
+                _sandbox_info("user::42::worker::0"),
+                _sandbox_info("user::42::worker::1"),
+                _sandbox_info("user::420::worker::0"),
+                _sandbox_info("tools::42::worker::0"),
+            ]
+        )
+        manager = SandboxManager(service)
+
+        await manager.delete_sandbox("user", "42")
+
+        deleted_names = {call.args[0] for call in service.delete.await_args_list}
+        assert deleted_names == {
+            "user::42",
+            "user::42::worker::0",
+            "user::42::worker::1",
+        }
 
 
 class TestSandboxManagerWarmup:
