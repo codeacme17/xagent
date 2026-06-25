@@ -57,6 +57,7 @@ SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -875,6 +876,21 @@ def get_sandbox_image() -> str:
         Sandbox image name
     """
     return os.getenv(SANDBOX_IMAGE, "xprobe/xagent-sandbox:latest")
+
+
+def get_sandbox_max_concurrency() -> int:
+    """Maximum concurrent worker sandboxes per lifecycle.
+
+    Priority:
+        1. XAGENT_SANDBOX_MAX_CONCURRENCY environment variable
+        2. Default ``3`` to match the default tool batch width
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The per-lifecycle sandbox worker cap (>= 1).
+    """
+    return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
 
 
 def get_lancedb_path() -> Path:

@@ -42,6 +42,29 @@ SANDBOX_BASE_DEPENDENCIES = [
 ]
 
 
+class _StaticSandboxLease:
+    """Async context manager that exposes one fixed sandbox."""
+
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sandbox = sandbox
+
+    async def __aenter__(self) -> Sandbox:
+        return self._sandbox
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        return None
+
+
+def _is_sandbox_lease_provider(value: Any) -> bool:
+    """Return whether an object is a real sandbox lease provider."""
+    return callable(getattr(type(value), "lease", None))
+
+
 class SandboxDependencyManager:
     """Track incremental dependency installation per sandbox."""
 
@@ -213,14 +236,14 @@ class SandboxedToolWrapper(AbstractBaseTool):
     def __init__(
         self,
         target_tool: AbstractBaseTool,
-        sandbox: Sandbox,
+        sandbox: Any,
     ):
         """
         Initialize sandboxed tool wrapper
 
         Args:
             target_tool: Target tool to wrap
-            sandbox: Sandbox instance
+            sandbox: Sandbox instance or lease provider
         """
         self._target = target_tool
         self._sandbox = sandbox
@@ -292,11 +315,21 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
         return env
 
-    async def _ensure_dependencies(self) -> None:
+    def _lease_sandbox(self) -> Any:
+        """Lease the sandbox that should execute this tool call."""
+        if _is_sandbox_lease_provider(self._sandbox):
+            return self._sandbox.lease(concurrency_safe=self.metadata.concurrency_safe)
+        return _StaticSandboxLease(self._sandbox)
+
+    async def _ensure_dependencies(self, sandbox: Sandbox | None = None) -> None:
         """Ensure dependencies are installed in the sandbox."""
-        await SandboxDependencyManager.ensure_requirements(
-            self._sandbox, self._requirements
-        )
+        if sandbox is None:
+            sandbox = (
+                self._sandbox.primary_sandbox
+                if _is_sandbox_lease_provider(self._sandbox)
+                else self._sandbox
+            )
+        await SandboxDependencyManager.ensure_requirements(sandbox, self._requirements)
 
     def _resolve_execution_spec(self) -> tuple[dict[str, str], Any]:
         """
@@ -358,8 +391,9 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
     async def get_sandbox_for_test(self) -> Sandbox:
         """Get the sandbox for exec test"""
-        await self._ensure_dependencies()
-        return self._sandbox
+        async with self._lease_sandbox() as sandbox:
+            await self._ensure_dependencies(sandbox)
+            return sandbox
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """Synchronous execution (calls async version via asyncio.run)"""
@@ -372,54 +406,57 @@ class SandboxedToolWrapper(AbstractBaseTool):
         result_file = f"/tmp/xagent_result_{uuid.uuid4().hex}.json"
 
         try:
-            # Ensure dependencies are installed
-            await self._ensure_dependencies()
+            async with self._lease_sandbox() as sandbox:
+                # Ensure dependencies are installed
+                await self._ensure_dependencies(sandbox)
 
-            # Execute script in sandbox
-            logger.debug(f"Executing tool {self._target.name} in sandbox")
-            command = self._build_execution_command(args, result_file)
-            result = await self._sandbox.exec(
-                command[0], *command[1:], env=self._build_execution_env()
-            )
-
-            # Check execution result
-            if result.exit_code != 0:
-                error_msg = result.stderr or result.error_message or "Unknown error"
-                logger.error(f"Tool execution failed: {error_msg}")
-                raise RuntimeError(f"Tool execution failed: {error_msg}")
-
-            # Read output from result file
-            output = ""
-            try:
-                read_result = await self._sandbox.exec("cat", result_file)
-                if read_result.exit_code != 0:
-                    logger.error(f"Failed to read result file: {read_result.stderr}")
-                    raise RuntimeError(
-                        f"Failed to read result file: {read_result.stderr}"
-                    )
-
-                output = read_result.stdout.strip()
-
-                # Handle empty output
-                if not output:
-                    return None
-
-                return json.loads(output)
-            except json.JSONDecodeError as e:
-                logger.error(
-                    f"Failed to parse tool output from {result_file}. Raw output:\n{output}"
+                # Execute script in sandbox
+                logger.debug(f"Executing tool {self._target.name} in sandbox")
+                command = self._build_execution_command(args, result_file)
+                result = await sandbox.exec(
+                    command[0], *command[1:], env=self._build_execution_env()
                 )
-                raise RuntimeError(f"Failed to parse tool output: {e}")
+
+                # Check execution result
+                if result.exit_code != 0:
+                    error_msg = result.stderr or result.error_message or "Unknown error"
+                    logger.error(f"Tool execution failed: {error_msg}")
+                    raise RuntimeError(f"Tool execution failed: {error_msg}")
+
+                # Read output from result file
+                output = ""
+                try:
+                    read_result = await sandbox.exec("cat", result_file)
+                    if read_result.exit_code != 0:
+                        logger.error(
+                            f"Failed to read result file: {read_result.stderr}"
+                        )
+                        raise RuntimeError(
+                            f"Failed to read result file: {read_result.stderr}"
+                        )
+
+                    output = read_result.stdout.strip()
+
+                    # Handle empty output
+                    if not output:
+                        return None
+
+                    return json.loads(output)
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        f"Failed to parse tool output from {result_file}. Raw output:\n{output}"
+                    )
+                    raise RuntimeError(f"Failed to parse tool output: {e}")
+                finally:
+                    # Clean up result file
+                    try:
+                        await sandbox.exec("rm", "-f", result_file)
+                    except Exception:
+                        pass
 
         except Exception as e:
             logger.error(f"Error executing tool in sandbox: {e}", exc_info=True)
             raise
-        finally:
-            # Clean up result file
-            try:
-                await self._sandbox.exec("rm", "-f", result_file)
-            except Exception:
-                pass
 
 
 async def create_sandboxed_tool(

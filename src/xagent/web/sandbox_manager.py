@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from ..config import (
     get_boxlite_home_dir,
+    get_sandbox_max_concurrency,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_storage_root,
@@ -28,6 +29,102 @@ from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 
 logger = logging.getLogger(__name__)
+
+
+class SandboxLease:
+    """Async context manager for one leased sandbox execution slot."""
+
+    def __init__(
+        self,
+        provider: "SandboxLeaseProvider",
+        *,
+        concurrency_safe: bool,
+    ) -> None:
+        self._provider = provider
+        self._concurrency_safe = concurrency_safe
+        self._slot: int | None = None
+        self._sandbox: Sandbox | None = None
+
+    async def __aenter__(self) -> Sandbox:
+        if not self._concurrency_safe:
+            self._sandbox = self._provider.primary_sandbox
+            return self._sandbox
+
+        self._slot = await self._provider.acquire_worker_slot()
+        try:
+            self._sandbox = await self._provider.get_worker_sandbox(self._slot)
+            return self._sandbox
+        except Exception:
+            await self._provider.release_worker_slot(self._slot)
+            self._slot = None
+            raise
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        if self._slot is not None:
+            await self._provider.release_worker_slot(self._slot)
+            self._slot = None
+        self._sandbox = None
+
+
+class SandboxLeaseProvider:
+    """Lease primary or worker sandboxes for sandboxed tool execution."""
+
+    def __init__(
+        self,
+        *,
+        manager: "SandboxManager",
+        lifecycle_type: str,
+        lifecycle_id: str,
+        primary_sandbox: Sandbox,
+        workspace_config: Mapping[str, Any] | None,
+        max_concurrency: int,
+    ) -> None:
+        self._manager = manager
+        self._lifecycle_type = lifecycle_type
+        self._lifecycle_id = lifecycle_id
+        self._workspace_config = workspace_config
+        self._available_slots: asyncio.Queue[int] = asyncio.Queue()
+        self._worker_locks: dict[int, asyncio.Lock] = {}
+        self._workers: dict[int, Sandbox] = {}
+        self.primary_sandbox = primary_sandbox
+        for slot in range(max(1, max_concurrency)):
+            self._available_slots.put_nowait(slot)
+
+    def lease(self, *, concurrency_safe: bool) -> SandboxLease:
+        """Return an async context manager for the requested execution mode."""
+        return SandboxLease(self, concurrency_safe=concurrency_safe)
+
+    async def acquire_worker_slot(self) -> int:
+        """Reserve one worker slot, waiting when all workers are busy."""
+        return await self._available_slots.get()
+
+    async def release_worker_slot(self, slot: int) -> None:
+        """Return a worker slot to the provider."""
+        self._available_slots.put_nowait(slot)
+
+    async def get_worker_sandbox(self, slot: int) -> Sandbox:
+        """Get or lazily create a worker sandbox for a slot."""
+        if slot in self._workers:
+            return self._workers[slot]
+
+        if slot not in self._worker_locks:
+            self._worker_locks[slot] = asyncio.Lock()
+
+        async with self._worker_locks[slot]:
+            if slot in self._workers:
+                return self._workers[slot]
+            worker = await self._manager.get_or_create_sandbox(
+                self._lifecycle_type,
+                f"{self._lifecycle_id}::worker::{slot}",
+                workspace_config=self._workspace_config,
+            )
+            self._workers[slot] = worker
+            return worker
 
 
 class SandboxPathMapper:
@@ -358,6 +455,28 @@ class SandboxManager:
             self._config_cache[sandbox_name] = config
             return sandbox
 
+    async def create_lease_provider(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        workspace_config: Mapping[str, Any] | None = None,
+    ) -> SandboxLeaseProvider:
+        """Create a lease provider for primary and worker sandboxes."""
+        primary = await self.get_or_create_sandbox(
+            lifecycle_type,
+            lifecycle_id,
+            workspace_config=workspace_config,
+        )
+        return SandboxLeaseProvider(
+            manager=self,
+            lifecycle_type=lifecycle_type,
+            lifecycle_id=lifecycle_id,
+            primary_sandbox=primary,
+            workspace_config=workspace_config,
+            max_concurrency=get_sandbox_max_concurrency(),
+        )
+
     async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
         """
         Delete sandbox.
@@ -367,17 +486,26 @@ class SandboxManager:
             lifecycle_id: e.g. task_id|user_id
         """
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
-        try:
-            await self._service.delete(sandbox_name)
-            logger.debug(f"Sandbox deleted: {sandbox_name}")
-        except Exception as e:
-            logger.error(f"Failed to delete sandbox {sandbox_name}: {e}")
-        finally:
-            # Always evict from cache — even on failure the instance
-            # may be in an unknown state and should be recreated.
-            self._cache.pop(sandbox_name, None)
-            self._config_cache.pop(sandbox_name, None)
-            self._locks.pop(sandbox_name, None)
+        worker_prefix = f"{sandbox_name}::worker::"
+        sandbox_names = {
+            name
+            for name in self._cache
+            if name == sandbox_name or name.startswith(worker_prefix)
+        }
+        sandbox_names.add(sandbox_name)
+
+        for name in sorted(sandbox_names):
+            try:
+                await self._service.delete(name)
+                logger.debug(f"Sandbox deleted: {name}")
+            except Exception as e:
+                logger.error(f"Failed to delete sandbox {name}: {e}")
+            finally:
+                # Always evict from cache — even on failure the instance
+                # may be in an unknown state and should be recreated.
+                self._cache.pop(name, None)
+                self._config_cache.pop(name, None)
+                self._locks.pop(name, None)
 
     async def warmup(self) -> None:
         """

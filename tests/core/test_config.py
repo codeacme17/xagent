@@ -1229,3 +1229,27 @@ class TestToolConcurrencyConfig:
         assert get_tool_max_concurrency() == 3
         monkeypatch.setenv("XAGENT_TOOL_MAX_CONCURRENCY", "0")
         assert get_tool_max_concurrency() == 3
+
+
+class TestSandboxConcurrencyConfig:
+    """Config for sandbox worker concurrency."""
+
+    def test_sandbox_max_concurrency_default_is_three(self, monkeypatch):
+        from xagent.config import get_sandbox_max_concurrency
+
+        monkeypatch.delenv("XAGENT_SANDBOX_MAX_CONCURRENCY", raising=False)
+        assert get_sandbox_max_concurrency() == 3
+
+    def test_sandbox_max_concurrency_env_override(self, monkeypatch):
+        from xagent.config import get_sandbox_max_concurrency
+
+        monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONCURRENCY", "5")
+        assert get_sandbox_max_concurrency() == 5
+
+    def test_sandbox_max_concurrency_invalid_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_sandbox_max_concurrency
+
+        monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONCURRENCY", "not-a-number")
+        assert get_sandbox_max_concurrency() == 3
+        monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONCURRENCY", "0")
+        assert get_sandbox_max_concurrency() == 3

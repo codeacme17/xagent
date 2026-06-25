@@ -356,7 +356,8 @@ class ToolFactory:
                     create_workspace_in_sandbox,
                 )
 
-                await create_workspace_in_sandbox(sandbox, workspace)
+                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
+                await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools

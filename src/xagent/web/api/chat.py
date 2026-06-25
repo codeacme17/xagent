@@ -995,7 +995,7 @@ class AgentServiceManager:
             sandbox_mgr = get_sandbox_manager()
             if sandbox_mgr:
                 try:
-                    sandbox = await sandbox_mgr.get_or_create_sandbox(
+                    sandbox = await sandbox_mgr.create_lease_provider(
                         "user",
                         str(workspace_owner_id),
                         workspace_config=sandbox_workspace_config,
@@ -1461,7 +1461,7 @@ class AgentServiceManager:
                     sandbox_mgr = get_sandbox_manager()
                     if sandbox_mgr:
                         try:
-                            sandbox = await sandbox_mgr.get_or_create_sandbox(
+                            sandbox = await sandbox_mgr.create_lease_provider(
                                 "user",
                                 str(workspace_owner_id),
                                 workspace_config=sandbox_workspace_config,
