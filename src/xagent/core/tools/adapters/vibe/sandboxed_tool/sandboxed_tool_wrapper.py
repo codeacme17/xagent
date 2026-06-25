@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional, Type
+from typing import Any, Mapping, Optional, Type, cast
 
 import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
@@ -393,7 +393,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         """Get the sandbox for exec test"""
         async with self._lease_sandbox() as sandbox:
             await self._ensure_dependencies(sandbox)
-            return sandbox
+            return cast(Sandbox, sandbox)
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """Synchronous execution (calls async version via asyncio.run)"""
