@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 from ..core.schemas import SearchResult
-from ..utils.user_scope import resolve_user_scope
 
 if TYPE_CHECKING:
     from .coordinator import KBCoordinator
@@ -49,68 +48,6 @@ class KBRetrievalHelperCompatibilityFacade:
 
         with bind_storage_shim_for_current_context(storage_shim):
             yield
-
-    def search_dense_engine(
-        self,
-        collection: str,
-        model_tag: str,
-        query_vector: List[float],
-        *,
-        top_k: int,
-        filters: Optional[Dict[str, Any]] = None,
-        readonly: bool = False,
-        nprobes: Optional[int] = None,
-        refine_factor: Optional[int] = None,
-        user_id: Optional[int] = None,
-        is_admin: Optional[bool] = None,
-    ) -> Tuple[List[SearchResult], str, Optional[str]]:
-        from ..retrieval.search_engine import _search_dense_engine_impl
-
-        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-        with self._storage_context():
-            return _search_dense_engine_impl(
-                collection=collection,
-                model_tag=model_tag,
-                query_vector=query_vector,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_scope.user_id,
-                is_admin=user_scope.is_admin,
-            )
-
-    async def search_dense_engine_async(
-        self,
-        collection: str,
-        model_tag: str,
-        query_vector: List[float],
-        *,
-        top_k: int,
-        filters: Optional[Dict[str, Any]] = None,
-        readonly: bool = False,
-        nprobes: Optional[int] = None,
-        refine_factor: Optional[int] = None,
-        user_id: Optional[int] = None,
-        is_admin: Optional[bool] = None,
-    ) -> Tuple[List[SearchResult], str, Optional[str]]:
-        from ..retrieval.search_engine import _search_dense_engine_async_impl
-
-        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-        with self._storage_context():
-            return await _search_dense_engine_async_impl(
-                collection=collection,
-                model_tag=model_tag,
-                query_vector=query_vector,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_scope.user_id,
-                is_admin=user_scope.is_admin,
-            )
 
     def format_search_results_for_llm(
         self,

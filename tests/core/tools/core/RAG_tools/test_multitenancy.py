@@ -34,7 +34,7 @@ from xagent.core.tools.core.RAG_tools.management.collections import (
     retry_document,
 )
 from xagent.core.tools.core.RAG_tools.parse.parse_document import parse_document
-from xagent.core.tools.core.RAG_tools.retrieval.search_engine import search_dense_engine
+from xagent.core.tools.core.RAG_tools.retrieval.search_dense import search_dense
 from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_vector_store_raw_connection,
@@ -448,7 +448,7 @@ class TestMultiTenancySearch:
             )
         )
 
-        results, _, _ = search_dense_engine(
+        resp = search_dense(
             collection="test_collection",
             model_tag="test_model",
             query_vector=[1.0],
@@ -458,7 +458,7 @@ class TestMultiTenancySearch:
             readonly=True,
         )
 
-        assert results == []
+        assert resp.results == []
 
 
 class TestToolUserContext:

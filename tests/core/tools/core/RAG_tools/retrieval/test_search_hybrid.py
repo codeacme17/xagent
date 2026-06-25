@@ -1,6 +1,6 @@
 import datetime
 from typing import Generator, Tuple
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -308,16 +308,29 @@ class TestSearchHybrid:
         return results
 
     @pytest.fixture
-    def mock_sub_searches(self) -> Generator[Tuple[Mock, Mock], None, None]:
-        """Fixture to mock dense and sparse implementation functions."""
+    def mock_sub_searches(
+        self, make_handle, routed_facade
+    ) -> Generator[Tuple[Mock, Mock], None, None]:
+        """Mock the handle's dense/sparse sub-searches and route the public call.
+
+        Re-pointed (#511): the public ``search_hybrid`` now runs the real handle
+        ``search_hybrid`` (fusion logic identical to before — it reuses the same
+        ``_rrf_fusion``/``_linear_fusion`` free functions), which calls
+        ``handle.search_dense``/``handle.search_sparse``. We patch those handle
+        methods and route the public function to that handle. The handle invokes
+        them positionally ``(model_tag, query_vector|query_text, top_k=..., ...)``
+        with NO ``collection`` kwarg (the handle owns its collection).
+        """
         search_hybrid_module = self._patch_search_hybrid_module()
+        handle, _store, _ = make_handle(collection="test_col")
 
         mock_dense = Mock()
         mock_sparse = Mock()
-        with (
-            patch.object(search_hybrid_module, "_search_dense_impl", new=mock_dense),
-            patch.object(search_hybrid_module, "_search_sparse_impl", new=mock_sparse),
-        ):
+        # Bind through the instance so calls drop the implicit ``self``.
+        object.__setattr__(handle, "search_dense", mock_dense)
+        object.__setattr__(handle, "search_sparse", mock_sparse)
+
+        with routed_facade(search_hybrid_module, handle):
             yield mock_dense, mock_sparse
 
     def test_hybrid_search_rrf_strategy(
@@ -411,9 +424,8 @@ class TestSearchHybrid:
         assert abs(response.results[1].score - 0.5) < 0.001
 
         mock_dense.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_vector=[0.1, 0.2, 0.3],
+            "test_model",
+            [0.1, 0.2, 0.3],
             top_k=4,  # top_k * 2
             filters=None,
             readonly=False,
@@ -423,9 +435,8 @@ class TestSearchHybrid:
             is_admin=False,
         )
         mock_sparse.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_text="hybrid query",
+            "test_model",
+            "hybrid query",
             top_k=4,  # top_k * 2
             filters=None,
             readonly=False,
@@ -616,9 +627,8 @@ class TestSearchHybrid:
         assert "Build index" in response.index_advice
 
         mock_dense.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_vector=[0.1, 0.2, 0.3],
+            "test_model",
+            [0.1, 0.2, 0.3],
             top_k=2,  # top_k * 2
             filters=filters,
             readonly=False,
@@ -628,9 +638,8 @@ class TestSearchHybrid:
             is_admin=False,
         )
         mock_sparse.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_text="filtered query",
+            "test_model",
+            "filtered query",
             top_k=2,  # top_k * 2
             filters=filters,
             readonly=False,
@@ -803,9 +812,8 @@ class TestSearchHybrid:
         assert any(w.code == "READONLY_MODE" for w in response.warnings)
 
         mock_dense.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_vector=[0.1, 0.2, 0.3],
+            "test_model",
+            [0.1, 0.2, 0.3],
             top_k=2,
             filters=None,
             readonly=True,  # Verify readonly is propagated
@@ -815,9 +823,8 @@ class TestSearchHybrid:
             is_admin=False,
         )
         mock_sparse.assert_called_once_with(
-            collection="test_col",
-            model_tag="test_model",
-            query_text="readonly query",
+            "test_model",
+            "readonly query",
             top_k=2,
             filters=None,
             readonly=True,  # Verify readonly is propagated

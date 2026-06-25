@@ -26,62 +26,57 @@ search_sparse_module = importlib.import_module(
 class TestSearchSparse:
     """Test search_sparse main function."""
 
-    def test_search_sparse_success_no_filters(self) -> None:
-        """Test successful sparse search with collection filter only (KB isolation)."""
-        # Mock table
-        mock_table = Mock()
-        mock_table.name = "embeddings_test_model"  # Set the table name
+    def test_search_sparse_success_no_filters(self, make_handle, routed_facade) -> None:
+        """Test successful sparse search with collection filter only (KB isolation).
 
-        # Mock FTS index exists
+        Re-pointed (#511): the public ``search_sparse`` runs the real handle FTS
+        logic against a mock ``vector_index_store``. The store-call chain
+        (open_embeddings_table -> create_index -> table.search(..fts).limit().where()
+        -> to_pandas) is identical to the legacy free-function path, so the
+        behavioral assertions are unchanged.
+        """
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
+
+        mock_table = Mock()
+        mock_table.name = "embeddings_test_model"
         mock_table.list_indices.return_value = [
             Mock(index_type="FTS", columns=["text"])
         ]
 
-        # Mock vector store
-        mock_vector_store = Mock()
-        # Return IndexResult object instead of string
-        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
-
         mock_vector_store.create_index.return_value = IndexResult(
-            status="index_ready",
-            advice=None,
-            fts_enabled=True,
+            status="index_ready", advice=None, fts_enabled=True
         )
         mock_vector_store.build_filter_expression.return_value = (
             "collection == 'test_col'"
         )
-        # open_embeddings_table now returns tuple (table, table_name)
         mock_vector_store.open_embeddings_table.return_value = (
             mock_table,
             "embeddings_test_model",
         )
 
-        with patch(
-            "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-        ) as mock_get_vector_store:
-            mock_get_vector_store.return_value = mock_vector_store
+        mock_results_df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "chunk_id": "chunk1",
+                    "text": "test content one",
+                    "_score": 0.9,
+                    "parse_hash": "hash1",
+                    "created_at": pd.Timestamp.now(),
+                }
+            ]
+        )
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = mock_results_df
 
-            # Mock search results; chain: search() -> limit() -> where() -> to_pandas()
-            mock_results_df = pd.DataFrame(
-                [
-                    {
-                        "doc_id": "doc1",
-                        "chunk_id": "chunk1",
-                        "text": "test content one",
-                        "_score": 0.9,
-                        "parse_hash": "hash1",
-                        "created_at": pd.Timestamp.now(),
-                    }
-                ]
-            )
-            mock_search = Mock()
-            mock_limit = Mock()
-            mock_where = Mock()
-            mock_table.search.return_value = mock_search
-            mock_search.limit.return_value = mock_limit
-            mock_limit.where.return_value = mock_where
-            mock_where.to_pandas.return_value = mock_results_df
-
+        with routed_facade(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",
@@ -91,79 +86,67 @@ class TestSearchSparse:
                 is_admin=True,
             )
 
-            assert isinstance(response, SparseSearchResponse)
-            assert response.status == "success"
-            assert response.total_count == 1
-            assert response.fts_enabled is True
-            assert len(response.results) == 1
-            assert response.results[0].doc_id == "doc1"
-            assert response.results[0].text == "test content one"
-            # Score is normalized from TF-IDF to similarity score (0-1 range)
-            assert abs(response.results[0].score - 0.4736842105263158) < 1e-10
-            assert not response.warnings
+        assert isinstance(response, SparseSearchResponse)
+        assert response.status == "success"
+        assert response.total_count == 1
+        assert response.fts_enabled is True
+        assert len(response.results) == 1
+        assert response.results[0].doc_id == "doc1"
+        assert response.results[0].text == "test content one"
+        # Score is normalized from TF-IDF to similarity score (0-1 range)
+        assert abs(response.results[0].score - 0.4736842105263158) < 1e-10
+        assert not response.warnings
 
-            # Verify calls: collection filter must be applied for KB isolation
-            # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
-            mock_vector_store.open_embeddings_table.assert_called_once_with(
-                "test_model"
-            )
-            mock_vector_store.build_filter_expression.assert_called_once()
-            mock_table.search.assert_called_once_with("content", query_type="fts")
-            mock_search.limit.assert_called_once_with(1)
-            mock_limit.where.assert_called_once()
-            where_arg = mock_limit.where.call_args[0][0]
-            assert "collection" in where_arg.lower() or "test_col" in where_arg
+        # Verify calls: collection filter must be applied for KB isolation
+        mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
+        mock_vector_store.build_filter_expression.assert_called_once()
+        mock_table.search.assert_called_once_with("content", query_type="fts")
+        mock_search.limit.assert_called_once_with(1)
+        mock_limit.where.assert_called_once()
+        where_arg = mock_limit.where.call_args[0][0]
+        assert "collection" in where_arg.lower() or "test_col" in where_arg
 
-    def test_search_sparse_with_filters(self) -> None:
+    def test_search_sparse_with_filters(self, make_handle, routed_facade) -> None:
         """Test sparse search with filters."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
+
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
+
+        mock_table = Mock()
+        mock_table.name = "embeddings_test_model"
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
+
+        mock_vector_store.create_index.return_value = IndexResult(
+            status="index_ready", advice=None, fts_enabled=True
+        )
+        mock_vector_store.build_filter_expression.return_value = (
+            "doc_id = 'filtered_doc' AND collection = 'test_col'"
+        )
+        mock_vector_store.open_embeddings_table.return_value = (
+            mock_table,
+            "embeddings_test_model",
+        )
+
+        mock_results_df = pd.DataFrame([])
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = mock_results_df
+
+        filters = {"doc_id": "filtered_doc", "collection": "test_col"}
+
         with patch.object(
-            search_sparse_module, "_substring_fallback", return_value=[]
+            LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ) as mock_fallback:
-            # Mock table
-            mock_table = Mock()
-            mock_table.name = "embeddings_test_model"  # Set the table name
-
-            # Mock FTS index exists
-            mock_table.list_indices.return_value = [
-                Mock(index_type="FTS", columns=["text"])
-            ]
-
-            # Mock vector store
-            mock_vector_store = Mock()
-            # Return IndexResult object instead of string
-            from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
-
-            mock_vector_store.create_index.return_value = IndexResult(
-                status="index_ready",
-                advice=None,
-                fts_enabled=True,
-            )
-            mock_vector_store.build_filter_expression.return_value = (
-                "doc_id = 'filtered_doc' AND collection = 'test_col'"
-            )
-            # open_embeddings_table now returns tuple (table, table_name)
-            mock_vector_store.open_embeddings_table.return_value = (
-                mock_table,
-                "embeddings_test_model",
-            )
-
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
-
-                mock_results_df = pd.DataFrame([])
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = mock_results_df
-
-                filters = {"doc_id": "filtered_doc", "collection": "test_col"}
-
+            with routed_facade(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -174,67 +157,56 @@ class TestSearchSparse:
                     is_admin=True,
                 )
 
-            assert response.status == "success"
-            assert response.total_count == 0
-            assert len(response.results) == 0
-            assert response.warnings == []
+        assert response.status == "success"
+        assert response.total_count == 0
+        assert len(response.results) == 0
+        assert response.warnings == []
 
-            mock_fallback.assert_called_once()
-            # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
-            mock_vector_store.open_embeddings_table.assert_called_once_with(
-                "test_model"
-            )
-            mock_vector_store.build_filter_expression.assert_called()
-            mock_table.search.assert_called_once_with(
-                "filtered content", query_type="fts"
-            )
-            mock_search.limit.assert_called_once_with(5)
-            mock_limit.where.assert_called_once()
-            mock_where.to_pandas.assert_called_once()
+        mock_fallback.assert_called_once()
+        mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
+        mock_vector_store.build_filter_expression.assert_called()
+        mock_table.search.assert_called_once_with("filtered content", query_type="fts")
+        mock_search.limit.assert_called_once_with(5)
+        mock_limit.where.assert_called_once()
+        mock_where.to_pandas.assert_called_once()
 
-    def test_search_sparse_applies_collection_filter(self) -> None:
+    def test_search_sparse_applies_collection_filter(
+        self, make_handle, routed_facade
+    ) -> None:
         """Test that search_sparse always applies collection filter for KB isolation (Issue #72)."""
-        with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
-            # Mock table
-            mock_table = Mock()
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
 
-            # Mock FTS index exists
-            mock_table.list_indices.return_value = [
-                Mock(index_type="FTS", columns=["text"])
-            ]
+        handle, mock_vector_store, _ = make_handle(collection="my_kb")
 
-            # Mock vector store
-            mock_vector_store = Mock()
-            # Return IndexResult object instead of string
-            from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        mock_table = Mock()
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
 
-            mock_vector_store.create_index.return_value = IndexResult(
-                status="index_ready",
-                advice=None,
-                fts_enabled=True,
-            )
-            mock_vector_store.build_filter_expression.return_value = (
-                "collection == 'my_kb'"
-            )
-            # open_embeddings_table now returns tuple (table, table_name)
-            mock_vector_store.open_embeddings_table.return_value = (
-                mock_table,
-                "embeddings_test_model",
-            )
+        mock_vector_store.create_index.return_value = IndexResult(
+            status="index_ready", advice=None, fts_enabled=True
+        )
+        mock_vector_store.build_filter_expression.return_value = "collection == 'my_kb'"
+        mock_vector_store.open_embeddings_table.return_value = (
+            mock_table,
+            "embeddings_test_model",
+        )
 
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = pd.DataFrame()
-
+        with patch.object(
+            LanceDBCollectionHandle, "_substring_fallback", return_value=[]
+        ):
+            with routed_facade(search_sparse_module, handle):
                 search_sparse_module.search_sparse(
                     collection="my_kb",
                     model_tag="test_model",
@@ -244,50 +216,46 @@ class TestSearchSparse:
                     is_admin=True,
                 )
 
-            mock_vector_store.build_filter_expression.assert_called_once()
-            mock_limit.where.assert_called_once()
+        mock_vector_store.build_filter_expression.assert_called_once()
+        mock_limit.where.assert_called_once()
 
-    def test_search_sparse_fts_index_missing(self) -> None:
+    def test_search_sparse_fts_index_missing(self, make_handle, routed_facade) -> None:
         """Test sparse search when FTS index is missing."""
-        with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
-            # Mock table
-            mock_table = Mock()
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
 
-            # Mock vector store - index status returned but FTS not enabled on table
-            mock_vector_store = Mock()
-            # Return IndexResult object instead of string
-            from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
 
-            mock_vector_store.create_index.return_value = IndexResult(
-                status="index_ready",
-                advice=None,
-                fts_enabled=False,  # FTS not enabled
-            )
-            mock_vector_store.build_filter_expression.return_value = (
-                "collection == 'test_col'"
-            )
-            # open_embeddings_table now returns tuple (table, table_name)
-            mock_vector_store.open_embeddings_table.return_value = (
-                mock_table,
-                "embeddings_test_model",
-            )
+        mock_table = Mock()
+        mock_table.list_indices.return_value = []
 
-            # Make list_indices return no FTS index
-            mock_table.list_indices.return_value = []
+        mock_vector_store.create_index.return_value = IndexResult(
+            status="index_ready",
+            advice=None,
+            fts_enabled=False,  # FTS not enabled
+        )
+        mock_vector_store.build_filter_expression.return_value = (
+            "collection == 'test_col'"
+        )
+        mock_vector_store.open_embeddings_table.return_value = (
+            mock_table,
+            "embeddings_test_model",
+        )
 
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = pd.DataFrame()
-
+        with patch.object(
+            LanceDBCollectionHandle, "_substring_fallback", return_value=[]
+        ):
+            with routed_facade(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -297,60 +265,51 @@ class TestSearchSparse:
                     is_admin=True,
                 )
 
-            assert response.status == "success"
-            assert response.fts_enabled is False
-            assert any(w.code == "FTS_INDEX_MISSING" for w in response.warnings)
+        assert response.status == "success"
+        assert response.fts_enabled is False
+        assert any(w.code == "FTS_INDEX_MISSING" for w in response.warnings)
 
-            # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
-            mock_vector_store.open_embeddings_table.assert_called_once_with(
-                "test_model"
-            )
-            mock_table.search.assert_called_once_with("query", query_type="fts")
-            mock_search.limit.assert_called_once_with(1)
+        mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
+        mock_table.search.assert_called_once_with("query", query_type="fts")
+        mock_search.limit.assert_called_once_with(1)
 
-    def test_search_sparse_readonly_mode(self) -> None:
+    def test_search_sparse_readonly_mode(self, make_handle, routed_facade) -> None:
         """Test sparse search in readonly mode."""
-        with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
-            # Mock table
-            mock_table = Mock()
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
 
-            # Mock vector store
-            mock_vector_store = Mock()
-            # Return IndexResult object instead of string
-            from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
 
-            mock_vector_store.create_index.return_value = IndexResult(
-                status="index_ready",
-                advice=None,
-                fts_enabled=True,
-            )
-            mock_vector_store.build_filter_expression.return_value = (
-                "collection == 'test_col'"
-            )
-            # open_embeddings_table now returns tuple (table, table_name)
-            mock_vector_store.open_embeddings_table.return_value = (
-                mock_table,
-                "embeddings_test_model",
-            )
+        mock_table = Mock()
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
 
-            # FTS index exists
-            mock_table.list_indices.return_value = [
-                Mock(index_type="FTS", columns=["text"])
-            ]
+        mock_vector_store.create_index.return_value = IndexResult(
+            status="index_ready", advice=None, fts_enabled=True
+        )
+        mock_vector_store.build_filter_expression.return_value = (
+            "collection == 'test_col'"
+        )
+        mock_vector_store.open_embeddings_table.return_value = (
+            mock_table,
+            "embeddings_test_model",
+        )
 
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = pd.DataFrame()
-
+        with patch.object(
+            LanceDBCollectionHandle, "_substring_fallback", return_value=[]
+        ):
+            with routed_facade(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -361,25 +320,23 @@ class TestSearchSparse:
                     is_admin=True,
                 )
 
-            assert response.status == "success"
-            # FTS should be enabled since the table has the index
-            assert response.fts_enabled is True
-            assert any(w.code == "READONLY_MODE" for w in response.warnings)
+        assert response.status == "success"
+        # FTS should be enabled since the table has the index
+        assert response.fts_enabled is True
+        assert any(w.code == "READONLY_MODE" for w in response.warnings)
 
-            # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
-            mock_vector_store.open_embeddings_table.assert_called_once_with(
-                "test_model"
-            )
-            mock_table.search.assert_called_once_with("query", query_type="fts")
-            mock_search.limit.assert_called_once_with(1)
+        mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
+        mock_table.search.assert_called_once_with("query", query_type="fts")
+        mock_search.limit.assert_called_once_with(1)
 
     @patch(
         "xagent.core.tools.core.RAG_tools.utils.model_resolver.resolve_embedding_adapter"
     )
-    def test_search_sparse_database_error(self, mock_resolve: Mock) -> None:
+    def test_search_sparse_database_error(
+        self, mock_resolve: Mock, make_handle, routed_facade
+    ) -> None:
         """Test error handling during database operation."""
-        # Mock vector store that raises exception when opening table
-        mock_vector_store = Mock()
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
         db_exception_message = "DB connection failed"
         mock_vector_store.open_embeddings_table.side_effect = Exception(
             db_exception_message
@@ -389,11 +346,7 @@ class TestSearchSparse:
         mock_cfg.model_name = "legacy_model"
         mock_resolve.return_value = (mock_cfg, object())
 
-        with patch(
-            "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-        ) as mock_get_vector_store:
-            mock_get_vector_store.return_value = mock_vector_store
-
+        with routed_facade(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",
@@ -414,52 +367,45 @@ class TestSearchSparse:
 
         # Verify calls - open_embeddings_table is called once (handles fallback internally)
         assert mock_vector_store.open_embeddings_table.call_count == 1
-        # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
 
-    def test_search_sparse_empty_results(self) -> None:
+    def test_search_sparse_empty_results(self, make_handle, routed_facade) -> None:
         """Test sparse search returning no results."""
-        with patch.object(search_sparse_module, "_substring_fallback", return_value=[]):
-            # Mock table
-            mock_table = Mock()
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
 
-            # Mock vector store
-            mock_vector_store = Mock()
-            # Return IndexResult object instead of string
-            from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
 
-            mock_vector_store.create_index.return_value = IndexResult(
-                status="index_ready",
-                advice=None,
-                fts_enabled=True,
-            )
-            mock_vector_store.build_filter_expression.return_value = (
-                "collection == 'test_col'"
-            )
-            # open_embeddings_table now returns tuple (table, table_name)
-            mock_vector_store.open_embeddings_table.return_value = (
-                mock_table,
-                "embeddings_test_model",
-            )
+        mock_table = Mock()
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
 
-            # FTS index exists
-            mock_table.list_indices.return_value = [
-                Mock(index_type="FTS", columns=["text"])
-            ]
+        mock_vector_store.create_index.return_value = IndexResult(
+            status="index_ready", advice=None, fts_enabled=True
+        )
+        mock_vector_store.build_filter_expression.return_value = (
+            "collection == 'test_col'"
+        )
+        mock_vector_store.open_embeddings_table.return_value = (
+            mock_table,
+            "embeddings_test_model",
+        )
 
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = pd.DataFrame()
-
+        with patch.object(
+            LanceDBCollectionHandle, "_substring_fallback", return_value=[]
+        ):
+            with routed_facade(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -469,22 +415,25 @@ class TestSearchSparse:
                     is_admin=True,
                 )
 
-            assert response.status == "success"
-            assert response.total_count == 0
-            assert len(response.results) == 0
-            assert response.warnings == []
+        assert response.status == "success"
+        assert response.total_count == 0
+        assert len(response.results) == 0
+        assert response.warnings == []
 
-            # Note: model_tag is passed as-is to open_embeddings_table (no pre-transformation)
-            mock_vector_store.open_embeddings_table.assert_called_once_with(
-                "test_model"
-            )
-            mock_table.search.assert_called_once_with("no matches", query_type="fts")
-            mock_search.limit.assert_called_once_with(5)
+        mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
+        mock_table.search.assert_called_once_with("no matches", query_type="fts")
+        mock_search.limit.assert_called_once_with(5)
 
-    def test_search_sparse_triggers_fallback_with_results(self) -> None:
+    def test_search_sparse_triggers_fallback_with_results(
+        self, make_handle, routed_facade
+    ) -> None:
         """Ensure fallback populates results and emits an FTS warning."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
 
-        def _fake_fallback(**kwargs: object) -> List[SearchResult]:
+        def _fake_fallback(self, **kwargs: object) -> List[SearchResult]:
             current_warnings: List[SearchWarning] = kwargs["current_warnings"]  # type: ignore[assignment]
             current_warnings.append(
                 SearchWarning(
@@ -506,49 +455,39 @@ class TestSearchSparse:
                 )
             ]
 
-        # Mock table
-        mock_table = Mock()
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
 
-        # Mock vector store
-        mock_vector_store = Mock()
-        # Return IndexResult object instead of string
-        from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
+        mock_table = Mock()
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
 
         mock_vector_store.create_index.return_value = IndexResult(
-            status="index_ready",
-            advice=None,
-            fts_enabled=True,
+            status="index_ready", advice=None, fts_enabled=True
         )
         mock_vector_store.build_filter_expression.return_value = (
             "collection == 'test_col'"
         )
-        # open_embeddings_table now returns tuple (table, table_name)
         mock_vector_store.open_embeddings_table.return_value = (
             mock_table,
             "embeddings_test_model",
         )
 
-        # FTS index exists
-        mock_table.list_indices.return_value = [
-            Mock(index_type="FTS", columns=["text"])
-        ]
+        mock_search = Mock()
+        mock_limit = Mock()
+        mock_where = Mock()
+        mock_table.search.return_value = mock_search
+        mock_search.limit.return_value = mock_limit
+        mock_limit.where.return_value = mock_where
+        mock_where.to_pandas.return_value = pd.DataFrame()
 
         with patch.object(
-            search_sparse_module, "_substring_fallback", side_effect=_fake_fallback
+            LanceDBCollectionHandle,
+            "_substring_fallback",
+            autospec=True,
+            side_effect=_fake_fallback,
         ):
-            with patch(
-                "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-            ) as mock_get_vector_store:
-                mock_get_vector_store.return_value = mock_vector_store
-
-                mock_search = Mock()
-                mock_limit = Mock()
-                mock_where = Mock()
-                mock_table.search.return_value = mock_search
-                mock_search.limit.return_value = mock_limit
-                mock_limit.where.return_value = mock_where
-                mock_where.to_pandas.return_value = pd.DataFrame()
-
+            with routed_facade(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -563,34 +502,27 @@ class TestSearchSparse:
         assert response.results[0].doc_id == "doc-fallback"
         assert any(w.code == "FTS_FALLBACK" for w in response.warnings)
 
-    def test_search_sparse_score_clamping(self) -> None:
+    def test_search_sparse_score_clamping(self, make_handle, routed_facade) -> None:
         """Test that sparse search scores are properly clamped to [0, 1] range."""
-        # Mock table
-        mock_table = Mock()
-
-        # Mock vector store
-        mock_vector_store = Mock()
-        # Return IndexResult object instead of string
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
 
+        handle, mock_vector_store, _ = make_handle(collection="test_col")
+
+        mock_table = Mock()
+        mock_table.list_indices.return_value = [
+            Mock(index_type="FTS", columns=["text"])
+        ]
+
         mock_vector_store.create_index.return_value = IndexResult(
-            status="index_ready",
-            advice=None,
-            fts_enabled=True,
+            status="index_ready", advice=None, fts_enabled=True
         )
         mock_vector_store.build_filter_expression.return_value = (
             "collection == 'test_col'"
         )
-        # open_embeddings_table now returns tuple (table, table_name)
         mock_vector_store.open_embeddings_table.return_value = (
             mock_table,
             "embeddings_test_model",
         )
-
-        # FTS index exists
-        mock_table.list_indices.return_value = [
-            Mock(index_type="FTS", columns=["text"])
-        ]
 
         mock_search = Mock()
         mock_limit = Mock()
@@ -613,11 +545,7 @@ class TestSearchSparse:
         )
         mock_where.to_pandas.return_value = test_data
 
-        with patch(
-            "xagent.core.tools.core.RAG_tools.retrieval.search_sparse.get_vector_index_store"
-        ) as mock_get_vector_store:
-            mock_get_vector_store.return_value = mock_vector_store
-
+        with routed_facade(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",
@@ -636,10 +564,14 @@ class TestSearchSparse:
         assert abs(response.results[0].score - expected_score) < 0.0001
 
     def test_search_sparse_fts_fallback_warning_content(self) -> None:
-        """Test that FTS_FALLBACK warning has correct content and fallback_action."""
-        # Test the warning creation directly by calling _substring_fallback
-        from xagent.core.tools.core.RAG_tools.retrieval.search_sparse import (
-            _substring_fallback,
+        """Test that FTS_FALLBACK warning has correct content and fallback_action.
+
+        The _substring_fallback logic now lives on LanceDBCollectionHandle.
+        Call it via the handle instance to verify warning message content.
+        """
+        from xagent.core.tools.core.RAG_tools.core.schemas import SearchWarning
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
         )
 
         warnings: List[SearchWarning] = []
@@ -660,7 +592,9 @@ class TestSearchSparse:
         )
         mock_table.to_batches.return_value = [mock_batch]
 
-        results = _substring_fallback(
+        # Create a handle instance to call the method
+        handle = LanceDBCollectionHandle.__new__(LanceDBCollectionHandle)
+        results = handle._substring_fallback(
             table=mock_table,
             collection="test_col",
             query_text="test query",
