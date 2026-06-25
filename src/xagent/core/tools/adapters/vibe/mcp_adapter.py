@@ -46,6 +46,36 @@ def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
     return f"{exc}: " + ", ".join(messages)
 
 
+def _normalize_concurrent_tools(value: Any) -> list[str]:
+    """Normalize raw MCP tool-name allowlists from server config."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _connection_concurrency_config(
+    connection: Mapping[str, Any],
+) -> tuple[bool, list[str]]:
+    return (
+        bool(connection.get("concurrency_safe", False)),
+        _normalize_concurrent_tools(connection.get("concurrent_tools")),
+    )
+
+
+def _mcp_tool_is_concurrency_safe(
+    tool_name: str, *, concurrency_safe: bool, concurrent_tools: list[str]
+) -> bool:
+    if not concurrency_safe:
+        return False
+    if not concurrent_tools:
+        return True
+    return tool_name in set(concurrent_tools)
+
+
 class MCPToolAdapter(AbstractBaseTool):
     """
     Adapter that converts an MCP tool into an Agent system Tool.
@@ -67,6 +97,8 @@ class MCPToolAdapter(AbstractBaseTool):
         visibility: Optional[ToolVisibility] = None,
         allow_users: Optional[List[str]] = None,
         source_server: Optional[str] = None,
+        concurrency_safe: bool = False,
+        concurrent_tools: Optional[List[str]] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -80,6 +112,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 (``normalize_mcp_server_name``), surfaced on
                 ``metadata.source_server`` so server-scoped selection matches
                 by structured equality rather than re-parsing the tool name.
+            concurrency_safe: Whether the server operator has opted this MCP
+                server into concurrent tool execution.
+            concurrent_tools: Optional allowlist of raw MCP tool names. Empty
+                means every tool from an opted-in server is safe.
         """
         self.mcp_tool = mcp_tool
         self.connection = connection
@@ -87,6 +123,11 @@ class MCPToolAdapter(AbstractBaseTool):
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
         self.source_server = source_server
+        self.concurrency_safe = _mcp_tool_is_concurrency_safe(
+            self.mcp_tool.name,
+            concurrency_safe=concurrency_safe,
+            concurrent_tools=_normalize_concurrent_tools(concurrent_tools),
+        )
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -482,6 +523,8 @@ def _build_mcp_tool_adapter(
     name_prefix: str = "mcp_",
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
+    concurrency_safe: bool = False,
+    concurrent_tools: Optional[List[str]] = None,
 ) -> MCPToolAdapter:
     """Create MCP tool adapter."""
     # Create tool name with server prefix
@@ -499,6 +542,8 @@ def _build_mcp_tool_adapter(
         visibility=visibility,
         allow_users=allow_users,
         source_server=normalize_mcp_server_name(server_name),
+        concurrency_safe=concurrency_safe,
+        concurrent_tools=concurrent_tools,
     )
 
 
@@ -517,6 +562,7 @@ async def _load_direct_mcp_tools(
     transport = connection.get("transport", "")
     non_retryable = {"oauth", "unknown"}
     max_attempts = 1 if transport in non_retryable else 3
+    concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
 
     for attempt in range(max_attempts):
         try:
@@ -544,6 +590,8 @@ async def _load_direct_mcp_tools(
                 name_prefix=name_prefix,
                 visibility=visibility,
                 allow_users=allow_users,
+                concurrency_safe=concurrency_safe,
+                concurrent_tools=concurrent_tools,
             )
 
             agent_tools.append(adapter)
@@ -587,11 +635,16 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             if sandbox is not None and should_sandbox_mcp_connection(connection):
+                concurrency_safe, concurrent_tools = _connection_concurrency_config(
+                    connection
+                )
 
                 def tool_builder(
                     mcp_tool: MCPTool,
                     _server_name: str = server_name,
                     _connection: Connection = connection,
+                    _concurrency_safe: bool = concurrency_safe,
+                    _concurrent_tools: list[str] = concurrent_tools,
                 ) -> MCPToolAdapter:
                     return _build_mcp_tool_adapter(
                         _server_name,
@@ -600,6 +653,8 @@ async def load_mcp_tools_as_agent_tools(
                         name_prefix=name_prefix,
                         visibility=visibility,
                         allow_users=allow_users,
+                        concurrency_safe=_concurrency_safe,
+                        concurrent_tools=_concurrent_tools,
                     )
 
                 server_tools = await load_sandboxed_mcp_tools(

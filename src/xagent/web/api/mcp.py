@@ -187,7 +187,7 @@ class MCPConfigFieldRegistry:
     STRING_LIST_FIELDS = {"args", "volumes"}
     KEY_VALUE_DICT_FIELDS = {"env", "headers", "docker_environment"}
     PORT_MAPPING_FIELDS = {"bind_ports"}
-    BOOLEAN_FIELDS = {"auto_start"}
+    BOOLEAN_FIELDS = {"auto_start", "concurrency_safe"}
     JSON_FIELDS = {"headers"}  # Fields that should prefer JSON parsing
 
     @classmethod
@@ -295,6 +295,8 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
         "headers": "headers",
         "timeout": "timeout",
         "auth": "auth",
+        "concurrency_safe": "concurrency_safe",
+        "concurrent_tools": "concurrent_tools",
         "docker_url": "docker_url",
         "docker_image": "docker_image",
         "docker_environment": "docker_environment",
