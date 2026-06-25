@@ -110,6 +110,8 @@ export function ConnectMcpDialog({
     config: {} as Record<string, any>
   })
 
+  const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
+
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300)
     return () => clearTimeout(timer)
@@ -631,7 +633,7 @@ export function ConnectMcpDialog({
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {apps.map(app => {
-                      const isGloballyConnected = app.is_connected || globalMcpServers.some(s => s.name.toLowerCase() === app.id.toLowerCase() || s.name.toLowerCase() === app.name.toLowerCase())
+                      const isGloballyConnected = isAppConnected(app)
                       const isSelected = localSelectedServers.includes(app.id) || localSelectedServers.includes(app.name)
                       const isLoading = loadingApp === app.id
                       return (
@@ -819,7 +821,7 @@ export function ConnectMcpDialog({
           }
           return selectedApp;
         })()}
-        isGloballyConnected={selectedApp ? (selectedApp.is_connected || globalMcpServers.some(s => s.name.toLowerCase() === selectedApp.id.toLowerCase() || s.name.toLowerCase() === selectedApp.name.toLowerCase())) : false}
+        isGloballyConnected={selectedApp ? isAppConnected(selectedApp) : false}
         onSuccess={() => {
           if (onSuccess) onSuccess();
           loadApps();

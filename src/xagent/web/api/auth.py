@@ -1009,6 +1009,46 @@ def _ensure_user_mcp_server(
 
     from ..models.mcp import MCPServer, UserMCPServer
 
+    def _oauth_auth_metadata() -> dict[str, str]:
+        metadata = {"app_id": str(app_info["id"])}
+        provider = app_info.get("provider")
+        if provider:
+            metadata["provider"] = str(provider)
+        return metadata
+
+    def _ensure_server_matches_oauth_app(server: MCPServer) -> None:
+        if server.transport != "oauth":
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with an existing MCP server "
+                f"using transport '{server.transport}'. Delete or rename that custom "
+                "server before connecting the official OAuth app."
+            )
+
+        auth = server.auth if isinstance(server.auth, dict) else {}
+        expected_app_id = str(app_info["id"])
+        existing_app_id = auth.get("app_id")
+        if existing_app_id and str(existing_app_id) != expected_app_id:
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with MCP server metadata "
+                f"for app '{existing_app_id}'."
+            )
+
+        expected_provider = app_info.get("provider")
+        existing_provider = auth.get("provider")
+        if (
+            expected_provider
+            and existing_provider
+            and str(existing_provider) != str(expected_provider)
+        ):
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with MCP server provider "
+                f"'{existing_provider}'."
+            )
+
+        auth.update(_oauth_auth_metadata())
+        server.auth = auth
+        server.description = app_info.get("description") or server.description
+
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
     if not mcp_server:
         mcp_server = MCPServer(
@@ -1016,6 +1056,7 @@ def _ensure_user_mcp_server(
             description=app_info["description"],
             managed="external",
             transport="oauth",
+            auth=_oauth_auth_metadata(),
         )
         db.add(mcp_server)
         try:
@@ -1027,6 +1068,8 @@ def _ensure_user_mcp_server(
             )
             if not mcp_server:
                 raise
+
+    _ensure_server_matches_oauth_app(mcp_server)
 
     user_mcp = (
         db.query(UserMCPServer)

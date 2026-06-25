@@ -1,11 +1,12 @@
 import os
 import tempfile
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.web.api.admin_mcp import admin_mcp_router
-from xagent.web.api.auth import auth_router
+from xagent.web.api.auth import _ensure_user_mcp_server, auth_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -117,6 +118,38 @@ def _connect_app_for_user(username: str, server_name: str) -> None:
         db.close()
 
 
+def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        server = MCPServer(
+            name=server_name,
+            description="custom stdio connector",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@floriscornel/teams-mcp@latest"],
+        )
+        db.add(server)
+        db.flush()
+
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
     temp_dir = _setup_test_db()
     try:
@@ -143,6 +176,87 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
         app_ids = {app["id"] for app in response.json()}
         assert "visible-app" in app_ids
         assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=teams",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        teams_app = next(app for app in response.json() if app["id"] == "teams")
+        assert teams_app["is_connected"] is False
+        assert "server_id" not in teams_app
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == "regular").first()
+            assert user is not None
+
+            with pytest.raises(ValueError, match="conflicts with an existing MCP server"):
+                _ensure_user_mcp_server(
+                    db,
+                    str(user.id),
+                    {
+                        "id": "teams",
+                        "name": "Teams",
+                        "description": "Connect to Microsoft Teams.",
+                        "provider": "microsoft",
+                    },
+                )
+        finally:
+            db.close()
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
