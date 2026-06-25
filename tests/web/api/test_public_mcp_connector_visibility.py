@@ -1,11 +1,14 @@
 import os
 import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.web.api.admin_mcp import admin_mcp_router
+import xagent.web.api.mcp as mcp_api
 from xagent.web.api.auth import _ensure_user_mcp_server, auth_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
@@ -148,6 +151,27 @@ def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
         db.commit()
     finally:
         db.close()
+
+
+def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is timezone.utc:
+                return cls(2026, 1, 1, 8, 0, tzinfo=timezone.utc)
+            return cls(2026, 1, 1, 16, 0)
+
+    monkeypatch.setattr(mcp_api, "datetime", FixedDateTime)
+
+    oauth_account = SimpleNamespace(
+        access_token="access-token",
+        refresh_token=None,
+        expires_at=FixedDateTime(2026, 1, 1, 9, 0),
+    )
+
+    assert mcp_api._oauth_account_can_connect(oauth_account) is True
 
 
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:

@@ -450,7 +450,10 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     if getattr(oauth_account, "refresh_token", None):
         return True
 
-    now = datetime.now(timezone.utc if expires_at.tzinfo else None)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
     return expires_at > now
 
 

@@ -15,6 +15,9 @@ interface McpApp {
   transport: string
   provider: string
   category: string
+  is_connected?: boolean
+  server_id?: number
+  connected_account?: string
 }
 
 interface McpAppsContextType {

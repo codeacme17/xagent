@@ -52,10 +52,15 @@ def _token_for(user: User) -> str:
     )
 
 
-def _provider(auth_url: str, default_scopes=None, redirect_uri=None):
+def _provider(
+    auth_url: str,
+    default_scopes=None,
+    redirect_uri=None,
+    client_id: str = "test-client-id",
+):
     """A duck-typed stand-in for the OAuthProvider ORM row."""
     return SimpleNamespace(
-        client_id=encrypt_value("test-client-id"),
+        client_id=encrypt_value(client_id),
         auth_url=auth_url,
         redirect_uri=redirect_uri,
         default_scopes=default_scopes or [],
@@ -175,3 +180,55 @@ def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     )
     qs = parse_qs(urlparse(_location(resp)).query)
     assert "prompt" not in qs
+
+
+def test_login_uses_env_client_id_when_provider_client_id_is_empty(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("MICROSOFT_CLIENT_ID", "env-client-id")
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+        client_id="",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["client_id"] == ["env-client-id"]
+
+
+def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("MICROSOFT_CLIENT_ID", raising=False)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+        client_id="",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 500
+    assert "MICROSOFT_CLIENT_ID" in resp.body.decode()

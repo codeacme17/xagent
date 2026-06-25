@@ -45,6 +45,48 @@ SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def _oauth_env_name(provider: str, suffix: str) -> str:
+    return f"{provider.upper()}_{suffix}"
+
+
+def _resolve_oauth_secret(
+    provider: str, encrypted_value: Optional[str], env_suffix: str
+) -> str:
+    from ...core.utils.encryption import decrypt_value
+
+    value = decrypt_value(encrypted_value or "")
+    if value:
+        return value
+    return os.environ.get(_oauth_env_name(provider, env_suffix), "")
+
+
+def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
+    if getattr(db_provider, "redirect_uri", None):
+        return str(db_provider.redirect_uri)
+    return os.environ.get(
+        _oauth_env_name(provider, "REDIRECT_URI"),
+        f"http://localhost:8000/api/auth/{provider}/callback",
+    )
+
+
+def _oauth_provider_config_error(
+    provider: str, missing_env_names: list[str]
+) -> HTMLResponse:
+    import html
+
+    escaped_provider = html.escape(provider)
+    escaped_missing = html.escape(", ".join(missing_env_names))
+    return HTMLResponse(
+        content=(
+            "<h1>Error: OAuth provider not configured</h1>"
+            f"<p>Missing {escaped_missing} for provider {escaped_provider}.</p>"
+            "<p>Configure the provider in admin settings or set the corresponding "
+            "environment variables and restart the backend.</p>"
+        ),
+        status_code=500,
+    )
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -931,19 +973,14 @@ def generic_oauth_login(
             content="<h1>Error: Provider not configured</h1>", status_code=500
         )
 
-    from ...core.utils.encryption import decrypt_value
-
-    client_id = decrypt_value(db_provider.client_id)
+    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+    if not client_id:
+        return _oauth_provider_config_error(
+            provider, [_oauth_env_name(provider, "CLIENT_ID")]
+        )
     auth_url = db_provider.auth_url
 
-    redirect_uri = None
-    if getattr(db_provider, "redirect_uri", None):
-        redirect_uri = db_provider.redirect_uri
-    if not redirect_uri:
-        redirect_uri = os.environ.get(
-            f"{provider.upper()}_REDIRECT_URI",
-            f"http://localhost:8000/api/auth/{provider}/callback",
-        )
+    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     user_id = None
     if token:
@@ -1130,21 +1167,21 @@ def generic_oauth_callback(
             content="<h1>Error: Provider not configured</h1>", status_code=500
         )
 
-    from ...core.utils.encryption import decrypt_value
-
-    client_id = decrypt_value(db_provider.client_id)
-    client_secret = decrypt_value(db_provider.client_secret)
+    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+    client_secret = _resolve_oauth_secret(
+        provider, db_provider.client_secret, "CLIENT_SECRET"
+    )
+    missing_config = []
+    if not client_id:
+        missing_config.append(_oauth_env_name(provider, "CLIENT_ID"))
+    if not client_secret:
+        missing_config.append(_oauth_env_name(provider, "CLIENT_SECRET"))
+    if missing_config:
+        return _oauth_provider_config_error(provider, missing_config)
     token_url = db_provider.token_url
     userinfo_url = db_provider.userinfo_url
 
-    redirect_uri = None
-    if getattr(db_provider, "redirect_uri", None):
-        redirect_uri = db_provider.redirect_uri
-    if not redirect_uri:
-        redirect_uri = os.environ.get(
-            f"{provider.upper()}_REDIRECT_URI",
-            f"http://localhost:8000/api/auth/{provider}/callback",
-        )
+    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     try:
         data = {
