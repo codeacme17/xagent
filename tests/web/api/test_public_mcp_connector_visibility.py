@@ -16,6 +16,7 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 
 
 def override_get_db():
@@ -157,6 +158,26 @@ def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
         db.close()
 
 
+def _connect_oauth_account_for_user(username: str, provider: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        db.add(
+            UserOAuth(
+                user_id=user.id,
+                provider=provider,
+                access_token="access-token",
+                provider_user_id=f"{provider}-user",
+                email=f"{provider}@example.com",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_connected_non_oauth_public_app_is_marked_connected() -> None:
     temp_dir = _setup_test_db()
     try:
@@ -192,6 +213,94 @@ def test_connected_non_oauth_public_app_is_marked_connected() -> None:
         public_app = next(app for app in response.json() if app["id"] == "public-stdio")
         assert public_app["is_connected"] is True
         assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_non_oauth_public_app_matches_space_hyphen_name_variant() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "space-hyphen",
+            "Different Display Name",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Space Hyphen")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=different",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "space-hyphen")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_remote_connector_builds_oauth_connectability_once_per_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user("regular", "microsoft")
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+
+        assert checked_providers == ["microsoft"]
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
