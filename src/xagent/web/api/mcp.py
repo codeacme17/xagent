@@ -9,7 +9,7 @@ import json
 import logging
 import shlex
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -518,7 +518,7 @@ def _connected_oauth_server_for_app(
         return None, None
 
     email = getattr(oauth_account, "email", None)
-    return server.id, str(email) if email else None
+    return cast(int, server.id), str(email) if email else None
 
 
 @mcp_router.get("/apps", response_model=List[dict])
@@ -533,12 +533,15 @@ def list_mcp_apps(
     """Get the list of available MCP applications in the library."""
 
     # Query connected servers for the current user
-    user_mcps = (
-        db.query(MCPServer, UserMCPServer)
-        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(UserMCPServer.user_id == current_user.id)
-        .all()
-    )
+    user_mcps = [
+        (server, user_mcp)
+        for server, user_mcp in (
+            db.query(MCPServer, UserMCPServer)
+            .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+            .filter(UserMCPServer.user_id == current_user.id)
+            .all()
+        )
+    ]
 
     # Also fetch user oauth accounts to get the connected email
     from ..models.user_oauth import UserOAuth

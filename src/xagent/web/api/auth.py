@@ -1061,7 +1061,7 @@ def _ensure_user_mcp_server(
                 "server before connecting the official OAuth app."
             )
 
-        auth = server.auth if isinstance(server.auth, dict) else {}
+        auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
         expected_app_id = str(app_info["id"])
         existing_app_id = auth.get("app_id")
         if existing_app_id and str(existing_app_id) != expected_app_id:
@@ -1083,7 +1083,7 @@ def _ensure_user_mcp_server(
             )
 
         auth.update(_oauth_auth_metadata())
-        server.auth = auth
+        cast(Any, server).auth = auth
         server.description = app_info.get("description") or server.description
 
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()

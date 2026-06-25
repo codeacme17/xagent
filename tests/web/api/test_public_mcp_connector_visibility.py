@@ -7,8 +7,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from xagent.web.api.admin_mcp import admin_mcp_router
 import xagent.web.api.mcp as mcp_api
+from xagent.web.api.admin_mcp import admin_mcp_router
 from xagent.web.api.auth import _ensure_user_mcp_server, auth_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
@@ -210,7 +210,9 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
             pass
 
 
-def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> None:
+def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> (
+    None
+):
     temp_dir = _setup_test_db()
     try:
         _setup_admin()
@@ -268,7 +270,9 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
             user = db.query(User).filter(User.username == "regular").first()
             assert user is not None
 
-            with pytest.raises(ValueError, match="conflicts with an existing MCP server"):
+            with pytest.raises(
+                ValueError, match="conflicts with an existing MCP server"
+            ):
                 _ensure_user_mcp_server(
                     db,
                     str(user.id),
