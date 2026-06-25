@@ -88,6 +88,72 @@ class TestDeepSeekLLM:
         assert "enable_thinking" not in call_kwargs["extra_body"]
 
     @pytest.mark.asyncio
+    async def test_chat_disables_thinking_by_default(
+        self, llm, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_disables_thinking_by_default(self, llm, mocker):
+        async def stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            reasoning_content=None,
+                            content="Hello",
+                            tool_calls=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                model_dump=lambda: {"id": "content"},
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            reasoning_content=None,
+                            content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                model_dump=lambda: {"id": "end"},
+            )
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hello"}])
+        ]
+
+        assert [chunk.delta for chunk in chunks if chunk.type == ChunkType.TOKEN] == [
+            "Hello"
+        ]
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.asyncio
     async def test_tool_calls_disable_thinking_by_default(
         self, llm, mock_tool_call_completion, mocker
     ):

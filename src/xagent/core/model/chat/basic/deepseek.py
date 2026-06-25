@@ -114,7 +114,7 @@ class DeepSeekLLM(OpenAILLM):
                 extra_body["thinking"] = {"type": "enabled"}
             else:
                 extra_body["thinking"] = {"type": "disabled"}
-        elif tools or response_format or output_config:
+        else:
             extra_body["thinking"] = {"type": "disabled"}
 
         return extra_body
