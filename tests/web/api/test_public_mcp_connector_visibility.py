@@ -70,7 +70,11 @@ def _login(username: str, password: str) -> dict[str, str]:
 
 
 def _create_public_app(
-    headers: dict[str, str], app_id: str, name: str, is_visible_in_connector: bool
+    headers: dict[str, str],
+    app_id: str,
+    name: str,
+    is_visible_in_connector: bool,
+    transport: str = "oauth",
 ) -> None:
     response = client.post(
         "/api/admin/mcp/apps",
@@ -80,7 +84,7 @@ def _create_public_app(
             "name": name,
             "description": f"{name} description",
             "icon": "",
-            "transport": "oauth",
+            "transport": transport,
             "provider_name": None,
             "category": "Communication",
             "oauth_scopes": [],
@@ -151,6 +155,51 @@ def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
         db.commit()
     finally:
         db.close()
+
+
+def test_connected_non_oauth_public_app_is_marked_connected() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "public-stdio",
+            "Public Stdio",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Public Stdio")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=public",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "public-stdio")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
 
 
 def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
