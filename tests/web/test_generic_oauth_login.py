@@ -17,7 +17,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
-from xagent.web.api.auth import create_access_token, generic_oauth_login
+from xagent.web.api.auth import (
+    _resolve_oauth_secret,
+    create_access_token,
+    generic_oauth_login,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 
@@ -207,6 +211,26 @@ def test_login_uses_env_client_id_when_provider_client_id_is_empty(
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["client_id"] == ["env-client-id"]
+
+
+@pytest.mark.parametrize("encrypted_value", [None, ""])
+def test_resolve_oauth_secret_uses_env_without_decrypting_empty_values(
+    encrypted_value, monkeypatch
+):
+    from xagent.core.utils import encryption
+
+    def fail_on_empty_decrypt(value: str) -> str:
+        if not value:
+            raise ValueError("empty values should not be decrypted")
+        return "db-secret"
+
+    monkeypatch.setattr(encryption, "decrypt_value", fail_on_empty_decrypt)
+    monkeypatch.setenv("MICROSOFT_CLIENT_SECRET", "env-secret")
+
+    assert (
+        _resolve_oauth_secret("microsoft", encrypted_value, "CLIENT_SECRET")
+        == "env-secret"
+    )
 
 
 def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):

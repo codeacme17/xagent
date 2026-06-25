@@ -54,9 +54,10 @@ def _resolve_oauth_secret(
 ) -> str:
     from ...core.utils.encryption import decrypt_value
 
-    value = decrypt_value(encrypted_value or "")
-    if value:
-        return value
+    if encrypted_value:
+        value = decrypt_value(encrypted_value)
+        if value:
+            return value
     return os.environ.get(_oauth_env_name(provider, env_suffix), "")
 
 
