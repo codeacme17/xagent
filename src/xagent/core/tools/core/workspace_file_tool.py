@@ -327,20 +327,25 @@ class WorkspaceFileOperations:
         resolved_path = self._resolve_path(file_path, "output")
         logger.debug("Resolved path: %s", resolved_path)
 
-        if create_dirs:
-            logger.debug("Creating parent directories for: %s", resolved_path.parent)
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            if create_dirs:
+                logger.debug(
+                    "Creating parent directories for: %s", resolved_path.parent
+                )
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use auto_register context to automatically register files
-        with self.workspace.auto_register_files():
-            logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
-            with open(resolved_path, "w", encoding=encoding) as f:
-                f.write(content)
+            # Use auto_register context to automatically register files
+            with self.workspace.auto_register_files():
+                logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
+                with open(resolved_path, "w", encoding=encoding) as f:
+                    f.write(content)
 
-        file_ref = build_workspace_file_ref(
-            workspace=self.workspace,
-            file_path=resolved_path,
-        )
+            file_ref = build_workspace_file_ref(
+                workspace=self.workspace,
+                file_path=resolved_path,
+            )
 
         logger.debug(
             "Successfully wrote file: %s with file_id: %s",
@@ -392,27 +397,31 @@ class WorkspaceFileOperations:
         ):
             raise ValueError("assets_subdir must resolve inside output")
 
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self._build_unique_asset_path(target_dir / asset_name)
+        base_target_path = target_dir / asset_name
+        with self.workspace.guard_workspace_mutation_path(target_dir) as guarded_dir:
+            guarded_dir.mkdir(parents=True, exist_ok=True)
+            target_path = self._build_unique_asset_path(
+                guarded_dir / base_target_path.name
+            )
 
-        with self.workspace.auto_register_files():
-            shutil.copy2(source_path, target_path)
+            with self.workspace.auto_register_files():
+                shutil.copy2(source_path, target_path)
 
-        html_src = Path(
-            os.path.relpath(target_path.resolve(), start=html_output_path.parent)
-        ).as_posix()
-        file_ref = build_workspace_file_ref(
-            workspace=self.workspace,
-            file_path=target_path,
-        )
-        return {
-            "success": True,
-            "source_file_id": source_ref,
-            "asset_file_id": file_ref["file_id"],
-            "html_src": html_src,
-            **file_ref,
-            "file_ref": file_ref,
-        }
+            html_src = Path(
+                os.path.relpath(target_path.resolve(), start=html_output_path.parent)
+            ).as_posix()
+            file_ref = build_workspace_file_ref(
+                workspace=self.workspace,
+                file_path=target_path,
+            )
+            return {
+                "success": True,
+                "source_file_id": source_ref,
+                "asset_file_id": file_ref["file_id"],
+                "html_src": html_src,
+                **file_ref,
+                "file_ref": file_ref,
+            }
 
     def _resolve_html_output_path(self, html_path: str) -> Path:
         path = Path(str(html_path).strip())
@@ -465,21 +474,27 @@ class WorkspaceFileOperations:
         """Append content to file in workspace"""
         resolved_path = self.workspace.resolve_path_with_search(file_path)
 
-        if create_dirs:
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            if create_dirs:
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(resolved_path, "a", encoding=encoding) as f:
-            f.write(content)
+            with open(resolved_path, "a", encoding=encoding) as f:
+                f.write(content)
         return True
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""
         resolved_path = self.workspace.resolve_path_with_search(file_path)
 
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
 
-        resolved_path.unlink()
+            resolved_path.unlink()
         return True
 
     def file_exists(self, file_path: str) -> bool:
@@ -546,7 +561,10 @@ class WorkspaceFileOperations:
     def create_directory(self, directory_path: str, parents: bool = True) -> bool:
         """Create directory in workspace"""
         resolved_path = self._resolve_path(directory_path)
-        resolved_path.mkdir(parents=parents, exist_ok=True)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            resolved_path.mkdir(parents=parents, exist_ok=True)
         return True
 
     def get_file_info(self, file_path_or_id: str) -> FileInfo:
@@ -595,12 +613,15 @@ class WorkspaceFileOperations:
         from .file_tool import write_json_file as basic_write_json_file
 
         resolved_path = self._resolve_path(file_path, "output")
-        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with self.workspace.auto_register_files():
-            basic_write_json_file(str(resolved_path), data, encoding, indent)
+            with self.workspace.auto_register_files():
+                basic_write_json_file(str(resolved_path), data, encoding, indent)
 
-        return self._registered_write_result(resolved_path)
+            return self._registered_write_result(resolved_path)
 
     def read_csv_file(
         self,
@@ -637,15 +658,18 @@ class WorkspaceFileOperations:
         from .file_tool import write_csv_file as basic_write_csv_file
 
         resolved_path = self._resolve_path(file_path, "output")
-        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with self.workspace.auto_register_files():
-            if data:
-                basic_write_csv_file(str(resolved_path), data, encoding, delimiter)
-            else:
-                resolved_path.write_text("", encoding=encoding)
+            with self.workspace.auto_register_files():
+                if data:
+                    basic_write_csv_file(str(resolved_path), data, encoding, delimiter)
+                else:
+                    resolved_path.write_text("", encoding=encoding)
 
-        return self._registered_write_result(resolved_path)
+            return self._registered_write_result(resolved_path)
 
     def get_workspace_output_files(self) -> Dict[str, Any]:
         """Get output file list from current workspace"""
@@ -706,11 +730,14 @@ class WorkspaceFileOperations:
         resolved_path = self._resolve_path_with_search(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
-        # Convert to string path for the basic edit_file function
-        str_path = str(resolved_path)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            # Convert to string path for the basic edit_file function
+            str_path = str(resolved_path)
 
-        # Call the basic edit_file function with the resolved path
-        result = basic_edit_file(str_path, operations, encoding, backup)
+            # Call the basic edit_file function with the resolved path
+            result = basic_edit_file(str_path, operations, encoding, backup)
 
         logger.debug("edit_file result: %s", result)
         return result
@@ -740,13 +767,22 @@ class WorkspaceFileOperations:
         resolved_path = self._resolve_path_with_search(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
-        # Convert to string path for the basic find_and_replace function
-        str_path = str(resolved_path)
+        with self.workspace.guard_workspace_mutation_path(
+            resolved_path
+        ) as resolved_path:
+            # Convert to string path for the basic find_and_replace function
+            str_path = str(resolved_path)
 
-        # Call the basic find_and_replace function with the resolved path
-        result = basic_find_and_replace(
-            str_path, pattern, replacement, encoding, use_regex, case_sensitive, backup
-        )
+            # Call the basic find_and_replace function with the resolved path
+            result = basic_find_and_replace(
+                str_path,
+                pattern,
+                replacement,
+                encoding,
+                use_regex,
+                case_sensitive,
+                backup,
+            )
 
         logger.debug("find_and_replace result: %s", result)
         return result

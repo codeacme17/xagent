@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from threading import Lock
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -40,7 +43,9 @@ from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
 from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
+from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
+from xagent.core.workspace import TaskWorkspace
 
 # How long a batched I/O seam waits to rendezvous with its sibling before giving
 # up. A serialized batch never rendezvouses, so it trips this instead of hanging.
@@ -52,6 +57,26 @@ class _FetchStub:
 
     def as_dict(self) -> dict[str, Any]:
         return {"success": True, "url": "https://example.com", "content": "ok"}
+
+
+class _WorkspaceRegisterTracker:
+    def __init__(self, workspace: TaskWorkspace) -> None:
+        self.workspace = workspace
+        self._lock = Lock()
+        self.active = 0
+        self.peak = 0
+
+    @contextmanager
+    def auto_register_files(self) -> Iterator[TaskWorkspace]:
+        with self._lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            time.sleep(0.05)
+            yield self.workspace
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 @dataclass
@@ -174,3 +199,87 @@ async def test_real_safe_tool_runs_concurrently(
     assert [r["tool_call_id"] for r in context.tool_results] == [
         tc["id"] for tc in batch
     ]
+
+
+def _workspace_write_tool(
+    tmp_path: Any, workspace_id: str
+) -> tuple[TaskWorkspace, _WorkspaceRegisterTracker, Any]:
+    workspace = TaskWorkspace(workspace_id, str(tmp_path))
+    tracker = _WorkspaceRegisterTracker(workspace)
+    workspace.auto_register_files = tracker.auto_register_files  # type: ignore[method-assign]
+    tool = next(
+        tool
+        for tool in WorkspaceFileTools(workspace).get_tools()
+        if tool.name == "write_file"
+    )
+    return workspace, tracker, tool
+
+
+def test_real_workspace_write_tool_is_batched_as_concurrent(tmp_path: Any) -> None:
+    """The real workspace write tool opts into the ReAct concurrent segment."""
+    _workspace, _tracker, tool = _workspace_write_tool(
+        tmp_path, "react_workspace_segment"
+    )
+    pattern = make_react(parallel=True, max_concurrency=2)
+    batch = [
+        make_tool_call(tool.name, {"file_path": "one.txt", "content": "one"}),
+        make_tool_call(tool.name, {"file_path": "two.txt", "content": "two"}),
+    ]
+
+    segment, kind = pattern._next_segment(batch, [tool])
+
+    assert kind == "concurrent"
+    assert segment == batch
+
+
+async def test_real_workspace_write_tool_serializes_same_path_in_batch(
+    tmp_path: Any,
+) -> None:
+    """Same normalized workspace path stays serial inside a ReAct batch."""
+    workspace, tracker, tool = _workspace_write_tool(
+        tmp_path, "react_workspace_same_path"
+    )
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call(tool.name, {"file_path": "same.txt", "content": "first"}),
+        make_tool_call(
+            tool.name, {"file_path": "output/same.txt", "content": "second"}
+        ),
+    ]
+
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+
+    assert tracker.peak == 1
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
+    assert (workspace.output_dir / "same.txt").exists()
+
+
+async def test_real_workspace_write_tool_overlaps_different_paths_in_batch(
+    tmp_path: Any,
+) -> None:
+    """Different normalized workspace paths can overlap in a ReAct batch."""
+    workspace, tracker, tool = _workspace_write_tool(
+        tmp_path, "react_workspace_different_paths"
+    )
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call(tool.name, {"file_path": "one.txt", "content": "one"}),
+        make_tool_call(tool.name, {"file_path": "two.txt", "content": "two"}),
+    ]
+
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+
+    assert tracker.peak == 2
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
+    assert (workspace.output_dir / "one.txt").read_text(encoding="utf-8") == "one"
+    assert (workspace.output_dir / "two.txt").read_text(encoding="utf-8") == "two"

@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -81,6 +82,9 @@ class TaskWorkspace:
         self.db_session = None  # Optional database session for file registration
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
+        self._file_registration_lock = threading.RLock()
+        self._mutation_locks_guard = threading.Lock()
+        self._mutation_locks: Dict[str, threading.RLock] = {}
         self.owner_user_id: Optional[int] = None
         self.current_task_id: Optional[int] = (
             db_task_id
@@ -110,6 +114,12 @@ class TaskWorkspace:
         self._ensure_directories()
 
     def register_file(
+        self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
+    ) -> str:
+        with self._file_registration_lock:
+            return self._register_file_unlocked(file_path, file_id, db_session)
+
+    def _register_file_unlocked(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
     ) -> str:
         resolved_path = self.resolve_path(file_path, default_dir="output")
@@ -640,6 +650,44 @@ class TaskWorkspace:
         dirs.extend([str(d) for d in self.allowed_external_dirs])
         return dirs
 
+    def normalize_workspace_mutation_path(
+        self, file_path: str | Path, default_dir: str = "output"
+    ) -> Path:
+        """Resolve a mutation target to a stable absolute path inside workspace."""
+        path = Path(file_path)
+        if path.is_absolute():
+            resolved_path = self._resolve_allowed_absolute_path(path)
+        else:
+            resolved_path = self.resolve_path(str(path), default_dir=default_dir)
+
+        workspace_abs = self.workspace_dir.resolve()
+        if resolved_path != workspace_abs and not resolved_path.is_relative_to(
+            workspace_abs
+        ):
+            raise ValueError(f"Mutation path {file_path} is outside workspace")
+        return resolved_path
+
+    def _mutation_lock_for_path(self, normalized_path: Path) -> threading.RLock:
+        key = str(normalized_path.resolve())
+        with self._mutation_locks_guard:
+            lock = self._mutation_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._mutation_locks[key] = lock
+            return lock
+
+    @contextmanager
+    def guard_workspace_mutation_path(
+        self, file_path: str | Path, default_dir: str = "output"
+    ) -> Iterator[Path]:
+        """Serialize mutations to the same normalized workspace path."""
+        normalized_path = self.normalize_workspace_mutation_path(
+            file_path, default_dir=default_dir
+        )
+        lock = self._mutation_lock_for_path(normalized_path)
+        with lock:
+            yield normalized_path
+
     def _resolve_allowed_absolute_path(self, path: Path) -> Path:
         """Resolve an absolute path after checking workspace allowlists."""
         abs_path = path.resolve()
@@ -984,37 +1032,33 @@ class TaskWorkspace:
         This is safer than relying on manual register_file() calls.
         """
         # Scan files before operation
-        files_before = self._scan_all_files()
+        with self._file_registration_lock:
+            files_before = self._scan_all_files()
 
         try:
             yield self
         finally:
             # Scan files after operation and register new/modified files.
-            files_after = self._scan_all_files()
-            changed_files = files_after - files_before
-            changed_files.update(
-                file_path
-                for file_path in files_after & files_before
-                if self._get_file_id_from_db(file_path, self.db_session) is not None
-            )
+            with self._file_registration_lock:
+                files_after = self._scan_all_files()
+                changed_files = files_after - files_before
+                changed_files.update(
+                    file_path
+                    for file_path in files_after & files_before
+                    if self._get_file_id_from_db(file_path, self.db_session) is not None
+                )
 
-            for file_path in changed_files:
-                try:
-                    file_id = self.register_file(str(file_path))
-                    # Store path -> file_id mapping
-                    path_str = str(file_path)
-                    resolved_str = str(file_path.resolve())
-                    self._recently_registered_files[path_str] = file_id
-                    self._recently_registered_files[resolved_str] = file_id
-                    # Store file_id -> path reverse mapping
-                    self._file_id_to_path[file_id] = file_path
-                    logger.debug(f"Auto-registered file: {file_path} -> {file_id}")
-                except Exception as e:
-                    # Don't generate fake file_id - file will need to be backfilled later
-                    logger.error(
-                        f"Failed to auto-register file {file_path}: {e}. "
-                        f"File exists on disk but is not in database - will require backfill."
-                    )
+                for file_path in changed_files:
+                    try:
+                        file_id = self._register_file_unlocked(str(file_path))
+                        self._remember_file_registration(file_id, file_path)
+                        logger.debug(f"Auto-registered file: {file_path} -> {file_id}")
+                    except Exception as e:
+                        # Don't generate fake file_id - file will need to be backfilled later
+                        logger.error(
+                            f"Failed to auto-register file {file_path}: {e}. "
+                            f"File exists on disk but is not in database - will require backfill."
+                        )
 
     def _scan_all_files(self) -> set[Path]:
         """Scan all files in workspace and return as set."""
@@ -1041,28 +1085,29 @@ class TaskWorkspace:
             resolved_path = Path(file_path).resolve()
             resolved_str = str(resolved_path)
 
-            # Check in-memory cache first (for files just registered)
-            logger.debug(f"get_file_id_from_path: Looking for {resolved_str}")
-            logger.debug(
-                f"get_file_id_from_path: Cache has {len(self._recently_registered_files)} entries: {list(self._recently_registered_files.keys())}"
-            )
-
-            if resolved_str in self._recently_registered_files:
+            with self._file_registration_lock:
+                # Check in-memory cache first (for files just registered)
+                logger.debug(f"get_file_id_from_path: Looking for {resolved_str}")
                 logger.debug(
-                    f"get_file_id_from_path: Found in cache: {self._recently_registered_files[resolved_str]}"
+                    f"get_file_id_from_path: Cache has {len(self._recently_registered_files)} entries: {list(self._recently_registered_files.keys())}"
                 )
-                return self._recently_registered_files[resolved_str]
 
-            # Also try the original path (not resolved)
-            if file_path in self._recently_registered_files:
-                logger.debug(
-                    f"get_file_id_from_path: Found in cache with original path: {self._recently_registered_files[file_path]}"
-                )
-                return self._recently_registered_files[file_path]
+                if resolved_str in self._recently_registered_files:
+                    logger.debug(
+                        f"get_file_id_from_path: Found in cache: {self._recently_registered_files[resolved_str]}"
+                    )
+                    return self._recently_registered_files[resolved_str]
 
-            logger.debug("get_file_id_from_path: Not found in cache, checking DB")
-            # Fall back to database query
-            return self._get_file_id_from_db(resolved_path)
+                # Also try the original path (not resolved)
+                if file_path in self._recently_registered_files:
+                    logger.debug(
+                        f"get_file_id_from_path: Found in cache with original path: {self._recently_registered_files[file_path]}"
+                    )
+                    return self._recently_registered_files[file_path]
+
+                logger.debug("get_file_id_from_path: Not found in cache, checking DB")
+                # Fall back to database query
+                return self._get_file_id_from_db(resolved_path)
         except Exception as e:
             logger.warning(f"get_file_id_from_path: Exception: {e}")
             return None

@@ -40,6 +40,8 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper impor
     SandboxedToolWrapper,
 )
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
+from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
+from xagent.core.workspace import TaskWorkspace
 
 
 def _noop(x: int = 0) -> dict[str, Any]:
@@ -125,6 +127,38 @@ def test_builtin_read_only_tools_are_concurrency_safe() -> None:
 def test_builtin_writing_or_stateful_tools_are_not_concurrency_safe() -> None:
     assert write_file_tool.metadata.concurrency_safe is False
     assert PythonExecutorTool().metadata.concurrency_safe is False
+
+
+def test_workspace_file_tool_metadata_matches_guarded_concurrency(tmp_path) -> None:
+    workspace = TaskWorkspace("metadata_workspace_files", str(tmp_path))
+    tools = {tool.name: tool for tool in WorkspaceFileTools(workspace).get_tools()}
+
+    for name in {
+        "read_file",
+        "list_files",
+        "file_exists",
+        "get_file_info",
+        "read_json_file",
+        "read_csv_file",
+        "get_workspace_output_files",
+        "list_all_user_files",
+    }:
+        assert tools[name].metadata.read_only is True
+        assert tools[name].metadata.concurrency_safe is True
+
+    for name in {
+        "write_file",
+        "prepare_html_asset",
+        "append_file",
+        "delete_file",
+        "create_directory",
+        "write_json_file",
+        "write_csv_file",
+        "edit_file",
+        "find_and_replace",
+    }:
+        assert tools[name].metadata.read_only is False
+        assert tools[name].metadata.concurrency_safe is True
 
 
 def test_abstract_base_tool_metadata_exposes_concurrency_fields() -> None:
