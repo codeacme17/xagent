@@ -35,7 +35,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
           lookup-only: true
 
       - name: Ensure uv is available
@@ -136,7 +136,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Upload Deepdoc cache artifact
         if: steps.deepdoc-cache.outputs.cache-hit != 'true'
@@ -346,7 +346,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
         if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'
@@ -472,7 +472,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.0-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
 
       - name: Download Deepdoc cache artifact
         if: needs.prepare-deepdoc-cache.outputs.cache-hit != 'true'

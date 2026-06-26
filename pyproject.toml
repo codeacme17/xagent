@@ -71,7 +71,7 @@ dependencies = [
   # Data science libraries (core for RAG and analysis)
   "pandas>=1.3.0",
   # Special handling - AI-enhanced document processing
-  "deepdoc-lib==0.2.0",
+  "deepdoc-lib==0.2.2",
   "aiogram>=3.4.1",
   "aiohttp-socks>=0.8.4",
   "lark-oapi>=1.5.3",
@@ -87,12 +87,18 @@ dependencies = [
 router = [
   "xrouter-llm>=0.1.2",
   "sentence-transformers>=3.0.0",
+  # xrouter-llm's embedding model is a Qwen3-architecture checkpoint; transformers
+  # only registered the `qwen3` model type in 4.51.
+  "transformers>=4.51",
   "torch>=2.0.0",
 ]
 # document processing libraries(Non-AI)
 document-processing = [
   "pdfplumber>=0.10.0",
   "unstructured>=0.15.0",
+  # Keep unstructured from resolving to legacy numba releases that cannot build
+  # on Python 3.12 after deepdoc-lib moved the environment to NumPy 2.x.
+  "numba>=0.64.0",
   "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
   "pymupdf>=1.23.0,<1.27.0",
   "python-docx>=1.1.0",
@@ -124,6 +130,7 @@ milvus = ["pymilvus>=2.6.9,<3.0.0"]
 # Note: List packages directly since optional-dependencies doesn't support include-group
 all = [
   "unstructured>=0.15.0",
+  "numba>=0.64.0",
   "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
   "pymupdf>=1.23.0,<1.27.0",
   "python-docx>=1.1.0",
@@ -143,6 +150,7 @@ all = [
 [dependency-groups]
 backend-image = [
   "unstructured>=0.15.0",
+  "numba>=0.64.0",
   "typer>=0.9.0",
   "pymupdf>=1.23.0,<1.27.0",
   "python-docx>=1.1.0",
