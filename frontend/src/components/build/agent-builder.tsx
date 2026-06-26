@@ -36,6 +36,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches } from "@/lib/mcp-lookup"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
@@ -104,7 +105,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
   const { t, locale } = useI18n()
-  const { apps: officialApps, getAppIcon } = useMcpApps()
+  const { apps: officialApps, getAppIcon, refresh: refreshMcpApps } = useMcpApps()
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -595,7 +596,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               if (!connName) return;
 
               // Find the actual server object to use its exact name, to avoid case mismatches
-              const server = mcpServers.find(s => s.name.toLowerCase() === connName.toLowerCase() || s.app_id?.toLowerCase() === connName.toLowerCase().replace(/\s+/g, '-'))
+              const server = findMatchingMcpServer(mcpServers, connName)
               const finalName = server ? server.name : connName;
               if (!connectedMcpApps.includes(finalName)) {
                 connectedMcpApps.push(finalName)
@@ -911,7 +912,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     // Add selected MCP servers back into tool_categories
     selectedMcpServers.forEach(server => {
-      finalToolCategories.push(`mcp:${server}`)
+      const connectedServer = findMatchingMcpServer(mcpServers, server)
+      const connectedApp = findMatchingMcpApp(officialApps, server)
+      finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.name || server}`)
     })
 
     setIsCreating(true)
@@ -1144,8 +1147,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const templateMissingMcp = Boolean(
     isTemplateBuildFlow &&
     templateRequirements?.requiredMcpServers.some((serverName) => {
-      const isSelected = selectedMcpServers.some((name) => name.toLowerCase() === serverName.toLowerCase())
-      const isConnected = mcpServers.some((server) => server.name.toLowerCase() === serverName.toLowerCase())
+      const isSelected = selectedMcpServers.some((name) => mcpNameMatches(name, serverName))
+      const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+      const connectedApp = findMatchingMcpApp(officialApps, serverName)
+      const isConnected = Boolean(connectedServer || connectedApp?.is_connected)
       return !isSelected || !isConnected
     })
   )
@@ -1878,21 +1883,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
           <div className="flex flex-col gap-2">
             {selectedMcpServers.map((serverName, index) => {
-              const isConnected = mcpServers.some((s: any) => s.name === serverName)
-              const isSupported = officialApps.some((app: any) => app.name.toLowerCase() === serverName.toLowerCase() || app.id.toLowerCase() === serverName.toLowerCase())
+              const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+              const matchingApp = findMatchingMcpApp(officialApps, serverName)
+              const isConnected = Boolean(connectedServer || matchingApp?.is_connected)
+              const isSupported = Boolean(matchingApp)
 
               let statusDesc = ""
 
-              if (isConnected) {
-                const server = mcpServers.find((s: any) => s.name === serverName)
-                statusDesc = server?.description || ""
+              if (connectedServer) {
+                statusDesc = connectedServer.description || ""
+              } else if (matchingApp?.is_connected) {
+                statusDesc = matchingApp.description || ""
               } else if (isSupported) {
                 statusDesc = t("tools.mcp.notConnected")
               } else {
                 statusDesc = t("tools.mcp.notSupported")
               }
 
-              const server = { name: serverName, description: statusDesc }
+              const server = { name: connectedServer?.name || matchingApp?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
                 <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>
@@ -1920,7 +1928,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                       variant="ghost"
                       size="sm"
                       className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-50"
-                      onClick={() => setSelectedMcpServers(prev => prev.filter(name => name !== server.name))}
+                      onClick={() => setSelectedMcpServers(prev => prev.filter(name => !mcpNameMatches(name, serverName)))}
                     >
                       <X className="h-4 w-4" />
                     </Button>
@@ -2150,6 +2158,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSelectedMcpServers(selectedApps)
         }}
         onSuccess={() => {
+          refreshMcpApps().catch(console.error)
           apiRequest(`${getApiUrl()}/api/mcp/servers`)
             .then(res => res.json())
             .then(data => setMcpServers(data || []))

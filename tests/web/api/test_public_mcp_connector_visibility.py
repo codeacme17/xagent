@@ -1,17 +1,22 @@
 import os
 import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import xagent.web.api.mcp as mcp_api
 from xagent.web.api.admin_mcp import admin_mcp_router
-from xagent.web.api.auth import auth_router
+from xagent.web.api.auth import _ensure_user_mcp_server, auth_router
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 
 
 def override_get_db():
@@ -66,7 +71,11 @@ def _login(username: str, password: str) -> dict[str, str]:
 
 
 def _create_public_app(
-    headers: dict[str, str], app_id: str, name: str, is_visible_in_connector: bool
+    headers: dict[str, str],
+    app_id: str,
+    name: str,
+    is_visible_in_connector: bool,
+    transport: str = "oauth",
 ) -> None:
     response = client.post(
         "/api/admin/mcp/apps",
@@ -76,7 +85,7 @@ def _create_public_app(
             "name": name,
             "description": f"{name} description",
             "icon": "",
-            "transport": "oauth",
+            "transport": transport,
             "provider_name": None,
             "category": "Communication",
             "oauth_scopes": [],
@@ -117,6 +126,212 @@ def _connect_app_for_user(username: str, server_name: str) -> None:
         db.close()
 
 
+def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        server = MCPServer(
+            name=server_name,
+            description="custom stdio connector",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@floriscornel/teams-mcp@latest"],
+        )
+        db.add(server)
+        db.flush()
+
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _connect_oauth_account_for_user(username: str, provider: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        db.add(
+            UserOAuth(
+                user_id=user.id,
+                provider=provider,
+                access_token="access-token",
+                provider_user_id=f"{provider}-user",
+                email=f"{provider}@example.com",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_connected_non_oauth_public_app_is_marked_connected() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "public-stdio",
+            "Public Stdio",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Public Stdio")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=public",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "public-stdio")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_non_oauth_public_app_matches_space_hyphen_name_variant() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "space-hyphen",
+            "Different Display Name",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Space Hyphen")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=different",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "space-hyphen")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_remote_connector_builds_oauth_connectability_once_per_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user("regular", "microsoft")
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+
+        assert checked_providers == ["microsoft"]
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is timezone.utc:
+                return cls(2026, 1, 1, 8, 0, tzinfo=timezone.utc)
+            return cls(2026, 1, 1, 16, 0)
+
+    monkeypatch.setattr(mcp_api, "datetime", FixedDateTime)
+
+    oauth_account = SimpleNamespace(
+        access_token="access-token",
+        refresh_token=None,
+        expires_at=FixedDateTime(2026, 1, 1, 9, 0),
+    )
+
+    assert mcp_api._oauth_account_can_connect(oauth_account) is True
+
+
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
     temp_dir = _setup_test_db()
     try:
@@ -143,6 +358,91 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
         app_ids = {app["id"] for app in response.json()}
         assert "visible-app" in app_ids
         assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> (
+    None
+):
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=teams",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        teams_app = next(app for app in response.json() if app["id"] == "teams")
+        assert teams_app["is_connected"] is False
+        assert "server_id" not in teams_app
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == "regular").first()
+            assert user is not None
+
+            with pytest.raises(
+                ValueError, match="conflicts with an existing MCP server"
+            ):
+                _ensure_user_mcp_server(
+                    db,
+                    str(user.id),
+                    {
+                        "id": "teams",
+                        "name": "Teams",
+                        "description": "Connect to Microsoft Teams.",
+                        "provider": "microsoft",
+                    },
+                )
+        finally:
+            db.close()
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

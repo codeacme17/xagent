@@ -8,8 +8,8 @@ in the web application.
 import json
 import logging
 import shlex
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -431,6 +431,183 @@ def _enrich_oauth_server_info(
     return app_id, provider, connected_account
 
 
+def _normalize_app_key(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = "-".join(str(value).strip().lower().split())
+    return normalized or None
+
+
+def _app_lookup_keys(*values: object) -> list[str]:
+    keys = []
+    for value in values:
+        key = _normalize_app_key(value)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _oauth_account_can_connect(oauth_account: object) -> bool:
+    access_token = getattr(oauth_account, "access_token", None)
+    if not access_token:
+        return False
+
+    expires_at = getattr(oauth_account, "expires_at", None)
+    if not isinstance(expires_at, datetime):
+        return True
+
+    if getattr(oauth_account, "refresh_token", None):
+        return True
+
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    return expires_at > now
+
+
+def _oauth_keys_for_app(app: dict) -> list[str]:
+    return _app_lookup_keys(app.get("id"), app.get("provider"))
+
+
+def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
+    if server.transport != "oauth":
+        return False
+
+    app_id = _normalize_app_key(app.get("id"))
+    app_name = _normalize_app_key(app.get("name"))
+    provider = _normalize_app_key(app.get("provider"))
+    server_name = _normalize_app_key(server.name)
+
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, dict):
+        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        auth_provider = _normalize_app_key(auth.get("provider"))
+
+        if auth_app_id and auth_app_id != app_id:
+            return False
+        if auth_provider and provider and auth_provider != provider:
+            return False
+        if auth_app_id or auth_provider:
+            return True
+
+    # Legacy OAuth server rows created before app metadata was stored in auth.
+    return bool(server_name and server_name in {app_id, app_name})
+
+
+def _connected_oauth_server_for_app(
+    app: dict,
+    oauth_server_lookup: dict[str, list[MCPServer]],
+    oauth_account_lookup: dict[str, object],
+) -> tuple[Optional[int], Optional[str]]:
+    oauth_account = next(
+        (
+            oauth_account_lookup[key]
+            for key in _oauth_keys_for_app(app)
+            if key in oauth_account_lookup
+        ),
+        None,
+    )
+    if not oauth_account:
+        return None, None
+
+    server = _lookup_oauth_server_for_app(app, oauth_server_lookup)
+    if not server:
+        return None, None
+
+    email = getattr(oauth_account, "email", None)
+    return cast(int, server.id), str(email) if email else None
+
+
+def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, object]:
+    lookup: dict[str, object] = {}
+    for account in oauth_accounts:
+        key = _normalize_app_key(getattr(account, "provider", None))
+        if key and key not in lookup and _oauth_account_can_connect(account):
+            lookup[key] = account
+    return lookup
+
+
+def _oauth_server_lookup_keys(server: MCPServer) -> list[str]:
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, dict):
+        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        if auth_app_id:
+            return [auth_app_id]
+
+        auth_provider = _normalize_app_key(auth.get("provider"))
+        if auth_provider:
+            return [auth_provider]
+
+    return _app_lookup_keys(server.name)
+
+
+def _build_active_oauth_server_lookup(
+    user_mcps: list[tuple[MCPServer, UserMCPServer]],
+) -> dict[str, list[MCPServer]]:
+    lookup: dict[str, list[MCPServer]] = {}
+    for server, user_mcp in user_mcps:
+        if not user_mcp.is_active or _normalize_app_key(server.transport) != "oauth":
+            continue
+        for key in _oauth_server_lookup_keys(server):
+            lookup.setdefault(key, []).append(server)
+    return lookup
+
+
+def _lookup_oauth_server_for_app(
+    app: dict, oauth_server_lookup: dict[str, list[MCPServer]]
+) -> Optional[MCPServer]:
+    seen_servers: set[int] = set()
+    for key in _app_lookup_keys(app.get("id"), app.get("provider"), app.get("name")):
+        for server in oauth_server_lookup.get(key, []):
+            marker = id(server)
+            if marker in seen_servers:
+                continue
+            seen_servers.add(marker)
+            if _is_oauth_server_for_app(server, app):
+                return server
+    return None
+
+
+def _build_active_non_oauth_server_lookup(
+    user_mcps: list[tuple[MCPServer, UserMCPServer]],
+) -> dict[tuple[str, str], MCPServer]:
+    lookup: dict[tuple[str, str], MCPServer] = {}
+    for server, user_mcp in user_mcps:
+        transport = _normalize_app_key(server.transport)
+        server_name = _normalize_app_key(server.name)
+        if (
+            not user_mcp.is_active
+            or not transport
+            or transport == "oauth"
+            or not server_name
+        ):
+            continue
+        lookup.setdefault((transport, server_name), server)
+    return lookup
+
+
+def _connected_non_oauth_server_for_app(
+    app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
+) -> Optional[int]:
+    app_transport = _normalize_app_key(app.get("transport"))
+    if not app_transport or app_transport == "oauth":
+        return None
+
+    server = next(
+        (
+            non_oauth_server_lookup[(app_transport, app_key)]
+            for app_key in _app_lookup_keys(app.get("id"), app.get("name"))
+            if (app_transport, app_key) in non_oauth_server_lookup
+        ),
+        None,
+    )
+    if not server:
+        return None
+
+    return cast(int, server.id)
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -443,12 +620,15 @@ def list_mcp_apps(
     """Get the list of available MCP applications in the library."""
 
     # Query connected servers for the current user
-    user_mcps = (
-        db.query(MCPServer, UserMCPServer)
-        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(UserMCPServer.user_id == current_user.id)
-        .all()
-    )
+    user_mcps = [
+        (server, user_mcp)
+        for server, user_mcp in (
+            db.query(MCPServer, UserMCPServer)
+            .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+            .filter(UserMCPServer.user_id == current_user.id)
+            .all()
+        )
+    ]
 
     # Also fetch user oauth accounts to get the connected email
     from ..models.user_oauth import UserOAuth
@@ -456,26 +636,27 @@ def list_mcp_apps(
     oauth_accounts = (
         db.query(UserOAuth).filter(UserOAuth.user_id == current_user.id).all()
     )
-    oauth_emails = {
-        str(oauth.provider): str(oauth.email) for oauth in oauth_accounts if oauth.email
-    }
-
-    # Try to map connected names to emails
-    connected_apps = {}
-    for server, _ in user_mcps:
-        connected_apps[server.name.lower()] = server.id
 
     results = []
     library_apps = (
         get_all_mcp_apps(db) if location in ["remote", "local", "all"] else []
     )
+    oauth_account_lookup = _build_oauth_account_lookup(list(oauth_accounts))
+    oauth_server_lookup = _build_active_oauth_server_lookup(user_mcps)
+    non_oauth_server_lookup = _build_active_non_oauth_server_lookup(user_mcps)
 
     if location in ["remote", "all"]:
         for app in library_apps:
-            is_connected = (
-                app["name"].lower() in connected_apps
-                or app["id"].lower() in connected_apps
-            )
+            if app.get("transport") == "oauth":
+                server_id, connected_account = _connected_oauth_server_for_app(
+                    app, oauth_server_lookup, oauth_account_lookup
+                )
+            else:
+                server_id = _connected_non_oauth_server_for_app(
+                    app, non_oauth_server_lookup
+                )
+                connected_account = None
+            is_connected = server_id is not None
             is_visible_in_connector = app.get("is_visible_in_connector", True)
 
             # Strong hide mode: hidden public apps are removed from the
@@ -499,21 +680,10 @@ def list_mcp_apps(
             app_copy["is_connected"] = is_connected
 
             if is_connected:
-                # Find the server id
-                server_id = connected_apps.get(
-                    app["name"].lower()
-                ) or connected_apps.get(app["id"].lower())
                 app_copy["server_id"] = server_id
 
-                # Find connected email
-                provider = app.get("provider")
-                app_id = app.get("id")
-                # Check for email in both provider and app_id keys
-                email = oauth_emails.get(str(app_id)) if app_id else None
-                if not email and provider:
-                    email = oauth_emails.get(str(provider))
-                if email:
-                    app_copy["connected_account"] = email
+                if connected_account:
+                    app_copy["connected_account"] = connected_account
 
             if status == "verified" and not app_copy["is_connected"]:
                 continue
