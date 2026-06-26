@@ -1,14 +1,22 @@
 import os
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import pytest
 
+from xagent.core.tools.core import file_tool as file_tool_module
+from xagent.core.tools.core import workspace_file_tool as workspace_file_tool_module
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.tools.adapters.vibe.file_tool import (
     FILE_TOOLS,
     append_file,
     create_directory,
     delete_file,
+    edit_file,
     file_exists,
+    find_and_replace,
     get_file_info,
     list_files,
     read_csv_file,
@@ -18,6 +26,64 @@ from xagent.core.tools.adapters.vibe.file_tool import (
     write_file,
     write_json_file,
 )
+from xagent.core.workspace import TaskWorkspace
+
+
+class _ConcurrencyTracker:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.active = 0
+        self.peak = 0
+
+    def enter(self) -> None:
+        with self._lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+
+    def leave(self) -> None:
+        with self._lock:
+            self.active -= 1
+
+
+class _TrackedFile:
+    def __init__(self, handle, tracker: _ConcurrencyTracker) -> None:
+        self._handle = handle
+        self._tracker = tracker
+
+    def __enter__(self):
+        entered = self._handle.__enter__()
+        self._tracker.enter()
+        time.sleep(0.05)
+        return entered
+
+    def __exit__(self, *args):
+        try:
+            return self._handle.__exit__(*args)
+        finally:
+            self._tracker.leave()
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+def _install_tracked_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tracker: _ConcurrencyTracker,
+    module=file_tool_module,
+) -> None:
+    real_open = open
+
+    def tracked_open(*args, **kwargs):
+        return _TrackedFile(real_open(*args, **kwargs), tracker)
+
+    monkeypatch.setattr(module, "open", tracked_open, raising=False)
+
+
+def _run_concurrently(*calls) -> None:
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        futures = [pool.submit(call) for call in calls]
+        for future in futures:
+            future.result()
 
 
 def test_basic_file_operations():
@@ -262,6 +328,136 @@ def test_non_image_file_info():
     finally:
         if os.path.exists(temp_file):
             delete_file(temp_file)
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        "write_file",
+        "append_file",
+        "write_json_file",
+        "write_csv_file",
+        "edit_file",
+        "find_and_replace",
+        "delete_file",
+        "create_directory",
+    ],
+)
+def test_same_normalized_basic_file_mutations_are_serialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, case_name: str
+) -> None:
+    tracker = _ConcurrencyTracker()
+    path = tmp_path / "same.txt"
+    same_path_alias = tmp_path / "." / "same.txt"
+
+    if case_name in {"delete_file", "create_directory"}:
+
+        def tracked_call(*args, **kwargs):
+            tracker.enter()
+            try:
+                time.sleep(0.05)
+            finally:
+                tracker.leave()
+            return None
+
+        if case_name == "delete_file":
+            monkeypatch.setattr(file_tool_module.os, "remove", tracked_call)
+            calls = [
+                lambda: delete_file(str(path)),
+                lambda: delete_file(str(same_path_alias)),
+            ]
+        else:
+            monkeypatch.setattr(file_tool_module.os, "makedirs", tracked_call)
+            directory_path = tmp_path / "same_dir"
+            same_directory_alias = tmp_path / "." / "same_dir"
+            calls = [
+                lambda: create_directory(str(directory_path)),
+                lambda: create_directory(str(same_directory_alias)),
+            ]
+    else:
+        _install_tracked_open(monkeypatch, tracker)
+
+        if case_name in {"edit_file", "find_and_replace"}:
+            path.write_text("needle\n", encoding="utf-8")
+
+        if case_name == "write_file":
+            calls = [
+                lambda: write_file(str(path), "first"),
+                lambda: write_file(str(same_path_alias), "second"),
+            ]
+        elif case_name == "append_file":
+            calls = [
+                lambda: append_file(str(path), "first"),
+                lambda: append_file(str(same_path_alias), "second"),
+            ]
+        elif case_name == "write_json_file":
+            calls = [
+                lambda: write_json_file(str(path), {"value": "first"}),
+                lambda: write_json_file(str(same_path_alias), {"value": "second"}),
+            ]
+        elif case_name == "write_csv_file":
+            calls = [
+                lambda: write_csv_file(str(path), [{"value": "first"}]),
+                lambda: write_csv_file(str(same_path_alias), [{"value": "second"}]),
+            ]
+        elif case_name == "edit_file":
+            operations = [
+                {
+                    "operation_type": "replace",
+                    "line_number": 1,
+                    "content": "needle",
+                }
+            ]
+            calls = [
+                lambda: edit_file(str(path), operations),
+                lambda: edit_file(str(same_path_alias), operations),
+            ]
+        else:
+            calls = [
+                lambda: find_and_replace(
+                    str(path), "needle", "needle", use_regex=False
+                ),
+                lambda: find_and_replace(
+                    str(same_path_alias), "needle", "needle", use_regex=False
+                ),
+            ]
+
+    _run_concurrently(*calls)
+
+    assert tracker.peak == 1
+
+
+def test_different_basic_file_mutation_paths_can_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    tracker = _ConcurrencyTracker()
+    _install_tracked_open(monkeypatch, tracker)
+
+    _run_concurrently(
+        lambda: write_file(str(tmp_path / "one.txt"), "one"),
+        lambda: write_file(str(tmp_path / "two.txt"), "two"),
+    )
+
+    assert tracker.peak == 2
+
+
+def test_basic_and_workspace_file_mutations_share_normalized_path_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    tracker = _ConcurrencyTracker()
+    _install_tracked_open(monkeypatch, tracker, file_tool_module)
+    _install_tracked_open(monkeypatch, tracker, workspace_file_tool_module)
+
+    workspace = TaskWorkspace("shared_basic_workspace_lock", str(tmp_path))
+    ops = WorkspaceFileOperations(workspace)
+    target_path = workspace.output_dir / "same.txt"
+
+    _run_concurrently(
+        lambda: ops.write_file("same.txt", "workspace"),
+        lambda: write_file(str(target_path), "basic"),
+    )
+
+    assert tracker.peak == 1
 
 
 def test_image_file_info_without_pil():

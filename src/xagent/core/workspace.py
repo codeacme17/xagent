@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from uuid import uuid4
 
 from ..config import get_uploads_dir
+from .path_locks import GLOBAL_PATH_MUTATION_LOCKS
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +84,7 @@ class TaskWorkspace:
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self._file_registration_lock = threading.RLock()
-        self._mutation_locks_guard = threading.Lock()
-        self._mutation_locks: Dict[str, threading.RLock] = {}
+        self._mutation_path_locks = GLOBAL_PATH_MUTATION_LOCKS
         self.owner_user_id: Optional[int] = None
         self.current_task_id: Optional[int] = (
             db_task_id
@@ -667,15 +667,6 @@ class TaskWorkspace:
             raise ValueError(f"Mutation path {file_path} is outside workspace")
         return resolved_path
 
-    def _mutation_lock_for_path(self, normalized_path: Path) -> threading.RLock:
-        key = str(normalized_path.resolve())
-        with self._mutation_locks_guard:
-            lock = self._mutation_locks.get(key)
-            if lock is None:
-                lock = threading.RLock()
-                self._mutation_locks[key] = lock
-            return lock
-
     @contextmanager
     def guard_workspace_mutation_path(
         self, file_path: str | Path, default_dir: str = "output"
@@ -684,9 +675,8 @@ class TaskWorkspace:
         normalized_path = self.normalize_workspace_mutation_path(
             file_path, default_dir=default_dir
         )
-        lock = self._mutation_lock_for_path(normalized_path)
-        with lock:
-            yield normalized_path
+        with self._mutation_path_locks.guard_path(normalized_path) as guarded_path:
+            yield guarded_path
 
     def _resolve_allowed_absolute_path(self, path: Path) -> Path:
         """Resolve an absolute path after checking workspace allowlists."""

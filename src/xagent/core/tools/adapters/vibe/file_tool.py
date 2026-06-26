@@ -45,12 +45,23 @@ read_file_tool = FileTool(
     read_only=True,
 )
 write_file_tool = FileTool(
-    write_file, name="write_file", description="Write content to file"
+    write_file,
+    name="write_file",
+    description="Write content to file",
+    concurrency_safe=True,
 )
 append_file_tool = FileTool(
-    append_file, name="append_file", description="Append content to file"
+    append_file,
+    name="append_file",
+    description="Append content to file",
+    concurrency_safe=True,
 )
-delete_file_tool = FileTool(delete_file, name="delete_file", description="Delete file")
+delete_file_tool = FileTool(
+    delete_file,
+    name="delete_file",
+    description="Delete file",
+    concurrency_safe=True,
+)
 list_files_tool = FileTool(
     list_files,
     name="list_files",
@@ -58,7 +69,10 @@ list_files_tool = FileTool(
     read_only=True,
 )
 create_directory_tool = FileTool(
-    create_directory, name="create_directory", description="Create directory"
+    create_directory,
+    name="create_directory",
+    description="Create directory",
+    concurrency_safe=True,
 )
 file_exists_tool = FileTool(
     file_exists,
@@ -79,7 +93,10 @@ read_json_file_tool = FileTool(
     read_only=True,
 )
 write_json_file_tool = FileTool(
-    write_json_file, name="write_json_file", description="Write JSON file"
+    write_json_file,
+    name="write_json_file",
+    description="Write JSON file",
+    concurrency_safe=True,
 )
 read_csv_file_tool = FileTool(
     read_csv_file,
@@ -88,17 +105,22 @@ read_csv_file_tool = FileTool(
     read_only=True,
 )
 write_csv_file_tool = FileTool(
-    write_csv_file, name="write_csv_file", description="Write CSV file"
+    write_csv_file,
+    name="write_csv_file",
+    description="Write CSV file",
+    concurrency_safe=True,
 )
 edit_file_tool = FileTool(
     edit_file,
     name="edit_file",
     description="Precisely edit file content, supporting various editing operations based on line numbers and pattern matching",
+    concurrency_safe=True,
 )
 find_and_replace_tool = FileTool(
     find_and_replace,
     name="find_and_replace",
     description="Convenient function to find and replace text content",
+    concurrency_safe=True,
 )
 
 

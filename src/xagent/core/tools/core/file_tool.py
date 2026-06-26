@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from pydantic import BaseModel
 
+from ...path_locks import GLOBAL_PATH_MUTATION_LOCKS
+
 try:
     from PIL import Image
 
@@ -78,6 +80,14 @@ class EditResult(BaseModel):
     message: str
     lines_changed: int = 0
     preview: Optional[str] = None
+
+
+def _guard_basic_file_mutation_path(file_path: str | Path):
+    return GLOBAL_PATH_MUTATION_LOCKS.guard_path(file_path)
+
+
+def _guard_basic_file_mutation_paths(*file_paths: str | Path):
+    return GLOBAL_PATH_MUTATION_LOCKS.guard_paths(list(file_paths))
 
 
 def read_file(
@@ -180,14 +190,15 @@ def write_file(
         raise ValueError("file_path is required")
     if not content:
         raise ValueError("content is required")
-    if create_dirs:
-        dir_path = os.path.dirname(file_path)
-        if dir_path:  # Only create directory if directory path is not empty
-            os.makedirs(dir_path, exist_ok=True)
-        # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
+    with _guard_basic_file_mutation_path(file_path):
+        if create_dirs:
+            dir_path = os.path.dirname(file_path)
+            if dir_path:  # Only create directory if directory path is not empty
+                os.makedirs(dir_path, exist_ok=True)
+            # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
 
-    with open(file_path, "w", encoding=encoding) as f:
-        f.write(content)
+        with open(file_path, "w", encoding=encoding) as f:
+            f.write(content)
     return True
 
 
@@ -209,15 +220,16 @@ def append_file(
     Raises:
         OSError: File operation error
     """
-    # Handle relative paths, use current directory if file path has no directory part
-    if create_dirs:
-        dir_path = os.path.dirname(file_path)
-        if dir_path:  # Only create directory if directory path is not empty
-            os.makedirs(dir_path, exist_ok=True)
-        # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
+    with _guard_basic_file_mutation_path(file_path):
+        # Handle relative paths, use current directory if file path has no directory part
+        if create_dirs:
+            dir_path = os.path.dirname(file_path)
+            if dir_path:  # Only create directory if directory path is not empty
+                os.makedirs(dir_path, exist_ok=True)
+            # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
 
-    with open(file_path, "a", encoding=encoding) as f:
-        f.write(content)
+        with open(file_path, "a", encoding=encoding) as f:
+            f.write(content)
     return True
 
 
@@ -235,7 +247,8 @@ def delete_file(file_path: str) -> bool:
         FileNotFoundError: File doesn't exist
         OSError: Deletion failed
     """
-    os.remove(file_path)
+    with _guard_basic_file_mutation_path(file_path):
+        os.remove(file_path)
     return True
 
 
@@ -303,7 +316,8 @@ def create_directory(directory_path: str, parents: bool = True) -> bool:
     Raises:
         OSError: Creation failed
     """
-    os.makedirs(directory_path, exist_ok=parents)
+    with _guard_basic_file_mutation_path(directory_path):
+        os.makedirs(directory_path, exist_ok=parents)
     return True
 
 
@@ -425,8 +439,9 @@ def write_json_file(
     Raises:
         OSError: File operation error
     """
-    with open(file_path, "w", encoding=encoding) as f:
-        json.dump(data, f, ensure_ascii=False, indent=indent)
+    with _guard_basic_file_mutation_path(file_path):
+        with open(file_path, "w", encoding=encoding) as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
     return True
 
 
@@ -475,17 +490,31 @@ def write_csv_file(
         OSError: File operation error
         csv.Error: CSV write error
     """
-    if not data:
-        return True
+    with _guard_basic_file_mutation_path(file_path):
+        if not data:
+            return True
 
-    with open(file_path, "w", encoding=encoding, newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=data[0].keys(), delimiter=delimiter)
-        writer.writeheader()
-        writer.writerows(data)
+        with open(file_path, "w", encoding=encoding, newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=data[0].keys(), delimiter=delimiter)
+            writer.writeheader()
+            writer.writerows(data)
     return True
 
 
 def edit_file(
+    file_path: str,
+    operations: List[Union[Dict[str, Any], EditOperation]],
+    encoding: str = "utf-8",
+    backup: bool = False,
+) -> EditResult:
+    guard_paths = [file_path]
+    if backup:
+        guard_paths.append(f"{file_path}.backup")
+    with _guard_basic_file_mutation_paths(*guard_paths):
+        return _edit_file_unlocked(file_path, operations, encoding, backup)
+
+
+def _edit_file_unlocked(
     file_path: str,
     operations: List[Union[Dict[str, Any], EditOperation]],
     encoding: str = "utf-8",
@@ -785,6 +814,30 @@ def _delete_lines(lines: List[str], operation: EditOperation) -> EditResult:
 
 
 def find_and_replace(
+    file_path: str,
+    search_pattern: str,
+    replacement: str,
+    encoding: str = "utf-8",
+    use_regex: bool = True,
+    case_sensitive: bool = True,
+    backup: bool = False,
+) -> EditResult:
+    guard_paths = [file_path]
+    if backup:
+        guard_paths.append(f"{file_path}.backup")
+    with _guard_basic_file_mutation_paths(*guard_paths):
+        return _find_and_replace_unlocked(
+            file_path,
+            search_pattern,
+            replacement,
+            encoding,
+            use_regex,
+            case_sensitive,
+            backup,
+        )
+
+
+def _find_and_replace_unlocked(
     file_path: str,
     search_pattern: str,
     replacement: str,

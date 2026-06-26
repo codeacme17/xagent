@@ -25,8 +25,15 @@ from tests.core.tools.adapters.sandboxed_tool.conftest import FakeBaseTool
 from xagent.core.tools.adapters.vibe.base import ToolMetadata
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
 from xagent.core.tools.adapters.vibe.file_tool import (
+    append_file_tool,
+    create_directory_tool,
+    delete_file_tool,
+    edit_file_tool,
+    find_and_replace_tool,
     read_file_tool,
+    write_csv_file_tool,
     write_file_tool,
+    write_json_file_tool,
 )
 from xagent.core.tools.adapters.vibe.function import FunctionTool
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
@@ -124,8 +131,22 @@ def test_builtin_read_only_tools_are_concurrency_safe() -> None:
     assert read_file_tool.metadata.concurrency_safe is True
 
 
-def test_builtin_writing_or_stateful_tools_are_not_concurrency_safe() -> None:
-    assert write_file_tool.metadata.concurrency_safe is False
+def test_basic_file_mutation_tools_match_guarded_concurrency() -> None:
+    for tool in {
+        write_file_tool,
+        append_file_tool,
+        delete_file_tool,
+        create_directory_tool,
+        write_json_file_tool,
+        write_csv_file_tool,
+        edit_file_tool,
+        find_and_replace_tool,
+    }:
+        assert tool.metadata.read_only is False
+        assert tool.metadata.concurrency_safe is True
+
+
+def test_stateful_tools_without_call_isolation_are_not_concurrency_safe() -> None:
     assert PythonExecutorTool().metadata.concurrency_safe is False
 
 
