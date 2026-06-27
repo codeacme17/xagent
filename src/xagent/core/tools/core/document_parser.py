@@ -4,6 +4,7 @@ from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, Field
 
+from ....core.path_locks import GLOBAL_PATH_MUTATION_LOCKS
 from ....providers.pdf_parser import (
     DeepDocParser,
     DocumentParser,
@@ -230,13 +231,16 @@ async def parse_document_with_output(
     resolved_output_path = tool_args.output_path
 
     try:
-        output_ext = Path(resolved_output_path).suffix.lower()
-        if tool_args.output_format == "json" or output_ext == ".json":
-            write_json_output(result, resolved_output_path)
-        elif tool_args.output_format == "txt" or output_ext == ".txt":
-            write_text_output(result, resolved_output_path)
-        else:  # Default to markdown
-            write_markdown_output(result, resolved_output_path)
+        with GLOBAL_PATH_MUTATION_LOCKS.guard_path(
+            resolved_output_path
+        ) as guarded_output_path:
+            output_ext = guarded_output_path.suffix.lower()
+            if tool_args.output_format == "json" or output_ext == ".json":
+                write_json_output(result, str(guarded_output_path))
+            elif tool_args.output_format == "txt" or output_ext == ".txt":
+                write_text_output(result, str(guarded_output_path))
+            else:  # Default to markdown
+                write_markdown_output(result, str(guarded_output_path))
 
         logger.info(f"Successfully wrote parsing result to: {resolved_output_path}")
         return DocumentParseWithOutputResult()

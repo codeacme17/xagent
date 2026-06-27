@@ -23,10 +23,12 @@ indirectly via ``run_json_async`` being a coroutine function.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import time
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterator
 
@@ -42,6 +44,7 @@ from tests.core.agent.concurrency_harness import (
 from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
 from xagent.core.tools.adapters.vibe.browser_use import BrowserEvaluateTool
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
+from xagent.core.tools.adapters.vibe.image_tool import ImageGenerationTool
 from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorTool
 from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
@@ -144,6 +147,35 @@ class _TrackedBrowserManager:
                 session_id, self._tracker, self._barrier
             )
         return self._sessions[session_id]
+
+
+class _TrackedImageModel:
+    model_id = "tracked-image"
+
+    def __init__(
+        self,
+        tracker: ConcurrencyTracker,
+        barrier: asyncio.Barrier,
+    ) -> None:
+        self._tracker = tracker
+        self._barrier = barrier
+
+    def has_ability(self, ability: str) -> bool:
+        return ability == "generate"
+
+    async def generate_image(self, **kwargs: Any) -> dict[str, Any]:
+        prompt = str(kwargs["prompt"])
+        self._tracker.enter(prompt)
+        try:
+            await asyncio.wait_for(self._barrier.wait(), timeout=_RENDEZVOUS_TIMEOUT)
+        finally:
+            self._tracker.leave(prompt)
+
+        encoded = base64.b64encode(f"image:{prompt}".encode()).decode()
+        return {
+            "image_url": f"data:image/png;base64,{encoded}",
+            "request_id": f"request-{prompt}",
+        }
 
 
 @dataclass
@@ -492,6 +524,64 @@ Path("..", {artifact!r}).write_bytes({label.encode()!r})
     assert "alpha:" not in results[1]["output"]
     assert results[0]["generated_files"] == ["alpha.docx"]
     assert results[1]["generated_files"] == ["beta.docx"]
+    assert [r["tool_call_id"] for r in context.tool_results] == [
+        tc["id"] for tc in batch
+    ]
+
+
+async def test_real_image_generation_tool_overlaps_and_registers_unique_artifacts(
+    tmp_path: Any,
+) -> None:
+    """Image generation runs through ReAct concurrency with isolated artifacts."""
+    tracker = ConcurrencyTracker()
+    barrier = asyncio.Barrier(2)
+    workspace = TaskWorkspace("react_image_generation", str(tmp_path))
+    tool = ImageGenerationTool(
+        {"tracked-image": _TrackedImageModel(tracker, barrier)},
+        workspace=workspace,
+    ).get_tools()[0]
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call(tool.name, {"prompt": "alpha"}),
+        make_tool_call(tool.name, {"prompt": "beta"}),
+    ]
+
+    segment, kind = pattern._next_segment(batch, [tool])
+    assert kind == "concurrent"
+    assert segment == batch
+
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+
+    assert tracker.peak == 2
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
+    assert results[0]["request_id"] == "request-alpha"
+    assert results[1]["request_id"] == "request-beta"
+
+    image_paths = [result["image_path"] for result in results]
+    assert len(set(image_paths)) == 2
+    assert all(
+        path and (workspace.output_dir / Path(path).name).exists()
+        for path in image_paths
+    )
+
+    for result in results:
+        assert result["file_id"]
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert result["artifacts"] == [
+            {
+                "type": "image",
+                "file_id": result["file_id"],
+                "filename": Path(result["image_path"]).name,
+                "mime_type": "image/png",
+                "display": "inline",
+            }
+        ]
+
     assert [r["tool_call_id"] for r in context.tool_results] == [
         tc["id"] for tc in batch
     ]

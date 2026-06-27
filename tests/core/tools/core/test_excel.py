@@ -1,6 +1,11 @@
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from openpyxl import Workbook, load_workbook
 
+from xagent.core.tools.core import excel as excel_module
 from xagent.core.tools.core.excel import (
     calculate_cell_size_from_font,
     read_excel_cells,
@@ -74,6 +79,33 @@ async def test_update_excel_cells_basic(temp_excel_file):
     updated_content = await read_excel_cells(temp_excel_file)
     assert any("D4: New Data 1" in cell for cell in updated_content)
     assert any("E5: New Data 2" in cell for cell in updated_content)
+
+
+@pytest.mark.asyncio
+async def test_update_excel_cells_guards_the_entire_file_mutation(
+    temp_excel_file, monkeypatch
+):
+    guarded_paths = []
+
+    @contextmanager
+    def guard_path(path):
+        guarded_paths.append(Path(path).resolve())
+        yield Path(path).resolve()
+
+    monkeypatch.setattr(
+        excel_module,
+        "GLOBAL_PATH_MUTATION_LOCKS",
+        SimpleNamespace(guard_path=guard_path),
+        raising=False,
+    )
+
+    result = await update_excel_cells(
+        file_path=temp_excel_file,
+        updates=[{"cell_address": "A1", "new_value": "Guarded"}],
+    )
+
+    assert "Successfully batch updated 1 cells" in result
+    assert guarded_paths == [Path(temp_excel_file).resolve()]
 
 
 def test_calculate_cell_size_from_font():

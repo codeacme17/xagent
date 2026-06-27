@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6,6 +9,7 @@ from xagent.core.tools.adapters.vibe.document_parser import (
     DocumentParseTool,
     DocumentParseWithOutputTool,
 )
+from xagent.core.tools.core import document_parser as document_parser_core
 from xagent.core.tools.core.document_parser import (
     DocumentCapabilities,
     DocumentParseArgs,
@@ -431,6 +435,57 @@ async def test_document_parse_with_output_tool_successful_execution(
     mock_file.write.assert_any_call("=== METADATA ===\n")
     mock_file.write.assert_any_call("doc_title: Test Doc\n")
     mock_file.write.assert_any_call("parser_version: v1.0\n")
+
+
+@pytest.mark.asyncio
+@patch("builtins.open")
+async def test_document_parse_with_output_guards_output_path(
+    mock_open,
+    mock_parser_registry,
+    mock_workspace,
+    parse_result_full,
+    monkeypatch,
+):
+    parser_name = "full_local_combo"
+    mock_parser_registry["instances"][
+        parser_name
+    ].parse.return_value = parse_result_full
+
+    mock_file = MagicMock()
+    mock_open.return_value.__enter__.return_value = mock_file
+    guarded_paths = []
+
+    @contextmanager
+    def guard_path(path):
+        guarded_paths.append(Path(path).resolve())
+        yield Path(path).resolve()
+
+    monkeypatch.setattr(
+        document_parser_core,
+        "GLOBAL_PATH_MUTATION_LOCKS",
+        SimpleNamespace(guard_path=guard_path),
+        raising=False,
+    )
+
+    tool = DocumentParseWithOutputTool(workspace=mock_workspace)
+    args = {
+        "file_path": "input.pdf",
+        "parser_name": parser_name,
+        "output_path": "output.txt",
+        "output_format": "txt",
+        "capabilities": {
+            "capability_text": True,
+            "capability_figure": False,
+            "requires_full_text_result": False,
+            "requires_segmented_result": True,
+            "use_local_parser": True,
+        },
+    }
+
+    result = await tool.run_json_async(args)
+
+    assert result == DocumentParseWithOutputResult()
+    assert guarded_paths == [Path("/mock/workspace/output.txt").resolve()]
 
 
 @pytest.mark.asyncio

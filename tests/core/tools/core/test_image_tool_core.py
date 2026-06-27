@@ -2,6 +2,8 @@
 Tests for ImageGenerationToolCore class
 """
 
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -338,6 +340,27 @@ class TestImageGenerationToolCore:
 
         # Verify the call was made
         mock_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_download_image_guards_workspace_output_path(self, mock_workspace):
+        """Image output writes must share the workspace path-lock contract."""
+        guarded_paths = []
+
+        @contextmanager
+        def guard_workspace_mutation_path(path, default_dir="output"):
+            guarded_paths.append(Path(path).resolve())
+            yield Path(path).resolve()
+
+        mock_workspace.guard_workspace_mutation_path = guard_workspace_mutation_path
+        tool = ImageGenerationToolCore({}, {}, mock_workspace)
+
+        result = await tool._download_image(
+            "data:image/png;base64,ZmFrZV9pbWFnZQ==",
+            filename="guarded.png",
+        )
+
+        assert Path(result).name == "guarded.png"
+        assert guarded_paths == [(mock_workspace.output_dir / "guarded.png").resolve()]
 
     def test_list_available_models(self, image_tool_core, mock_image_models):
         """Test listing available models"""

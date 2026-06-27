@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentParseTool(AbstractBaseTool):
+    read_only = True
+
     def __init__(self, workspace: TaskWorkspace | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.workspace = workspace
@@ -60,6 +62,8 @@ class DocumentParseTool(AbstractBaseTool):
 
 # This alternative tool will write the result to a file
 class DocumentParseWithOutputTool(AbstractBaseTool):
+    concurrency_safe = True
+
     def __init__(self, workspace: TaskWorkspace | None = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.workspace = workspace

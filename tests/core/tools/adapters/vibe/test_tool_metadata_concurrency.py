@@ -23,6 +23,10 @@ from pydantic import BaseModel
 
 from tests.core.tools.adapters.sandboxed_tool.conftest import FakeBaseTool
 from xagent.core.tools.adapters.vibe.base import ToolMetadata
+from xagent.core.tools.adapters.vibe.document_parser import (
+    DocumentParseTool,
+    DocumentParseWithOutputTool,
+)
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
 from xagent.core.tools.adapters.vibe.file_tool import (
     append_file_tool,
@@ -36,6 +40,7 @@ from xagent.core.tools.adapters.vibe.file_tool import (
     write_json_file_tool,
 )
 from xagent.core.tools.adapters.vibe.function import FunctionTool
+from xagent.core.tools.adapters.vibe.image_tool import ImageGenerationTool
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
@@ -56,6 +61,12 @@ from xagent.core.workspace import TaskWorkspace
 def _noop(x: int = 0) -> dict[str, Any]:
     """A trivial function for FunctionTool-based tests."""
     return {"x": x}
+
+
+def _image_model() -> MagicMock:
+    model = MagicMock()
+    model.has_ability.side_effect = lambda ability: ability in {"generate", "edit"}
+    return model
 
 
 def test_tool_metadata_defaults_are_not_concurrency_safe() -> None:
@@ -184,6 +195,29 @@ def test_workspace_file_tool_metadata_matches_guarded_concurrency(tmp_path) -> N
     }:
         assert tools[name].metadata.read_only is False
         assert tools[name].metadata.concurrency_safe is True
+
+
+def test_image_tool_metadata_matches_artifact_safety(tmp_path) -> None:
+    workspace = TaskWorkspace("metadata_image_artifacts", str(tmp_path))
+    image_tool = ImageGenerationTool({"model": _image_model()}, workspace=workspace)
+    tools = {tool.name: tool for tool in image_tool.get_tools()}
+
+    assert tools["list_image_models"].metadata.read_only is True
+    assert tools["list_image_models"].metadata.concurrency_safe is True
+
+    for name in {"generate_image", "edit_image"}:
+        assert tools[name].metadata.read_only is False
+        assert tools[name].metadata.concurrency_safe is True
+
+
+def test_document_parser_metadata_matches_artifact_safety() -> None:
+    parse_tool = DocumentParseTool()
+    parse_with_output_tool = DocumentParseWithOutputTool()
+
+    assert parse_tool.metadata.read_only is True
+    assert parse_tool.metadata.concurrency_safe is True
+    assert parse_with_output_tool.metadata.read_only is False
+    assert parse_with_output_tool.metadata.concurrency_safe is True
 
 
 def test_abstract_base_tool_metadata_exposes_concurrency_fields() -> None:

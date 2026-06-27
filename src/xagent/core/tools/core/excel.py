@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from types import ModuleType
 from typing import Any, Dict, List, Optional, Set
+
+from ...path_locks import GLOBAL_PATH_MUTATION_LOCKS
 
 # Optional import for openpyxl
 openpyxl: ModuleType | None = None
@@ -201,7 +204,39 @@ async def update_excel_cells(
     loop = asyncio.get_running_loop()
 
     try:
-        workbook = await loop.run_in_executor(None, load_workbook, file_path)
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                _update_excel_cells_sync,
+                file_path=file_path,
+                updates=updates,
+                sheet_name=sheet_name,
+                font_size=font_size,
+                auto_size=auto_size,
+                padding=padding,
+                wrap_text=wrap_text,
+                max_width=max_width,
+                auto_size_links=auto_size_links,
+            ),
+        )
+    except Exception as e:
+        raise ValueError(f"Batch update Excel failed: {e}") from e
+
+
+def _update_excel_cells_sync(
+    *,
+    file_path: str,
+    updates: List[Dict[str, Any]],
+    sheet_name: str,
+    font_size: Optional[int],
+    auto_size: bool,
+    padding: float,
+    wrap_text: bool,
+    max_width: Optional[float],
+    auto_size_links: bool,
+) -> str:
+    with GLOBAL_PATH_MUTATION_LOCKS.guard_path(file_path) as guarded_file_path:
+        workbook = load_workbook(filename=guarded_file_path)
         sheet = workbook[sheet_name]
 
         updated_count = 0
@@ -216,12 +251,10 @@ async def update_excel_cells(
             try:
                 cell = sheet[cell_address]
 
-                # Value update
                 if "new_value" in update_item:
                     cell.value = update_item.get("new_value")
                 new_value = cell.value
 
-                # Hyperlink handling: set or clear if provided
                 hyperlink_provided = "hyperlink" in update_item
                 hyperlink_target = (
                     update_item.get("hyperlink") if hyperlink_provided else None
@@ -238,7 +271,6 @@ async def update_excel_cells(
                     _apply_basic_font(cell, font_size)
                     _apply_wrap_alignment(cell, wrap_text)
 
-                # Comment handling: set or clear if provided
                 if "comment_text" in update_item:
                     comment_text = update_item.get("comment_text")
                     if comment_text:
@@ -247,7 +279,6 @@ async def update_excel_cells(
                     else:
                         cell.comment = None
 
-                # Auto size
                 should_auto_size = auto_size and (
                     auto_size_links or not hyperlink_target
                 )
@@ -268,9 +299,7 @@ async def update_excel_cells(
             except Exception as e:
                 raise ValueError(f"Failed to update cell {cell_address}: {e}") from e
 
-        await loop.run_in_executor(None, workbook.save, file_path)
+        workbook.save(guarded_file_path)
         return (
             f"Successfully batch updated {updated_count} cells in sheet '{sheet_name}'."
         )
-    except Exception as e:
-        raise ValueError(f"Batch update Excel failed: {e}") from e

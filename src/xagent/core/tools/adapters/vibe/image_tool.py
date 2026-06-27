@@ -80,16 +80,19 @@ class ImageGenerationTool(ImageGenerationToolCore):
                 self.generate_image,
                 name="generate_image",
                 description=generate_description,
+                concurrency_safe=True,
             ),
             ImageGenerationFunctionTool(
                 self.edit_image,
                 name="edit_image",
                 description=edit_description,
+                concurrency_safe=True,
             ),
             ImageGenerationFunctionTool(
                 self.list_available_models,
                 name="list_image_models",
                 description="List all available image generation models, including model ID, availability status, and detailed description information (Note: model information is already provided in the generate_image tool description)",
+                read_only=True,
             ),
         ]
 
