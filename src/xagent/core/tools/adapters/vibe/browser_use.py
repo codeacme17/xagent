@@ -7,6 +7,7 @@ Browser sessions are automatically cleaned up when tasks complete.
 
 import logging
 import os
+import uuid
 from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -32,6 +33,19 @@ from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 logger = logging.getLogger(__name__)
 
 _STEP_SESSION_ARG = "_xagent_step_id"
+
+
+def _browser_output_filename(
+    output_filename: Any, *, prefix: str, extension: str
+) -> str:
+    if output_filename:
+        return os.path.basename(str(output_filename))
+
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    unique_suffix = uuid.uuid4().hex[:8]
+    return f"{prefix}_{timestamp}_{unique_suffix}.{extension}"
 
 
 class BrowserTaskSessionMixin:
@@ -324,6 +338,7 @@ class BrowserPdfResult(BaseModel):
 
 class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Navigate to a URL in a browser session."""
 
     def __init__(
@@ -491,6 +506,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Click an element on the current page."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -539,6 +555,7 @@ class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserFillTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Fill an input field with text."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -587,6 +604,7 @@ class BrowserFillTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Take a screenshot of the current page."""
 
     def __init__(
@@ -650,7 +668,6 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
         if self._workspace and result.get("success"):
             try:
                 import base64
-                from datetime import datetime
 
                 # Extract base64 data from data URI
                 screenshot_data = result.get("screenshot", "")
@@ -663,29 +680,30 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 image_bytes = base64.b64decode(base64_data)
 
                 # Determine filename - always save to output directory
-                output_filename = args.get("output_filename")
-                if output_filename:
-                    # Sanitize filename to prevent path traversal attacks
-                    filename = os.path.basename(output_filename)
-                else:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"screenshot_{timestamp}.png"
+                filename = _browser_output_filename(
+                    args.get("output_filename"), prefix="screenshot", extension="png"
+                )
                 # Always save to output directory
                 file_path = self._workspace.output_dir / filename
 
-                # Save to file within auto_register context
-                with self._workspace.auto_register_files():
-                    with open(file_path, "wb") as f:
-                        f.write(image_bytes)
+                # Save and register under the shared path guard so concurrent
+                # explicit filenames cannot interleave writes or metadata.
+                with self._workspace.guard_workspace_mutation_path(
+                    file_path
+                ) as guarded_path:
+                    file_path = guarded_path
+                    with self._workspace.auto_register_files():
+                        with open(file_path, "wb") as f:
+                            f.write(image_bytes)
 
-                relative_path = str(
-                    file_path.relative_to(self._workspace.workspace_dir)
-                )
-                file_ref = build_workspace_file_ref(
-                    workspace=self._workspace,
-                    file_path=file_path,
-                    mime_type="image/png",
-                )
+                    relative_path = str(
+                        file_path.relative_to(self._workspace.workspace_dir)
+                    )
+                    file_ref = build_workspace_file_ref(
+                        workspace=self._workspace,
+                        file_path=file_path,
+                        mime_type="image/png",
+                    )
                 result["screenshot"] = relative_path
                 result["format"] = "file"
                 result["file_id"] = file_ref["file_id"]
@@ -707,6 +725,7 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserExtractTextTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Extract text content from the page."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -754,6 +773,7 @@ class BrowserExtractTextTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserEvaluateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Execute JavaScript code in the browser."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -861,6 +881,7 @@ class BrowserListSessionsTool(AbstractBaseTool):
 
 class BrowserSelectOptionTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Select an option from a dropdown."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -910,6 +931,7 @@ class BrowserSelectOptionTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserWaitForSelectorTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Wait for an element to appear on the page."""
 
     def __init__(self, task_id: Optional[str] = None):
@@ -1001,6 +1023,7 @@ class BrowserCloseTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
 class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
+    concurrency_safe = True
     """Save current page as PDF."""
 
     def __init__(
@@ -1060,7 +1083,6 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
         if self._workspace and result.get("success"):
             try:
                 import base64
-                from datetime import datetime
 
                 # Extract base64 data
                 pdf_data = result.get("pdf", "")
@@ -1073,30 +1095,31 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 pdf_bytes = base64.b64decode(base64_data)
 
                 # Determine filename - always save to output directory
-                output_filename = args.get("output_filename")
-                if output_filename:
-                    # Sanitize filename to prevent path traversal attacks
-                    filename = os.path.basename(output_filename)
-                else:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"page_{timestamp}.pdf"
+                filename = _browser_output_filename(
+                    args.get("output_filename"), prefix="page", extension="pdf"
+                )
 
                 # Always save to output directory
                 file_path = self._workspace.output_dir / filename
 
-                # Save to file within auto_register context
-                with self._workspace.auto_register_files():
-                    with open(file_path, "wb") as f:
-                        f.write(pdf_bytes)
+                # Save and register under the shared path guard so concurrent
+                # explicit filenames cannot interleave writes or metadata.
+                with self._workspace.guard_workspace_mutation_path(
+                    file_path
+                ) as guarded_path:
+                    file_path = guarded_path
+                    with self._workspace.auto_register_files():
+                        with open(file_path, "wb") as f:
+                            f.write(pdf_bytes)
 
-                relative_path = str(
-                    file_path.relative_to(self._workspace.workspace_dir)
-                )
-                file_ref = build_workspace_file_ref(
-                    workspace=self._workspace,
-                    file_path=file_path,
-                    mime_type="application/pdf",
-                )
+                    relative_path = str(
+                        file_path.relative_to(self._workspace.workspace_dir)
+                    )
+                    file_ref = build_workspace_file_ref(
+                        workspace=self._workspace,
+                        file_path=file_path,
+                        mime_type="application/pdf",
+                    )
                 result["output_path"] = relative_path
                 result["format"] = "file"
                 result["file_id"] = file_ref["file_id"]

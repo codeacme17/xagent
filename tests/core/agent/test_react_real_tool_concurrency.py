@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Callable, Iterator
@@ -41,10 +41,12 @@ from tests.core.agent.concurrency_harness import (
 )
 from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
+from xagent.core.tools.adapters.vibe.browser_use import BrowserEvaluateTool
 from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
+from xagent.core.tools.core import browser_use as browser_core
 from xagent.core.workspace import TaskWorkspace
 
 # How long a batched I/O seam waits to rendezvous with its sibling before giving
@@ -77,6 +79,70 @@ class _WorkspaceRegisterTracker:
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class _TrackedBrowserPage:
+    def __init__(
+        self,
+        session_id: str,
+        tracker: ConcurrencyTracker,
+        barrier: asyncio.Barrier | None = None,
+    ) -> None:
+        self._session_id = session_id
+        self._tracker = tracker
+        self._barrier = barrier
+
+    async def evaluate(self, javascript: str) -> str:
+        self._tracker.enter(self._session_id)
+        try:
+            if self._barrier is not None:
+                await asyncio.wait_for(
+                    self._barrier.wait(), timeout=_RENDEZVOUS_TIMEOUT
+                )
+            else:
+                await asyncio.sleep(0.05)
+            return javascript
+        finally:
+            self._tracker.leave(self._session_id)
+
+
+class _TrackedBrowserSession:
+    def __init__(
+        self,
+        session_id: str,
+        tracker: ConcurrencyTracker,
+        barrier: asyncio.Barrier | None = None,
+    ) -> None:
+        self._page = _TrackedBrowserPage(session_id, tracker, barrier)
+        self._operation_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def operation_guard(self) -> Iterator[None]:
+        async with self._operation_lock:
+            yield
+
+    async def get_page(self) -> _TrackedBrowserPage:
+        return self._page
+
+
+class _TrackedBrowserManager:
+    def __init__(
+        self,
+        tracker: ConcurrencyTracker,
+        barrier: asyncio.Barrier | None = None,
+    ) -> None:
+        self._tracker = tracker
+        self._barrier = barrier
+        self._sessions: dict[str, _TrackedBrowserSession] = {}
+
+    async def get_or_create(
+        self, session_id: str, headless: bool = False
+    ) -> _TrackedBrowserSession:
+        if session_id not in self._sessions:
+            self._sessions[session_id] = _TrackedBrowserSession(
+                session_id, self._tracker, self._barrier
+            )
+        return self._sessions[session_id]
 
 
 @dataclass
@@ -230,6 +296,84 @@ def test_real_workspace_write_tool_is_batched_as_concurrent(tmp_path: Any) -> No
 
     assert kind == "concurrent"
     assert segment == batch
+
+
+def test_real_browser_evaluate_tool_is_batched_as_concurrent() -> None:
+    """Browser evaluate opts into the ReAct concurrent segment."""
+    tool = BrowserEvaluateTool()
+    pattern = make_react(parallel=True, max_concurrency=2)
+    batch = [
+        make_tool_call(tool.name, {"session_id": "session-a", "javascript": "'first'"}),
+        make_tool_call(
+            tool.name, {"session_id": "session-b", "javascript": "'second'"}
+        ),
+    ]
+
+    segment, kind = pattern._next_segment(batch, [tool])
+
+    assert kind == "concurrent"
+    assert segment == batch
+
+
+async def test_real_browser_evaluate_tool_serializes_same_session_in_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-session browser calls stay serial inside a ReAct batch."""
+    tracker = ConcurrencyTracker()
+    manager = _TrackedBrowserManager(tracker)
+    monkeypatch.setattr(browser_core, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(browser_core, "get_browser_manager", lambda: manager)
+
+    tool = BrowserEvaluateTool()
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call(
+            tool.name, {"session_id": "same-session", "javascript": "'first'"}
+        ),
+        make_tool_call(
+            tool.name, {"session_id": "same-session", "javascript": "'second'"}
+        ),
+    ]
+
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+
+    assert tracker.peak == 1
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
+
+
+async def test_real_browser_evaluate_tool_overlaps_different_sessions_in_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different browser sessions can overlap inside a ReAct batch."""
+    tracker = ConcurrencyTracker()
+    barrier = asyncio.Barrier(2)
+    manager = _TrackedBrowserManager(tracker, barrier)
+    monkeypatch.setattr(browser_core, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(browser_core, "get_browser_manager", lambda: manager)
+
+    tool = BrowserEvaluateTool()
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    batch = [
+        make_tool_call(tool.name, {"session_id": "session-a", "javascript": "'first'"}),
+        make_tool_call(
+            tool.name, {"session_id": "session-b", "javascript": "'second'"}
+        ),
+    ]
+
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+
+    assert tracker.peak == 2
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
 
 
 async def test_real_workspace_write_tool_serializes_same_path_in_batch(

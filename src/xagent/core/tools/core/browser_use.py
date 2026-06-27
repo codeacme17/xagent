@@ -7,8 +7,9 @@ automatically cleaned up after a timeout period.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Optional
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -72,6 +73,13 @@ class BrowserSession:
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
+        self._operation_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def operation_guard(self) -> AsyncIterator[None]:
+        """Serialize operations that target this session's page/context."""
+        async with self._operation_lock:
+            yield
 
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
@@ -162,6 +170,11 @@ class BrowserSession:
 
     async def close(self) -> None:
         """Close the browser and cleanup resources."""
+        async with self.operation_guard():
+            await self._close_unlocked()
+
+    async def _close_unlocked(self) -> None:
+        """Close resources while the caller holds the operation guard."""
         try:
             # Close page first
             if self._page:
@@ -362,71 +375,72 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id, headless)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        # For local files, use 'domcontentloaded' or 'load' instead of 'networkidle'
-        # because local files don't have network activity
-        if url.startswith("file://"):
-            # Override wait_until for local files
-            wait_until_local = (
-                wait_until if wait_until != "networkidle" else "domcontentloaded"
+        try:
+            # For local files, use 'domcontentloaded' or 'load' instead of 'networkidle'
+            # because local files don't have network activity
+            if url.startswith("file://"):
+                # Override wait_until for local files
+                wait_until_local = (
+                    wait_until if wait_until != "networkidle" else "domcontentloaded"
+                )
+            else:
+                wait_until_local = wait_until
+
+            # Log navigation attempt for debugging
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"[browser_navigate] Navigating to {url} (headless={headless}, wait_until={wait_until_local})"
             )
-        else:
-            wait_until_local = wait_until
 
-        # Log navigation attempt for debugging
-        import logging
+            # Add timeout to prevent hanging (default 30 seconds)
+            # Using wait_until parameter (default: 'networkidle', but can be 'domcontentloaded' or 'load')
+            # networkidle can hang on pages with continuous background requests
+            await page.goto(url, wait_until=wait_until_local, timeout=30000)  # type: ignore[arg-type]
+            # Get title (no timeout parameter available for title())
+            title = await page.title()
 
-        logger = logging.getLogger(__name__)
-        logger.info(
-            f"[browser_navigate] Navigating to {url} (headless={headless}, wait_until={wait_until_local})"
-        )
+            logger.info(
+                f"[browser_navigate] Successfully navigated to {url}, title: {title}"
+            )
 
-        # Add timeout to prevent hanging (default 30 seconds)
-        # Using wait_until parameter (default: 'networkidle', but can be 'domcontentloaded' or 'load')
-        # networkidle can hang on pages with continuous background requests
-        await page.goto(url, wait_until=wait_until_local, timeout=30000)  # type: ignore[arg-type]
-        # Get title (no timeout parameter available for title())
-        title = await page.title()
+            return {
+                "success": True,
+                "session_id": session_id,
+                "url": url,
+                "title": title,
+                "message": (
+                    f"Navigation complete: opened {url}. This only confirms the page "
+                    "loaded; it does not inspect content, validate visual rendering, "
+                    "or create an image export. Do not call browser_navigate again for "
+                    "this same URL unless navigation failed or the target URL changed. "
+                    "Use browser_screenshot for visual inspection/rendered output, "
+                    "or browser_extract_text for page text. "
+                    f"Session ID: '{session_id}'."
+                ),
+            }
+        except Exception as e:
+            import logging
+            import traceback
 
-        logger.info(
-            f"[browser_navigate] Successfully navigated to {url}, title: {title}"
-        )
+            logger = logging.getLogger(__name__)
+            logger.error(f"[browser_navigate] Failed to navigate to {url}: {str(e)}")
+            logger.error(f"[browser_navigate] Traceback: {traceback.format_exc()}")
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "url": url,
-            "title": title,
-            "message": (
-                f"Navigation complete: opened {url}. This only confirms the page "
-                "loaded; it does not inspect content, validate visual rendering, "
-                "or create an image export. Do not call browser_navigate again for "
-                "this same URL unless navigation failed or the target URL changed. "
-                "Use browser_screenshot for visual inspection/rendered output, "
-                "or browser_extract_text for page text. "
-                f"Session ID: '{session_id}'."
-            ),
-        }
-    except Exception as e:
-        import logging
-        import traceback
-
-        logger = logging.getLogger(__name__)
-        logger.error(f"[browser_navigate] Failed to navigate to {url}: {str(e)}")
-        logger.error(f"[browser_navigate] Traceback: {traceback.format_exc()}")
-
-        return {
-            "success": False,
-            "session_id": session_id,
-            "url": url,
-            "title": "",
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Navigation failed for URL '{url}'"
-            ),
-        }
+            return {
+                "success": False,
+                "session_id": session_id,
+                "url": url,
+                "title": "",
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Navigation failed for URL '{url}'"
+                ),
+            }
 
 
 async def browser_click(**kwargs: Any) -> Dict[str, Any]:
@@ -466,26 +480,27 @@ async def browser_click(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        await page.click(selector, timeout=timeout)
-        return {
-            "success": True,
-            "session_id": session_id,
-            "selector": selector,
-            "message": f"Successfully clicked element: {selector}. Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "selector": selector,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Click failed for selector '{selector}'"
-            ),
-        }
+        try:
+            await page.click(selector, timeout=timeout)
+            return {
+                "success": True,
+                "session_id": session_id,
+                "selector": selector,
+                "message": f"Successfully clicked element: {selector}. Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "selector": selector,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Click failed for selector '{selector}'"
+                ),
+            }
 
 
 async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
@@ -527,30 +542,31 @@ async def browser_fill(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        # Add timeout to prevent hanging (default 30 seconds)
-        await page.fill(selector, value, timeout=30000)
-        preview = value[:50] + "..." if len(value) > 50 else value
-        return {
-            "success": True,
-            "session_id": session_id,
-            "selector": selector,
-            "value": preview,
-            "message": f"Filled {selector} with: {preview}. Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "selector": selector,
-            "value": "",
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Fill failed for selector '{selector}'"
-            ),
-        }
+        try:
+            # Add timeout to prevent hanging (default 30 seconds)
+            await page.fill(selector, value, timeout=30000)
+            preview = value[:50] + "..." if len(value) > 50 else value
+            return {
+                "success": True,
+                "session_id": session_id,
+                "selector": selector,
+                "value": preview,
+                "message": f"Filled {selector} with: {preview}. Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "selector": selector,
+                "value": "",
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Fill failed for selector '{selector}'"
+                ),
+            }
 
 
 async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
@@ -625,141 +641,144 @@ async def browser_screenshot(**kwargs: Any) -> Dict[str, Any]:
     session = await manager.get_or_create(session_id)
     logger.info(f"[browser_screenshot] Got/created session (session={session_id})")
 
-    page = await session.get_page()
-    logger.info(f"[browser_screenshot] Got page object (session={session_id})")
-
-    # Set viewport size if width or height is specified
-    current_viewport = page.viewport_size
-    if current_viewport is not None and (
-        current_viewport.get("width") != width
-        or current_viewport.get("height") != height
-    ):
-        logger.info(
-            f"[browser_screenshot] Setting viewport size to {width}x{height} (session={session_id})"
-        )
-        await page.set_viewport_size({"width": width, "height": height})
-
     # Track actual screenshot mode (may differ from requested if fallback occurs)
     actual_full_page = full_page
 
-    try:
-        # Screenshot returns bytes, convert to base64 with data URI prefix
-        import base64
+    async with session.operation_guard():
+        page = await session.get_page()
+        logger.info(f"[browser_screenshot] Got page object (session={session_id})")
 
-        logger = logging.getLogger(__name__)
-
-        logger.info(
-            f"[browser_screenshot] Starting screenshot (session={session_id}, full_page={full_page})"
-        )
-
-        if not full_page:
-            # Viewport-only screenshot (fast, reliable)
-            try:
-                logger.info(
-                    f"[browser_screenshot] Taking viewport screenshot (session={session_id})"
-                )
-
-                screenshot_bytes = await page.screenshot(
-                    full_page=False,
-                    type="png",
-                )
-
-                logger.info(
-                    f"[browser_screenshot] Viewport screenshot captured (session={session_id}, size={len(screenshot_bytes)} bytes)"
-                )
-            except Exception as screenshot_error:
-                raise screenshot_error
-        else:
-            # full_page=True: Use Playwright's full_page (works fine in clean asyncio)
+        # Set viewport size if width or height is specified
+        current_viewport = page.viewport_size
+        if current_viewport is not None and (
+            current_viewport.get("width") != width
+            or current_viewport.get("height") != height
+        ):
             logger.info(
-                f"[browser_screenshot] Using Playwright full_page (session={session_id}, wait_for_lazy_load={wait_for_lazy_load})"
+                f"[browser_screenshot] Setting viewport size to {width}x{height} (session={session_id})"
+            )
+            await page.set_viewport_size({"width": width, "height": height})
+
+        try:
+            # Screenshot returns bytes, convert to base64 with data URI prefix
+            import base64
+
+            logger = logging.getLogger(__name__)
+
+            logger.info(
+                f"[browser_screenshot] Starting screenshot (session={session_id}, full_page={full_page})"
             )
 
-            if wait_for_lazy_load and full_page:
-                # Trigger lazy loading by scrolling the page before screenshot
-                logger.info(
-                    f"[browser_screenshot] Triggering lazy loading before screenshot (session={session_id})"
-                )
-
-                # Get page height
-                page_height = await page.evaluate("document.body.scrollHeight")
-                logger.info(
-                    f"[browser_screenshot] Page height: {page_height}px (session={session_id})"
-                )
-
-                # Scroll through the page in chunks to trigger lazy loading
-                viewport_size = page.viewport_size
-                viewport_height = (
-                    viewport_size.get("height", 1080) if viewport_size else 1080
-                )
-                scroll_position = 0
-                scroll_count = 0
-                max_scrolls = 50  # Prevent infinite loops
-
-                while scroll_position < page_height and scroll_count < max_scrolls:
+            if not full_page:
+                # Viewport-only screenshot (fast, reliable)
+                try:
                     logger.info(
-                        f"[browser_screenshot] Scrolling to y={scroll_position}/{page_height} (session={session_id}, scroll {scroll_count + 1}/{max_scrolls})"
+                        f"[browser_screenshot] Taking viewport screenshot (session={session_id})"
                     )
-                    await page.evaluate(f"window.scrollTo(0, {scroll_position})")
-                    await page.wait_for_timeout(300)  # Wait 300ms for content to load
-                    scroll_position += viewport_height
-                    scroll_count += 1
 
-                # Scroll back to top before screenshot
+                    screenshot_bytes = await page.screenshot(
+                        full_page=False,
+                        type="png",
+                    )
+
+                    logger.info(
+                        f"[browser_screenshot] Viewport screenshot captured (session={session_id}, size={len(screenshot_bytes)} bytes)"
+                    )
+                except Exception as screenshot_error:
+                    raise screenshot_error
+            else:
+                # full_page=True: Use Playwright's full_page (works fine in clean asyncio)
                 logger.info(
-                    f"[browser_screenshot] Scrolled back to top (session={session_id})"
+                    f"[browser_screenshot] Using Playwright full_page (session={session_id}, wait_for_lazy_load={wait_for_lazy_load})"
                 )
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(500)  # Wait for page to stabilize
 
-            try:
-                logger.info(
-                    f"[browser_screenshot] Calling page.screenshot(full_page=True) (session={session_id})"
-                )
-                screenshot_bytes = await page.screenshot(
-                    full_page=True,
-                    type="png",
-                )
-                logger.info(
-                    f"[browser_screenshot] Full page screenshot successful: {len(screenshot_bytes)} bytes (session={session_id})"
-                )
-            except Exception as native_error:
-                logger.warning(
-                    f"[browser_screenshot] Full page failed: {native_error}, falling back to viewport (session={session_id})"
-                )
-                # Fallback to viewport
-                screenshot_bytes = await page.screenshot(
-                    full_page=False,
-                    type="png",
-                )
-                actual_full_page = False
+                if wait_for_lazy_load and full_page:
+                    # Trigger lazy loading by scrolling the page before screenshot
+                    logger.info(
+                        f"[browser_screenshot] Triggering lazy loading before screenshot (session={session_id})"
+                    )
 
-        screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-        # Add data URI prefix for compatibility with vision tools
-        screenshot_data_uri = f"data:image/png;base64,{screenshot_b64}"
+                    # Get page height
+                    page_height = await page.evaluate("document.body.scrollHeight")
+                    logger.info(
+                        f"[browser_screenshot] Page height: {page_height}px (session={session_id})"
+                    )
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "screenshot": screenshot_data_uri,
-            "format": "base64",
-            "full_page": actual_full_page,  # Will be False if we fell back
-            "wait_for_lazy_load": wait_for_lazy_load,
-            "message": f"Screenshot captured successfully (full_page={actual_full_page}). Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "screenshot": "",
-            "format": "base64",
-            "full_page": actual_full_page,
-            "wait_for_lazy_load": wait_for_lazy_load,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Screenshot failed for session '{session_id}'"
-            ),
-        }
+                    # Scroll through the page in chunks to trigger lazy loading
+                    viewport_size = page.viewport_size
+                    viewport_height = (
+                        viewport_size.get("height", 1080) if viewport_size else 1080
+                    )
+                    scroll_position = 0
+                    scroll_count = 0
+                    max_scrolls = 50  # Prevent infinite loops
+
+                    while scroll_position < page_height and scroll_count < max_scrolls:
+                        logger.info(
+                            f"[browser_screenshot] Scrolling to y={scroll_position}/{page_height} (session={session_id}, scroll {scroll_count + 1}/{max_scrolls})"
+                        )
+                        await page.evaluate(f"window.scrollTo(0, {scroll_position})")
+                        await page.wait_for_timeout(
+                            300
+                        )  # Wait 300ms for content to load
+                        scroll_position += viewport_height
+                        scroll_count += 1
+
+                    # Scroll back to top before screenshot
+                    logger.info(
+                        f"[browser_screenshot] Scrolled back to top (session={session_id})"
+                    )
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(500)  # Wait for page to stabilize
+
+                try:
+                    logger.info(
+                        f"[browser_screenshot] Calling page.screenshot(full_page=True) (session={session_id})"
+                    )
+                    screenshot_bytes = await page.screenshot(
+                        full_page=True,
+                        type="png",
+                    )
+                    logger.info(
+                        f"[browser_screenshot] Full page screenshot successful: {len(screenshot_bytes)} bytes (session={session_id})"
+                    )
+                except Exception as native_error:
+                    logger.warning(
+                        f"[browser_screenshot] Full page failed: {native_error}, falling back to viewport (session={session_id})"
+                    )
+                    # Fallback to viewport
+                    screenshot_bytes = await page.screenshot(
+                        full_page=False,
+                        type="png",
+                    )
+                    actual_full_page = False
+
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+            # Add data URI prefix for compatibility with vision tools
+            screenshot_data_uri = f"data:image/png;base64,{screenshot_b64}"
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "screenshot": screenshot_data_uri,
+                "format": "base64",
+                "full_page": actual_full_page,  # Will be False if we fell back
+                "wait_for_lazy_load": wait_for_lazy_load,
+                "message": f"Screenshot captured successfully (full_page={actual_full_page}). Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "screenshot": "",
+                "format": "base64",
+                "full_page": actual_full_page,
+                "wait_for_lazy_load": wait_for_lazy_load,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Screenshot failed for session '{session_id}'"
+                ),
+            }
 
 
 async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
@@ -801,49 +820,50 @@ async def browser_extract_text(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        # Try inner_text() first with timeout
-        element = page.locator(selector)
         try:
-            # Wait for element to be attached with short timeout
-            await element.wait_for(state="attached", timeout=5000)
-            text = await element.inner_text(timeout=10000)
-        except Exception as inner_error:
-            # Fallback: use JavaScript textContent which is more reliable
-            import json
-
-            escaped_selector = json.dumps(selector)
+            # Try inner_text() first with timeout
+            element = page.locator(selector)
             try:
-                text = await page.evaluate(
-                    f'document.querySelector({escaped_selector})?.textContent || ""'
-                )
-                if not text or not isinstance(text, str):
-                    raise inner_error  # Re-raise original error if JS also fails
-            except Exception:
-                raise inner_error  # Re-raise original error
+                # Wait for element to be attached with short timeout
+                await element.wait_for(state="attached", timeout=5000)
+                text = await element.inner_text(timeout=10000)
+            except Exception as inner_error:
+                # Fallback: use JavaScript textContent which is more reliable
+                import json
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "selector": selector,
-            "text": text,
-            "length": len(text),
-            "message": f"Extracted {len(text)} characters from {selector}. Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "selector": selector,
-            "text": "",
-            "length": 0,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Text extraction failed for selector '{selector}'"
-            ),
-        }
+                escaped_selector = json.dumps(selector)
+                try:
+                    text = await page.evaluate(
+                        f'document.querySelector({escaped_selector})?.textContent || ""'
+                    )
+                    if not text or not isinstance(text, str):
+                        raise inner_error  # Re-raise original error if JS also fails
+                except Exception:
+                    raise inner_error  # Re-raise original error if JS also fails
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "selector": selector,
+                "text": text,
+                "length": len(text),
+                "message": f"Extracted {len(text)} characters from {selector}. Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "selector": selector,
+                "text": "",
+                "length": 0,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Text extraction failed for selector '{selector}'"
+                ),
+            }
 
 
 async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
@@ -881,25 +901,29 @@ async def browser_evaluate(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
 
-    try:
-        result = await page.evaluate(javascript)
+    async with session.operation_guard():
+        page = await session.get_page()
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "result": result,
-            "message": f"JavaScript executed successfully. Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "result": None,
-            "message": "",
-            "error": _format_error_with_traceback(e, "JavaScript evaluation failed"),
-        }
+        try:
+            result = await page.evaluate(javascript)
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "result": result,
+                "message": f"JavaScript executed successfully. Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "result": None,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, "JavaScript evaluation failed"
+                ),
+            }
 
 
 async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
@@ -955,30 +979,41 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        if value is not None:
-            # Add timeout to prevent hanging (default 30 seconds)
-            await page.select_option(selector, value=value, timeout=30000)
-            return {
-                "success": True,
-                "session_id": session_id,
-                "selector": selector,
-                "selected_value": value,
-                "message": f"Selected option with value: {value}. Session ID: {session_id}",
-            }
-        elif index is not None:
-            # Add timeout to prevent hanging (default 30 seconds)
-            await page.select_option(selector, index=index, timeout=30000)
-            return {
-                "success": True,
-                "session_id": session_id,
-                "selector": selector,
-                "selected_index": index,
-                "message": f"Selected option at index: {index}. Session ID: {session_id}",
-            }
-        else:
+        try:
+            if value is not None:
+                # Add timeout to prevent hanging (default 30 seconds)
+                await page.select_option(selector, value=value, timeout=30000)
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "selector": selector,
+                    "selected_value": value,
+                    "message": f"Selected option with value: {value}. Session ID: {session_id}",
+                }
+            elif index is not None:
+                # Add timeout to prevent hanging (default 30 seconds)
+                await page.select_option(selector, index=index, timeout=30000)
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "selector": selector,
+                    "selected_index": index,
+                    "message": f"Selected option at index: {index}. Session ID: {session_id}",
+                }
+            else:
+                return {
+                    "success": False,
+                    "session_id": session_id,
+                    "selector": selector,
+                    "selected_value": "",
+                    "selected_index": None,
+                    "message": "",
+                    "error": "Either value or index must be provided",
+                }
+        except Exception as e:
             return {
                 "success": False,
                 "session_id": session_id,
@@ -986,20 +1021,10 @@ async def browser_select_option(**kwargs: Any) -> Dict[str, Any]:
                 "selected_value": "",
                 "selected_index": None,
                 "message": "",
-                "error": "Either value or index must be provided",
+                "error": _format_error_with_traceback(
+                    e, f"Select option failed for selector '{selector}'"
+                ),
             }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "selector": selector,
-            "selected_value": "",
-            "selected_index": None,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Select option failed for selector '{selector}'"
-            ),
-        }
 
 
 async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
@@ -1039,26 +1064,27 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        await page.wait_for_selector(selector, timeout=timeout)
-        return {
-            "success": True,
-            "session_id": session_id,
-            "selector": selector,
-            "message": f"Element found: {selector}. Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "selector": selector,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"Timeout waiting for selector '{selector}'"
-            ),
-        }
+        try:
+            await page.wait_for_selector(selector, timeout=timeout)
+            return {
+                "success": True,
+                "session_id": session_id,
+                "selector": selector,
+                "message": f"Element found: {selector}. Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "selector": selector,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"Timeout waiting for selector '{selector}'"
+                ),
+            }
 
 
 async def browser_close(session_id: str) -> Dict[str, Any]:
@@ -1148,47 +1174,48 @@ async def browser_pdf(**kwargs: Any) -> Dict[str, Any]:
 
     manager = get_browser_manager()
     session = await manager.get_or_create(session_id)
-    page = await session.get_page()
+    async with session.operation_guard():
+        page = await session.get_page()
 
-    try:
-        import logging
+        try:
+            import logging
 
-        logger = logging.getLogger(__name__)
-        logger.info(
-            f"[browser_pdf] Generating PDF (session={session_id}, format={format}, landscape={landscape})"
-        )
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"[browser_pdf] Generating PDF (session={session_id}, format={format}, landscape={landscape})"
+            )
 
-        # Generate PDF from current page
-        pdf_bytes = await page.pdf(
-            landscape=landscape,
-            format=format,
-            print_background=print_background,
-        )
+            # Generate PDF from current page
+            pdf_bytes = await page.pdf(
+                landscape=landscape,
+                format=format,
+                print_background=print_background,
+            )
 
-        # Encode to base64
-        import base64
+            # Encode to base64
+            import base64
 
-        pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
-        file_size = len(pdf_bytes)
+            pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+            file_size = len(pdf_bytes)
 
-        logger.info(f"[browser_pdf] PDF generated successfully ({file_size} bytes)")
+            logger.info(f"[browser_pdf] PDF generated successfully ({file_size} bytes)")
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "pdf": pdf_base64,
-            "format": "base64",
-            "size": file_size,
-            "message": f"PDF generated successfully ({file_size} bytes). Session ID: {session_id}",
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "session_id": session_id,
-            "pdf": "",
-            "size": 0,
-            "message": "",
-            "error": _format_error_with_traceback(
-                e, f"PDF generation failed for session '{session_id}'"
-            ),
-        }
+            return {
+                "success": True,
+                "session_id": session_id,
+                "pdf": pdf_base64,
+                "format": "base64",
+                "size": file_size,
+                "message": f"PDF generated successfully ({file_size} bytes). Session ID: {session_id}",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "pdf": "",
+                "size": 0,
+                "message": "",
+                "error": _format_error_with_traceback(
+                    e, f"PDF generation failed for session '{session_id}'"
+                ),
+            }

@@ -5,11 +5,29 @@ These tests use mocking to avoid requiring actual browser installation.
 Run with: pytest tests/core/tools/test_browser_use.py
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 import pytest
 
 from xagent.core.tools.core import browser_use
+
+
+_SESSION_GUARDED_OPERATIONS = [
+    (
+        browser_use.browser_navigate,
+        {"url": "https://example.com", "wait_until": "domcontentloaded"},
+    ),
+    (browser_use.browser_click, {"selector": "button.submit"}),
+    (browser_use.browser_fill, {"selector": "input[name='email']", "value": "x"}),
+    (browser_use.browser_screenshot, {}),
+    (browser_use.browser_extract_text, {}),
+    (browser_use.browser_evaluate, {"javascript": "'ok'"}),
+    (browser_use.browser_select_option, {"selector": "select.country", "value": "US"}),
+    (browser_use.browser_wait_for_selector, {"selector": ".ready"}),
+    (browser_use.browser_pdf, {}),
+]
 
 
 @pytest.fixture
@@ -33,6 +51,30 @@ def reset_manager():
     browser_use._manager = None
     yield
     browser_use._manager = None
+
+
+@pytest.mark.parametrize(
+    ("operation", "extra_args"),
+    _SESSION_GUARDED_OPERATIONS,
+    ids=[operation.__name__ for operation, _extra_args in _SESSION_GUARDED_OPERATIONS],
+)
+async def test_browser_operation_serializes_calls_for_same_session(
+    monkeypatch, operation, extra_args
+):
+    """Every browser operation is guarded by the target session."""
+    tracker = _AsyncConcurrencyTracker()
+    manager = _FakeBrowserManager(tracker)
+
+    monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(browser_use, "get_browser_manager", lambda: manager)
+
+    results = await asyncio.gather(
+        operation(session_id="shared-session", **extra_args),
+        operation(session_id="shared-session", **extra_args),
+    )
+
+    assert [result["success"] for result in results] == [True, True]
+    assert tracker.peak == 1
 
 
 class TestBrowserNavigate:
@@ -179,6 +221,44 @@ class TestBrowserEvaluate:
             assert result["success"] is False
             assert "not installed" in result["error"]
 
+    async def test_evaluate_serializes_operations_for_same_session(self, monkeypatch):
+        """Concurrent calls sharing a browser session run one at a time."""
+        tracker = _AsyncConcurrencyTracker()
+        manager = _FakeBrowserManager(tracker)
+
+        monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(browser_use, "get_browser_manager", lambda: manager)
+
+        results = await asyncio.gather(
+            browser_use.browser_evaluate(
+                session_id="shared-session", javascript="'first'"
+            ),
+            browser_use.browser_evaluate(
+                session_id="shared-session", javascript="'second'"
+            ),
+        )
+
+        assert [result["success"] for result in results] == [True, True]
+        assert tracker.peak == 1
+
+    async def test_evaluate_allows_operations_for_different_sessions_to_overlap(
+        self, monkeypatch
+    ):
+        """Concurrent calls with different sessions can overlap."""
+        tracker = _AsyncConcurrencyTracker()
+        manager = _FakeBrowserManager(tracker)
+
+        monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(browser_use, "get_browser_manager", lambda: manager)
+
+        results = await asyncio.gather(
+            browser_use.browser_evaluate(session_id="session-a", javascript="'a'"),
+            browser_use.browser_evaluate(session_id="session-b", javascript="'b'"),
+        )
+
+        assert [result["success"] for result in results] == [True, True]
+        assert tracker.peak == 2
+
 
 class TestBrowserSelectOption:
     """Tests for browser_select_option function."""
@@ -284,3 +364,95 @@ class TestBrowserSession:
             assert session.session_id == "test-session"
             assert session.headless is True
             assert session._initialized is False
+
+
+class _AsyncConcurrencyTracker:
+    def __init__(self):
+        self.active = 0
+        self.peak = 0
+
+    async def run(self, result):
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return result
+        finally:
+            self.active -= 1
+
+
+class _FakeBrowserPage:
+    def __init__(self, tracker):
+        self._tracker = tracker
+        self.viewport_size = {"width": 1920, "height": 1080}
+
+    async def goto(self, url, **kwargs):
+        return await self._tracker.run(url)
+
+    async def title(self):
+        return "Fake title"
+
+    async def click(self, selector, **kwargs):
+        return await self._tracker.run(selector)
+
+    async def fill(self, selector, value, **kwargs):
+        return await self._tracker.run(value)
+
+    async def screenshot(self, **kwargs):
+        return await self._tracker.run(b"fake-png")
+
+    def locator(self, selector):
+        return _FakeBrowserLocator(selector, self._tracker)
+
+    async def evaluate(self, javascript):
+        return await self._tracker.run(javascript)
+
+    async def select_option(self, selector, **kwargs):
+        return await self._tracker.run(kwargs)
+
+    async def wait_for_selector(self, selector, **kwargs):
+        return await self._tracker.run(selector)
+
+    async def pdf(self, **kwargs):
+        return await self._tracker.run(b"fake-pdf")
+
+    async def set_viewport_size(self, viewport_size):
+        self.viewport_size = dict(viewport_size)
+
+
+class _FakeBrowserLocator:
+    def __init__(self, selector, tracker):
+        self._selector = selector
+        self._tracker = tracker
+
+    async def wait_for(self, **kwargs):
+        return None
+
+    async def inner_text(self, **kwargs):
+        return await self._tracker.run(f"text for {self._selector}")
+
+
+class _FakeBrowserSession:
+    def __init__(self, session_id, tracker):
+        self.session_id = session_id
+        self._page = _FakeBrowserPage(tracker)
+        self._operation_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def operation_guard(self):
+        async with self._operation_lock:
+            yield
+
+    async def get_page(self):
+        return self._page
+
+
+class _FakeBrowserManager:
+    def __init__(self, tracker):
+        self._tracker = tracker
+        self._sessions = {}
+
+    async def get_or_create(self, session_id, headless=False):
+        if session_id not in self._sessions:
+            self._sessions[session_id] = _FakeBrowserSession(session_id, self._tracker)
+        return self._sessions[session_id]
