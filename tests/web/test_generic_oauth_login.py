@@ -22,6 +22,7 @@ from xagent.web.api.auth import (
     create_access_token,
     generic_oauth_login,
 )
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 
@@ -184,6 +185,84 @@ def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     )
     qs = parse_qs(urlparse(_location(resp)).query)
     assert "prompt" not in qs
+
+
+def test_meta_login_uses_comma_separated_scopes_from_selected_app(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list", "pages_manage_posts"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["public_profile,pages_manage_posts,pages_show_list"]
+
+
+def test_meta_login_uses_config_id_without_scope_when_configured(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="instagram",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["1234567890"]
+    assert "scope" not in qs
 
 
 def test_login_uses_env_client_id_when_provider_client_id_is_empty(

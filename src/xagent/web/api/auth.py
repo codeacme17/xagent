@@ -88,6 +88,68 @@ def _oauth_provider_config_error(
     )
 
 
+def _merge_oauth_scopes(
+    default_scopes: list[str] | None, app_scopes: list[str] | None
+) -> list[str]:
+    scopes: list[str] = []
+    seen: set[str] = set()
+
+    for scope in default_scopes or []:
+        if scope and scope not in seen:
+            scopes.append(scope)
+            seen.add(scope)
+
+    for scope in sorted(app_scopes or []):
+        if scope and scope not in seen:
+            scopes.append(scope)
+            seen.add(scope)
+
+    return scopes
+
+
+def _oauth_scope_separator(provider: str) -> str:
+    if provider.lower() == "meta":
+        return ","
+    return " "
+
+
+def _meta_login_config_id() -> str:
+    return os.environ.get("META_CONFIG_ID") or os.environ.get(
+        "META_LOGIN_CONFIG_ID", ""
+    )
+
+
+def _exchange_meta_long_lived_token(
+    provider: str,
+    token_url: str,
+    token_data: dict[str, Any],
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    if provider.lower() != "meta":
+        return token_data
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return token_data
+
+    response = requests.get(
+        token_url,
+        params={
+            "grant_type": "fb_exchange_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "fb_exchange_token": access_token,
+        },
+        timeout=10.0,
+    )
+    long_lived_token_data = response.json()
+    if response.status_code != 200 or "error" in long_lived_token_data:
+        return token_data
+
+    return {**token_data, **long_lived_token_data}
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -1007,15 +1069,17 @@ def generic_oauth_login(
     }
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
-    scopes = db_provider.default_scopes or []
+    scopes = _merge_oauth_scopes(db_provider.default_scopes or [], None)
     from ..mcp_apps import get_app_by_id
 
     if app_id:
         app_info = get_app_by_id(db, app_id)
         if app_info and "oauth_scopes" in app_info:
-            scopes = list(set(scopes + app_info["oauth_scopes"]))
+            scopes = _merge_oauth_scopes(
+                db_provider.default_scopes or [], app_info["oauth_scopes"]
+            )
 
-    scope_str = " ".join(scopes)
+    scope_str = _oauth_scope_separator(provider).join(scopes)
 
     from urllib.parse import urlencode
 
@@ -1031,7 +1095,10 @@ def generic_oauth_login(
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
-    if scope_str:
+    meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
+    if meta_config_id:
+        params["config_id"] = meta_config_id
+    elif scope_str:
         params["scope"] = scope_str
 
     separator = "&" if "?" in auth_url else "?"
@@ -1207,6 +1274,9 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        token_data = _exchange_meta_long_lived_token(
+            provider, token_url, token_data, client_id, client_secret
+        )
         access_token = token_data.get("access_token")
 
         provider_user_id = None

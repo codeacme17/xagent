@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.core.utils.encryption import encrypt_value
+from xagent.web.api import auth as auth_api
+from xagent.web.api.auth import create_access_token, generic_oauth_callback
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.tools import config as tool_config
+
+
+class MockResponse:
+    def __init__(self, json_data=None, status_code: int = 200, text: str = ""):
+        self._json_data = json_data or {}
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return self._json_data
+
+
+@pytest.fixture()
+def db_session(tmp_path):
+    db_path = tmp_path / "test.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    db = SessionLocal()
+
+    user = User(username="alice", password_hash="x", is_admin=False)
+    db.add(user)
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list", "pages_manage_posts"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+    db.refresh(user)
+
+    yield db, user
+    db.close()
+    engine.dispose()
+
+
+def _meta_provider() -> SimpleNamespace:
+    return SimpleNamespace(
+        provider_name="meta",
+        client_id=encrypt_value("meta-client-id"),
+        client_secret=encrypt_value("meta-client-secret"),
+        token_url="https://graph.facebook.com/v25.0/oauth/access_token",
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+        userinfo_url="https://graph.facebook.com/v25.0/me?fields=id,email",
+        user_id_path="id",
+        email_path="email",
+        default_scopes=["public_profile"],
+    )
+
+
+def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+            "redirect": "https://app.example.com/tools",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "short-token",
+                "token_type": "bearer",
+                "expires_in": 3600,
+            }
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            assert kwargs["params"] == {
+                "grant_type": "fb_exchange_token",
+                "client_id": "meta-client-id",
+                "client_secret": "meta-client-secret",
+                "fb_exchange_token": "short-token",
+            }
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        assert kwargs["headers"] == {"Authorization": "Bearer long-token"}
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "facebook")
+        .one()
+    )
+    assert oauth_account.access_token == "long-token"
+    assert oauth_account.provider_user_id == "meta-user-1"
+    assert oauth_account.email == "alice@example.com"
+    assert oauth_account.expires_at is not None
+
+    server = db.query(MCPServer).filter(MCPServer.name == "Facebook Pages").one()
+    assert server.transport == "oauth"
+    assert server.auth == {"app_id": "facebook", "provider": "meta"}
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assert user_mcp.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_meta_expired_token_refresh_uses_fb_exchange_token(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("meta-client-id"),
+            client_secret=encrypt_value("meta-client-secret"),
+            auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+            token_url="https://graph.facebook.com/v25.0/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/meta/callback",
+            userinfo_url="https://graph.facebook.com/v25.0/me?fields=id,email",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["public_profile"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="facebook",
+        access_token="old-long-token",
+        refresh_token=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="meta-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {
+                    "access_token": "new-long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")
+        is True
+    )
+
+    assert oauth_account.access_token == "new-long-token"
+    assert oauth_account.expires_at is not None
+    assert captured_requests == [
+        (
+            "https://graph.facebook.com/v25.0/oauth/access_token",
+            {
+                "params": {
+                    "grant_type": "fb_exchange_token",
+                    "client_id": "meta-client-id",
+                    "client_secret": "meta-client-secret",
+                    "fb_exchange_token": "old-long-token",
+                },
+                "timeout": 10.0,
+            },
+        )
+    ]
