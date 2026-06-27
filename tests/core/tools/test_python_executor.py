@@ -2,7 +2,11 @@
 Tests for PythonExecutor tool
 """
 
+import asyncio
+import os
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -169,6 +173,62 @@ class TestPythonExecutorTool:
                 "display": "inline",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_workspace_calls_isolate_process_state_and_metadata(
+        self, tmp_path
+    ):
+        """Concurrent executions keep cwd, output, env, and artifacts separate."""
+        workspace = TaskWorkspace("test_python_concurrent_isolation", str(tmp_path))
+        executor = PythonExecutorTool(workspace=workspace)
+        original_cwd = Path.cwd()
+
+        def code_for(label: str) -> str:
+            dirname = f"{label}_dir"
+            artifact = f"{label}.docx"
+            return f"""
+import os
+import time
+from pathlib import Path
+
+Path({dirname!r}).mkdir(exist_ok=True)
+os.chdir({dirname!r})
+print({f"{label}:entered:"!r} + Path.cwd().name)
+time.sleep(1.0)
+print({f"{label}:final:"!r} + Path.cwd().name)
+print({f"{label}:env:"!r} + str(os.environ.get("WORKSPACE_DIR") == WORKSPACE_DIR))
+Path("..", {artifact!r}).write_bytes({label.encode()!r})
+"""
+
+        started = time.perf_counter()
+        try:
+            left_result, right_result = await asyncio.gather(
+                executor.run_json_async(
+                    {"code": code_for("left"), "capture_output": True}
+                ),
+                executor.run_json_async(
+                    {"code": code_for("right"), "capture_output": True}
+                ),
+            )
+        finally:
+            os.chdir(original_cwd)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.8
+        assert left_result["success"] is True
+        assert right_result["success"] is True
+        assert "left:entered:left_dir" in left_result["output"]
+        assert "left:final:left_dir" in left_result["output"]
+        assert "left:env:True" in left_result["output"]
+        assert "right:" not in left_result["output"]
+        assert "right:entered:right_dir" in right_result["output"]
+        assert "right:final:right_dir" in right_result["output"]
+        assert "right:env:True" in right_result["output"]
+        assert "left:" not in right_result["output"]
+        assert left_result["generated_files"] == ["left.docx"]
+        assert right_result["generated_files"] == ["right.docx"]
+        assert left_result["file_refs"][0]["file_id"]
+        assert right_result["file_refs"][0]["file_id"]
 
     def test_syntax_error(self, python_executor):
         """Test handling of syntax errors"""

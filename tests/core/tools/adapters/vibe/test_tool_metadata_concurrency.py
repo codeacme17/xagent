@@ -40,6 +40,8 @@ from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
 from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorTool
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
+from xagent.core.tools.adapters.vibe.python_executor import get_python_executor_tool
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     sandbox_config,
 )
@@ -146,8 +148,10 @@ def test_basic_file_mutation_tools_match_guarded_concurrency() -> None:
         assert tool.metadata.concurrency_safe is True
 
 
-def test_stateful_tools_without_call_isolation_are_not_concurrency_safe() -> None:
-    assert PythonExecutorTool().metadata.concurrency_safe is False
+def test_python_executor_tools_are_concurrency_safe_after_call_isolation() -> None:
+    assert PythonExecutorTool().metadata.concurrency_safe is True
+    assert PythonExecutorToolForBasic().metadata.concurrency_safe is True
+    assert get_python_executor_tool().metadata.concurrency_safe is True
 
 
 def test_workspace_file_tool_metadata_matches_guarded_concurrency(tmp_path) -> None:

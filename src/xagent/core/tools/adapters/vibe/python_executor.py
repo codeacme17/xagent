@@ -5,6 +5,7 @@ Framework wrapper around the pure Python executor tool
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
@@ -12,10 +13,8 @@ from pydantic import BaseModel, Field
 from ....workspace import TaskWorkspace
 from ...artifacts import (
     build_generated_file_metadata,
-    changed_generated_artifact_files,
-    snapshot_generated_artifact_files,
 )
-from ...core.python_executor import PythonExecutorCore
+from ...core.python_executor import _INTERNAL_WRITTEN_FILES_KEY, PythonExecutorCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
 from .sandboxed_tool.sandbox_config import sandbox_config
@@ -47,6 +46,8 @@ class PythonExecutorResult(BaseModel):
 
 class PythonExecutorTool(AbstractBaseTool):
     """Framework wrapper for the pure Python executor tool"""
+
+    concurrency_safe = True
 
     def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
         self._visibility = ToolVisibility.PUBLIC
@@ -82,7 +83,10 @@ class PythonExecutorTool(AbstractBaseTool):
         workspace_env = self._get_workspace_env()
 
         # Create core executor instance
-        executor = PythonExecutorCore(working_directory=working_directory)
+        executor = PythonExecutorCore(
+            working_directory=working_directory,
+            environment=workspace_env,
+        )
 
         # Add workspace variables to the executor's globals if available
         if workspace_env:
@@ -92,23 +96,23 @@ class PythonExecutorTool(AbstractBaseTool):
         else:
             full_code = exec_args.code
 
-        # Execute code within auto_register context
+        # Execute code in an isolated subprocess. The child reports only files
+        # written by this execution, avoiding concurrent snapshot bleed-through.
         if self._workspace and working_directory:
-            files_before = snapshot_generated_artifact_files(working_directory)
-            with self._workspace.auto_register_files():
-                result = executor.execute_code(full_code, exec_args.capture_output)
+            result = executor.execute_code(full_code, exec_args.capture_output)
+            written_files = result.pop(_INTERNAL_WRITTEN_FILES_KEY, [])
             if result.get("success"):
-                files_after = snapshot_generated_artifact_files(working_directory)
+                workspace_files = self._existing_workspace_files(written_files)
+                self._register_workspace_files(workspace_files)
                 result.update(
                     build_generated_file_metadata(
                         workspace=self._workspace,
-                        file_paths=changed_generated_artifact_files(
-                            files_before, files_after
-                        ),
+                        file_paths=workspace_files,
                     )
                 )
         else:
             result = executor.execute_code(full_code, exec_args.capture_output)
+            result.pop(_INTERNAL_WRITTEN_FILES_KEY, None)
 
         return PythonExecutorResult(**result).model_dump()
 
@@ -133,6 +137,49 @@ class PythonExecutorTool(AbstractBaseTool):
             "WORKSPACE_TEMP_DIR": str(self._workspace.resolve_path("", "temp")),
             "WORKSPACE_DIR": str(self._workspace.workspace_dir.resolve()),
         }
+
+    def _existing_workspace_files(self, file_paths: Any) -> list[Path]:
+        """Return existing files from this workspace for this execution only."""
+        if not self._workspace or not isinstance(file_paths, list):
+            return []
+
+        workspace_root = self._workspace.workspace_dir.resolve()
+        result: list[Path] = []
+        seen: set[str] = set()
+
+        for file_path in file_paths:
+            try:
+                resolved = Path(str(file_path)).resolve()
+                resolved.relative_to(workspace_root)
+            except (OSError, ValueError):
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            if any(
+                part.startswith(".") or part == "__pycache__"
+                for part in resolved.relative_to(workspace_root).parts
+            ):
+                continue
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(resolved)
+
+        return result
+
+    def _register_workspace_files(self, file_paths: list[Path]) -> None:
+        if not self._workspace:
+            return
+        for file_path in file_paths:
+            try:
+                self._workspace.register_file(str(file_path))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to register Python executor generated file %s: %s",
+                    file_path,
+                    exc,
+                )
 
 
 @sandbox_config(
@@ -181,7 +228,9 @@ def get_python_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionT
         return result
 
     return PythonExecutorFunctionTool(
-        execute_python_code, description=executor.description
+        execute_python_code,
+        description=executor.description,
+        concurrency_safe=True,
     )
 
 

@@ -40,8 +40,9 @@ from tests.core.agent.concurrency_harness import (
     make_tool_call,
 )
 from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
-from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
 from xagent.core.tools.adapters.vibe.browser_use import BrowserEvaluateTool
+from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorTool
 from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
@@ -315,6 +316,22 @@ def test_real_browser_evaluate_tool_is_batched_as_concurrent() -> None:
     assert segment == batch
 
 
+def test_real_python_executor_tool_is_batched_as_concurrent(tmp_path: Any) -> None:
+    """Python executor opts into the ReAct concurrent segment after isolation."""
+    workspace = TaskWorkspace("react_python_segment", str(tmp_path))
+    tool = PythonExecutorTool(workspace)
+    pattern = make_react(parallel=True, max_concurrency=2)
+    batch = [
+        make_tool_call(tool.name, {"code": "print('first')"}),
+        make_tool_call(tool.name, {"code": "print('second')"}),
+    ]
+
+    segment, kind = pattern._next_segment(batch, [tool])
+
+    assert kind == "concurrent"
+    assert segment == batch
+
+
 async def test_real_browser_evaluate_tool_serializes_same_session_in_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -427,3 +444,54 @@ async def test_real_workspace_write_tool_overlaps_different_paths_in_batch(
     assert all(pattern._tool_result_success(result) for result in results)
     assert (workspace.output_dir / "one.txt").read_text(encoding="utf-8") == "one"
     assert (workspace.output_dir / "two.txt").read_text(encoding="utf-8") == "two"
+
+
+async def test_real_python_executor_tool_overlaps_and_isolates_batch_results(
+    tmp_path: Any,
+) -> None:
+    """ReAct batch execution overlaps Python calls without output/artifact bleed."""
+    workspace = TaskWorkspace("react_python_overlap", str(tmp_path))
+    tool = PythonExecutorTool(workspace)
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+
+    def code_for(label: str) -> str:
+        dirname = f"{label}_dir"
+        artifact = f"{label}.docx"
+        return f"""
+import os
+import time
+from pathlib import Path
+
+Path({dirname!r}).mkdir(exist_ok=True)
+os.chdir({dirname!r})
+print({f"{label}:entered:"!r} + Path.cwd().name)
+time.sleep(1.0)
+print({f"{label}:final:"!r} + Path.cwd().name)
+Path("..", {artifact!r}).write_bytes({label.encode()!r})
+"""
+
+    batch = [
+        make_tool_call(tool.name, {"code": code_for("alpha")}),
+        make_tool_call(tool.name, {"code": code_for("beta")}),
+    ]
+
+    started = time.perf_counter()
+    results = await asyncio.wait_for(
+        pattern._run_concurrent_batch(batch, [tool], FakeRuntime(), context),
+        timeout=_RENDEZVOUS_TIMEOUT * 2,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 2.0
+    assert len(results) == 2
+    assert all(pattern._tool_result_success(result) for result in results)
+    assert "alpha:final:alpha_dir" in results[0]["output"]
+    assert "beta:" not in results[0]["output"]
+    assert "beta:final:beta_dir" in results[1]["output"]
+    assert "alpha:" not in results[1]["output"]
+    assert results[0]["generated_files"] == ["alpha.docx"]
+    assert results[1]["generated_files"] == ["beta.docx"]
+    assert [r["tool_call_id"] for r in context.tool_results] == [
+        tc["id"] for tc in batch
+    ]
