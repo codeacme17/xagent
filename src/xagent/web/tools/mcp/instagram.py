@@ -197,7 +197,9 @@ def _list_pages_with_instagram_accounts() -> list[dict[str, Any]]:
         "/me/accounts",
         params={"fields": LINKED_ACCOUNT_FIELDS},
     )
-    pages = result.get("data", []) if isinstance(result, dict) else []
+    pages = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(pages, list):
+        return []
     accounts: list[dict[str, Any]] = []
     for page in pages:
         if not isinstance(page, dict):

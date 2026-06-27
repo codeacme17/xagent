@@ -30,6 +30,11 @@ class MockResponse:
         return self._json_data
 
 
+class NonJsonResponse(MockResponse):
+    def json(self):
+        raise ValueError("response body is not JSON")
+
+
 @pytest.fixture()
 def db_session(tmp_path):
     db_path = tmp_path / "test.db"
@@ -155,6 +160,57 @@ def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
         .one()
     )
     assert user_mcp.is_active is True
+
+
+def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_json(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "short-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return NonJsonResponse(status_code=502, text="<html>bad gateway</html>")
+
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "facebook")
+        .one()
+    )
+    assert oauth_account.access_token == "short-token"
+    assert oauth_account.provider_user_id == "meta-user-1"
 
 
 @pytest.mark.asyncio

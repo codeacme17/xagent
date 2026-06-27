@@ -95,6 +95,19 @@ def test_list_pages_hides_page_access_tokens(monkeypatch):
     }
 
 
+def test_list_pages_treats_non_list_data_as_empty(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        facebook.requests,
+        "request",
+        Mock(return_value=MockResponse({"data": None})),
+    )
+
+    result = _payload(facebook.facebook_list_pages())
+
+    assert result == {"status": "success", "pages": []}
+
+
 def test_list_page_posts_uses_page_access_token(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
 

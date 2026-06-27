@@ -158,7 +158,9 @@ def _list_pages_with_tokens() -> list[dict[str, Any]]:
         "/me/accounts",
         params={"fields": "id,name,category,tasks,access_token"},
     )
-    pages = result.get("data", []) if isinstance(result, dict) else []
+    pages = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(pages, list):
+        return []
     return [page for page in pages if isinstance(page, dict)]
 
 

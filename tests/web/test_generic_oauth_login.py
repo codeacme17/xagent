@@ -187,9 +187,13 @@ def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     assert "prompt" not in qs
 
 
-def test_meta_login_uses_comma_separated_scopes_from_selected_app(db_session):
+def test_meta_login_uses_comma_separated_scopes_from_selected_app(
+    db_session, monkeypatch
+):
     db, user = db_session
     token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_LOGIN_CONFIG_ID", raising=False)
     db.add(
         PublicMCPApp(
             app_id="facebook",

@@ -118,6 +118,19 @@ def test_list_linked_accounts_returns_pages_with_instagram_accounts(monkeypatch)
     assert "page-token" not in json.dumps(result)
 
 
+def test_list_linked_accounts_treats_non_list_data_as_empty(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        instagram.requests,
+        "request",
+        Mock(return_value=MockResponse({"data": None})),
+    )
+
+    result = _payload(instagram.instagram_list_linked_accounts())
+
+    assert result == {"status": "success", "accounts": []}
+
+
 def test_get_profile_reads_selected_instagram_account(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     mock_request = Mock(

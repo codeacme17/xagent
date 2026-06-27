@@ -143,8 +143,16 @@ def _exchange_meta_long_lived_token(
         },
         timeout=10.0,
     )
-    long_lived_token_data = response.json()
-    if response.status_code != 200 or "error" in long_lived_token_data:
+    try:
+        long_lived_token_data = response.json()
+    except ValueError:
+        return token_data
+
+    if (
+        response.status_code != 200
+        or not isinstance(long_lived_token_data, dict)
+        or "error" in long_lived_token_data
+    ):
         return token_data
 
     return {**token_data, **long_lived_token_data}
@@ -1304,12 +1312,12 @@ def generic_oauth_callback(
             )
             db.add(oauth_account)
 
-            oauth_account.access_token = access_token
+            setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
             setattr(oauth_account, "scope", token_data.get("scope", ""))
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
-                oauth_account.refresh_token = token_data.get("refresh_token")
+                setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,
