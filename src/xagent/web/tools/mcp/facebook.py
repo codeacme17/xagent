@@ -18,6 +18,7 @@ mcp = FastMCP("facebook-mcp")
 
 GRAPH_BASE_URL = "https://graph.facebook.com/v25.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
 
 class GraphAPIError(RuntimeError):
@@ -93,6 +94,13 @@ def _graph_headers(token: str, *, form: bool = False) -> dict[str, str]:
     return headers
 
 
+def _response_error_text(response: Any) -> str:
+    response_text = str(getattr(response, "text", "")).strip()
+    if len(response_text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        return response_text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    return response_text
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -116,7 +124,7 @@ def _graph_request(
     except requests.HTTPError as exc:
         details = _response_json(response)
         message = str(exc)
-        response_text = response.text.strip()
+        response_text = _response_error_text(response)
         if response_text:
             message = f"{message} - {response_text}"
         sensitive_values = {request_token, os.environ.get("META_ACCESS_TOKEN", "")}

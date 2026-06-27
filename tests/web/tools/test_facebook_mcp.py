@@ -237,6 +237,22 @@ def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):
     assert result["details"]["error"]["code"] == 190
 
 
+def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    long_response_text = "x" * 1200
+    monkeypatch.setattr(
+        facebook.requests,
+        "request",
+        Mock(return_value=MockResponse(text=long_response_text, status_code=502)),
+    )
+
+    result = _payload(facebook.facebook_auth_status())
+
+    assert result["status"] == "error"
+    assert "... [truncated]" in result["message"]
+    assert "x" * 1001 not in result["message"]
+
+
 def test_page_token_is_redacted_from_publish_errors(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
 

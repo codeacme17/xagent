@@ -133,19 +133,19 @@ def _exchange_meta_long_lived_token(
     if not access_token:
         return token_data
 
-    response = requests.get(
-        token_url,
-        params={
-            "grant_type": "fb_exchange_token",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "fb_exchange_token": access_token,
-        },
-        timeout=10.0,
-    )
     try:
+        response = requests.get(
+            token_url,
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "fb_exchange_token": access_token,
+            },
+            timeout=10.0,
+        )
         long_lived_token_data = response.json()
-    except ValueError:
+    except (requests.RequestException, ValueError):
         return token_data
 
     if (

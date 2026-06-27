@@ -213,6 +213,57 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_js
     assert oauth_account.provider_user_id == "meta-user-1"
 
 
+def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "meta",
+            "app_id": "facebook",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "short-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "short-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            raise auth_api.requests.RequestException("meta token exchange timed out")
+
+        assert url == "https://graph.facebook.com/v25.0/me?fields=id,email"
+        assert kwargs["headers"] == {"Authorization": "Bearer short-token"}
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "facebook")
+        .one()
+    )
+    assert oauth_account.access_token == "short-token"
+    assert oauth_account.provider_user_id == "meta-user-1"
+
+
 @pytest.mark.asyncio
 async def test_meta_expired_token_refresh_uses_fb_exchange_token(
     db_session, monkeypatch
