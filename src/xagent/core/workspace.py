@@ -16,7 +16,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, cast
 from uuid import uuid4
 
 from ..config import get_uploads_dir
@@ -622,7 +622,7 @@ class TaskWorkspace:
                         return None
                     from ..web.services.managed_file_ref import ManagedFileRef
 
-                    return ManagedFileRef(record).materialize()
+                    return cast(Path, ManagedFileRef(record).materialize())
                 return None
             finally:
                 if should_close:
@@ -1023,20 +1023,31 @@ class TaskWorkspace:
         """
         # Scan files before operation
         with self._file_registration_lock:
-            files_before = self._scan_all_files()
+            file_states_before = self._scan_all_file_states()
 
         try:
             yield self
         finally:
             # Scan files after operation and register new/modified files.
             with self._file_registration_lock:
-                files_after = self._scan_all_files()
+                file_states_after = self._scan_all_file_states()
+                files_before = set(file_states_before)
+                files_after = set(file_states_after)
                 changed_files = files_after - files_before
-                changed_files.update(
-                    file_path
-                    for file_path in files_after & files_before
-                    if self._get_file_id_from_db(file_path, self.db_session) is not None
-                )
+
+                for file_path in files_after & files_before:
+                    if file_states_after[file_path] == file_states_before[file_path]:
+                        continue
+
+                    resolved_str = str(file_path.resolve())
+                    cached_file_id = self._recently_registered_files.get(
+                        str(file_path)
+                    ) or self._recently_registered_files.get(resolved_str)
+                    if cached_file_id or (
+                        self._get_file_id_from_db(file_path, self.db_session)
+                        is not None
+                    ):
+                        changed_files.add(file_path)
 
                 for file_path in changed_files:
                     try:
@@ -1068,6 +1079,17 @@ class TaskWorkspace:
                     continue
                 files.add(file_path)
         return files
+
+    def _scan_all_file_states(self) -> dict[Path, tuple[int, int]]:
+        """Scan all workspace files and return path to mtime/size state."""
+        file_states: dict[Path, tuple[int, int]] = {}
+        for file_path in self._scan_all_files():
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            file_states[file_path] = (stat.st_mtime_ns, stat.st_size)
+        return file_states
 
     def get_file_id_from_path(self, file_path: str) -> Optional[str]:
         """Get file_id from file path using database or in-memory cache."""

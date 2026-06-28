@@ -4,6 +4,7 @@ Tests for PythonExecutor tool
 
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from xagent.core.tools.adapters.vibe.python_executor import (
     PythonExecutorResult,
     PythonExecutorTool,
 )
+from xagent.core.tools.core import python_executor as python_executor_core
 from xagent.core.workspace import TaskWorkspace
 
 
@@ -81,6 +83,27 @@ class TestPythonExecutorTool:
         assert result["success"] is True
         assert "3 True" in result["output"]
         assert result["error"] == ""
+
+    def test_child_main_handles_non_dict_payload_without_secondary_exception(self):
+        """Invalid child payloads should report the original error cleanly."""
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(Path(python_executor_core.__file__).resolve()),
+                "--xagent-python-executor-child",
+            ],
+            input="[]",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert process.returncode == 1
+        assert (
+            "Python executor child error: Child payload must be a JSON object"
+            in process.stderr
+        )
+        assert "AttributeError" not in process.stderr
 
     def test_print_output(self, python_executor):
         """Test code with print statements"""

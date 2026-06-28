@@ -560,6 +560,30 @@ def test_auto_register_files_resyncs_modified_existing_file(
         engine.dispose()
 
 
+def test_auto_register_files_skips_db_lookup_for_unchanged_existing_files(
+    monkeypatch, tmp_path
+):
+    workspace = TaskWorkspace(id="web_task_900", base_dir=str(tmp_path / "workspaces"))
+    for index in range(5):
+        (workspace.output_dir / f"unchanged-{index}.txt").write_text(
+            "same content", encoding="utf-8"
+        )
+
+    queried_paths = []
+
+    def record_db_lookup(file_path, db_session=None):
+        del db_session
+        queried_paths.append(file_path)
+        return None
+
+    monkeypatch.setattr(workspace, "_get_file_id_from_db", record_db_lookup)
+
+    with workspace.auto_register_files():
+        pass
+
+    assert queried_paths == []
+
+
 def test_workspace_register_file_resyncs_external_file_without_reclassifying_upload(
     monkeypatch, tmp_path, mock_workspace_db
 ):

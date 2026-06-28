@@ -294,10 +294,12 @@ def _execute_child_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _child_main() -> int:
+    result_path_value: Any = None
     try:
         payload = json.loads(sys.stdin.read())
         if not isinstance(payload, dict):
             raise ValueError("Child payload must be a JSON object")
+        result_path_value = payload.get("result_path")
         result_path = Path(str(payload["result_path"]))
         result = _execute_child_payload(payload)
         result_path.write_text(json.dumps(result), encoding="utf-8")
@@ -309,7 +311,6 @@ def _child_main() -> int:
             "error": f"Python executor child error: {exc}",
             _INTERNAL_WRITTEN_FILES_KEY: [],
         }
-        result_path_value = locals().get("payload", {}).get("result_path")
         if result_path_value:
             try:
                 Path(str(result_path_value)).write_text(
