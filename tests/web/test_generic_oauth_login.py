@@ -22,8 +22,8 @@ from xagent.web.api.auth import (
     create_access_token,
     generic_oauth_login,
 )
-from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.database import Base
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 
 # ---------- helpers ---------------------------------------------------------
