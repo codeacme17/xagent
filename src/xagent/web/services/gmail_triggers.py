@@ -7,8 +7,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import quote
 
-from google.auth.transport.requests import AuthorizedSession, Request
-from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import (  # type: ignore[import-untyped]
+    AuthorizedSession,
+    Request,
+)
+from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -44,7 +47,7 @@ class GmailWatchConfigurationError(GmailTriggerError):
 class _GmailApiRequest:
     def __init__(
         self,
-        session: AuthorizedSession,
+        session: Any,
         method: str,
         url: str,
         **kwargs: Any,
@@ -69,7 +72,7 @@ class _GmailApiRequest:
 
 
 class _GmailMessagesResource:
-    def __init__(self, session: AuthorizedSession, user_id: str) -> None:
+    def __init__(self, session: Any, user_id: str) -> None:
         self._session = session
         self._user_id = quote(user_id, safe="")
 
@@ -84,7 +87,7 @@ class _GmailMessagesResource:
 
 
 class _GmailHistoryResource:
-    def __init__(self, session: AuthorizedSession, user_id: str) -> None:
+    def __init__(self, session: Any, user_id: str) -> None:
         self._session = session
         self._user_id = quote(user_id, safe="")
 
@@ -98,7 +101,7 @@ class _GmailHistoryResource:
 
 
 class _GmailUsersResource:
-    def __init__(self, session: AuthorizedSession) -> None:
+    def __init__(self, session: Any) -> None:
         self._session = session
         self._user_id = "me"
 
@@ -119,7 +122,7 @@ class _GmailUsersResource:
 
 
 class _GmailApiService:
-    def __init__(self, session: AuthorizedSession) -> None:
+    def __init__(self, session: Any) -> None:
         self._session = session
 
     def users(self) -> _GmailUsersResource:
