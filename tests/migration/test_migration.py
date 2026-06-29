@@ -99,7 +99,7 @@ class TestTryUpgradeDb:
                 "(1, 'sdk', 1, NULL, NULL), "
                 "(2, 'internal', 1, 'Web Widget', '{\"guest_id\":\"g1\"}'), "
                 "(3, 'internal', 1, 'Shared Agent', "
-                "'{\"auth_mode\":\"share\",\"share_agent_id\":7}'), "
+                '\'{"auth_mode":"share","share_agent_id":7}\'), '
                 "(4, 'trigger', 0, NULL, '{\"trigger_type\":\"webhook\"}'), "
                 "(5, 'internal', 1, 'Desktop', NULL), "
                 "(6, 'widget', 0, 'Web Widget', '{\"guest_id\":\"g2\"}')"
