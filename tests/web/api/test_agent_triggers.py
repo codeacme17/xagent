@@ -228,6 +228,118 @@ def test_trigger_name_validation_rejects_empty_and_oversized() -> None:
     assert patched.status_code == 400
 
 
+def test_gmail_trigger_crud_persists_filters() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {
+                "watch_label": "INBOX",
+                "sender_filter": "boss@company.com",
+                "subject_keyword": "urgent",
+            },
+            "prompt_template": "Handle Gmail message {{payload}}",
+        },
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["type"] == "gmail"
+    assert body["webhook_token"] is None
+    assert body["webhook_secret"] is None
+    assert body["config"] == {
+        "watch_label": "INBOX",
+        "sender_filter": "boss@company.com",
+        "subject_keyword": "urgent",
+    }
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{body['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "watch_label": "CATEGORY_PRIMARY",
+                "sender_filter": "",
+                "subject_keyword": "invoice",
+            }
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["config"] == {
+        "watch_label": "CATEGORY_PRIMARY",
+        "sender_filter": "",
+        "subject_keyword": "invoice",
+    }
+
+
+def test_gmail_trigger_requires_watch_label() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Missing label",
+            "config": {"sender_filter": "boss@company.com"},
+        },
+    )
+    assert created.status_code == 400
+    assert "watch_label" in created.json()["detail"]
+
+
+def test_gmail_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Gmail support",
+            "config": {"watch_label": "INBOX"},
+            "prompt_template": "Triage this email: {{payload}}",
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    fired = client.post(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+        headers=headers,
+        json={
+            "payload": {
+                "from": "boss@company.com",
+                "subject": "urgent invoice",
+                "snippet": "please review",
+            },
+            "source_event_id": "gmail-msg-1",
+        },
+    )
+    assert fired.status_code == 200, fired.text
+    run_body = fired.json()["trigger_run"]
+    assert run_body["status"] == TriggerRunStatus.RUNNING.value
+    assert run_body["task_id"]
+    assert fired.json()["duplicate"] is False
+    assert mock_bg_scheduler.call_count == 1
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
+        assert task.agent_id == agent_id
+        assert task.source == "trigger"
+        assert task.is_visible is False
+        assert task.status == TaskStatus.RUNNING
+        assert "urgent invoice" in (task.description or "")
+    finally:
+        db.close()
+
+
 def test_scheduled_next_run_skips_stale_intervals_without_iteration() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     stale_due_at = now - timedelta(days=3650)

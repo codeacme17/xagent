@@ -3099,7 +3099,8 @@ Build when you need.`,
     subtitle: "Choose how this agent gets activated",
     defaults: {
       webhookName: "API / Webhook",
-      scheduledName: "Schedule"
+      scheduledName: "Schedule",
+      gmailName: "Gmail"
     },
     overview: {
       info: "Triggers define when this agent runs. Enable one or more ways to automatically activate the agent in response to external events or schedules."
@@ -3113,6 +3114,14 @@ Build when you need.`,
         title: "Schedule",
         description: "Run the agent automatically on a recurring interval"
       },
+      gmail: {
+        title: "Gmail",
+        description: "Run the agent when a new email arrives in Gmail"
+      },
+      appWidget: {
+        title: "App Widget",
+        description: "Embed a chat bubble on any website or app"
+      },
       activeCount: "{count} Active"
     },
     builder: {
@@ -3125,7 +3134,8 @@ Build when you need.`,
     },
     type: {
       webhook: "Webhook",
-      scheduled: "Scheduled"
+      scheduled: "Scheduled",
+      gmail: "Gmail"
     },
     status: {
       enabled: "Enabled",
@@ -3154,6 +3164,12 @@ Build when you need.`,
       secret: "Webhook secret",
       secretPlaceholder: "Leave blank to generate one",
       secretEditPlaceholder: "Leave blank to keep the current secret",
+      watchLabel: "Watch label / folder",
+      watchLabelPlaceholder: "INBOX",
+      senderFilter: "Filter by sender (optional)",
+      senderFilterPlaceholder: "e.g. @acme.com or boss@company.com",
+      subjectKeyword: "Filter by subject keyword (optional)",
+      subjectKeywordPlaceholder: "e.g. [SUPPORT] or leave blank for all",
       promptTemplate: "Prompt template",
       promptPlaceholder: "Use {{payload}}, {{trigger_type}}, {{source_event_id}}, and {{test}}."
     },
@@ -3174,6 +3190,27 @@ Build when you need.`,
     webhook: {
       title: "Webhook endpoint",
       secretHeader: "Send the secret with the x-xagent-trigger-secret header."
+    },
+    gmail: {
+      connected: "Gmail connected",
+      connectedDescription: "A Gmail account is connected for this workspace.",
+      notConnected: "Connect Gmail to activate this trigger",
+      notConnectedDescription: "Connect the official Gmail connector before relying on incoming email events.",
+      connect: "Connect Gmail"
+    },
+    appWidget: {
+      info: "The app widget lets visitors start a chat with this agent from an embedded bubble.",
+      allowedDomains: "Allowed domains",
+      allowedDomainsDescription: "Restrict widget access to trusted domains. Use * to allow any domain.",
+      domainPlaceholder: "e.g. example.com",
+      addDomain: "Add",
+      removeDomain: "Remove domain",
+      noDomains: "No domains configured. Widget requests are blocked until a domain or * is added.",
+      embedTitle: "Embed snippet",
+      embedDescription: "Copy this script into the page where the chat bubble should appear.",
+      copySnippet: "Copy snippet",
+      updated: "Widget configuration updated",
+      updateFailed: "Failed to update widget configuration"
     },
     test: {
       title: "Test run",
@@ -3197,6 +3234,7 @@ Build when you need.`,
       interval: "Interval must be a positive integer",
       nextRunAt: "First run time is invalid",
       scheduleRequired: "Scheduled triggers need an interval or a first run time",
+      watchLabel: "Gmail triggers need a label or folder to watch",
       testPayload: "Test payload must be a JSON object"
     },
     messages: {

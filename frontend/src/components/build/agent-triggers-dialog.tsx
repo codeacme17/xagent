@@ -8,9 +8,11 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Code2,
   Copy,
   Info,
   Loader2,
+  Mail,
   Play,
   Plus,
   RefreshCcw,
@@ -30,6 +32,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
+import { apiRequest } from "@/lib/api-wrapper"
 import {
   AgentTrigger,
   AgentTriggerRun,
@@ -41,8 +44,21 @@ import {
   testAgentTrigger,
   updateAgentTrigger,
 } from "@/lib/agent-triggers-api"
+import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import { copyToClipboard } from "@/lib/clipboard"
 import { cn, getApiUrl } from "@/lib/utils"
+
+type TriggerEntryType = AgentTriggerType | "app_widget"
+
+interface AppWidgetConfig {
+  widget_enabled: boolean
+  allowed_domains: string[]
+}
+
+interface GmailConnectionState {
+  isConnected: boolean
+  connectedAccount?: string | null
+}
 
 interface AgentTriggersDialogProps {
   agentId: number | null
@@ -50,7 +66,11 @@ interface AgentTriggersDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onChanged?: () => void
-  initialType?: AgentTriggerType | null
+  initialType?: TriggerEntryType | null
+  appWidget?: AppWidgetConfig | null
+  onWidgetConfigUpdated?: (updatedAgent: Record<string, unknown>) => void
+  gmailConnection?: GmailConnectionState | null
+  onConnectGmail?: () => void
 }
 
 interface TriggerFormState {
@@ -61,10 +81,17 @@ interface TriggerFormState {
   nextRunAt: string
   secret: string
   promptTemplate: string
+  watchLabel: string
+  senderFilter: string
+  subjectKeyword: string
 }
 
-const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled"]
+const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
 const DEFAULT_TEST_PAYLOAD = "{\n  \"message\": \"test trigger\"\n}"
+const DEFAULT_WIDGET_STATE: AppWidgetConfig = {
+  widget_enabled: false,
+  allowed_domains: [],
+}
 
 function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
   return {
@@ -75,11 +102,16 @@ function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
     nextRunAt: "",
     secret: "",
     promptTemplate: "",
+    watchLabel: "INBOX",
+    senderFilter: "",
+    subjectKeyword: "",
   }
 }
 
 function defaultConfigForType(type: AgentTriggerType): Record<string, unknown> {
-  return type === "scheduled" ? { interval_seconds: 3600 } : {}
+  if (type === "scheduled") return { interval_seconds: 3600 }
+  if (type === "gmail") return { watch_label: "INBOX" }
+  return {}
 }
 
 function formatDateTime(value: string | null): string {
@@ -102,6 +134,11 @@ function configNumber(config: Record<string, unknown>, key: string): string {
   return typeof value === "number" || typeof value === "string" ? String(value) : ""
 }
 
+function configString(config: Record<string, unknown>, key: string): string {
+  const value = config[key]
+  return typeof value === "string" ? value : ""
+}
+
 function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
   return {
     type: trigger.type,
@@ -117,6 +154,10 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
         : "",
     secret: "",
     promptTemplate: trigger.prompt_template ?? "",
+    watchLabel:
+      trigger.type === "gmail" ? configString(trigger.config, "watch_label") || "INBOX" : "INBOX",
+    senderFilter: trigger.type === "gmail" ? configString(trigger.config, "sender_filter") : "",
+    subjectKeyword: trigger.type === "gmail" ? configString(trigger.config, "subject_keyword") : "",
   }
 }
 
@@ -140,6 +181,18 @@ function isValidAgentId(agentId: number | null): agentId is number {
   return typeof agentId === "number" && Number.isFinite(agentId)
 }
 
+async function parseWidgetConfigError(response: Response): Promise<Error> {
+  try {
+    const data = await response.json()
+    if (typeof data?.detail === "string" && data.detail.trim()) {
+      return new Error(data.detail)
+    }
+  } catch {
+    // Fall through to the generic message below.
+  }
+  return new Error("Failed to update widget configuration")
+}
+
 export function AgentTriggersDialog({
   agentId,
   agentName,
@@ -147,17 +200,26 @@ export function AgentTriggersDialog({
   onOpenChange,
   onChanged,
   initialType = null,
+  appWidget = null,
+  onWidgetConfigUpdated,
+  gmailConnection = null,
+  onConnectGmail,
 }: AgentTriggersDialogProps) {
   const { t } = useI18n()
   const router = useRouter()
   const [triggers, setTriggers] = useState<AgentTrigger[]>([])
   const [activeType, setActiveTypeState] = useState<AgentTriggerType | null>(null)
+  const [activeWidget, setActiveWidget] = useState(false)
   const [selectedTriggerId, setSelectedTriggerIdState] = useState<number | null>(null)
   const [runs, setRuns] = useState<AgentTriggerRun[]>([])
   const [loading, setLoading] = useState(false)
   const [runsLoading, setRunsLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [busyType, setBusyType] = useState<AgentTriggerType | null>(null)
+  const [widgetBusy, setWidgetBusy] = useState(false)
+  const [widgetState, setWidgetState] = useState<AppWidgetConfig>(DEFAULT_WIDGET_STATE)
+  const [newWidgetDomain, setNewWidgetDomain] = useState("")
+  const [appOrigin, setAppOrigin] = useState("")
   const [form, setForm] = useState<TriggerFormState>(emptyForm)
   const [testPayload, setTestPayload] = useState(DEFAULT_TEST_PAYLOAD)
   const [sourceEventId, setSourceEventId] = useState("")
@@ -183,11 +245,23 @@ export function AgentTriggersDialog({
         acc[type] = triggers.filter((trigger) => trigger.type === type).sort(newestFirst)
         return acc
       },
-      { webhook: [], scheduled: [] },
+      { webhook: [], scheduled: [], gmail: [] },
     )
   }, [triggers])
 
   const activeTypeTriggers = activeType ? triggerGroups[activeType] : []
+  const widgetSnippet = useMemo(() => {
+    if (!isValidAgentId(agentId)) return ""
+    const origin = appOrigin || getApiUrl()
+    return `<script
+  src="${origin}/widget.js"
+  data-agent-id="${agentId}"
+  data-button-size="60px"
+  data-button-color="#000"
+  data-icon-color="#fff"
+  data-panel-bg-color="#fff">
+</script>`
+  }, [agentId, appOrigin])
   const selectedTrigger = useMemo(() => {
     if (!activeType) return null
     return (
@@ -200,9 +274,9 @@ export function AgentTriggersDialog({
   const selectedWebhookUrl = webhookUrl(selectedTrigger)
 
   const defaultNameForType = useCallback((type: AgentTriggerType) => {
-    return type === "webhook"
-      ? t("triggers.defaults.webhookName")
-      : t("triggers.defaults.scheduledName")
+    if (type === "webhook") return t("triggers.defaults.webhookName")
+    if (type === "gmail") return t("triggers.defaults.gmailName")
+    return t("triggers.defaults.scheduledName")
   }, [t])
 
   const loadTriggers = useCallback(async (preferredTriggerId?: number | null) => {
@@ -247,17 +321,29 @@ export function AgentTriggersDialog({
 
   useEffect(() => {
     if (!open) return
-    setActiveType(initialType)
+    const opensWidget = initialType === "app_widget"
+    setActiveWidget(opensWidget)
+    setActiveType(opensWidget ? null : initialType)
     setSelectedTriggerId(null)
     setSecretReveal(null)
     setCopied(null)
     setDeleteConfirmId(null)
     setRuns([])
-    if (initialType) {
+    setNewWidgetDomain("")
+    if (initialType && initialType !== "app_widget") {
       setForm(emptyForm(initialType))
     }
     void loadTriggers(null)
   }, [initialType, loadTriggers, open, setActiveType, setSelectedTriggerId])
+
+  useEffect(() => {
+    if (!open) return
+    setWidgetState({
+      widget_enabled: Boolean(appWidget?.widget_enabled),
+      allowed_domains: Array.isArray(appWidget?.allowed_domains) ? appWidget.allowed_domains : [],
+    })
+    setAppOrigin(getBrowserLocationOrigin())
+  }, [appWidget?.allowed_domains, appWidget?.widget_enabled, open])
 
   useEffect(() => {
     if (!open || !activeType) return
@@ -271,6 +357,7 @@ export function AgentTriggersDialog({
   }, [activeType, loadRuns, open, selectedTrigger])
 
   const openType = (type: AgentTriggerType) => {
+    setActiveWidget(false)
     const primary =
       triggerGroups[type].find((trigger) => trigger.enabled) ??
       triggerGroups[type][0] ??
@@ -283,6 +370,7 @@ export function AgentTriggersDialog({
   }
 
   const beginCreateForType = (type: AgentTriggerType) => {
+    setActiveWidget(false)
     setActiveType(type)
     setSelectedTriggerId(null)
     setSecretReveal(null)
@@ -292,6 +380,7 @@ export function AgentTriggersDialog({
   }
 
   const beginEdit = (trigger: AgentTrigger) => {
+    setActiveWidget(false)
     setActiveType(trigger.type)
     setSelectedTriggerId(trigger.id)
     setSecretReveal(null)
@@ -308,6 +397,19 @@ export function AgentTriggersDialog({
 
   const buildConfig = (): Record<string, unknown> => {
     if (form.type === "webhook") return {}
+
+    if (form.type === "gmail") {
+      const watchLabel = form.watchLabel.trim()
+      if (!watchLabel) {
+        throw new Error(t("triggers.validation.watchLabel"))
+      }
+      const config: Record<string, unknown> = { watch_label: watchLabel }
+      const senderFilter = form.senderFilter.trim()
+      const subjectKeyword = form.subjectKeyword.trim()
+      if (senderFilter) config.sender_filter = senderFilter
+      if (subjectKeyword) config.subject_keyword = subjectKeyword
+      return config
+    }
 
     const config: Record<string, unknown> = {}
     const intervalValue = form.intervalSeconds.trim()
@@ -527,22 +629,74 @@ export function AgentTriggersDialog({
     }
   }
 
+  const handleWidgetConfigUpdate = async (updates: Partial<AppWidgetConfig>) => {
+    if (!isValidAgentId(agentId)) return
+    setWidgetBusy(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      })
+      if (!response.ok) {
+        throw await parseWidgetConfigError(response)
+      }
+      const updatedAgent = await response.json()
+      const nextWidgetState = {
+        widget_enabled:
+          typeof updatedAgent.widget_enabled === "boolean"
+            ? updatedAgent.widget_enabled
+            : updates.widget_enabled ?? widgetState.widget_enabled,
+        allowed_domains: Array.isArray(updatedAgent.allowed_domains)
+          ? updatedAgent.allowed_domains
+          : updates.allowed_domains ?? widgetState.allowed_domains,
+      }
+      setWidgetState(nextWidgetState)
+      onWidgetConfigUpdated?.(updatedAgent)
+      toast.success(t("triggers.appWidget.updated"))
+    } catch (err) {
+      console.error(err)
+      toast.error(err instanceof Error ? err.message : t("triggers.appWidget.updateFailed"))
+    } finally {
+      setWidgetBusy(false)
+    }
+  }
+
+  const handleAddWidgetDomain = () => {
+    const domain = newWidgetDomain.trim()
+    if (!domain) return
+    if (widgetState.allowed_domains.includes(domain)) {
+      setNewWidgetDomain("")
+      return
+    }
+    setNewWidgetDomain("")
+    void handleWidgetConfigUpdate({
+      allowed_domains: [...widgetState.allowed_domains, domain],
+    })
+  }
+
+  const handleRemoveWidgetDomain = (domain: string) => {
+    void handleWidgetConfigUpdate({
+      allowed_domains: widgetState.allowed_domains.filter((item) => item !== domain),
+    })
+  }
+
   const closeDialog = (nextOpen: boolean) => {
     if (!nextOpen) {
       setActiveType(null)
+      setActiveWidget(false)
       setSecretReveal(null)
       setCopied(null)
       setDeleteConfirmId(null)
+      setNewWidgetDomain("")
     }
     onOpenChange(nextOpen)
   }
 
   const renderTypeIcon = (type: AgentTriggerType, className?: string) => {
-    return type === "webhook" ? (
-      <Webhook className={className} />
-    ) : (
-      <CalendarClock className={className} />
-    )
+    if (type === "webhook") return <Webhook className={className} />
+    if (type === "gmail") return <Mail className={className} />
+    return <CalendarClock className={className} />
   }
 
   const renderTypeCard = (type: AgentTriggerType) => {
@@ -553,7 +707,9 @@ export function AgentTriggersDialog({
     const iconClass =
       type === "webhook"
         ? "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300"
-        : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
+        : type === "gmail"
+          ? "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"
+          : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
 
     return (
       <div
@@ -607,6 +763,62 @@ export function AgentTriggersDialog({
     )
   }
 
+  const renderWidgetCard = () => {
+    const isEnabled = widgetState.widget_enabled
+    return (
+      <div
+        key="app_widget"
+        className={cn(
+          "group flex w-full items-center gap-4 rounded-lg border bg-background p-4 text-left transition-colors",
+          "hover:border-primary/50 hover:bg-muted/30",
+          isEnabled && "border-primary/40 bg-primary/[0.03]",
+        )}
+      >
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-center gap-4 text-left"
+          onClick={() => {
+            setActiveType(null)
+            setActiveWidget(true)
+          }}
+        >
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-pink-50 text-pink-600 dark:bg-pink-950/40 dark:text-pink-300">
+            <Code2 className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <div className="truncate text-sm font-semibold">{t("triggers.cards.appWidget.title")}</div>
+              <Badge variant={isEnabled ? "default" : "secondary"} className="h-5 px-1.5 text-[10px]">
+                {isEnabled ? t("triggers.status.enabled") : t("triggers.status.disabled")}
+              </Badge>
+            </div>
+            <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+              {t("triggers.cards.appWidget.description")}
+            </div>
+          </div>
+        </button>
+        <div className="flex items-center gap-3">
+          <Switch
+            checked={isEnabled}
+            disabled={widgetBusy || !isValidAgentId(agentId)}
+            onCheckedChange={(checked) => void handleWidgetConfigUpdate({ widget_enabled: checked })}
+          />
+          <button
+            type="button"
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            onClick={() => {
+              setActiveType(null)
+              setActiveWidget(true)
+            }}
+            aria-label={t("triggers.cards.appWidget.title")}
+          >
+            <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   const renderOverview = () => (
     <div className="space-y-4">
       <Alert className="border-primary/20 bg-primary/5 text-primary">
@@ -622,7 +834,10 @@ export function AgentTriggersDialog({
             <Loader2 className="h-5 w-5 animate-spin" />
           </div>
         ) : (
-          TRIGGER_TYPES.map(renderTypeCard)
+          <>
+            {TRIGGER_TYPES.map(renderTypeCard)}
+            {renderWidgetCard()}
+          </>
         )}
       </div>
     </div>
@@ -660,6 +875,117 @@ export function AgentTriggersDialog({
       </div>
     )
   }
+
+  const renderWidgetDetail = () => (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between gap-3 border-b pb-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <Button variant="ghost" size="sm" className="-ml-2" onClick={() => setActiveWidget(false)}>
+            <ChevronLeft className="mr-1 h-4 w-4" />
+            {t("common.back")}
+          </Button>
+          <div className="flex min-w-0 items-center gap-2 border-l pl-3">
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted">
+              <Code2 className="h-4 w-4" />
+            </div>
+            <div className="truncate text-sm font-semibold">
+              {t("triggers.cards.appWidget.title")}
+            </div>
+          </div>
+        </div>
+        <Switch
+          checked={widgetState.widget_enabled}
+          onCheckedChange={(checked) => void handleWidgetConfigUpdate({ widget_enabled: checked })}
+          disabled={widgetBusy || !isValidAgentId(agentId)}
+        />
+      </div>
+
+      <Alert className="border-primary/20 bg-primary/5">
+        <Info className="h-4 w-4" />
+        <AlertDescription className="text-sm text-foreground">
+          {t("triggers.appWidget.info")}
+        </AlertDescription>
+      </Alert>
+
+      <section className="space-y-4 rounded-lg border p-4">
+        <div>
+          <h3 className="text-sm font-medium">{t("triggers.appWidget.allowedDomains")}</h3>
+          <p className="text-xs text-muted-foreground">
+            {t("triggers.appWidget.allowedDomainsDescription")}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Input
+            value={newWidgetDomain}
+            onChange={(event) => setNewWidgetDomain(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault()
+                handleAddWidgetDomain()
+              }
+            }}
+            placeholder={t("triggers.appWidget.domainPlaceholder")}
+            disabled={widgetBusy}
+          />
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={handleAddWidgetDomain}
+            disabled={widgetBusy || !newWidgetDomain.trim()}
+          >
+            {t("triggers.appWidget.addDomain")}
+          </Button>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {widgetState.allowed_domains.length > 0 ? (
+            widgetState.allowed_domains.map((domain) => (
+              <Badge key={domain} variant="secondary" className="gap-1 px-2.5 py-1 text-xs">
+                {domain}
+                <button
+                  type="button"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => handleRemoveWidgetDomain(domain)}
+                  disabled={widgetBusy}
+                  aria-label={t("triggers.appWidget.removeDomain")}
+                >
+                  x
+                </button>
+              </Badge>
+            ))
+          ) : (
+            <span className="text-xs text-muted-foreground">
+              {t("triggers.appWidget.noDomains")}
+            </span>
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-3 rounded-lg border p-4">
+        <div>
+          <h3 className="text-sm font-medium">{t("triggers.appWidget.embedTitle")}</h3>
+          <p className="text-xs text-muted-foreground">
+            {t("triggers.appWidget.embedDescription")}
+          </p>
+        </div>
+        <div className="relative rounded-md bg-muted p-3">
+          <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all pr-11 text-xs text-muted-foreground">
+            {widgetSnippet}
+          </pre>
+          <Button
+            type="button"
+            size="icon"
+            variant="secondary"
+            className="absolute right-2 top-2"
+            onClick={() => void handleCopy("widget-snippet", widgetSnippet)}
+            title={t("triggers.appWidget.copySnippet")}
+            disabled={!widgetSnippet}
+          >
+            {copied === "widget-snippet" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+          </Button>
+        </div>
+      </section>
+    </div>
+  )
 
   const renderDetail = () => {
     if (!activeType) return null
@@ -714,6 +1040,16 @@ export function AgentTriggersDialog({
                 onChange={(event) => setFormValue("intervalSeconds", event.target.value)}
               />
             </div>
+          ) : activeType === "gmail" ? (
+            <div className="space-y-2">
+              <Label htmlFor="trigger-watch-label">{t("triggers.form.watchLabel")}</Label>
+              <Input
+                id="trigger-watch-label"
+                value={form.watchLabel}
+                onChange={(event) => setFormValue("watchLabel", event.target.value)}
+                placeholder={t("triggers.form.watchLabelPlaceholder")}
+              />
+            </div>
           ) : (
             <div className="space-y-2">
               <Label htmlFor="trigger-secret">{t("triggers.form.secret")}</Label>
@@ -738,6 +1074,65 @@ export function AgentTriggersDialog({
               onChange={(event) => setFormValue("nextRunAt", event.target.value)}
             />
           </div>
+        )}
+
+        {activeType === "gmail" && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="trigger-sender-filter">{t("triggers.form.senderFilter")}</Label>
+              <Input
+                id="trigger-sender-filter"
+                value={form.senderFilter}
+                onChange={(event) => setFormValue("senderFilter", event.target.value)}
+                placeholder={t("triggers.form.senderFilterPlaceholder")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="trigger-subject-keyword">{t("triggers.form.subjectKeyword")}</Label>
+              <Input
+                id="trigger-subject-keyword"
+                value={form.subjectKeyword}
+                onChange={(event) => setFormValue("subjectKeyword", event.target.value)}
+                placeholder={t("triggers.form.subjectKeywordPlaceholder")}
+              />
+            </div>
+          </div>
+        )}
+
+        {activeType === "gmail" && (
+          <Alert
+            className={cn(
+              gmailConnection?.isConnected
+                ? "border-emerald-200 bg-emerald-50 text-emerald-950 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-100"
+                : "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-100",
+            )}
+          >
+            <Mail className="h-4 w-4" />
+            <AlertTitle>
+              {gmailConnection?.isConnected
+                ? t("triggers.gmail.connected")
+                : t("triggers.gmail.notConnected")}
+            </AlertTitle>
+            <AlertDescription>
+              <div className="mt-1 flex flex-wrap items-center justify-between gap-3 text-sm">
+                <span>
+                  {gmailConnection?.isConnected
+                    ? gmailConnection.connectedAccount || t("triggers.gmail.connectedDescription")
+                    : t("triggers.gmail.notConnectedDescription")}
+                </span>
+                {!gmailConnection?.isConnected && onConnectGmail && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    onClick={onConnectGmail}
+                  >
+                    {t("triggers.gmail.connect")}
+                  </Button>
+                )}
+              </div>
+            </AlertDescription>
+          </Alert>
         )}
 
         <div className="space-y-2">
@@ -922,7 +1317,7 @@ export function AgentTriggersDialog({
         </DialogHeader>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          {activeType ? renderDetail() : renderOverview()}
+          {activeWidget ? renderWidgetDetail() : activeType ? renderDetail() : renderOverview()}
         </div>
       </DialogContent>
     </Dialog>

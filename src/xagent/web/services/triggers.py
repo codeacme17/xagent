@@ -142,6 +142,8 @@ def _default_trigger_name(trigger_type: str) -> str:
         return "Webhook trigger"
     if trigger_type == TriggerType.SCHEDULED.value:
         return "Scheduled trigger"
+    if trigger_type == TriggerType.GMAIL.value:
+        return "Gmail trigger"
     return "Agent trigger"
 
 
@@ -205,6 +207,14 @@ def _validate_config(trigger_type: str, config: dict[str, Any]) -> None:
                 "scheduled trigger requires interval_seconds or next_run_at"
             )
         _compute_next_run_at(config)
+    if trigger_type == TriggerType.GMAIL.value:
+        watch_label = config.get("watch_label")
+        if not isinstance(watch_label, str) or not watch_label.strip():
+            raise TriggerServiceError("gmail trigger requires watch_label")
+        for key in ("sender_filter", "subject_keyword"):
+            value = config.get(key)
+            if value is not None and not isinstance(value, str):
+                raise TriggerServiceError(f"gmail trigger {key} must be a string")
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:

@@ -3099,7 +3099,8 @@ Build when you need.`,
     subtitle: "选择此 Agent 的触发方式",
     defaults: {
       webhookName: "API / Webhook",
-      scheduledName: "Schedule"
+      scheduledName: "Schedule",
+      gmailName: "Gmail"
     },
     overview: {
       info: "Triggers 定义此 Agent 什么时候运行。启用一个或多个触发方式，让外部事件或定时计划自动启动 Agent。"
@@ -3113,6 +3114,14 @@ Build when you need.`,
         title: "Schedule",
         description: "按固定时间间隔自动运行 Agent"
       },
+      gmail: {
+        title: "Gmail",
+        description: "当 Gmail 收到新邮件时运行 Agent"
+      },
+      appWidget: {
+        title: "App Widget",
+        description: "在任意网站或应用中嵌入聊天气泡"
+      },
       activeCount: "{count} Active"
     },
     builder: {
@@ -3125,7 +3134,8 @@ Build when you need.`,
     },
     type: {
       webhook: "Webhook",
-      scheduled: "定时"
+      scheduled: "定时",
+      gmail: "Gmail"
     },
     status: {
       enabled: "已启用",
@@ -3154,6 +3164,12 @@ Build when you need.`,
       secret: "Webhook Secret",
       secretPlaceholder: "留空则自动生成",
       secretEditPlaceholder: "留空则保留当前 secret",
+      watchLabel: "监听标签 / 文件夹",
+      watchLabelPlaceholder: "INBOX",
+      senderFilter: "按发件人过滤（可选）",
+      senderFilterPlaceholder: "例如 @acme.com 或 boss@company.com",
+      subjectKeyword: "按主题关键词过滤（可选）",
+      subjectKeywordPlaceholder: "例如 [SUPPORT]，留空则全部触发",
       promptTemplate: "提示词模板",
       promptPlaceholder: "可使用 {{payload}}、{{trigger_type}}、{{source_event_id}} 和 {{test}}。"
     },
@@ -3174,6 +3190,27 @@ Build when you need.`,
     webhook: {
       title: "Webhook 地址",
       secretHeader: "调用时通过 x-xagent-trigger-secret header 传入 secret。"
+    },
+    gmail: {
+      connected: "Gmail 已连接",
+      connectedDescription: "当前工作区已有可用的 Gmail 账号连接。",
+      notConnected: "连接 Gmail 后才能启用此触发器",
+      notConnectedDescription: "依赖新邮件事件前，请先连接官方 Gmail Connector。",
+      connect: "连接 Gmail"
+    },
+    appWidget: {
+      info: "App Widget 允许访客通过嵌入式聊天气泡与此 Agent 对话。",
+      allowedDomains: "允许的域名",
+      allowedDomainsDescription: "限制 Widget 只能在可信域名访问。使用 * 允许所有域名。",
+      domainPlaceholder: "例如 example.com",
+      addDomain: "添加",
+      removeDomain: "移除域名",
+      noDomains: "还没有配置域名。添加域名或 * 前，Widget 请求会被拦截。",
+      embedTitle: "嵌入代码",
+      embedDescription: "将这段 script 复制到需要显示聊天气泡的页面。",
+      copySnippet: "复制代码",
+      updated: "Widget 配置已更新",
+      updateFailed: "更新 Widget 配置失败"
     },
     test: {
       title: "测试运行",
@@ -3197,6 +3234,7 @@ Build when you need.`,
       interval: "重复间隔必须是正整数",
       nextRunAt: "首次运行时间无效",
       scheduleRequired: "定时 Trigger 需要重复间隔或首次运行时间",
+      watchLabel: "Gmail Trigger 需要监听的标签或文件夹",
       testPayload: "测试 payload 必须是 JSON object"
     },
     messages: {

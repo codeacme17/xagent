@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Code2 } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -138,7 +138,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isKbModalOpen, setIsKbModalOpen] = useState(false)
   const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
   const [isTriggersDialogOpen, setIsTriggersDialogOpen] = useState(false)
-  const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | null>(null)
+  const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | "app_widget" | null>(null)
   const [triggerSummary, setTriggerSummary] = useState<AgentTrigger[]>([])
   const [triggerSummaryLoading, setTriggerSummaryLoading] = useState(false)
   const [showAIAssistant, setShowAIAssistant] = useState(false)
@@ -195,9 +195,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const stats = {
       webhook: { total: 0, enabled: 0 },
       scheduled: { total: 0, enabled: 0 },
+      gmail: { total: 0, enabled: 0 },
     }
     triggerSummary.forEach((trigger) => {
-      if (trigger.type !== "webhook" && trigger.type !== "scheduled") return
+      if (trigger.type !== "webhook" && trigger.type !== "scheduled" && trigger.type !== "gmail") return
       stats[trigger.type].total += 1
       if (trigger.enabled) {
         stats[trigger.type].enabled += 1
@@ -205,6 +206,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
     return stats
   }, [triggerSummary])
+
+  const appWidgetConfig = useMemo(() => {
+    const source = originalData ?? createdAgent
+    return {
+      widget_enabled: Boolean(source?.widget_enabled),
+      allowed_domains: Array.isArray(source?.allowed_domains) ? source.allowed_domains : [],
+    }
+  }, [createdAgent, originalData])
+
+  const gmailConnection = useMemo(() => {
+    const gmailApp = findMatchingMcpApp(officialApps, "gmail")
+    return {
+      isConnected: Boolean(gmailApp?.is_connected),
+      connectedAccount: gmailApp?.connected_account ?? null,
+    }
+  }, [officialApps])
 
   // File picker state for Instructions
   const instructionsRef = useRef<HTMLDivElement>(null)
@@ -982,6 +999,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
+          setOriginalData(newAgent)
           setShowSuccessDialog(true)
           setLocalAgentId(newAgent.id.toString())
 
@@ -1808,9 +1826,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 description: t("triggers.cards.scheduled.description"),
                 iconClass: "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300",
               },
+              {
+                type: "gmail" as const,
+                icon: Mail,
+                title: t("triggers.cards.gmail.title"),
+                description: t("triggers.cards.gmail.description"),
+                iconClass: "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300",
+              },
+              {
+                type: "app_widget" as const,
+                icon: Code2,
+                title: t("triggers.cards.appWidget.title"),
+                description: t("triggers.cards.appWidget.description"),
+                iconClass: "bg-pink-50 text-pink-600 dark:bg-pink-950/40 dark:text-pink-300",
+              },
             ]).map((item) => {
-              const stat = triggerStats[item.type]
-              const enabled = stat.enabled > 0
+              const isAppWidget = item.type === "app_widget"
+              const stat = isAppWidget ? { total: 0, enabled: appWidgetConfig.widget_enabled ? 1 : 0 } : triggerStats[item.type]
+              const enabled = isAppWidget ? appWidgetConfig.widget_enabled : stat.enabled > 0
               return (
                 <div
                   key={item.type}
@@ -2140,6 +2173,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }}
         onChanged={refreshTriggerSummary}
         initialType={triggerDialogInitialType}
+        appWidget={appWidgetConfig}
+        onWidgetConfigUpdated={(updatedAgent) => {
+          setOriginalData((current: any) => current ? { ...current, ...updatedAgent } : current)
+          setCreatedAgent((current: any) => current ? { ...current, ...updatedAgent } : current)
+        }}
+        gmailConnection={gmailConnection}
+        onConnectGmail={() => {
+          setIsTriggersDialogOpen(false)
+          setIsConnectMcpOpen(true)
+        }}
       />
 
       {state.filePreview.isOpen && (

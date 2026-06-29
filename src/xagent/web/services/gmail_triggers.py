@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
+from urllib.parse import quote
+
+from google.auth.transport.requests import AuthorizedSession, Request  # type: ignore
+from google.oauth2.credentials import Credentials  # type: ignore
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ...config import (
+    get_gmail_pubsub_topic_name,
+    get_gmail_watch_enabled,
+    get_gmail_watch_renewal_lead_seconds,
+)
+from ...core.utils.encryption import decrypt_value
+from ..models.gmail_watch import GmailWatchState
+from ..models.oauth_provider import OAuthProvider
+from ..models.trigger import AgentTrigger, TriggerType
+from ..models.user_oauth import UserOAuth
+from .triggers import fire_trigger
+
+logger = logging.getLogger(__name__)
+
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GMAIL_WATCH_LABEL_IDS = ["INBOX"]
+GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
+
+GmailServiceFactory = Callable[[Session, UserOAuth], Any]
+
+
+class GmailTriggerError(RuntimeError):
+    """Base error for Gmail trigger integration failures."""
+
+
+class GmailWatchConfigurationError(GmailTriggerError):
+    """Raised when Gmail watch cannot be configured for the deployment."""
+
+
+class _GmailApiRequest:
+    def __init__(
+        self,
+        session: AuthorizedSession,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> None:
+        self._session = session
+        self._method = method
+        self._url = url
+        self._kwargs = kwargs
+
+    def execute(self) -> dict[str, Any]:
+        response = self._session.request(
+            self._method,
+            self._url,
+            timeout=10,
+            **self._kwargs,
+        )
+        response.raise_for_status()
+        if not response.content:
+            return {}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+
+class _GmailMessagesResource:
+    def __init__(self, session: AuthorizedSession, user_id: str) -> None:
+        self._session = session
+        self._user_id = quote(user_id, safe="")
+
+    def get(self, **kwargs: Any) -> _GmailApiRequest:
+        message_id = quote(str(kwargs.pop("id")), safe="")
+        return _GmailApiRequest(
+            self._session,
+            "GET",
+            f"{GMAIL_API_ROOT}/users/{self._user_id}/messages/{message_id}",
+            params=kwargs,
+        )
+
+
+class _GmailHistoryResource:
+    def __init__(self, session: AuthorizedSession, user_id: str) -> None:
+        self._session = session
+        self._user_id = quote(user_id, safe="")
+
+    def list(self, **kwargs: Any) -> _GmailApiRequest:
+        return _GmailApiRequest(
+            self._session,
+            "GET",
+            f"{GMAIL_API_ROOT}/users/{self._user_id}/history",
+            params=kwargs,
+        )
+
+
+class _GmailUsersResource:
+    def __init__(self, session: AuthorizedSession) -> None:
+        self._session = session
+        self._user_id = "me"
+
+    def watch(self, *, userId: str, body: dict[str, Any]) -> _GmailApiRequest:
+        user_id = quote(userId, safe="")
+        return _GmailApiRequest(
+            self._session,
+            "POST",
+            f"{GMAIL_API_ROOT}/users/{user_id}/watch",
+            json=body,
+        )
+
+    def history(self) -> _GmailHistoryResource:
+        return _GmailHistoryResource(self._session, self._user_id)
+
+    def messages(self) -> _GmailMessagesResource:
+        return _GmailMessagesResource(self._session, self._user_id)
+
+
+class _GmailApiService:
+    def __init__(self, session: AuthorizedSession) -> None:
+        self._session = session
+
+    def users(self) -> _GmailUsersResource:
+        return _GmailUsersResource(self._session)
+
+
+@dataclass(frozen=True)
+class GmailPubsubNotification:
+    email_address: str
+    history_id: str
+    pubsub_message_id: str | None = None
+
+
+@dataclass(frozen=True)
+class GmailPubsubProcessResult:
+    processed: int = 0
+    duplicates: int = 0
+    skipped: int = 0
+
+
+def _get_google_oauth_config(db: Session) -> tuple[str | None, str | None]:
+    env_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    env_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+    )
+    if not provider:
+        return (env_client_id, env_client_secret)
+
+    client_id = decrypt_value(str(provider.client_id))
+    client_secret = decrypt_value(str(provider.client_secret))
+    return client_id or env_client_id, client_secret or env_client_secret
+
+
+def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
+    """Build an authenticated Gmail API client for a connected Gmail account."""
+    client_id, client_secret = _get_google_oauth_config(db)
+    if not client_id or not client_secret:
+        raise GmailWatchConfigurationError("Google OAuth configuration missing")
+
+    creds = Credentials(
+        token=str(oauth_account.access_token),
+        refresh_token=oauth_account.refresh_token,
+        token_uri=GOOGLE_TOKEN_URI,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=oauth_account.scope.split(" ") if oauth_account.scope else None,
+    )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        oauth_account.access_token = creds.token
+        if creds.expiry:
+            oauth_account.expires_at = creds.expiry
+        db.commit()
+
+    return _GmailApiService(AuthorizedSession(creds))
+
+
+def _watch_expiration_from_millis(value: object) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(str(value)) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _coerce_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def register_gmail_watch_for_account(
+    db: Session,
+    oauth_account: UserOAuth,
+    *,
+    service_factory: GmailServiceFactory = build_gmail_service,
+) -> GmailWatchState:
+    topic_name = get_gmail_pubsub_topic_name()
+    if not topic_name:
+        raise GmailWatchConfigurationError("XAGENT_GMAIL_PUBSUB_TOPIC is required")
+
+    service = service_factory(db, oauth_account)
+    response = (
+        service.users()
+        .watch(
+            userId="me",
+            body={"topicName": topic_name, "labelIds": GMAIL_WATCH_LABEL_IDS},
+        )
+        .execute()
+    )
+    history_id = response.get("historyId")
+    if history_id is None:
+        raise GmailTriggerError("Gmail watch response did not include historyId")
+
+    state = (
+        db.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == oauth_account.id)
+        .first()
+    )
+    if state is None:
+        state = GmailWatchState(
+            user_id=int(oauth_account.user_id),
+            oauth_account_id=int(oauth_account.id),
+            email=str(oauth_account.email or oauth_account.provider_user_id or ""),
+            history_id=str(history_id),
+            topic_name=topic_name,
+        )
+        db.add(state)
+
+    state.user_id = int(oauth_account.user_id)
+    state.email = str(oauth_account.email or oauth_account.provider_user_id or "")
+    state.history_id = str(history_id)
+    state.watch_expiration = _watch_expiration_from_millis(response.get("expiration"))
+    state.topic_name = topic_name
+    state.last_error = None
+    db.commit()
+    db.refresh(state)
+    return state
+
+
+def ensure_gmail_watches_for_user(
+    db: Session,
+    *,
+    user_id: int,
+    service_factory: GmailServiceFactory = build_gmail_service,
+) -> list[GmailWatchState]:
+    has_enabled_gmail_trigger = (
+        db.query(AgentTrigger.id)
+        .filter(
+            AgentTrigger.user_id == user_id,
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+        )
+        .first()
+        is not None
+    )
+    if not has_enabled_gmail_trigger:
+        return []
+
+    oauth_accounts = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user_id, UserOAuth.provider == "gmail")
+        .all()
+    )
+    states: list[GmailWatchState] = []
+    for oauth_account in oauth_accounts:
+        states.append(
+            register_gmail_watch_for_account(
+                db,
+                oauth_account,
+                service_factory=service_factory,
+            )
+        )
+    return states
+
+
+def scan_due_gmail_watch_renewals(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    service_factory: GmailServiceFactory = build_gmail_service,
+) -> int:
+    if not get_gmail_watch_enabled():
+        return 0
+
+    scan_time = _coerce_utc(now) or datetime.now(timezone.utc)
+    renew_before = scan_time + timedelta(seconds=get_gmail_watch_renewal_lead_seconds())
+    oauth_accounts = db.query(UserOAuth).filter(UserOAuth.provider == "gmail").all()
+
+    renewed = 0
+    for oauth_account in oauth_accounts:
+        user_id = int(oauth_account.user_id)
+        has_enabled_gmail_trigger = (
+            db.query(AgentTrigger.id)
+            .filter(
+                AgentTrigger.user_id == user_id,
+                AgentTrigger.type == TriggerType.GMAIL.value,
+                AgentTrigger.enabled.is_(True),
+            )
+            .first()
+            is not None
+        )
+        if not has_enabled_gmail_trigger:
+            continue
+
+        state = (
+            db.query(GmailWatchState)
+            .filter(GmailWatchState.oauth_account_id == int(oauth_account.id))
+            .first()
+        )
+        expiration = _coerce_utc(getattr(state, "watch_expiration", None))
+        if state is not None and expiration is not None and expiration > renew_before:
+            continue
+
+        register_gmail_watch_for_account(
+            db,
+            oauth_account,
+            service_factory=service_factory,
+        )
+        renewed += 1
+
+    return renewed
+
+
+def _header_value(message: dict[str, Any], name: str) -> str:
+    headers = (
+        message.get("payload", {}).get("headers", [])
+        if isinstance(message.get("payload"), dict)
+        else []
+    )
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        if str(header.get("name", "")).lower() == name.lower():
+            return str(header.get("value") or "")
+    return ""
+
+
+def _message_payload(
+    message: dict[str, Any], *, notification: GmailPubsubNotification
+) -> dict[str, Any]:
+    label_ids = [str(label_id) for label_id in message.get("labelIds", [])]
+    return {
+        "message_id": str(message.get("id") or ""),
+        "thread_id": str(message.get("threadId") or ""),
+        "history_id": notification.history_id,
+        "pubsub_message_id": notification.pubsub_message_id,
+        "from": _header_value(message, "From"),
+        "subject": _header_value(message, "Subject"),
+        "snippet": str(message.get("snippet") or ""),
+        "label_ids": label_ids,
+    }
+
+
+def _trigger_matches_message(trigger: AgentTrigger, payload: dict[str, Any]) -> bool:
+    config = dict(trigger.config or {})
+    label_ids = {str(label_id).lower() for label_id in payload.get("label_ids", [])}
+    watch_label = str(config.get("watch_label") or "INBOX").strip()
+    if watch_label and watch_label not in {"*", "all", "ALL"}:
+        if watch_label.lower() not in label_ids:
+            return False
+
+    sender_filter = str(config.get("sender_filter") or "").strip().lower()
+    if sender_filter and sender_filter not in str(payload.get("from") or "").lower():
+        return False
+
+    subject_keyword = str(config.get("subject_keyword") or "").strip().lower()
+    if (
+        subject_keyword
+        and subject_keyword not in str(payload.get("subject") or "").lower()
+    ):
+        return False
+
+    return True
+
+
+def _added_message_ids_from_history(history_response: dict[str, Any]) -> list[str]:
+    message_ids: list[str] = []
+    for history_item in history_response.get("history", []) or []:
+        if not isinstance(history_item, dict):
+            continue
+        for added in history_item.get("messagesAdded", []) or []:
+            if not isinstance(added, dict):
+                continue
+            message = added.get("message")
+            if isinstance(message, dict) and message.get("id"):
+                message_ids.append(str(message["id"]))
+    return message_ids
+
+
+def _list_added_message_ids(service: Any, *, start_history_id: str) -> list[str]:
+    message_ids: list[str] = []
+    page_token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "startHistoryId": start_history_id,
+            "historyTypes": ["messageAdded"],
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = service.users().history().list(**kwargs).execute()
+        if isinstance(response, dict):
+            message_ids.extend(_added_message_ids_from_history(response))
+            page_token = response.get("nextPageToken")
+        else:
+            page_token = None
+        if not page_token:
+            return message_ids
+
+
+def _get_gmail_message(service: Any, message_id: str) -> dict[str, Any]:
+    response = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute()
+    )
+    return response if isinstance(response, dict) else {}
+
+
+async def process_gmail_pubsub_notification(
+    db: Session,
+    notification: GmailPubsubNotification,
+    *,
+    service_factory: GmailServiceFactory = build_gmail_service,
+) -> GmailPubsubProcessResult:
+    email_address = notification.email_address.strip().lower()
+    if not email_address or not notification.history_id:
+        return GmailPubsubProcessResult(skipped=1)
+
+    state = (
+        db.query(GmailWatchState)
+        .filter(func.lower(GmailWatchState.email) == email_address)
+        .first()
+    )
+    if state is None:
+        return GmailPubsubProcessResult(skipped=1)
+
+    oauth_account = (
+        db.query(UserOAuth).filter(UserOAuth.id == int(state.oauth_account_id)).first()
+    )
+    if oauth_account is None:
+        return GmailPubsubProcessResult(skipped=1)
+
+    service = service_factory(db, oauth_account)
+    start_history_id = str(state.history_id)
+    message_ids = _list_added_message_ids(service, start_history_id=start_history_id)
+    triggers = (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.user_id == int(state.user_id),
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+        )
+        .all()
+    )
+
+    processed = 0
+    duplicates = 0
+    skipped = 0
+    for message_id in message_ids:
+        message = _get_gmail_message(service, message_id)
+        payload = _message_payload(message, notification=notification)
+        payload["message_id"] = payload["message_id"] or message_id
+        matched = False
+        for trigger in triggers:
+            if not _trigger_matches_message(trigger, payload):
+                continue
+            matched = True
+            run, created = await fire_trigger(
+                db,
+                trigger=trigger,
+                event_payload=payload,
+                source_event_id=f"gmail:{message_id}",
+                test=False,
+            )
+            if created:
+                processed += 1
+            elif run is not None:
+                duplicates += 1
+        if not matched:
+            skipped += 1
+
+    state.history_id = str(notification.history_id)
+    state.last_error = None
+    db.add(state)
+    db.commit()
+    return GmailPubsubProcessResult(
+        processed=processed,
+        duplicates=duplicates,
+        skipped=skipped,
+    )

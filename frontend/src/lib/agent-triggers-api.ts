@@ -3,7 +3,7 @@
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 
-export type AgentTriggerType = "webhook" | "scheduled"
+export type AgentTriggerType = "webhook" | "scheduled" | "gmail"
 export type AgentTriggerRunStatus = "pending" | "running" | "completed" | "failed"
 
 export interface AgentTrigger {
