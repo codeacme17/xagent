@@ -321,6 +321,60 @@ describe("TaskConversationPanel", () => {
     expect(processMessages[1]).toHaveAttribute("data-process-status", "completed")
   })
 
+  it("keeps late react_task_end events in the same thinking group after the assistant result", () => {
+    appState.messages = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Hello",
+        timestamp: "1000",
+      },
+      {
+        id: "msg-result",
+        role: "assistant",
+        content: "Hi there",
+        timestamp: "3000",
+        isResult: true,
+        status: "completed",
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "react-start",
+        event_type: "react_task_start",
+        step_id: "step-1",
+        timestamp: 2000,
+        data: {},
+      },
+      {
+        event_id: "react-end",
+        event_type: "react_task_end",
+        step_id: "step-1",
+        timestamp: 4000,
+        data: {},
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const processMessages = screen
+      .getAllByTestId("chat-message")
+      .filter((message) => message.getAttribute("data-trace-count") !== "0")
+
+    expect(processMessages).toHaveLength(1)
+    expect(processMessages[0]).toHaveAttribute("data-trace-count", "2")
+    expect(processMessages[0]).toHaveAttribute("data-process-status", "completed")
+    expect(processMessages[0]).toHaveAttribute("data-show-empty-status", "false")
+  })
+
   it("does not apply current task status to a previous turn when the new turn has no trace yet", () => {
     appState.messages = [
       {

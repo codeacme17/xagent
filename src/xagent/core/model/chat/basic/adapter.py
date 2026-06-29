@@ -8,11 +8,13 @@ from ...providers import (
     canonical_provider_name,
     is_auto_router_model,
     provider_compatibility_for_provider,
+    resolve_base_url_for_provider,
 )
 from ..error import retry_on
 from .azure_openai import AzureOpenAILLM
 from .base import BaseLLM
 from .claude import ClaudeLLM
+from .dashscope import DashScopeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
@@ -57,7 +59,7 @@ def create_base_llm(
         llm = DeepSeekLLM(
             model_name=model.model_name,
             api_key=model.api_key,
-            base_url=model.base_url,
+            base_url=resolve_base_url_for_provider(provider, model.base_url),
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,
@@ -68,6 +70,20 @@ def create_base_llm(
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            timeout=model.timeout,
+            abilities=model.abilities,
+        )
+    elif provider in {
+        "dashscope",
+        "alibaba-coding-plan",
+        "alibaba-coding-plan-cn",
+    }:
+        llm = DashScopeLLM(
+            model_name=model.model_name,
+            api_key=model.api_key,
+            base_url=resolve_base_url_for_provider(provider, model.base_url),
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

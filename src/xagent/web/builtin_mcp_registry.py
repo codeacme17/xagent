@@ -80,6 +80,19 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "email_path": "userPrincipalName",
             "default_scopes": ["User.Read"],
         },
+        {
+            "provider_name": "meta",
+            "name": "Meta",
+            "client_id": os.environ.get("META_CLIENT_ID", ""),
+            "client_secret": os.environ.get("META_CLIENT_SECRET", ""),
+            "auth_url": "https://www.facebook.com/v25.0/dialog/oauth",
+            "token_url": "https://graph.facebook.com/v25.0/oauth/access_token",
+            "redirect_uri": os.environ.get("META_REDIRECT_URI", ""),
+            "userinfo_url": "https://graph.facebook.com/v25.0/me?fields=id,email",
+            "user_id_path": "id",
+            "email_path": "email",
+            "default_scopes": ["public_profile"],
+        },
     ]
 
 
@@ -212,6 +225,47 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "uv",
                 "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "facebook",
+            "name": "Facebook Pages",
+            "description": "Connect to Facebook Pages to discover managed pages and publish page posts.",
+            "icon": "https://www.google.com/s2/favicons?domain=facebook.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "meta",
+            "category": "Marketing",
+            "oauth_scopes": [
+                "pages_show_list",
+                "pages_read_engagement",
+                "pages_manage_posts",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "instagram",
+            "name": "Instagram",
+            "description": "Connect to Instagram professional accounts through Meta Graph API.",
+            "icon": "https://www.google.com/s2/favicons?domain=instagram.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "meta",
+            "category": "Marketing",
+            "oauth_scopes": [
+                "pages_show_list",
+                "pages_read_engagement",
+                "instagram_basic",
+                "instagram_content_publish",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

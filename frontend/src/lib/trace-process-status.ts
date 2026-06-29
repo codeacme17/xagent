@@ -18,6 +18,13 @@ const TERMINAL_FAILURE_EVENTS = new Set([
   "task_failed_react",
 ])
 
+const TERMINAL_SUCCESS_EVENTS = new Set([
+  "react_task_end",
+  "task_end_react",
+  "task_completion",
+  "dag_execute_end",
+])
+
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : null
 
@@ -68,6 +75,10 @@ export const getTraceProcessStatusFromEvents = (
     if (TERMINAL_FAILURE_EVENTS.has(eventType)) {
       return "failed"
     }
+
+    if (TERMINAL_SUCCESS_EVENTS.has(eventType)) {
+      return "completed"
+    }
   }
 
   return undefined
@@ -81,7 +92,17 @@ export const resolveTraceProcessStatus = ({
   processStatus?: unknown
   taskStatus?: unknown
   traceEvents?: TraceProcessEvent[]
-}): TraceProcessStatus | undefined =>
-  normalizeTraceProcessStatus(processStatus) ||
-  normalizeTraceProcessStatus(taskStatus) ||
-  getTraceProcessStatusFromEvents(traceEvents)
+}): TraceProcessStatus | undefined => {
+  const explicit =
+    normalizeTraceProcessStatus(processStatus) ||
+    normalizeTraceProcessStatus(taskStatus)
+  const inferred = getTraceProcessStatusFromEvents(traceEvents)
+
+  if (explicit && isStoppedTraceProcessStatus(explicit)) {
+    return explicit
+  }
+  if (inferred && isStoppedTraceProcessStatus(inferred)) {
+    return inferred
+  }
+  return explicit || inferred
+}

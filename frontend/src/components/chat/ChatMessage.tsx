@@ -96,7 +96,7 @@ function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latest
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["failed", "paused", "waiting_for_user"].includes(taskStatus || "") && (
+      {!["failed", "paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />

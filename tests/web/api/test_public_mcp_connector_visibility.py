@@ -458,7 +458,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
     db = next(get_db())
     try:
         provider_names = {row.provider_name for row in db.query(OAuthProvider).all()}
-        assert {"google", "linkedin", "microsoft"}.issubset(provider_names)
+        assert {"google", "linkedin", "microsoft", "meta"}.issubset(provider_names)
 
         microsoft_provider = (
             db.query(OAuthProvider)
@@ -467,6 +467,13 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
         )
         assert microsoft_provider is not None
         assert microsoft_provider.default_scopes == ["User.Read"]
+        meta_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "meta")
+            .first()
+        )
+        assert meta_provider is not None
+        assert meta_provider.default_scopes == ["public_profile"]
 
         app_ids = {row.app_id for row in db.query(PublicMCPApp).all()}
         assert {
@@ -477,6 +484,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "teams",
             "outlook",
             "onedrive",
+            "facebook",
+            "instagram",
         }.issubset(app_ids)
 
         teams_app = (
@@ -487,6 +496,12 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
         )
         onedrive_app = (
             db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "onedrive").first()
+        )
+        facebook_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "facebook").first()
+        )
+        instagram_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "instagram").first()
         )
 
         assert teams_app is not None
@@ -526,6 +541,35 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "command": "uv",
             "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
             "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert facebook_app is not None
+        assert facebook_app.provider_name == "meta"
+        assert facebook_app.category == "Marketing"
+        assert facebook_app.oauth_scopes == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+        ]
+        assert facebook_app.launch_config == {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        }
+
+        assert instagram_app is not None
+        assert instagram_app.provider_name == "meta"
+        assert instagram_app.category == "Marketing"
+        assert instagram_app.oauth_scopes == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "instagram_basic",
+            "instagram_content_publish",
+        ]
+        assert instagram_app.launch_config == {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
         }
     finally:
         db.close()

@@ -688,7 +688,7 @@ class KBApiCompatibilityFacade:
         with self._storage_context():
             return collections_module.delete_collection(collection, user_id, is_admin)
 
-    def rename_collection_data(
+    async def rename_collection_data(
         self,
         *,
         collection_name: str,
@@ -696,11 +696,22 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> list[str]:
+        if self._coordinator is not None:
+            return await self._coordinator.rename_collection(
+                old_name=collection_name,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+        import asyncio
+
         with self._storage_context():
             from ..storage.factory import get_vector_index_store
 
             store = get_vector_index_store()
-            return store.rename_collection_data(
+            return await asyncio.to_thread(
+                store.rename_collection_data,
                 collection_name=collection_name,
                 new_name=new_name,
                 user_id=user_id,
@@ -715,6 +726,13 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> None:
+        if self._coordinator is not None:
+            # rename_collection_data (called earlier in the web API rename sequence)
+            # already routed all three rename steps (data + status + metadata) through
+            # coordinator.rename_collection().  This call is a no-op to avoid a
+            # double-rename of metadata rows that no longer exist under old_name.
+            return
+
         with self._storage_context():
             from ..storage.factory import get_metadata_store
 
@@ -734,6 +752,12 @@ class KBApiCompatibilityFacade:
         user_id: Optional[int],
         is_admin: bool = False,
     ) -> list[str]:
+        if self._coordinator is not None:
+            # rename_collection_data already completed all three rename steps via
+            # coordinator.rename_collection().  Return empty warnings to avoid
+            # double-renaming status rows that no longer exist under old_name.
+            return []
+
         with self._storage_context():
             from ..storage.factory import get_ingestion_status_store
 

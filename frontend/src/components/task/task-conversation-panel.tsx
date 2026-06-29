@@ -16,7 +16,8 @@ import { useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
-import { getProcessGroupIndex } from "@/lib/task-timeline"
+import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
+import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
@@ -73,13 +74,6 @@ const toTimestampMs = (timestamp: unknown): number => {
 
   return time < 100000000000 ? time * 1000 : time
 }
-
-const getLastUserMessageIndex = (messages: Array<{ role?: string }>): number =>
-  messages.reduce(
-    (latestIndex, message, index) =>
-      message.role === "user" ? index : latestIndex,
-    -1
-  )
 
 const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
@@ -249,10 +243,13 @@ export function TaskConversationPanel({
       return items
     }
 
+    const userTurnAnchors = getUserTimelineAnchors(sortedMessages)
+    const userTurnCount = userTurnAnchors.length
+
     const processGroups = new Map<number, TimelineProcessEvent[]>()
     processEvents.forEach((event) => {
       const eventTime = toTimestampMs(event.timestamp)
-      const groupIndex = getProcessGroupIndex(sortedMessages, eventTime)
+      const groupIndex = getProcessGroupIndex(userTurnAnchors, eventTime)
       const group = processGroups.get(groupIndex) || []
       group.push(event)
       processGroups.set(groupIndex, group)
@@ -261,7 +258,6 @@ export function TaskConversationPanel({
     const groupEntries = Array.from(processGroups.entries()).sort((a, b) => a[0] - b[0])
     const latestGroupIndex =
       groupEntries.length > 0 ? groupEntries[groupEntries.length - 1][0] : -1
-    const lastUserMessageIndex = getLastUserMessageIndex(sortedMessages)
 
     groupEntries.forEach(([groupIndex, events]) => {
       if (events.length === 0) {
@@ -275,12 +271,15 @@ export function TaskConversationPanel({
       const shouldShowEmptyStatus =
         !hasFinalAssistantMessage &&
         groupIndex === latestGroupIndex &&
-        groupIndex >= sortedMessages.length
-      const isCurrentTurnGroup = groupIndex > lastUserMessageIndex
-      const processStatus =
-        groupIndex === latestGroupIndex && isCurrentTurnGroup
-          ? state.currentTask?.status
-          : undefined
+        groupIndex >= userTurnCount
+      const isCurrentTurnGroup =
+        groupIndex >= userTurnCount && groupIndex === latestGroupIndex
+      const processStatus = isCurrentTurnGroup
+        ? resolveTraceProcessStatus({
+            processStatus: state.currentTask?.status,
+            traceEvents: events,
+          })
+        : resolveTraceProcessStatus({ traceEvents: events })
 
       items.push({
         id: `process-${groupIndex}-${firstEvent?.event_id || groupTimestamp}`,
@@ -315,14 +314,15 @@ export function TaskConversationPanel({
     }
 
     const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp)
-    const lastUserMessageIndex = getLastUserMessageIndex(sortedMessages)
-    if (lastUserMessageIndex < 0) {
+    const userTurnAnchors = getUserTimelineAnchors(sortedMessages)
+    const userTurnCount = userTurnAnchors.length
+    if (userTurnCount === 0) {
       return state.traceEvents
     }
 
     return state.traceEvents.filter((event: any) => {
       const eventTime = toTimestampMs(event?.timestamp)
-      return getProcessGroupIndex(sortedMessages, eventTime) > lastUserMessageIndex
+      return getProcessGroupIndex(userTurnAnchors, eventTime) >= userTurnCount
     })
   }, [messageItems, state.traceEvents])
 

@@ -19,7 +19,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
+
+if TYPE_CHECKING:
+    from .maintenance_compatibility import CollectionConfigSnapshot
 
 import pandas as pd
 
@@ -30,7 +33,9 @@ except ImportError:  # pragma: no cover - pyarrow is an optional runtime dep
     pa = None
     PyArrowTable = Any
 
-from ..core.config import DEFAULT_LANCEDB_BATCH_SIZE
+from ..core.config import (
+    DEFAULT_LANCEDB_BATCH_SIZE,
+)
 from ..core.exceptions import (
     ConfigurationError,
     DatabaseOperationError,
@@ -637,6 +642,229 @@ class KBCollectionHandle(ABC):
         is_admin: bool = False,
     ) -> int:
         """Idempotently delete newly created chunk rows (compensation)."""
+
+    # --- Collection-level rename primitives (#H05 Phase 2) ---
+
+    @abstractmethod
+    def rename_collection_data(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> list[str]:
+        """Rename the collection field across all vector-side data tables.
+
+        Updates the ``collection`` column from ``self.context.collection`` to
+        ``new_name`` in the documents, parses, chunks, and all embeddings_*
+        tables.  Uses the same multi-tenancy filter semantics as other store
+        writes.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename; ``None`` treated as 0
+                for non-admin callers.
+            is_admin: When ``True`` renames all matching rows regardless of
+                ``user_id``.
+            warnings_out: Optional list to accumulate per-table warning
+                messages (best-effort updates).
+
+        Returns:
+            List of warning messages generated during best-effort updates
+            (empty on full success).
+        """
+
+    @abstractmethod
+    def rename_collection_status(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename ingestion status rows from this collection's name to ``new_name``.
+
+        Updates the ``collection`` column in the ``ingestion_runs`` table from
+        ``self.context.collection`` to ``new_name``.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames all matching rows regardless of
+                ``user_id``.
+
+        Returns:
+            List of warning messages on partial failure (empty on success).
+        """
+
+    @abstractmethod
+    async def rename_collection_metadata(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> None:
+        """Rename control-plane metadata from this collection's name to ``new_name``.
+
+        Async – this is the **only** async method on ``KBCollectionHandle``.
+        Wraps ``await metadata_store.rename_collection(...)`` to update the
+        ``collection_config`` and ``collection_metadata`` rows.
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames across all tenants.
+        """
+
+    # --- Collection-level cascade delete (#H05) ---
+
+    @abstractmethod
+    def delete_collection_data(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete all data for this collection (cascade across all vector-side tables).
+
+        Uses ``self.context.collection`` as the collection name; no external
+        ``collection_name`` argument is accepted (the handle is already scoped).
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        Raises ``DatabaseOperationError`` on failure.
+        """
+
+    @abstractmethod
+    def delete_documents_data(
+        self,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete vector-side data for specific document IDs in this collection.
+
+        Batches deletes internally.  On partial failure raises
+        ``DatabaseOperationError`` with ``details`` containing:
+            ``{"deleted_counts": dict, "deleted_doc_ids": list, "failed_batch_index": int}``
+        This exact shape is the downstream contract for
+        ``CollectionOperationResult.partial_success``.
+
+        Returns a ``dict[str, int]`` mapping table names to total deleted row
+        counts across all successfully processed batches.
+        """
+
+    # --- Collection-level rollback config primitives (#H05 Phase 4) ---
+
+    @abstractmethod
+    async def capture_collection_config_snapshot(
+        self,
+    ) -> "CollectionConfigSnapshot":
+        """Capture the collection_config row for this collection before mutation.
+
+        Returns a :class:`CollectionConfigSnapshot` whose ``existed`` flag is
+        ``True`` when a config row was present and ``False`` otherwise.  A
+        snapshot with ``existed=False`` is safe to pass to
+        :meth:`restore_collection_config_snapshot` – the restore is a no-op.
+        """
+
+    @abstractmethod
+    async def restore_collection_config_snapshot(
+        self,
+        snapshot: "CollectionConfigSnapshot",
+    ) -> None:
+        """Restore or remove a collection_config row from a snapshot.
+
+        When ``snapshot.existed`` is ``True`` the original config JSON is
+        written back via :meth:`MetadataStore.save_collection_config`.  When
+        ``snapshot.existed`` is ``False`` this is a no-op (the config row did
+        not exist before the mutation so there is nothing to restore).
+
+        The rollback-complete / side-effects-may-remain guard logic lives in
+        the coordinator/policy layer, not here.
+        """
+
+    @abstractmethod
+    async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
+        """Delete the collection_config row(s) for this collection.
+
+        When ``tenant_only`` is ``False`` (default) all tenant rows for this
+        collection are removed (admin scope – use only when the collection is
+        completely empty across all tenants).  When ``tenant_only`` is ``True``
+        only the row belonging to the handle's bound user scope is deleted,
+        leaving other tenants' rows intact.
+
+        Idempotent – returns the number of rows deleted (0 when no row
+        existed, which is not an error).
+        """
+
+    @abstractmethod
+    def cleanup_collection_data_after_rollback(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Remove all vector-side data for this collection (rollback compensation).
+
+        Composes the Phase 1 :meth:`delete_collection_data` primitive to clean
+        up a failed new-collection ingestion.  Does **not** touch the
+        filesystem; physical file cleanup is the caller's responsibility.
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+
+    # --- Collection-level statistics (#H05 Phase 3) ---
+
+    @abstractmethod
+    def count_documents(self, user_id: int | None, is_admin: bool) -> int:
+        """Count documents visible to the given user in this collection.
+
+        When ``is_admin`` is ``True`` all rows are counted regardless of
+        ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
+
+        Returns:
+            Number of document rows visible to the caller.
+        """
+
+    @abstractmethod
+    def collection_stats(self, user_id: int | None, is_admin: bool) -> dict[str, int]:
+        """Return aggregate statistics for this collection.
+
+        Counts rows across the documents, chunks, and all embeddings_* tables
+        that are visible to the caller under the given user/admin scope.
+
+        Returns:
+            A ``dict`` with at least these keys:
+            - ``"documents"`` – count of document rows
+            - ``"chunks"``    – count of chunk rows
+            - ``"embeddings"``– total count of embedding rows across all model
+              tables
+        """
+
+    @abstractmethod
+    def list_collection_documents(
+        self,
+        user_id: int | None,
+        is_admin: bool,
+        max_results: int = 1_000_000,
+    ) -> list[str]:
+        """List document IDs visible to the given user in this collection.
+
+        Returns a sorted list of unique doc_id strings for documents visible
+        to the caller under the given user/admin scope.  Used by the coordinator
+        before deletion to populate ``affected_documents`` and to collect
+        tenant-owned doc_ids when the caller has not pre-computed them.
+
+        Args:
+            user_id: Owner filter; ``None`` treated as 0 for non-admin callers.
+            is_admin: When ``True`` lists all documents regardless of user_id.
+            max_results: Upper bound on the number of document IDs returned.
+
+        Returns:
+            Sorted list of unique doc_id strings.
+        """
 
 
 @dataclass(frozen=True)
@@ -2979,3 +3207,320 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             user_id=user_id,
             is_admin=is_admin,
         )
+
+    # --- Collection-level cascade delete (#H05) ---
+
+    def delete_collection_data(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete all data for this collection from vector-side tables.
+
+        Delegates to the bound vector index store's ``delete_collection_data``,
+        passing ``self.context.collection`` so the handle boundary is respected.
+        Subsequent reads will not observe stale cached table handles because the
+        store invalidates its table cache internally.
+        """
+        return self.vector_index_store.delete_collection_data(
+            collection_name=self.context.collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            warnings_out=warnings_out,
+        )
+
+    def delete_documents_data(
+        self,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> dict[str, int]:
+        """Delete vector-side data for specific document IDs in this collection.
+
+        Delegates to the bound vector index store's ``delete_documents_data``.
+        On partial failure the store raises ``DatabaseOperationError`` with
+        ``details={"deleted_counts": ..., "deleted_doc_ids": ..., "failed_batch_index": ...}``
+        which is the downstream contract for ``CollectionOperationResult.partial_success``.
+        That exception propagates unchanged so callers receive the exact details dict.
+        """
+        return self.vector_index_store.delete_documents_data(
+            collection_name=self.context.collection,
+            doc_ids=doc_ids,
+            user_id=user_id,
+            is_admin=is_admin,
+            warnings_out=warnings_out,
+        )
+
+    # --- Collection-level rename primitives (#H05 Phase 2) ---
+
+    def rename_collection_data(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+        warnings_out: list[str] | None = None,
+    ) -> list[str]:
+        """Rename the collection field across all vector-side data tables.
+
+        Delegates to the bound vector index store's ``rename_collection_data``,
+        passing ``self.context.collection`` as the old name.  The coordinator
+        should call this via ``asyncio.to_thread`` when running in an async
+        context.
+
+        The table cache is invalidated after the rename so that subsequent
+        ``count_rows`` / ``iter_batches`` calls see the updated rows (matching
+        the behaviour of ``delete_collection_data``).
+
+        Returns:
+            List of per-table warning messages (empty on full success).
+        """
+        store = self.vector_index_store
+        warnings = store.rename_collection_data(
+            collection_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        # Invalidate the table cache so subsequent reads observe the renamed rows.
+        if hasattr(store, "invalidate_table_cache"):
+            store.invalidate_table_cache()
+        if warnings_out is not None:
+            warnings_out.extend(warnings)
+        return warnings
+
+    def rename_collection_status(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename ingestion status rows in the ``ingestion_runs`` table.
+
+        Delegates to the ingestion status store's ``rename_collection_status``,
+        passing ``self.context.collection`` as the old name.  The coordinator
+        should call this via ``asyncio.to_thread`` when running in an async
+        context.
+
+        Returns:
+            List of warning messages on partial failure (empty on success).
+        """
+        from ..storage.factory import get_ingestion_status_store
+
+        store = get_ingestion_status_store()
+        return store.rename_collection_status(
+            old_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def rename_collection_metadata(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> None:
+        """Rename control-plane metadata rows to ``new_name``.
+
+        This is the **only** async method on ``KBCollectionHandle``.  It wraps
+        ``await metadata_store.rename_collection(...)`` which updates the
+        ``collection_config`` and ``collection_metadata`` rows.  The coordinator
+        calls this directly with ``await`` (no ``asyncio.to_thread`` wrapper
+        needed, unlike the two sync rename primitives above).
+
+        Args:
+            new_name: Target collection name.
+            user_id: User ID for tenant-scoped rename.
+            is_admin: When ``True`` renames across all tenants.
+        """
+        await self.metadata_store.rename_collection(
+            old_name=self.context.collection,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    # --- Collection-level statistics (#H05 Phase 3) ---
+
+    def collection_stats(self, user_id: int | None, is_admin: bool) -> dict[str, int]:
+        """Return aggregate statistics for this collection.
+
+        Counts document rows, chunk rows, and all embedding rows (summed across
+        all ``embeddings_*`` tables) that are visible to the caller under the
+        given user/admin scope.
+
+        Returns:
+            A ``dict`` with keys ``"documents"``, ``"chunks"``, and
+            ``"embeddings"``.
+        """
+        collection = self.context.collection
+        store = self.vector_index_store
+
+        documents = store.count_rows_or_zero(
+            "documents",
+            filters={"collection": collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        chunks = store.count_rows_or_zero(
+            "chunks",
+            filters={"collection": collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        embeddings = sum(
+            store.count_rows_or_zero(
+                table_name,
+                filters={"collection": collection},
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            for table_name in store.list_table_names()
+            if table_name.startswith("embeddings_")
+        )
+        return {
+            "documents": documents,
+            "chunks": chunks,
+            "embeddings": embeddings,
+        }
+
+    def count_documents(self, user_id: int | None, is_admin: bool) -> int:
+        """Count documents visible to the given user in this collection.
+
+        When ``is_admin`` is ``True`` all rows are counted regardless of
+        ``user_id``.  Otherwise only rows owned by ``user_id`` are counted.
+        """
+        return self.vector_index_store.count_rows_or_zero(
+            "documents",
+            filters={"collection": self.context.collection},
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def list_collection_documents(
+        self,
+        user_id: int | None,
+        is_admin: bool,
+        max_results: int = 1_000_000,
+    ) -> list[str]:
+        """List document IDs for this collection.
+
+        Delegates to the bound vector index store's ``list_document_records`` and
+        returns a sorted list of unique doc_id strings.  The coordinator uses this
+        before deletion to collect tenant-owned doc_ids (when the caller has not
+        pre-computed them) and to populate ``affected_documents`` in the result.
+        """
+        store = self.vector_index_store
+        records = store.list_document_records(
+            collection_name=self.context.collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            max_results=max_results,
+        )
+        return sorted({r.doc_id for r in records})
+
+    # --- Collection-level rollback config primitives (#H05 Phase 4) ---
+
+    async def capture_collection_config_snapshot(
+        self,
+    ) -> "CollectionConfigSnapshot":
+        """Capture the collection_config row for this collection (metadata read only).
+
+        Reads the config row via the metadata store and wraps it in a
+        :class:`CollectionConfigSnapshot`.  ``config_user_id`` is normalized to
+        0 when ``user_id`` is ``None``, matching legacy ownership convention.
+        """
+        from .maintenance_compatibility import CollectionConfigSnapshot
+
+        collection = self.context.collection
+        # Normalize: None user_id maps to 0 (legacy convention).
+        user_id = self.context.user_scope.user_id
+        config_user_id: int = 0 if user_id is None else int(user_id)
+
+        config_json = await self.metadata_store.get_collection_config(
+            collection,
+            config_user_id,
+            is_admin=False,
+        )
+        return CollectionConfigSnapshot(
+            collection_name=collection,
+            user_id=user_id,
+            config_user_id=config_user_id,
+            config_json=config_json,
+            existed=config_json is not None,
+        )
+
+    async def restore_collection_config_snapshot(
+        self,
+        snapshot: "CollectionConfigSnapshot",
+    ) -> None:
+        """Restore a collection_config row from snapshot (metadata write only).
+
+        When ``snapshot.existed`` is ``True`` the config JSON is written back
+        via :meth:`MetadataStore.save_collection_config`.  When
+        ``snapshot.existed`` is ``False`` this is a no-op.
+
+        The rollback-complete / side-effects-may-remain guard lives in the
+        coordinator/policy layer and is intentionally absent here.
+        """
+        if not snapshot.existed:
+            return
+        assert (
+            snapshot.config_json is not None
+        )  # invariant: existed ↔ config_json is not None
+        await self.metadata_store.save_collection_config(
+            snapshot.collection_name,
+            snapshot.config_json,
+            snapshot.config_user_id,
+        )
+
+    async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
+        """Delete the collection_config row(s) for this collection (idempotent).
+
+        When ``tenant_only`` is ``False`` (default) delegates with
+        ``is_admin=True`` so all tenant rows for this collection are removed.
+        When ``tenant_only`` is ``True`` uses the handle's bound user scope so
+        only that tenant's config row is removed, leaving other tenants' rows
+        intact.  Returns the number of config rows deleted (0 when none
+        existed).
+
+        ``delete_orphaned_metadata=True`` lets the metadata store drop the
+        collection_metadata record once removing this tenant's config row
+        leaves the collection with zero config rows (a true orphan).  This is
+        scope-safe: it only ever deletes the current tenant's own config row
+        and the shared metadata record when nothing remains — it never touches
+        another tenant's config row.
+        """
+        if tenant_only:
+            user_id = self.context.user_scope.user_id
+            is_admin = self.context.user_scope.is_admin
+        else:
+            user_id = None
+            is_admin = True
+        result = await self.metadata_store.delete_collection_metadata(
+            collection_name=self.context.collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            delete_orphaned_metadata=True,
+        )
+        return result.get("config_rows", 0)
+
+    def cleanup_collection_data_after_rollback(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Remove all vector-side data for this collection (rollback compensation).
+
+        Composes the Phase 1 :meth:`delete_collection_data` primitive.  Does
+        **not** access the filesystem; physical file cleanup is the caller's
+        responsibility.
+
+        Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+        return self.delete_collection_data(user_id=user_id, is_admin=is_admin)
