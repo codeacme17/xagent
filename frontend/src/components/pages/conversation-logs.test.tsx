@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -155,6 +155,32 @@ const detailPayload = {
   read_only: true,
 }
 
+const webhookDetailPayload = {
+  ...detailPayload,
+  log: listPayload.logs[1],
+  transcript: [
+    {
+      id: 3,
+      role: "user",
+      content: "Handle webhook event",
+      message_type: "chat",
+      created_at: "2026-06-29T02:00:10Z",
+    },
+  ],
+  metadata: {
+    task: {
+      task_id: 202,
+      input: "Handle webhook event",
+      output: "Webhook handled",
+      error_message: null,
+      description: "Webhook payload",
+      agent_config: {},
+    },
+    trigger: null,
+    public_context: null,
+  },
+}
+
 describe("ConversationLogsPage", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
@@ -209,5 +235,44 @@ describe("ConversationLogsPage", () => {
       expect(listUrls.some((url) => url.includes("source=webhook"))).toBe(true)
       expect(listUrls.some((url) => url.includes("search=crm"))).toBe(true)
     })
+  })
+
+  it("ignores stale detail responses after a newer log is selected", async () => {
+    let resolveFirstDetail: (response: Response) => void = () => {}
+    const firstDetailPromise = new Promise<Response>((resolve) => {
+      resolveFirstDetail = resolve
+    })
+
+    apiRequestMock.mockImplementation((url: string) => {
+      const parsed = new URL(url)
+      if (parsed.pathname === "/api/conversation-logs/101") {
+        return firstDetailPromise
+      }
+      if (parsed.pathname === "/api/conversation-logs/202") {
+        return Promise.resolve(
+          new Response(JSON.stringify(webhookDetailPayload), { status: 200 })
+        )
+      }
+      if (parsed.pathname === "/api/conversation-logs") {
+        return Promise.resolve(
+          new Response(JSON.stringify(listPayload), { status: 200 })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<ConversationLogsPage />)
+
+    await screen.findAllByText("Sales Agent")
+    fireEvent.click(screen.getByText("Webhook"))
+    expect(await screen.findByText("Handle webhook event")).toBeInTheDocument()
+
+    await act(async () => {
+      resolveFirstDetail(new Response(JSON.stringify(detailPayload), { status: 200 }))
+      await Promise.resolve()
+    })
+
+    expect(screen.getByText("Handle webhook event")).toBeInTheDocument()
+    expect(screen.queryByText("Qualify this lead")).not.toBeInTheDocument()
   })
 })

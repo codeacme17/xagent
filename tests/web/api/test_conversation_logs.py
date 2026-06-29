@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
+from sqlalchemy import event
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
@@ -18,6 +21,28 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@contextmanager
+def _capture_sql_statements():
+    statements: list[tuple[str, Any]] = []
+    engine = get_engine()
+
+    def before_cursor_execute(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
 
 
 def _user_id(username: str) -> int:
@@ -309,7 +334,9 @@ def test_conversation_logs_list_maps_sources_counts_filters_and_access_scope() -
     assert [item["task_id"] for item in bob_response.json()["logs"]] == [bob_task_id]
 
 
-def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata() -> None:
+def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata() -> (
+    None
+):
     headers = _admin_headers()
     user_id = _user_id("admin")
     agent_id = _create_agent_row(user_id=user_id, name="Audit Agent")
@@ -370,7 +397,9 @@ def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata
     assert body["read_only"] is True
 
 
-def test_public_widget_and_share_task_creation_classifies_hidden_external_logs() -> None:
+def test_public_widget_and_share_task_creation_classifies_hidden_external_logs() -> (
+    None
+):
     _admin_headers()
     owner_id = _user_id("admin")
     widget_agent_id = _create_agent_row(
@@ -412,8 +441,12 @@ def test_public_widget_and_share_task_creation_classifies_hidden_external_logs()
 
     db = _direct_db_session()
     try:
-        widget_task = db.query(Task).filter(Task.id == widget_response.json()["task_id"]).one()
-        share_task = db.query(Task).filter(Task.id == share_response.json()["task_id"]).one()
+        widget_task = (
+            db.query(Task).filter(Task.id == widget_response.json()["task_id"]).one()
+        )
+        share_task = (
+            db.query(Task).filter(Task.id == share_response.json()["task_id"]).one()
+        )
         assert widget_task.source == "widget"
         assert widget_task.is_visible is False
         assert share_task.source == "shared_link"
@@ -426,3 +459,83 @@ def test_public_widget_and_share_task_creation_classifies_hidden_external_logs()
     assert logs_response.status_code == 200, logs_response.text
     logs = logs_response.json()["logs"]
     assert {item["source"] for item in logs} == {"widget", "shared_link"}
+
+
+def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Paged Agent")
+
+    for index in range(12):
+        task_id = _create_task_row(
+            user_id=user_id,
+            title=f"Paged REST task {index}",
+            source="sdk",
+            is_visible=False,
+            agent_id=agent_id,
+        )
+        _add_chat_message(
+            task_id=task_id,
+            user_id=user_id,
+            role="user",
+            content=f"message {index}",
+        )
+
+    with _capture_sql_statements() as statements:
+        response = client.get(
+            "/api/conversation-logs?page=2&per_page=5",
+            headers=headers,
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()["logs"]) == 5
+
+    message_query_param_counts = [
+        len(parameters)
+        for statement, parameters in statements
+        if "FROM task_chat_messages" in statement
+        and "task_chat_messages.task_id IN" in statement
+        and isinstance(parameters, tuple)
+    ]
+    assert message_query_param_counts
+    assert max(message_query_param_counts) <= 5
+
+
+def test_conversation_logs_list_batches_trigger_type_lookup() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Webhook Agent")
+
+    for index in range(8):
+        task_id = _create_task_row(
+            user_id=user_id,
+            title=f"Webhook task {index}",
+            source="trigger",
+            is_visible=False,
+            agent_id=agent_id,
+        )
+        _attach_trigger_run(
+            user_id=user_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type="webhook",
+            source_event_id=f"evt-{index}",
+        )
+
+    with _capture_sql_statements() as statements:
+        response = client.get(
+            "/api/conversation-logs?source=webhook&page=1&per_page=5",
+            headers=headers,
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["logs"]) == 5
+    assert body["pagination"]["total"] == 8
+
+    trigger_lookup_queries = [
+        statement
+        for statement, _parameters in statements
+        if "FROM trigger_runs" in statement or "FROM agent_triggers" in statement
+    ]
+    assert len(trigger_lookup_queries) <= 4

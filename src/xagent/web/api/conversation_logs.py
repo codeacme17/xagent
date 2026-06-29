@@ -4,8 +4,8 @@ import math
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, case, func, or_
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
@@ -40,7 +40,9 @@ EXTERNAL_TASK_SOURCES = {"sdk", "trigger", "widget", "shared_link"}
 
 def _status_value(task: Task) -> str:
     status = getattr(task, "status", None)
-    return str(status.value if hasattr(status, "value") else status or "unknown")
+    if status is None:
+        return "unknown"
+    return str(getattr(status, "value", status) or "unknown")
 
 
 def _agent_config(task: Task) -> dict[str, Any]:
@@ -80,19 +82,6 @@ def _ui_source_for_task(db: Session, task: Task) -> str | None:
     return None
 
 
-def _matches_search(task: Task, search: str | None) -> bool:
-    if not search:
-        return True
-    needle = search.casefold()
-    haystack = [
-        task.title,
-        task.description,
-        task.input,
-        task.output,
-    ]
-    return any(needle in str(value).casefold() for value in haystack if value)
-
-
 def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
     return (
         message.created_at is not None,
@@ -101,28 +90,22 @@ def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
     )
 
 
-def _base_task_query(db: Session, user: User):
-    query = (
-        db.query(Task)
-        .options(selectinload(Task.agent), selectinload(Task.chat_messages))
-        .filter(
-            Task.is_visible.is_(False),
-            Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
-        )
+def _apply_external_task_scope(query: Any, user: User) -> Any:
+    query = query.filter(
+        Task.is_visible.is_(False),
+        Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
     return query
 
 
-def _load_candidate_tasks(
-    db: Session,
-    user: User,
+def _apply_task_filters(
+    query: Any,
     *,
     agent_id: int | None,
     search: str | None,
-) -> list[tuple[Task, str]]:
-    query = _base_task_query(db, user)
+) -> Any:
     if agent_id is not None:
         query = query.filter(Task.agent_id == agent_id)
     if search:
@@ -135,17 +118,59 @@ def _load_candidate_tasks(
                 Task.output.ilike(like),
             )
         )
+    return query
 
-    tasks = query.order_by(Task.updated_at.desc(), Task.id.desc()).all()
-    external_tasks: list[tuple[Task, str]] = []
-    for task in tasks:
-        ui_source = _ui_source_for_task(db, task)
-        if ui_source is None:
-            continue
-        if not _matches_search(task, search):
-            continue
-        external_tasks.append((task, ui_source))
-    return external_tasks
+
+def _base_task_query(db: Session, user: User) -> Any:
+    query = db.query(Task).options(
+        selectinload(Task.agent),
+        selectinload(Task.chat_messages),
+    )
+    return _apply_external_task_scope(query, user)
+
+
+def _conversation_source_query(
+    db: Session,
+    user: User,
+    *,
+    agent_id: int | None,
+    search: str | None,
+) -> tuple[Any, Any]:
+    latest_run_ids = (
+        db.query(
+            TriggerRun.task_id.label("task_id"),
+            func.max(TriggerRun.id).label("trigger_run_id"),
+        )
+        .filter(TriggerRun.task_id.isnot(None))
+        .group_by(TriggerRun.task_id)
+        .subquery()
+    )
+    latest_run = aliased(TriggerRun)
+    latest_trigger = aliased(AgentTrigger)
+
+    trigger_type = func.coalesce(
+        Task.agent_config["trigger_type"].as_string(),
+        latest_trigger.type,
+    )
+    ui_source = case(
+        (Task.source == "sdk", SOURCE_REST_API),
+        (Task.source == "widget", SOURCE_WIDGET),
+        (Task.source == "shared_link", SOURCE_SHARED_LINK),
+        (
+            and_(Task.source == "trigger", trigger_type == "webhook"),
+            SOURCE_WEBHOOK,
+        ),
+        else_=None,
+    ).label("ui_source")
+
+    query = (
+        _apply_external_task_scope(db.query(Task), user)
+        .outerjoin(latest_run_ids, latest_run_ids.c.task_id == Task.id)
+        .outerjoin(latest_run, latest_run.id == latest_run_ids.c.trigger_run_id)
+        .outerjoin(latest_trigger, latest_trigger.id == latest_run.trigger_id)
+    )
+    query = _apply_task_filters(query, agent_id=agent_id, search=search)
+    return query, ui_source
 
 
 def _last_activity_at(task: Task) -> Any:
@@ -239,28 +264,48 @@ def _serialize_public_context(task: Task, ui_source: str) -> dict[str, Any] | No
     return None
 
 
-def _source_counts(items: list[tuple[Task, str]]) -> dict[str, int]:
+def _source_counts_from_query(query: Any, ui_source: Any) -> dict[str, int]:
     counts = {source: 0 for source in SOURCE_ORDER}
-    for _task, source in items:
-        counts[source] += 1
-    return {"all": len(items), **counts}
+    rows = (
+        query.with_entities(ui_source, func.count(Task.id))
+        .filter(ui_source.isnot(None))
+        .group_by(ui_source)
+        .all()
+    )
+    for source, count in rows:
+        if source in counts:
+            counts[source] = int(count)
+    return {"all": sum(counts.values()), **counts}
 
 
-def _agent_options(items: list[tuple[Task, str]]) -> list[dict[str, Any]]:
+def _agent_options_from_query(query: Any, ui_source: Any) -> list[dict[str, Any]]:
     options: dict[int, dict[str, Any]] = {}
-    for task, _source in items:
-        if task.agent_id is None:
+    rows = (
+        query.outerjoin(Agent, Agent.id == Task.agent_id)
+        .with_entities(Task.agent_id, Agent.name, Agent.logo_url)
+        .filter(Task.agent_id.isnot(None), ui_source.isnot(None))
+        .distinct()
+        .all()
+    )
+    for task_agent_id, agent_name, agent_logo_url in rows:
+        if task_agent_id is None:
             continue
-        agent_id = int(task.agent_id)
-        if agent_id in options:
+        option_agent_id = int(task_agent_id)
+        if option_agent_id in options:
             continue
-        agent = task.agent if isinstance(task.agent, Agent) else None
-        options[agent_id] = {
-            "agent_id": agent_id,
-            "agent_name": agent.name if agent else f"Agent {agent_id}",
-            "agent_logo_url": agent.logo_url if agent else None,
+        options[option_agent_id] = {
+            "agent_id": option_agent_id,
+            "agent_name": agent_name or f"Agent {option_agent_id}",
+            "agent_logo_url": agent_logo_url,
         }
     return sorted(options.values(), key=lambda item: item["agent_name"].casefold())
+
+
+def _load_tasks_by_id(db: Session, user: User, task_ids: list[int]) -> dict[int, Task]:
+    if not task_ids:
+        return {}
+    tasks = _base_task_query(db, user).filter(Task.id.in_(task_ids)).all()
+    return {int(task.id): task for task in tasks}
 
 
 @router.get("")
@@ -278,28 +323,41 @@ async def list_conversation_logs(
     if normalized_source not in allowed_sources:
         raise HTTPException(status_code=400, detail="Unsupported conversation source")
 
-    candidate_items = _load_candidate_tasks(
+    search_value = search.strip() if search else None
+    source_query, ui_source = _conversation_source_query(
         db,
         user,
         agent_id=agent_id,
-        search=search.strip() if search else None,
+        search=search_value,
     )
-    filtered_items = (
-        candidate_items
-        if normalized_source == "all"
-        else [item for item in candidate_items if item[1] == normalized_source]
-    )
-    total = len(filtered_items)
+    source_counts = _source_counts_from_query(source_query, ui_source)
+    agent_options = _agent_options_from_query(source_query, ui_source)
+
+    filtered_query = source_query.filter(ui_source.isnot(None))
+    if normalized_source != "all":
+        filtered_query = filtered_query.filter(ui_source == normalized_source)
+
+    total = int(filtered_query.count())
     start = (page - 1) * per_page
-    paged_items = filtered_items[start : start + per_page]
+    page_rows = (
+        filtered_query.with_entities(Task.id, ui_source)
+        .order_by(Task.updated_at.desc(), Task.id.desc())
+        .offset(start)
+        .limit(per_page)
+        .all()
+    )
+    task_ids = [int(task_id) for task_id, _source in page_rows]
+    source_by_task_id = {int(task_id): str(source) for task_id, source in page_rows}
+    tasks_by_id = _load_tasks_by_id(db, user, task_ids)
 
     return {
         "logs": [
-            _serialize_log_summary(task, ui_source)
-            for task, ui_source in paged_items
+            _serialize_log_summary(tasks_by_id[task_id], source_by_task_id[task_id])
+            for task_id in task_ids
+            if task_id in tasks_by_id
         ],
-        "source_counts": _source_counts(candidate_items),
-        "agents": _agent_options(candidate_items),
+        "source_counts": source_counts,
+        "agents": agent_options,
         "pagination": {
             "page": page,
             "per_page": per_page,

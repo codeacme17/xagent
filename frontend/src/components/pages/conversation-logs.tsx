@@ -95,12 +95,18 @@ export function ConversationLogsPage() {
     setDetailError(null)
     try {
       const data = await fetchConversationLogDetail(taskId)
-      setDetail(data)
+      if (taskId === selectedTaskIdRef.current) {
+        setDetail(data)
+      }
     } catch (err) {
-      setDetail(null)
-      setDetailError(err instanceof Error ? err.message : unknownErrorRef.current)
+      if (taskId === selectedTaskIdRef.current) {
+        setDetail(null)
+        setDetailError(err instanceof Error ? err.message : unknownErrorRef.current)
+      }
     } finally {
-      setIsDetailLoading(false)
+      if (taskId === selectedTaskIdRef.current) {
+        setIsDetailLoading(false)
+      }
     }
   }, [])
 
@@ -132,16 +138,20 @@ export function ConversationLogsPage() {
         const nextSelectedId = currentStillVisible
           ? currentSelectedId
           : data.logs[0]?.task_id ?? null
+        selectedTaskIdRef.current = nextSelectedId
         setSelectedTaskId(nextSelectedId)
         if (nextSelectedId) {
           void loadDetail(nextSelectedId)
         } else {
           setDetail(null)
+          setDetailError(null)
+          setIsDetailLoading(false)
         }
       } catch (err) {
         if (cancelled) return
         setListData(null)
         setDetail(null)
+        selectedTaskIdRef.current = null
         setSelectedTaskId(null)
         setError(err instanceof Error ? err.message : unknownErrorRef.current)
       } finally {
@@ -168,6 +178,7 @@ export function ConversationLogsPage() {
   const hasFilter = source !== "all" || Boolean(search.trim()) || agentId !== null
 
   function selectLog(taskId: number) {
+    selectedTaskIdRef.current = taskId
     setSelectedTaskId(taskId)
     void loadDetail(taskId)
   }
@@ -301,7 +312,10 @@ export function ConversationLogsPage() {
                             {sourceLabel(log)}
                           </Badge>
                         </div>
-                        <span className="whitespace-nowrap text-xs text-slate-500">
+                        <span
+                          suppressHydrationWarning
+                          className="whitespace-nowrap text-xs text-slate-500"
+                        >
                           {formatRelativeTime(log.last_activity_at || log.updated_at)}
                         </span>
                       </div>
@@ -381,7 +395,7 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
         </div>
         <p className="mt-2 text-sm text-slate-600">
           {t("conversationLogs.lastActivity")}{" "}
-          <span className="text-slate-500">
+          <span suppressHydrationWarning className="text-slate-500">
             {formatRelativeTime(log.last_activity_at || log.updated_at)}
           </span>
         </p>
