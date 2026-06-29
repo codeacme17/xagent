@@ -23,14 +23,13 @@ class TestDeepSeekLLM:
         assert llm.api_key == "test-api-key"
         assert llm.abilities == ["chat", "tool_calling", "thinking_mode"]
 
-    def test_env_fallbacks(self, monkeypatch):
+    def test_api_key_env_fallback(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek-key")
-        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://deepseek.example.com")
 
         llm = DeepSeekLLM(api_key=None, base_url=None)
 
         assert llm.api_key == "env-deepseek-key"
-        assert llm.base_url == "https://deepseek.example.com"
+        assert llm.base_url == DEEPSEEK_DEFAULT_BASE_URL
 
     def test_api_key_falls_back_to_openai_key_after_deepseek_key(self, monkeypatch):
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -63,15 +62,25 @@ class TestDeepSeekLLM:
         with pytest.raises(ValueError, match="Unsupported DeepSeek model"):
             DeepSeekLLM(model_name="not-a-deepseek-model", api_key="test-api-key")
 
-    def test_supports_enable_thinking_param_is_false(self, llm):
-        assert llm.supports_enable_thinking_param is False
-
     def test_structured_output_capabilities(self, llm):
         assert llm.supports_json_schema_response_format is False
         assert llm.supports_json_object_response_format is True
 
     def test_deepseek_is_not_openai_subclass(self):
         assert not issubclass(DeepSeekLLM, OpenAILLM)
+
+    def test_provider_reasoning_hook_disables_deepseek_thinking(self, llm):
+        assert llm._prepare_provider_reasoning_extra_body(
+            extra_body={"trace_id": "abc"},
+            thinking={"type": "disabled"},
+            tools=None,
+            response_format=None,
+            output_config=None,
+            is_streaming=False,
+        ) == {
+            "trace_id": "abc",
+            "thinking": {"type": "disabled"},
+        }
 
     @pytest.mark.asyncio
     async def test_explicit_thinking_enabled_uses_deepseek_extra_body(
