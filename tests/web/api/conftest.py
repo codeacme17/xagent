@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
+from xagent.web.api.conversation_logs import router as conversation_logs_router
 from xagent.web.api.files import file_router
 from xagent.web.api.me import router as me_router
 from xagent.web.api.share import share_router
@@ -64,6 +65,7 @@ def _override_get_db() -> Iterator[Session]:
 app_for_tests = FastAPI()
 app_for_tests.include_router(auth_router)
 app_for_tests.include_router(me_router)
+app_for_tests.include_router(conversation_logs_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(workforces_router)
 app_for_tests.include_router(file_router)

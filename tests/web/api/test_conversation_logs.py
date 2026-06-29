@@ -1,0 +1,428 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
+from xagent.web.models.user import User
+
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _register_second_user,
+    client,
+)
+
+pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+def _user_id(username: str) -> int:
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == username).one()
+        return int(user.id)
+    finally:
+        db.close()
+
+
+def _create_agent_row(
+    *,
+    user_id: int,
+    name: str,
+    status: AgentStatus = AgentStatus.PUBLISHED,
+    widget_enabled: bool = True,
+    allowed_domains: list[str] | None = None,
+    share_enabled: bool = False,
+    share_token: str | None = None,
+) -> int:
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=user_id,
+            name=name,
+            description=f"{name} description",
+            instructions=f"{name} instructions",
+            execution_mode="balanced",
+            status=status,
+            widget_enabled=widget_enabled,
+            allowed_domains=allowed_domains or ["example.com"],
+            share_enabled=share_enabled,
+            share_token=share_token,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        return int(agent.id)
+    finally:
+        db.close()
+
+
+def _create_task_row(
+    *,
+    user_id: int,
+    title: str,
+    source: str = "internal",
+    is_visible: bool = True,
+    agent_id: int | None = None,
+    description: str | None = None,
+    input_text: str | None = None,
+    output_text: str | None = None,
+    agent_config: dict[str, Any] | None = None,
+    channel_name: str | None = None,
+) -> int:
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=user_id,
+            title=title,
+            description=description or title,
+            status=TaskStatus.COMPLETED,
+            source=source,
+            is_visible=is_visible,
+            agent_id=agent_id,
+            input=input_text,
+            output=output_text,
+            agent_config=agent_config,
+            channel_name=channel_name,
+            input_tokens=3,
+            output_tokens=5,
+            total_tokens=8,
+            llm_calls=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+def _attach_trigger_run(
+    *,
+    user_id: int,
+    agent_id: int,
+    task_id: int,
+    trigger_type: str,
+    source_event_id: str,
+) -> tuple[int, int]:
+    db = _direct_db_session()
+    try:
+        trigger = AgentTrigger(
+            user_id=user_id,
+            agent_id=agent_id,
+            type=trigger_type,
+            name=f"{trigger_type} trigger",
+            enabled=True,
+            config={},
+            webhook_token=f"token-{task_id}" if trigger_type == "webhook" else None,
+            secret_hash="$2b$hidden",
+        )
+        db.add(trigger)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=int(trigger.id),
+            task_id=task_id,
+            status=TriggerRunStatus.COMPLETED.value,
+            source_event_id=source_event_id,
+            payload_snapshot={"subject": source_event_id},
+            idempotency_key=f"{trigger_type}:{source_event_id}",
+        )
+        db.add(run)
+        db.commit()
+        return int(trigger.id), int(run.id)
+    finally:
+        db.close()
+
+
+def _add_chat_message(
+    *,
+    task_id: int,
+    user_id: int,
+    role: str,
+    content: str,
+    message_type: str = "chat",
+) -> None:
+    db = _direct_db_session()
+    try:
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role=role,
+                content=content,
+                message_type=message_type,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _authenticate_widget_guest(
+    *,
+    agent_id: int,
+    guest_id: str = "guest-1",
+    origin: str = "https://example.com",
+) -> dict[str, str]:
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": guest_id},
+        headers={"origin": origin},
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def _authenticate_share_guest(share_token: str) -> dict[str, str]:
+    response = client.post("/api/share/auth", json={"share_token": share_token})
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def test_conversation_logs_list_maps_sources_counts_filters_and_access_scope() -> None:
+    admin_headers = _admin_headers()
+    bob_headers = _register_second_user(username="bob")
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+    alpha_agent_id = _create_agent_row(user_id=admin_id, name="Alpha Agent")
+    beta_agent_id = _create_agent_row(user_id=admin_id, name="Beta Agent")
+    bob_agent_id = _create_agent_row(user_id=bob_id, name="Bob Agent")
+
+    rest_task_id = _create_task_row(
+        user_id=admin_id,
+        title="REST lead intake",
+        description="Lead intake from API",
+        input_text="needle from api input",
+        output_text="lead accepted",
+        source="sdk",
+        is_visible=False,
+        agent_id=alpha_agent_id,
+    )
+    webhook_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Webhook crm event",
+        source="trigger",
+        is_visible=False,
+        agent_id=alpha_agent_id,
+        agent_config={"trigger_type": "webhook"},
+        input_text="crm payload",
+    )
+    _attach_trigger_run(
+        user_id=admin_id,
+        agent_id=alpha_agent_id,
+        task_id=webhook_task_id,
+        trigger_type="webhook",
+        source_event_id="evt-webhook",
+    )
+    scheduled_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Scheduled daily digest",
+        source="trigger",
+        is_visible=False,
+        agent_id=alpha_agent_id,
+        agent_config={"trigger_type": "scheduled"},
+    )
+    _attach_trigger_run(
+        user_id=admin_id,
+        agent_id=alpha_agent_id,
+        task_id=scheduled_task_id,
+        trigger_type="scheduled",
+        source_event_id="evt-scheduled",
+    )
+    widget_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Widget visitor",
+        source="widget",
+        is_visible=False,
+        agent_id=beta_agent_id,
+        agent_config={"guest_id": "guest-1"},
+        channel_name="Web Widget",
+    )
+    share_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Share visitor",
+        source="shared_link",
+        is_visible=False,
+        agent_id=beta_agent_id,
+        agent_config={"auth_mode": "share", "share_agent_id": beta_agent_id},
+        channel_name="Shared Agent",
+    )
+    _create_task_row(
+        user_id=admin_id,
+        title="Visible SDK should stay out",
+        source="sdk",
+        is_visible=True,
+        agent_id=alpha_agent_id,
+    )
+    _create_task_row(
+        user_id=admin_id,
+        title="Hidden internal should stay out",
+        source="internal",
+        is_visible=False,
+        agent_id=alpha_agent_id,
+    )
+    bob_task_id = _create_task_row(
+        user_id=bob_id,
+        title="Bob REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=bob_agent_id,
+    )
+
+    response = client.get("/api/conversation-logs", headers=admin_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    returned_ids = {item["task_id"] for item in body["logs"]}
+    assert returned_ids == {
+        rest_task_id,
+        webhook_task_id,
+        widget_task_id,
+        share_task_id,
+        bob_task_id,
+    }
+    assert scheduled_task_id not in returned_ids
+    assert body["source_counts"] == {
+        "all": 5,
+        "widget": 1,
+        "rest_api": 2,
+        "shared_link": 1,
+        "webhook": 1,
+    }
+    labels_by_id = {item["task_id"]: item["source_label"] for item in body["logs"]}
+    assert labels_by_id[rest_task_id] == "REST API"
+    assert labels_by_id[webhook_task_id] == "Webhook"
+
+    filtered = client.get(
+        f"/api/conversation-logs?source=rest_api&agent_id={alpha_agent_id}&search=needle",
+        headers=admin_headers,
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert [item["task_id"] for item in filtered.json()["logs"]] == [rest_task_id]
+    assert filtered.json()["pagination"]["total"] == 1
+
+    bob_response = client.get("/api/conversation-logs", headers=bob_headers)
+    assert bob_response.status_code == 200, bob_response.text
+    assert [item["task_id"] for item in bob_response.json()["logs"]] == [bob_task_id]
+
+
+def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Audit Agent")
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Webhook audit",
+        source="trigger",
+        is_visible=False,
+        agent_id=agent_id,
+        input_text="incoming payload",
+        output_text="processed payload",
+        agent_config={"trigger_type": "webhook"},
+    )
+    trigger_id, run_id = _attach_trigger_run(
+        user_id=user_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        trigger_type="webhook",
+        source_event_id="evt-42",
+    )
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content="Please handle this event",
+    )
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="assistant",
+        content="Event handled",
+    )
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["log"]["task_id"] == task_id
+    assert body["log"]["source"] == "webhook"
+    assert body["metadata"]["task"]["input"] == "incoming payload"
+    assert body["metadata"]["task"]["output"] == "processed payload"
+    assert body["metadata"]["trigger"] == {
+        "trigger_id": trigger_id,
+        "trigger_run_id": run_id,
+        "trigger_type": "webhook",
+        "source_event_id": "evt-42",
+        "status": TriggerRunStatus.COMPLETED.value,
+        "test": False,
+    }
+    assert "webhook_secret" not in str(body["metadata"])
+    assert [message["role"] for message in body["transcript"]] == [
+        "user",
+        "assistant",
+    ]
+    assert [message["content"] for message in body["transcript"]] == [
+        "Please handle this event",
+        "Event handled",
+    ]
+    assert body["read_only"] is True
+
+
+def test_public_widget_and_share_task_creation_classifies_hidden_external_logs() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    widget_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Agent",
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    share_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Share Agent",
+        share_enabled=True,
+        share_token="share-token",
+    )
+
+    widget_headers = _authenticate_widget_guest(agent_id=widget_agent_id)
+    widget_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "Widget conversation",
+            "description": "Widget hello",
+            "agent_id": widget_agent_id,
+        },
+        headers=widget_headers,
+    )
+    assert widget_response.status_code == 200, widget_response.text
+
+    share_headers = _authenticate_share_guest("share-token")
+    share_response = client.post(
+        "/api/share/chat/task/create",
+        json={
+            "title": "Share conversation",
+            "description": "Share hello",
+            "agent_id": share_agent_id,
+        },
+        headers=share_headers,
+    )
+    assert share_response.status_code == 200, share_response.text
+
+    db = _direct_db_session()
+    try:
+        widget_task = db.query(Task).filter(Task.id == widget_response.json()["task_id"]).one()
+        share_task = db.query(Task).filter(Task.id == share_response.json()["task_id"]).one()
+        assert widget_task.source == "widget"
+        assert widget_task.is_visible is False
+        assert share_task.source == "shared_link"
+        assert share_task.is_visible is False
+    finally:
+        db.close()
+
+    owner_headers = _admin_headers()
+    logs_response = client.get("/api/conversation-logs", headers=owner_headers)
+    assert logs_response.status_code == 200, logs_response.text
+    logs = logs_response.json()["logs"]
+    assert {item["source"] for item in logs} == {"widget", "shared_link"}

@@ -16,6 +16,10 @@ import {
     Globe,
 } from "lucide-react"
 
+interface SidebarUser {
+    is_admin?: boolean | null
+}
+
 export interface NavigationItem {
     name: string
     href: string
@@ -55,6 +59,13 @@ const baseMoreResourceItems: NavigationItem[] = [
         color: "text-blue-400"
     },
     {
+        name: "Conversation Logs",
+        nameKey: "nav.conversationLogs",
+        href: "/conversation-logs",
+        icon: MessageSquare,
+        color: "text-blue-400"
+    },
+    {
         name: "Monitoring",
         nameKey: "nav.monitoring",
         href: "/monitoring",
@@ -63,7 +74,7 @@ const baseMoreResourceItems: NavigationItem[] = [
     }
 ]
 
-const getMoreResourceItemsForUser = (user: any): NavigationItem[] => {
+const getMoreResourceItemsForUser = (user?: SidebarUser | null): NavigationItem[] => {
     const items = [...baseMoreResourceItems]
 
     if (user?.is_admin) {
@@ -86,7 +97,7 @@ const getMoreResourceItemsForUser = (user: any): NavigationItem[] => {
     return items
 }
 
-export const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
+export const getNavigationGroupsForUser = (user?: SidebarUser | null): NavigationGroup[] => [
     {
         title: "Agent Development",
         titleKey: "nav.sections.agentDevelopment",
@@ -168,6 +179,7 @@ const baseUserMenuItems: NavigationItem[] = [
     }
 ]
 
-export const getUserMenuItemsForUser = (_user: any): NavigationItem[] => {
+export const getUserMenuItemsForUser = (user?: SidebarUser | null): NavigationItem[] => {
+    void user
     return [...baseUserMenuItems]
 }
