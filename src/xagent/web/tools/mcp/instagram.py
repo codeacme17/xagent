@@ -7,13 +7,13 @@ from mcp.server.fastmcp import FastMCP
 from . import meta_graph
 from .meta_graph import (
     GraphAPIError,
-    bounded_limit as _bounded_limit,
-    error_response as _error,
-    graph_error_response as _graph_error,
-    graph_request as _graph_request,
-    is_public_image_url as _is_public_image_url,
-    success_response as _success,
 )
+from .meta_graph import bounded_limit as _bounded_limit
+from .meta_graph import error_response as _error
+from .meta_graph import graph_error_response as _graph_error
+from .meta_graph import graph_request as _graph_request
+from .meta_graph import is_public_image_url as _is_public_image_url
+from .meta_graph import success_response as _success
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
