@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -163,7 +164,7 @@ def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
 
 
 def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_json(
-    db_session, monkeypatch
+    db_session, monkeypatch, caplog
 ):
     db, user = db_session
     state = create_access_token(
@@ -200,6 +201,7 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_js
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
 
     monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
 
     response = generic_oauth_callback("meta", request, db, _meta_provider())
 
@@ -211,10 +213,12 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_is_not_js
     )
     assert oauth_account.access_token == "short-token"
     assert oauth_account.provider_user_id == "meta-user-1"
+    assert "Meta long-lived token exchange failed" in caplog.text
+    assert "response body is not JSON" in caplog.text
 
 
 def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
-    db_session, monkeypatch
+    db_session, monkeypatch, caplog
 ):
     db, user = db_session
     state = create_access_token(
@@ -251,6 +255,7 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
         return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
 
     monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
 
     response = generic_oauth_callback("meta", request, db, _meta_provider())
 
@@ -262,6 +267,40 @@ def test_meta_callback_uses_short_lived_token_when_long_lived_exchange_fails(
     )
     assert oauth_account.access_token == "short-token"
     assert oauth_account.provider_user_id == "meta-user-1"
+    assert "Meta long-lived token exchange failed" in caplog.text
+    assert "meta token exchange timed out" in caplog.text
+
+
+def test_meta_long_lived_token_exchange_logs_rejected_response(monkeypatch, caplog):
+    token_data = {
+        "access_token": "short-token",
+        "token_type": "bearer",
+        "expires_in": 3600,
+    }
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"message": "invalid short token"}},
+                status_code=400,
+            )
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    result = auth_api._exchange_meta_long_lived_token(
+        "meta",
+        "https://graph.facebook.com/v25.0/oauth/access_token",
+        token_data,
+        "meta-client-id",
+        "meta-client-secret",
+    )
+
+    assert result == token_data
+    assert "Meta long-lived token exchange returned unusable response" in caplog.text
+    assert "status=400" in caplog.text
+    assert "invalid short token" in caplog.text
 
 
 @pytest.mark.asyncio

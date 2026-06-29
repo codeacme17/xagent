@@ -22,7 +22,7 @@ logger = logging.getLogger("facebook-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("facebook-mcp")
-requests = meta_graph.requests
+requests = meta_graph.requests  # exposed for test monkeypatching
 
 
 def _page_path(page_id: str, suffix: str) -> str:

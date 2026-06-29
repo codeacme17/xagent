@@ -22,7 +22,7 @@ logger = logging.getLogger("instagram-mcp")
 setup_proxy_env()
 
 mcp = FastMCP("instagram-mcp")
-requests = meta_graph.requests
+requests = meta_graph.requests  # exposed for test monkeypatching
 
 LINKED_ACCOUNT_FIELDS = (
     "id,name,category,tasks,access_token,"

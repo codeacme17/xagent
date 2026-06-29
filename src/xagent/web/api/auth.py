@@ -91,6 +91,7 @@ def _oauth_provider_config_error(
 def _merge_oauth_scopes(
     default_scopes: list[str] | None, app_scopes: list[str] | None
 ) -> list[str]:
+    """Preserve provider default order and sort app scopes for deterministic URLs."""
     scopes: list[str] = []
     seen: set[str] = set()
 
@@ -143,7 +144,11 @@ def _exchange_meta_long_lived_token(
             timeout=10.0,
         )
         long_lived_token_data = response.json()
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning(
+            "Meta long-lived token exchange failed; using short-lived token: %s",
+            exc,
+        )
         return token_data
 
     if (
@@ -151,6 +156,21 @@ def _exchange_meta_long_lived_token(
         or not isinstance(long_lived_token_data, dict)
         or "error" in long_lived_token_data
     ):
+        reason_parts = []
+        if response.status_code != 200:
+            reason_parts.append(f"status={response.status_code}")
+        if not isinstance(long_lived_token_data, dict):
+            reason_parts.append(f"body_type={type(long_lived_token_data).__name__}")
+        else:
+            error = long_lived_token_data.get("error")
+            if error:
+                reason_parts.append(f"error={error}")
+        reason = ", ".join(reason_parts) or "unknown reason"
+        logger.warning(
+            "Meta long-lived token exchange returned unusable response; "
+            "using short-lived token: %s",
+            reason,
+        )
         return token_data
 
     return {**token_data, **long_lived_token_data}
