@@ -28,6 +28,9 @@ from xagent.core.tools.adapters.vibe.document_parser import (
     DocumentParseWithOutputTool,
 )
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
+from xagent.core.tools.adapters.vibe.file_ingestion_tool import (
+    CreateKnowledgeBaseFromFileTool,
+)
 from xagent.core.tools.adapters.vibe.file_tool import (
     append_file_tool,
     create_directory_tool,
@@ -52,6 +55,9 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxedToolWrapper,
+)
+from xagent.core.tools.adapters.vibe.web_ingestion_tool import (
+    CreateKnowledgeBaseFromUrlTool,
 )
 from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
@@ -218,6 +224,17 @@ def test_document_parser_metadata_matches_artifact_safety() -> None:
     assert parse_tool.metadata.concurrency_safe is True
     assert parse_with_output_tool.metadata.read_only is False
     assert parse_with_output_tool.metadata.concurrency_safe is True
+
+
+def test_knowledge_base_ingestion_tools_remain_unsafe_until_real_tool_coverage() -> (
+    None
+):
+    file_ingestion_tool = CreateKnowledgeBaseFromFileTool(user_id=1)
+    url_ingestion_tool = CreateKnowledgeBaseFromUrlTool(user_id=1)
+
+    for tool in {file_ingestion_tool, url_ingestion_tool}:
+        assert tool.metadata.read_only is False
+        assert tool.metadata.concurrency_safe is False
 
 
 def test_abstract_base_tool_metadata_exposes_concurrency_fields() -> None:

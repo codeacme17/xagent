@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -333,6 +336,262 @@ def test_run_document_ingestion_preserves_legacy_non_result_boundary(
     result = facade.run_document_ingestion("demo", "/tmp/doc.md")
 
     assert result is expected_result
+
+
+def test_run_document_ingestion_serializes_same_collection_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=KBOperationCompatibilityFacade(),
+    )
+    active_count = 0
+    max_active_count = 0
+    active_guard = threading.Lock()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    worker_errors: list[BaseException] = []
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        nonlocal active_count, max_active_count
+
+        with active_guard:
+            active_count += 1
+            max_active_count = max(max_active_count, active_count)
+            is_first = not first_entered.is_set()
+            if is_first:
+                first_entered.set()
+
+        try:
+            if is_first:
+                assert release_first.wait(timeout=2)
+            return _successful_ingestion_result()
+        finally:
+            with active_guard:
+                active_count -= 1
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    def run_ingestion(source_path: str) -> None:
+        try:
+            facade.run_document_ingestion("demo", source_path)
+        except BaseException as exc:  # noqa: BLE001
+            worker_errors.append(exc)
+
+    first = threading.Thread(target=lambda: run_ingestion("/tmp/first.md"))
+    second = threading.Thread(target=lambda: run_ingestion("/tmp/second.md"))
+
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert worker_errors == []
+    assert max_active_count == 1
+
+
+def test_run_document_ingestion_allows_different_collections_to_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+
+    metadata_store = _FakeMetadataStore(None)
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(metadata_store),
+        operation_compatibility=KBOperationCompatibilityFacade(),
+    )
+    entered_barrier = threading.Barrier(2)
+    entered_collections: list[str] = []
+    entered_guard = threading.Lock()
+    worker_errors: list[BaseException] = []
+
+    def fake_run_document_ingestion_impl(
+        collection: str, **_: object
+    ) -> IngestionResult:
+        with entered_guard:
+            entered_collections.append(collection)
+        entered_barrier.wait(timeout=2)
+        return _successful_ingestion_result(doc_id=f"doc-{collection}")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    def run_ingestion(collection: str, source_path: str) -> None:
+        try:
+            facade.run_document_ingestion(collection, source_path)
+        except BaseException as exc:  # noqa: BLE001
+            worker_errors.append(exc)
+
+    first = threading.Thread(target=lambda: run_ingestion("first", "/tmp/first.md"))
+    second = threading.Thread(target=lambda: run_ingestion("second", "/tmp/second.md"))
+
+    first.start()
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert worker_errors == []
+    assert sorted(entered_collections) == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_run_web_ingestion_serializes_same_collection_without_blocking_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(CollectionInfo(name="demo"))),
+        operation_compatibility=KBOperationCompatibilityFacade(),
+    )
+    active_count = 0
+    max_active_count = 0
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_run_web_ingestion_impl(
+        collection: str,
+        crawl_config: WebCrawlConfig,
+        **_: object,
+    ) -> WebIngestionResult:
+        nonlocal active_count, max_active_count
+
+        active_count += 1
+        max_active_count = max(max_active_count, active_count)
+        is_first = not first_entered.is_set()
+        if is_first:
+            first_entered.set()
+
+        try:
+            if is_first:
+                await asyncio.wait_for(release_first.wait(), timeout=2)
+            return WebIngestionResult(
+                status="success",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=0,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=[crawl_config.start_url],
+                failed_urls={},
+                message="ok",
+                elapsed_time_ms=1,
+            )
+        finally:
+            active_count -= 1
+
+    monkeypatch.setattr(
+        web_ingestion,
+        "_run_web_ingestion_impl",
+        fake_run_web_ingestion_impl,
+    )
+
+    first = asyncio.create_task(
+        facade.run_web_ingestion(
+            "demo",
+            WebCrawlConfig(start_url="https://example.com/first"),
+        )
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=2)
+    second = asyncio.create_task(
+        facade.run_web_ingestion(
+            "demo",
+            WebCrawlConfig(start_url="https://example.com/second"),
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not second.done()
+
+    release_first.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+
+    assert max_active_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_web_ingestion_allows_different_collections_to_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    facade = KBPipelineCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMetadataStore(None)),
+        operation_compatibility=KBOperationCompatibilityFacade(),
+    )
+    active_count = 0
+    max_active_count = 0
+    both_entered = asyncio.Event()
+
+    async def fake_run_web_ingestion_impl(
+        collection: str,
+        crawl_config: WebCrawlConfig,
+        **_: object,
+    ) -> WebIngestionResult:
+        nonlocal active_count, max_active_count
+
+        active_count += 1
+        max_active_count = max(max_active_count, active_count)
+        if active_count == 2:
+            both_entered.set()
+
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=2)
+            return WebIngestionResult(
+                status="success",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=0,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=[crawl_config.start_url],
+                failed_urls={},
+                message="ok",
+                elapsed_time_ms=1,
+            )
+        finally:
+            active_count -= 1
+
+    monkeypatch.setattr(
+        web_ingestion,
+        "_run_web_ingestion_impl",
+        fake_run_web_ingestion_impl,
+    )
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            facade.run_web_ingestion(
+                "first",
+                WebCrawlConfig(start_url="https://example.com/first"),
+            ),
+            facade.run_web_ingestion(
+                "second",
+                WebCrawlConfig(start_url="https://example.com/second"),
+            ),
+        ),
+        timeout=2,
+    )
+
+    assert max_active_count == 2
 
 
 @pytest.mark.asyncio

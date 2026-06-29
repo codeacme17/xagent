@@ -23,6 +23,7 @@ from .operation_compatibility import (
     PersistencePolicy,
     SideEffectPlane,
 )
+from .ingestion_locks import RAG_INGESTION_LOCKS
 
 if TYPE_CHECKING:
     from ..core.schemas import CollectionInfo
@@ -173,36 +174,37 @@ class KBPipelineCompatibilityFacade:
     ) -> IngestionResult:
         from ..pipelines.document_ingestion import _process_document_impl
 
-        with self._operation_context(
-            operation_type="document_ingestion",
-            collection=collection,
-            details={"source_path": source_path, "file_id": file_id},
-        ) as operation:
-            with self._storage_context():
-                result = _process_document_impl(
-                    collection=collection,
-                    source_path=source_path,
-                    config=config,
-                    progress_manager=progress_manager,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_id=file_id,
-                    metadata_source_path=metadata_source_path,
-                    commit_gate=commit_gate,
-                )
-                self._record_document_ingestion_side_effects(
-                    operation,
-                    result,
-                    collection=collection,
-                    source_path=source_path,
-                    file_id=file_id,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-                self.ensure_collection_backend_binding(collection)
-                if self._should_finish_document_ingestion_operation(operation):
-                    self._finish_document_ingestion_outcome(operation, result)
-                return result
+        with RAG_INGESTION_LOCKS.guard_collection(collection):
+            with self._operation_context(
+                operation_type="document_ingestion",
+                collection=collection,
+                details={"source_path": source_path, "file_id": file_id},
+            ) as operation:
+                with self._storage_context():
+                    result = _process_document_impl(
+                        collection=collection,
+                        source_path=source_path,
+                        config=config,
+                        progress_manager=progress_manager,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        file_id=file_id,
+                        metadata_source_path=metadata_source_path,
+                        commit_gate=commit_gate,
+                    )
+                    self._record_document_ingestion_side_effects(
+                        operation,
+                        result,
+                        collection=collection,
+                        source_path=source_path,
+                        file_id=file_id,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                    self.ensure_collection_backend_binding(collection)
+                    if self._should_finish_document_ingestion_operation(operation):
+                        self._finish_document_ingestion_outcome(operation, result)
+                    return result
 
     def run_document_ingestion(
         self,
@@ -219,44 +221,46 @@ class KBPipelineCompatibilityFacade:
     ) -> IngestionResult:
         from ..pipelines.document_ingestion import _run_document_ingestion_impl
 
-        with self._operation_context(
-            operation_type="document_ingestion",
-            collection=collection,
-            details={"source_path": source_path, "file_id": file_id},
-        ) as operation:
-            with self._storage_context():
-                result: object = _run_document_ingestion_impl(
-                    collection=collection,
-                    source_path=source_path,
-                    ingestion_config=ingestion_config,
-                    progress_manager=progress_manager,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_id=file_id,
-                    metadata_source_path=metadata_source_path,
-                    commit_gate=commit_gate,
-                )
-                # Phase-1 compatibility: _run_document_ingestion_impl() still calls
-                # the public process_document symbol, which legacy tests/callers may
-                # monkeypatch. Only structured results carry rollback metadata.
-                if not isinstance(result, IngestionResult):
-                    return cast(IngestionResult, result)
-                if operation is not None and operation.outcome is None:
-                    self._record_document_ingestion_side_effects(
-                        operation,
-                        result,
+        with RAG_INGESTION_LOCKS.guard_collection(collection):
+            with self._operation_context(
+                operation_type="document_ingestion",
+                collection=collection,
+                details={"source_path": source_path, "file_id": file_id},
+            ) as operation:
+                with self._storage_context():
+                    result: object = _run_document_ingestion_impl(
                         collection=collection,
                         source_path=source_path,
-                        file_id=file_id,
+                        ingestion_config=ingestion_config,
+                        progress_manager=progress_manager,
                         user_id=user_id,
                         is_admin=is_admin,
+                        file_id=file_id,
+                        metadata_source_path=metadata_source_path,
+                        commit_gate=commit_gate,
                     )
-                    self.ensure_collection_backend_binding(collection)
-                    if self._should_finish_document_ingestion_operation(operation):
-                        self._finish_document_ingestion_outcome(operation, result)
-                elif operation is None:
-                    self.ensure_collection_backend_binding(collection)
-                return result
+                    # Phase-1 compatibility: _run_document_ingestion_impl() still
+                    # calls the public process_document symbol, which legacy
+                    # tests/callers may monkeypatch. Only structured results carry
+                    # rollback metadata.
+                    if not isinstance(result, IngestionResult):
+                        return cast(IngestionResult, result)
+                    if operation is not None and operation.outcome is None:
+                        self._record_document_ingestion_side_effects(
+                            operation,
+                            result,
+                            collection=collection,
+                            source_path=source_path,
+                            file_id=file_id,
+                            user_id=user_id,
+                            is_admin=is_admin,
+                        )
+                        self.ensure_collection_backend_binding(collection)
+                        if self._should_finish_document_ingestion_operation(operation):
+                            self._finish_document_ingestion_outcome(operation, result)
+                    elif operation is None:
+                        self.ensure_collection_backend_binding(collection)
+                    return result
 
     def search_documents(
         self,
@@ -315,36 +319,39 @@ class KBPipelineCompatibilityFacade:
     ) -> WebIngestionResult:
         from ..pipelines.web_ingestion import _run_web_ingestion_impl
 
-        with self._operation_context(
-            operation_type="web_ingestion",
-            collection=collection,
-            persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
-            details={"start_url": crawl_config.start_url},
-        ) as operation:
-            with self._storage_context():
-                result = await _run_web_ingestion_impl(
-                    collection=collection,
-                    crawl_config=crawl_config,
-                    ingestion_config=ingestion_config,
-                    progress_callback=progress_callback,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    file_handler=file_handler,
-                    pipeline_facade=self,
-                )
-                await self.ensure_collection_backend_binding_async(collection)
-                outcome = self._record_web_ingestion_outcome(operation, result)
-                if (
-                    outcome is not None
-                    and result.side_effects_may_remain
-                    != outcome.side_effects_may_remain
-                ):
-                    result = result.model_copy(
-                        update={
-                            "side_effects_may_remain": outcome.side_effects_may_remain
-                        }
+        async with RAG_INGESTION_LOCKS.async_guard_collection(collection):
+            with self._operation_context(
+                operation_type="web_ingestion",
+                collection=collection,
+                persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+                details={"start_url": crawl_config.start_url},
+            ) as operation:
+                with self._storage_context():
+                    result = await _run_web_ingestion_impl(
+                        collection=collection,
+                        crawl_config=crawl_config,
+                        ingestion_config=ingestion_config,
+                        progress_callback=progress_callback,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        file_handler=file_handler,
+                        pipeline_facade=self,
                     )
-                return result
+                    await self.ensure_collection_backend_binding_async(collection)
+                    outcome = self._record_web_ingestion_outcome(operation, result)
+                    if (
+                        outcome is not None
+                        and result.side_effects_may_remain
+                        != outcome.side_effects_may_remain
+                    ):
+                        result = result.model_copy(
+                            update={
+                                "side_effects_may_remain": (
+                                    outcome.side_effects_may_remain
+                                )
+                            }
+                        )
+                    return result
 
     @contextmanager
     def web_page_operation(
