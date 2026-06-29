@@ -1,7 +1,7 @@
 """backfill external conversation logs
 
 Revision ID: 20260629_backfill_external_conversation_logs
-Revises: 20260624_add_mcp_concurrency_config
+Revises: 20260627_seed_meta_connectors
 Create Date: 2026-06-29 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260629_backfill_external_conversation_logs"
-down_revision: str | tuple[str, str] | None = "20260624_add_mcp_concurrency_config"
+down_revision: str | tuple[str, str] | None = "20260627_seed_meta_connectors"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -46,7 +46,9 @@ def upgrade() -> None:
     if "channel_name" not in existing_columns:
         return
 
-    legacy_public_source = sa.or_(tasks.c.source.is_(None), tasks.c.source == "internal")
+    legacy_public_source = sa.or_(
+        tasks.c.source.is_(None), tasks.c.source == "internal"
+    )
     bind.execute(
         tasks.update()
         .where(
