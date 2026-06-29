@@ -269,6 +269,34 @@ def test_meta_login_uses_config_id_without_scope_when_configured(
     assert "scope" not in qs
 
 
+def test_meta_login_ignores_undocumented_legacy_config_id_alias(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.setenv("META_LOGIN_CONFIG_ID", "legacy-config-id")
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "config_id" not in qs
+    assert qs["scope"] == ["public_profile"]
+
+
 def test_login_uses_env_client_id_when_provider_client_id_is_empty(
     db_session, monkeypatch
 ):

@@ -114,9 +114,7 @@ def _oauth_scope_separator(provider: str) -> str:
 
 
 def _meta_login_config_id() -> str:
-    return os.environ.get("META_CONFIG_ID") or os.environ.get(
-        "META_LOGIN_CONFIG_ID", ""
-    )
+    return os.environ.get("META_CONFIG_ID", "")
 
 
 def _exchange_meta_long_lived_token(
@@ -1077,16 +1075,15 @@ def generic_oauth_login(
     }
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
-    scopes = _merge_oauth_scopes(db_provider.default_scopes or [], None)
+    app_scopes: list[str] | None = None
     from ..mcp_apps import get_app_by_id
 
     if app_id:
         app_info = get_app_by_id(db, app_id)
         if app_info and "oauth_scopes" in app_info:
-            scopes = _merge_oauth_scopes(
-                db_provider.default_scopes or [], app_info["oauth_scopes"]
-            )
+            app_scopes = app_info["oauth_scopes"]
 
+    scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
     scope_str = _oauth_scope_separator(provider).join(scopes)
 
     from urllib.parse import urlencode
