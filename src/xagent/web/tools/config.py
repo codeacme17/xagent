@@ -42,12 +42,6 @@ async def refresh_oauth_token_if_needed(
     if expires_at > now + timedelta(minutes=5):
         return True  # Token is still valid
 
-    if not oauth_account.refresh_token:
-        logger.warning(
-            f"Token expired for {provider_name} but no refresh_token available."
-        )
-        return False
-
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
         from ...core.utils.encryption import decrypt_value
@@ -68,6 +62,44 @@ async def refresh_oauth_token_if_needed(
         if not client_id or not client_secret:
             logger.warning(
                 f"{provider_name} OAuth not configured (missing CLIENT_ID or SECRET)."
+            )
+            return False
+
+        if provider_name == "meta":
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    provider_config.token_url,
+                    params={
+                        "grant_type": "fb_exchange_token",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "fb_exchange_token": oauth_account.access_token,
+                    },
+                    timeout=10.0,
+                )
+
+            if response.status_code == 200:
+                data = response.json()
+                if "access_token" in data:
+                    oauth_account.access_token = data["access_token"]
+                    if "expires_in" in data:
+                        oauth_account.expires_at = datetime.now(
+                            timezone.utc
+                        ) + timedelta(seconds=int(data["expires_in"]))
+                    db.commit()
+                    logger.info(
+                        f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
+                    )
+                    return True
+            else:
+                logger.error(
+                    f"Failed to refresh {provider_name} token: {response.text}"
+                )
+            return False
+
+        if not oauth_account.refresh_token:
+            logger.warning(
+                f"Token expired for {provider_name} but no refresh_token available."
             )
             return False
 
