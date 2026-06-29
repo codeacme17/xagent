@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 from datetime import datetime
@@ -361,8 +362,9 @@ def _decode_gmail_pubsub_notification(
     if not isinstance(data, str) or not data:
         raise ValueError("Missing Pub/Sub message data")
     try:
-        decoded = json.loads(base64.b64decode(data).decode("utf-8"))
-    except (ValueError, TypeError) as exc:
+        padded_data = data + "=" * ((4 - len(data) % 4) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded_data).decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, ValueError, TypeError) as exc:
         raise ValueError("Invalid Pub/Sub message data") from exc
     if not isinstance(decoded, dict):
         raise ValueError("Invalid Pub/Sub message payload")
