@@ -76,4 +76,57 @@ describe("trace process status", () => {
       })
     ).toBe("completed")
   })
+
+  it("infers a completed process from react_task_end events", () => {
+    expect(
+      resolveTraceProcessStatus({
+        traceEvents: [
+          {
+            event_type: "react_task_start",
+            data: {},
+          },
+          {
+            event_type: "react_task_end",
+            data: {},
+          },
+        ],
+      })
+    ).toBe("completed")
+  })
+
+  it("prefers terminal trace status over a still-running task status", () => {
+    expect(
+      resolveTraceProcessStatus({
+        processStatus: "running",
+        traceEvents: [
+          {
+            event_type: "react_task_start",
+            data: {},
+          },
+          {
+            event_type: "react_task_end",
+            data: {},
+          },
+        ],
+      })
+    ).toBe("completed")
+  })
+
+  it("prefers explicit failed status over inferred completed trace status", () => {
+    expect(
+      resolveTraceProcessStatus({
+        processStatus: "failed",
+        traceEvents: [
+          {
+            event_type: "react_task_start",
+            data: {},
+          },
+          {
+            event_type: "react_task_end",
+            data: {},
+          },
+        ],
+      })
+    ).toBe("failed")
+  })
 })

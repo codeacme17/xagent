@@ -3,6 +3,13 @@ export type TimelineAnchor = {
   role?: string;
 };
 
+/** User messages delimit execution turns; assistant result messages should not split trace groups. */
+export function getUserTimelineAnchors(
+  sortedMessages: TimelineAnchor[],
+): TimelineAnchor[] {
+  return sortedMessages.filter((message) => message.role === "user");
+}
+
 export function getProcessGroupIndex(
   sortedMessages: TimelineAnchor[],
   eventTime: number

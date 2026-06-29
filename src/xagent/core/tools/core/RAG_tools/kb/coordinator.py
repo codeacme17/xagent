@@ -8,7 +8,15 @@ from collections.abc import Coroutine
 from contextvars import copy_context
 from typing import Any, Optional, TypeVar
 
+from ..core.exceptions import (
+    CascadeCleanupError,
+    DatabaseOperationError,
+    RagCoreException,
+)
 from ..core.schemas import (
+    CollectionOperationDetail,
+    CollectionOperationResult,
+    DocumentProcessingStatus,
     DocumentRecordDetail,
     DocumentRecordListResult,
     RegisterDocumentRequest,
@@ -42,6 +50,39 @@ from .version_compatibility import KBVersionCompatibilityFacade
 T = TypeVar("T")
 
 KB_STORAGE_METADATA_KEY = "kb_storage"
+
+
+def _normalize_user_id(user_id: str | int | None) -> int | None:
+    """Coerce ``user_id`` from ``str | int | None`` to ``int | None``.
+
+    Raises:
+        ValueError: If ``user_id`` is provided but cannot be converted to int.
+    """
+    if user_id is None:
+        return None
+    try:
+        return int(user_id)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid user_id: {user_id!r}") from exc
+
+
+def _merge_positive_counts(
+    target: dict[str, int], source: dict[str, int] | None
+) -> None:
+    """Merge ``source`` row counts into ``target``, dropping non-positive values.
+
+    Mirrors the legacy ``_delete_collection_impl`` accounting: a ``{"documents": 0}``
+    entry means "no rows of that kind were deleted" and is omitted so callers do
+    not see misleading zero-count clutter in ``deleted_counts``.
+    """
+    for key, value in dict(source or {}).items():
+        try:
+            count = int(value)
+        except (ValueError, TypeError):
+            continue
+        if count <= 0:
+            continue
+        target[str(key)] = target.get(str(key), 0) + count
 
 
 class KBCoordinator:
@@ -414,6 +455,281 @@ class KBCoordinator:
                 collection, doc_id, user_id=user_id, is_admin=is_admin
             )
         )
+
+    async def delete_collection(
+        self,
+        collection: str,
+        user_id: str | int | None,
+        is_admin: bool,
+        doc_ids: list[str] | None = None,
+        warnings_out: list[str] | None = None,
+        delete_orphaned_metadata: bool = True,
+    ) -> CollectionOperationResult:
+        """Delete a collection by routing through the collection handle.
+
+        When ``is_admin`` is ``True`` all rows are deleted via
+        :meth:`LanceDBCollectionHandle.delete_collection_data`.  For a tenant
+        caller, only the rows identified by ``doc_ids`` are removed via
+        :meth:`LanceDBCollectionHandle.delete_documents_data`.  When
+        ``doc_ids`` is ``None`` or empty and ``is_admin`` is ``False`` the
+        data plane is left untouched (config-only path).
+
+        ``delete_orphaned_metadata=True`` (default) additionally removes the
+        collection config row via :meth:`LanceDBCollectionHandle.delete_collection_config`.
+
+        Returns:
+            :class:`CollectionOperationResult` with status ``success``,
+            ``partial_success`` (when a :class:`DatabaseOperationError` was
+            caught during the data-plane delete), or ``error``.
+        """
+        int_user_id = _normalize_user_id(user_id)
+
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=int_user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+
+        warnings: list[str] = warnings_out if warnings_out is not None else []
+        deleted_counts: dict[str, int] = {}
+        data_error: Exception | None = None
+
+        # Collect doc_ids BEFORE deletion for affected_documents tracking.
+        # Skip discovery when the caller already provided explicit doc_ids — those
+        # are the affected documents.  Only query when we need auto-discovery (admin
+        # deletes all, or tenant lets us discover their scope via doc_ids=None).
+        affected_doc_ids: list[str] = []
+        if is_admin or doc_ids is None:
+            try:
+                affected_doc_ids = await asyncio.to_thread(
+                    handle.list_collection_documents,
+                    user_id=int_user_id,
+                    is_admin=is_admin,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # For a tenant caller where doc_ids=None (delete their entire collection),
+                # discovery failure means we cannot determine the correct deletion scope.
+                # Silently skipping data-plane delete and returning "success" would be wrong.
+                if not is_admin and doc_ids is None:
+                    return CollectionOperationResult(
+                        status="error",
+                        collection=collection,
+                        message=f"Failed to list documents before delete for {collection!r}: {exc}",
+                        warnings=list(warnings),
+                        affected_documents=[],
+                        deleted_counts={},
+                    )
+                warnings.append(
+                    f"Failed to list documents before delete for {collection!r}: {exc}"
+                )
+        else:
+            # Caller supplied explicit doc_ids — they are the affected documents.
+            affected_doc_ids = list(doc_ids)
+
+        # For tenant (non-admin) callers: use caller-supplied doc_ids when provided,
+        # otherwise fall back to the discovered set so the data-plane delete always
+        # operates on the right scope (consistent with _delete_collection_impl).
+        effective_doc_ids: list[str] | None = doc_ids
+        if not is_admin and effective_doc_ids is None:
+            effective_doc_ids = affected_doc_ids
+
+        try:
+            if is_admin:
+                result_counts = await asyncio.to_thread(
+                    handle.delete_collection_data,
+                    user_id=int_user_id,
+                    is_admin=is_admin,
+                    warnings_out=warnings,
+                )
+                _merge_positive_counts(deleted_counts, result_counts)
+            elif effective_doc_ids:
+                result_counts = await asyncio.to_thread(
+                    handle.delete_documents_data,
+                    effective_doc_ids,
+                    user_id=int_user_id,
+                    is_admin=is_admin,
+                    warnings_out=warnings,
+                )
+                _merge_positive_counts(deleted_counts, result_counts)
+            # else: config-only — no data-plane delete
+        except (DatabaseOperationError, CascadeCleanupError) as exc:
+            # CascadeCleanupError (admin cascade path) carries no per-doc details;
+            # DatabaseOperationError (tenant batch path) may carry deleted_counts.
+            data_error = exc
+            details = getattr(exc, "details", {}) or {}
+            if isinstance(details, dict):
+                raw_counts = details.get("deleted_counts")
+                if isinstance(raw_counts, dict):
+                    _merge_positive_counts(deleted_counts, raw_counts)
+
+        if delete_orphaned_metadata and data_error is None:
+            # Always remove the current tenant's config row so it does not
+            # become orphaned when other tenants still have documents.
+            # When the collection is completely empty across all tenants, also
+            # do an admin-scope cleanup to remove any remaining rows.
+            # Skip config cleanup when the data-plane delete failed — removing
+            # config while data rows remain would lose the user's KB state.
+            try:
+                remaining = await asyncio.to_thread(
+                    handle.count_documents,
+                    user_id=None,
+                    is_admin=True,
+                )
+            except (RagCoreException, OSError):
+                remaining = 1
+            try:
+                if is_admin and remaining == 0:
+                    # Admin caller + collection fully empty: remove all tenant rows.
+                    await handle.delete_collection_config()
+                else:
+                    # Non-admin caller, or other tenants still have data: only remove
+                    # the current tenant's config row to preserve tenant isolation.
+                    await handle.delete_collection_config(tenant_only=True)
+            except Exception as cfg_exc:  # noqa: BLE001 - best-effort
+                warnings.append(
+                    f"Failed to delete collection config for {collection!r}: {cfg_exc}"
+                )
+
+        def _to_details(
+            doc_ids: list[str], status: DocumentProcessingStatus
+        ) -> list[CollectionOperationDetail]:
+            return [CollectionOperationDetail(doc_id=d, status=status) for d in doc_ids]
+
+        if data_error is not None:
+            if deleted_counts:
+                # Extract successfully deleted doc_ids from error details to provide
+                # accurate per-document status instead of marking everything FAILED.
+                err_details = getattr(data_error, "details", {}) or {}
+                raw_deleted = (
+                    err_details.get("deleted_doc_ids")
+                    if isinstance(err_details, dict)
+                    else None
+                )
+                deleted_doc_ids: list[str] = (
+                    raw_deleted if isinstance(raw_deleted, list) else []
+                )
+                deleted_set = set(deleted_doc_ids)
+                failed_doc_ids = [d for d in affected_doc_ids if d not in deleted_set]
+                return CollectionOperationResult(
+                    status="partial_success",
+                    collection=collection,
+                    message=f"Partially deleted collection {collection!r}: {data_error}",
+                    warnings=list(warnings),
+                    affected_documents=(
+                        _to_details(deleted_doc_ids, DocumentProcessingStatus.SUCCESS)
+                        + _to_details(failed_doc_ids, DocumentProcessingStatus.FAILED)
+                    ),
+                    deleted_counts=dict(deleted_counts),
+                )
+            return CollectionOperationResult(
+                status="error",
+                collection=collection,
+                message=f"Failed to delete collection {collection!r}: {data_error}",
+                warnings=list(warnings),
+                affected_documents=_to_details(
+                    affected_doc_ids, DocumentProcessingStatus.FAILED
+                ),
+                deleted_counts={},
+            )
+
+        # Best-effort data-plane deletes (delete_collection_data / config cleanup)
+        # surface partial failures as appended warnings rather than raising.  When
+        # such warnings accompany an actual deletion, report ``partial_success`` so
+        # the caller is not told the operation fully succeeded — mirroring the
+        # legacy ``_delete_collection_impl`` status semantics.
+        something_deleted = bool(deleted_counts) or bool(affected_doc_ids)
+        status = "partial_success" if warnings and something_deleted else "success"
+        message = (
+            f"Partially deleted collection {collection!r}."
+            if status == "partial_success"
+            else f"Collection {collection!r} deleted successfully."
+        )
+        return CollectionOperationResult(
+            status=status,
+            collection=collection,
+            message=message,
+            warnings=list(warnings),
+            affected_documents=_to_details(
+                affected_doc_ids, DocumentProcessingStatus.SUCCESS
+            ),
+            deleted_counts=dict(deleted_counts),
+        )
+
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: str | int | None,
+        is_admin: bool,
+    ) -> list[str]:
+        """Rename a collection's data, status, and metadata in best-effort order.
+
+        Calls three handle primitives sequentially:
+        1. :meth:`LanceDBCollectionHandle.rename_collection_data` – vector-side data tables
+        2. :meth:`LanceDBCollectionHandle.rename_collection_status` – ingestion status rows
+        3. :meth:`LanceDBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
+
+        Each step is best-effort: if one raises, the error is recorded as a
+        warning and the remaining steps still execute.
+
+        Returns:
+            A list of warning strings (empty on full success).
+        """
+        int_user_id = _normalize_user_id(user_id)
+
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=int_user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+
+        warnings: list[str] = []
+
+        # The data rename is the gate for the control-plane rename: if any vector
+        # row was not moved, abort before touching status/metadata to avoid a
+        # split-brain collection where metadata points at new_name while vector
+        # data remains under old_name.  Failures surface two ways and BOTH must
+        # gate: a hard exception (e.g. no DB connection) propagates out, and
+        # per-table failures are returned as a non-empty warnings list (the store
+        # catches them per table rather than raising) — short-circuit on those too.
+        data_warnings = await asyncio.to_thread(
+            handle.rename_collection_data,
+            new_name,
+            int_user_id,
+            is_admin,
+        )
+        if data_warnings:
+            warnings.extend(data_warnings)
+            return warnings
+
+        try:
+            status_warnings = await asyncio.to_thread(
+                handle.rename_collection_status,
+                new_name,
+                int_user_id,
+                is_admin,
+            )
+            if status_warnings:
+                warnings.extend(status_warnings)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"rename_collection_status for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        try:
+            await handle.rename_collection_metadata(new_name, int_user_id, is_admin)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"rename_collection_metadata for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        return warnings
 
     @staticmethod
     def _normalize_collection(collection: str) -> str:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { getProcessGroupIndex } from "./task-timeline";
+import { getProcessGroupIndex, getUserTimelineAnchors } from "./task-timeline";
 
 describe("getProcessGroupIndex", () => {
   it("places same-time process events after the user message that triggered them", () => {
@@ -36,5 +36,15 @@ describe("getProcessGroupIndex", () => {
     expect(getProcessGroupIndex(messages, 500)).toBe(0);
     expect(getProcessGroupIndex(messages, 1500)).toBe(1);
     expect(getProcessGroupIndex(messages, 2500)).toBe(2);
+  });
+
+  it("keeps late trace events in the same turn when grouping by user anchors only", () => {
+    const userAnchors = getUserTimelineAnchors([
+      { role: "user", timestamp: 1000 },
+      { role: "assistant", timestamp: 3000 },
+    ]);
+
+    expect(getProcessGroupIndex(userAnchors, 1500)).toBe(1);
+    expect(getProcessGroupIndex(userAnchors, 4000)).toBe(1);
   });
 });
