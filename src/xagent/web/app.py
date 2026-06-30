@@ -32,6 +32,7 @@ from .api.auth import auth_router
 from .api.channel import router as channel_router
 from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
+from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
 from .api.files import file_router
 from .api.jobs import jobs_router
@@ -535,6 +536,7 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
+app.include_router(conversation_logs_router)
 app.include_router(file_router)
 app.include_router(jobs_router)
 app.include_router(kb_router)

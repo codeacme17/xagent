@@ -1,7 +1,7 @@
 """add gmail watch states
 
 Revision ID: 20260629_add_gmail_watch_states
-Revises: 20260627_seed_meta_connectors
+Revises: 20260629_backfill_external_conversation_logs
 Create Date: 2026-06-29 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260629_add_gmail_watch_states"
-down_revision: Union[str, None] = "20260627_seed_meta_connectors"
+down_revision: Union[str, None] = "20260629_backfill_external_conversation_logs"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

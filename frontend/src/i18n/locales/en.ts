@@ -64,12 +64,37 @@ const en = {
     search: "Search Tasks",
     templates: "Templates",
     channels: "Channels",
+    conversationLogs: "Conversation Logs",
     more: "More",
     menu: "Navigation menu",
     openMenu: "Open navigation",
     sections: {
       agentDevelopment: "Agent Development",
       resources: "Resources",
+    },
+  },
+  conversationLogs: {
+    title: "Conversation Logs",
+    subtitle:
+      "End-user conversations from your deployed agents - across Widget, REST API, Shareable Link, and Webhook channels. Your own workspace tasks stay under All Tasks.",
+    readOnly: "Read-only",
+    lastActivity: "Last activity:",
+    searchPlaceholder: "Search conversations",
+    agentFilterLabel: "Agent filter",
+    agentFilterAll: "All agents",
+    untitled: "Untitled conversation",
+    sources: {
+      all: "All",
+      widget: "Widget",
+      restApi: "REST API",
+      sharedLink: "Shareable Link",
+      webhook: "Webhook",
+    },
+    empty: {
+      title: "No conversation logs yet",
+      filteredTitle: "No matching logs",
+      detail: "Select a conversation log to inspect its transcript.",
+      transcript: "No transcript has been captured for this conversation.",
     },
   },
   home: {

@@ -69,6 +69,65 @@ class TestTryUpgradeDb:
 
         assert rows == [(1, 0), (2, 1), (3, 0)]
 
+    def test_upgrade_backfills_external_conversation_sources_conservatively(self):
+        engine = create_engine("sqlite:///:memory:")
+        cfg = create_alembic_config(engine)
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE alembic_version (version_num VARCHAR(255) NOT NULL)")
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO alembic_version (version_num) "
+                    "VALUES ('20260624_add_mcp_concurrency_config')"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE TABLE tasks ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source VARCHAR(20), "
+                    "is_visible BOOLEAN NOT NULL, "
+                    "channel_name VARCHAR(100), "
+                    "agent_config JSON)"
+                )
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO tasks "
+                "(id, source, is_visible, channel_name, agent_config) VALUES "
+                "(1, 'sdk', 1, NULL, NULL), "
+                "(2, 'internal', 1, 'Web Widget', '{\"guest_id\":\"g1\"}'), "
+                "(3, 'internal', 1, 'Shared Agent', "
+                '\'{"auth_mode":"share","share_agent_id":7}\'), '
+                "(4, 'trigger', 0, NULL, '{\"trigger_type\":\"webhook\"}'), "
+                "(5, 'internal', 1, 'Desktop', NULL), "
+                "(6, 'widget', 0, 'Web Widget', '{\"guest_id\":\"g2\"}')"
+            )
+
+            cfg.attributes["connection"] = conn
+            command.upgrade(cfg, "head")
+
+            first_rows = conn.execute(
+                text("SELECT id, source, is_visible FROM tasks ORDER BY id")
+            ).all()
+            command.downgrade(cfg, "20260624_add_mcp_concurrency_config")
+            command.upgrade(cfg, "head")
+            rows = conn.execute(
+                text("SELECT id, source, is_visible FROM tasks ORDER BY id")
+            ).all()
+
+        expected_rows = [
+            (1, "sdk", 0),
+            (2, "widget", 0),
+            (3, "shared_link", 0),
+            (4, "trigger", 0),
+            (5, "internal", 1),
+            (6, "widget", 0),
+        ]
+        assert first_rows == expected_rows
+        assert rows == expected_rows
+
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")

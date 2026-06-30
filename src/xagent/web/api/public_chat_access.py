@@ -371,8 +371,11 @@ async def create_public_chat_task(
     )
     channel_name = channel.channel_name if channel else default_channel_name
 
-    agent_config = request.agent_config or {}
+    agent_config = dict(request.agent_config or {})
     agent_config["guest_id"] = access_context.guest_id
+    agent_config["auth_mode"] = "widget"
+    if access_context.widget_agent_id is not None:
+        agent_config["widget_agent_id"] = access_context.widget_agent_id
 
     agent_id = request.agent_id
     if agent_id is None and channel and channel.config:
@@ -395,6 +398,8 @@ async def create_public_chat_task(
         channel_name=channel_name,
         agent_id=agent_id,
         agent_config=agent_config,
+        source="widget",
+        is_visible=False,
     )
 
     db.add(task)
@@ -447,6 +452,8 @@ async def create_share_chat_task(
         channel_name=default_channel_name,
         agent_id=share_agent_id,
         agent_config=agent_config,
+        source="shared_link",
+        is_visible=False,
     )
 
     db.add(task)

@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Conversation Logs now separate historical REST API tasks from the main task list**
+  Historical tasks created through the REST API (`source='sdk'`) are backfilled as hidden external conversation logs (`is_visible=false`). After migration, these tasks move out of the main task list and are available through Conversation Logs instead.
+
 - **Knowledge Base embedding model binding (breaking / migration)**
   The Knowledge Base now treats the **Model Hub ID** as the single source of truth for embedding model identity:
   - `collection_metadata.embedding_model_id` stores the Hub ID (trimmed; no other normalization).

@@ -64,12 +64,37 @@ const zh = {
     search: "搜索任务",
     templates: "模板",
     channels: "渠道",
+    conversationLogs: "会话日志",
     more: "更多",
     menu: "导航菜单",
     openMenu: "打开导航",
     sections: {
       agentDevelopment: "Agent 开发",
       resources: "资源",
+    },
+  },
+  conversationLogs: {
+    title: "会话日志",
+    subtitle:
+      "来自已部署 Agent 的终端用户会话，覆盖 Widget、REST API、分享链接和 Webhook 渠道。你自己的工作区任务仍保留在全部任务中。",
+    readOnly: "只读",
+    lastActivity: "最近活动：",
+    searchPlaceholder: "搜索会话",
+    agentFilterLabel: "Agent 筛选",
+    agentFilterAll: "全部 Agent",
+    untitled: "未命名会话",
+    sources: {
+      all: "全部",
+      widget: "Widget",
+      restApi: "REST API",
+      sharedLink: "分享链接",
+      webhook: "Webhook",
+    },
+    empty: {
+      title: "暂无会话日志",
+      filteredTitle: "没有匹配的日志",
+      detail: "选择一条会话日志查看对话记录。",
+      transcript: "这条会话还没有记录到对话内容。",
     },
   },
   home: {
