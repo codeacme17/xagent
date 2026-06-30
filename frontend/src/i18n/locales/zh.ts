@@ -83,7 +83,6 @@ const zh = {
     agentFilterLabel: "Agent 筛选",
     agentFilterAll: "全部 Agent",
     untitled: "未命名会话",
-    unknownAgent: "未知 Agent",
     sources: {
       all: "全部",
       widget: "Widget",

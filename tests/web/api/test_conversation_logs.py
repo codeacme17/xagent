@@ -344,6 +344,16 @@ def test_conversation_logs_list_maps_sources_counts_filters_and_access_scope() -
     assert [item["task_id"] for item in bob_response.json()["logs"]] == [bob_task_id]
 
 
+def test_conversation_logs_list_rejects_unsupported_source() -> None:
+    response = client.get(
+        "/api/conversation-logs?source=internal",
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Unsupported conversation source"
+
+
 def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata() -> (
     None
 ):
@@ -407,6 +417,24 @@ def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata
     assert body["read_only"] is True
 
 
+def test_conversation_log_detail_rejects_non_owner_external_task() -> None:
+    _admin_headers()
+    bob_headers = _register_second_user(username="detailbob")
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Private External Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Admin REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=bob_headers)
+
+    assert response.status_code == 404, response.text
+
+
 def test_conversation_log_detail_returns_404_for_non_webhook_trigger_tasks() -> None:
     headers = _admin_headers()
     user_id = _user_id("admin")
@@ -430,6 +458,53 @@ def test_conversation_log_detail_returns_404_for_non_webhook_trigger_tasks() -> 
     response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
 
     assert response.status_code == 404, response.text
+
+
+def test_conversation_log_detail_returns_public_context_for_widget_and_share_logs() -> (
+    None
+):
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Public Context Agent")
+    widget_task_id = _create_task_row(
+        user_id=user_id,
+        title="Widget public context",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"guest_id": "guest-42", "widget_agent_id": agent_id},
+        channel_name="Web Widget",
+    )
+    share_task_id = _create_task_row(
+        user_id=user_id,
+        title="Share public context",
+        source="shared_link",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"auth_mode": "share", "share_agent_id": agent_id},
+        channel_name="Shared Agent",
+    )
+
+    widget_response = client.get(
+        f"/api/conversation-logs/{widget_task_id}", headers=headers
+    )
+    share_response = client.get(
+        f"/api/conversation-logs/{share_task_id}", headers=headers
+    )
+
+    assert widget_response.status_code == 200, widget_response.text
+    assert widget_response.json()["metadata"]["public_context"] == {
+        "guest_id": "guest-42",
+        "auth_mode": "widget",
+        "channel_name": "Web Widget",
+        "widget_agent_id": agent_id,
+    }
+    assert share_response.status_code == 200, share_response.text
+    assert share_response.json()["metadata"]["public_context"] == {
+        "auth_mode": "share",
+        "channel_name": "Shared Agent",
+        "share_agent_id": agent_id,
+    }
 
 
 def test_public_widget_and_share_task_creation_classifies_hidden_external_logs() -> (

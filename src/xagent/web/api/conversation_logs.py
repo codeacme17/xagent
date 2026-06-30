@@ -341,6 +341,11 @@ async def list_conversation_logs(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    """List hidden external conversation logs.
+
+    Admin users can inspect hidden external conversation logs across all users.
+    Non-admin users are limited to their own logs.
+    """
     normalized_source = source.strip().lower()
     allowed_sources = {"all", *SOURCE_ORDER}
     if normalized_source not in allowed_sources:
@@ -405,6 +410,11 @@ async def get_conversation_log_detail(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    """Return one hidden external conversation log.
+
+    Admin users can inspect hidden external conversation logs across all users.
+    Non-admin users are limited to their own logs.
+    """
     query = _base_task_query(db, user).filter(Task.id == task_id)
     task = query.first()
     if task is None:

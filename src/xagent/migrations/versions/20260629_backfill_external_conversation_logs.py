@@ -1,5 +1,10 @@
 """backfill external conversation logs
 
+Historical REST API tasks are moved out of the main task list by setting
+``is_visible=False`` for existing ``source='sdk'`` rows. Widget and shared-link
+tasks with legacy channel names are also reclassified as hidden external
+conversation logs.
+
 Revision ID: 20260629_backfill_external_conversation_logs
 Revises: 20260627_seed_meta_connectors
 Create Date: 2026-06-29 00:00:00.000000

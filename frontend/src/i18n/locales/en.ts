@@ -83,7 +83,6 @@ const en = {
     agentFilterLabel: "Agent filter",
     agentFilterAll: "All agents",
     untitled: "Untitled conversation",
-    unknownAgent: "Unknown agent",
     sources: {
       all: "All",
       widget: "Widget",
