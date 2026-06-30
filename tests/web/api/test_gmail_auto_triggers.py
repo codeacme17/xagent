@@ -78,13 +78,16 @@ class _FakeHistoryResource:
 
 
 class _FakeMessagesResource:
-    def __init__(self, messages: dict[str, dict[str, object]]) -> None:
+    def __init__(self, messages: dict[str, dict[str, object] | Exception]) -> None:
         self._messages = messages
         self.calls: list[dict[str, object]] = []
 
     def get(self, **kwargs: object) -> _FakeExecutable:
         self.calls.append(dict(kwargs))
-        return _FakeExecutable(self._messages[str(kwargs["id"])])
+        message = self._messages[str(kwargs["id"])]
+        if isinstance(message, Exception):
+            return _FakeExecutable({}, exception=message)
+        return _FakeExecutable(message)
 
 
 class _FakeUsersResource:
@@ -118,7 +121,7 @@ class _FakeGmailService:
         *,
         history_response: dict[str, object] | None = None,
         history_exception: Exception | None = None,
-        messages: dict[str, dict[str, object]] | None = None,
+        messages: dict[str, dict[str, object] | Exception] | None = None,
     ) -> None:
         self.calls: list[dict[str, object]] = []
         self._response = response or {}
@@ -682,6 +685,58 @@ def test_process_gmail_pubsub_notification_accepts_case_insensitive_all_label(
         db.close()
 
 
+def test_process_gmail_pubsub_notification_accepts_wildcard_star_label(
+    mock_bg_scheduler,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-star-label-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(db, user, config={"watch_label": "*"})
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-star"}}]}]
+            },
+            messages={
+                "msg-star": _gmail_message(
+                    "msg-star",
+                    label_ids=["CATEGORY_PROMOTIONS"],
+                )
+            },
+        )
+
+        result = asyncio.run(
+            process_gmail_pubsub_notification(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-star",
+                ),
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert result.processed == 1
+        assert result.skipped == 0
+        run = (
+            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
+        )
+        assert run.source_event_id == "gmail:msg-star"
+        assert mock_bg_scheduler.call_count == 1
+    finally:
+        db.close()
+
+
 def test_process_gmail_pubsub_notification_skips_sender_mismatch() -> None:
     db = _direct_db_session()
     try:
@@ -949,7 +1004,7 @@ def test_process_gmail_pubsub_notification_records_service_configuration_error()
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_failed_message_and_continues(
+def test_process_gmail_pubsub_notification_skips_deleted_message_and_advances_cursor(
     mock_bg_scheduler,
 ) -> None:
     db = _direct_db_session()
@@ -978,6 +1033,7 @@ def test_process_gmail_pubsub_notification_skips_failed_message_and_continues(
                 ]
             },
             messages={
+                "deleted-msg": _FakeHttpError(404, "message deleted"),
                 "msg-2": {
                     "id": "msg-2",
                     "threadId": "thread-2",
@@ -989,7 +1045,67 @@ def test_process_gmail_pubsub_notification_skips_failed_message_and_continues(
                             {"name": "Subject", "value": "urgent: e2e"},
                         ]
                     },
-                }
+                },
+            },
+        )
+
+        result = asyncio.run(
+            process_gmail_pubsub_notification(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-batch",
+                ),
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert result.processed == 1
+        assert result.skipped == 1
+        run = (
+            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
+        )
+        assert run.source_event_id == "gmail:msg-2"
+        db.refresh(state)
+        assert state.history_id == "222"
+        assert state.last_error is None
+        assert mock_bg_scheduler.call_count == 1
+    finally:
+        db.close()
+
+
+def test_process_gmail_pubsub_notification_fails_batch_on_transient_message_error_and_holds_cursor(
+    mock_bg_scheduler,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-transient-message-error-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(db, user)
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [
+                    {
+                        "messagesAdded": [
+                            {"message": {"id": "transient-msg"}},
+                            {"message": {"id": "msg-2", "threadId": "thread-2"}},
+                        ]
+                    }
+                ]
+            },
+            messages={
+                "transient-msg": _FakeHttpError(503, "gmail unavailable"),
+                "msg-2": _gmail_message("msg-2"),
             },
         )
 
@@ -1000,7 +1116,7 @@ def test_process_gmail_pubsub_notification_skips_failed_message_and_continues(
                     GmailPubsubNotification(
                         email_address="codeacme17@gmail.com",
                         history_id="222",
-                        pubsub_message_id="pubsub-batch",
+                        pubsub_message_id="pubsub-transient",
                     ),
                     service_factory=lambda _db, _oauth: fake_service,
                 )
@@ -1012,7 +1128,7 @@ def test_process_gmail_pubsub_notification_skips_failed_message_and_continues(
         assert run.source_event_id == "gmail:msg-2"
         db.refresh(state)
         assert state.history_id == "100"
-        assert "deleted-msg" in str(state.last_error)
+        assert "transient-msg" in str(state.last_error)
         assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
@@ -1285,6 +1401,67 @@ def test_scan_due_gmail_watch_renewals_applies_batch_limit(
             int(oauth_accounts[1].id),
         }
         assert len(fake_service.calls) == 2
+    finally:
+        db.close()
+
+
+def test_scan_due_gmail_watch_renewals_prioritizes_missing_and_earliest_expiration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    db = _direct_db_session()
+    try:
+        later_user = _create_user(db, "gmail-renewal-later-user")
+        later_oauth = _create_gmail_oauth(db, later_user)
+        later_oauth.email = "later@example.com"
+        _create_gmail_trigger(db, later_user)
+        later_state = GmailWatchState(
+            user_id=int(later_user.id),
+            oauth_account_id=int(later_oauth.id),
+            email="later@example.com",
+            history_id="100",
+            watch_expiration=datetime(2026, 6, 29, 20, tzinfo=timezone.utc),
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+
+        missing_expiration_user = _create_user(db, "gmail-renewal-missing-user")
+        missing_expiration_oauth = _create_gmail_oauth(db, missing_expiration_user)
+        missing_expiration_oauth.email = "missing@example.com"
+        _create_gmail_trigger(db, missing_expiration_user)
+        missing_expiration_state = GmailWatchState(
+            user_id=int(missing_expiration_user.id),
+            oauth_account_id=int(missing_expiration_oauth.id),
+            email="missing@example.com",
+            history_id="100",
+            watch_expiration=None,
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add_all(
+            [
+                later_oauth,
+                later_state,
+                missing_expiration_oauth,
+                missing_expiration_state,
+            ]
+        )
+        db.commit()
+        fake_service = _FakeGmailService(
+            {"historyId": "789", "expiration": "1782864000000"}
+        )
+
+        renewed = scan_due_gmail_watch_renewals(
+            db,
+            now=datetime(2026, 6, 29, tzinfo=timezone.utc),
+            service_factory=lambda _db, _oauth: fake_service,
+            limit=1,
+        )
+
+        assert renewed == 1
+        db.refresh(later_state)
+        db.refresh(missing_expiration_state)
+        assert later_state.history_id == "100"
+        assert missing_expiration_state.history_id == "789"
     finally:
         db.close()
 

@@ -146,8 +146,7 @@ def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(
         raise RuntimeError("watch registration unavailable")
 
     monkeypatch.setattr(
-        auth_api,
-        "ensure_gmail_watches_for_user",
+        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
         fake_ensure_gmail_watches_for_user,
         raising=False,
     )

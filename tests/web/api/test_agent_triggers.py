@@ -287,7 +287,7 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
         raise RuntimeError("watch registration unavailable")
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.ensure_gmail_watches_for_user",
+        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
         fake_ensure_gmail_watches_for_user,
         raising=False,
     )
@@ -305,6 +305,10 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
     )
 
     assert created.status_code == 200, created.text
+    assert (
+        created.json()["last_error"]
+        == "Gmail watch registration failed: watch registration unavailable"
+    )
     db = _direct_db_session()
     try:
         admin = db.query(User).filter(User.username == "admin").one()
@@ -323,7 +327,7 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
         raise RuntimeError("watch registration unavailable")
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.ensure_gmail_watches_for_user",
+        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
         fake_ensure_gmail_watches_for_user,
         raising=False,
     )
@@ -349,6 +353,10 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
     )
 
     assert patched.status_code == 200, patched.text
+    assert (
+        patched.json()["last_error"]
+        == "Gmail watch registration failed: watch registration unavailable"
+    )
     db = _direct_db_session()
     try:
         admin = db.query(User).filter(User.username == "admin").one()

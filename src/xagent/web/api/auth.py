@@ -45,23 +45,14 @@ SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> Any:
-    from ..services.gmail_triggers import ensure_gmail_watches_for_user as _ensure
-
-    return _ensure(db, user_id=user_id)
-
-
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    try:
-        ensure_gmail_watches_for_user(db, user_id=user_id)
-    except Exception as exc:
-        db.rollback()
-        logger.warning(
-            "Failed to ensure Gmail watches for user %s after OAuth callback: %s",
-            user_id,
-            exc,
-            exc_info=True,
-        )
+    from ..services.gmail_triggers import best_effort_ensure_gmail_watches_for_user
+
+    best_effort_ensure_gmail_watches_for_user(
+        db,
+        user_id=user_id,
+        context="after OAuth callback",
+    )
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:

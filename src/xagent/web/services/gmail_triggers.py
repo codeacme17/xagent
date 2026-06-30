@@ -13,7 +13,7 @@ from google.auth.transport.requests import (  # type: ignore[import-untyped]
     Request,
 )
 from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -243,6 +243,39 @@ def _record_watch_state_error(
     db.commit()
 
 
+def _record_enabled_gmail_trigger_error(
+    db: Session,
+    *,
+    user_id: int,
+    error_message: str | None,
+) -> None:
+    triggers = (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.user_id == user_id,
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+        )
+        .all()
+    )
+    if not triggers:
+        return
+
+    try:
+        for trigger in triggers:
+            setattr(trigger, "last_error", error_message)
+            db.add(trigger)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to record Gmail watch registration status for user %s: %s",
+            user_id,
+            exc,
+            exc_info=True,
+        )
+
+
 def register_gmail_watch_for_account(
     db: Session,
     oauth_account: UserOAuth,
@@ -335,6 +368,35 @@ def ensure_gmail_watches_for_user(
     return states
 
 
+def best_effort_ensure_gmail_watches_for_user(
+    db: Session,
+    *,
+    user_id: int,
+    context: str,
+) -> list[GmailWatchState]:
+    try:
+        states = ensure_gmail_watches_for_user(db, user_id=user_id)
+    except Exception as exc:
+        db.rollback()
+        error_message = f"Gmail watch registration failed: {exc}"
+        _record_enabled_gmail_trigger_error(
+            db,
+            user_id=user_id,
+            error_message=error_message,
+        )
+        logger.warning(
+            "Failed to ensure Gmail watches for user %s %s: %s",
+            user_id,
+            context,
+            exc,
+            exc_info=True,
+        )
+        return []
+
+    _record_enabled_gmail_trigger_error(db, user_id=user_id, error_message=None)
+    return states
+
+
 def scan_due_gmail_watch_renewals(
     db: Session,
     *,
@@ -372,7 +434,11 @@ def scan_due_gmail_watch_renewals(
                 GmailWatchState.watch_expiration <= renew_before,
             )
         )
-        .order_by(UserOAuth.id)
+        .order_by(
+            case((GmailWatchState.watch_expiration.is_(None), 0), else_=1),
+            GmailWatchState.watch_expiration,
+            UserOAuth.id,
+        )
         .limit(batch_size)
         .all()
     )
@@ -609,7 +675,20 @@ async def process_gmail_pubsub_notification(
     failed_message_ids: list[str] = []
     for message_id in message_ids:
         try:
-            message = _get_gmail_message(service, message_id)
+            try:
+                message = _get_gmail_message(service, message_id)
+            except Exception as exc:
+                if _exception_status_code(exc) in (404, 410):
+                    logger.warning(
+                        "Skipping inaccessible Gmail message %s for %s: %s",
+                        message_id,
+                        email_address,
+                        exc,
+                    )
+                    skipped += 1
+                    continue
+                raise
+
             payload = _message_payload(message, notification=notification)
             payload["message_id"] = payload["message_id"] or message_id
             matched = False
