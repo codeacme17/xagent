@@ -25,10 +25,10 @@ from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_triggers import (
     GmailPubsubNotification,
     GmailPubsubProcessResult,
+    GmailWatchConfigurationError,
     _get_google_oauth_config,
     build_gmail_service,
     ensure_gmail_watches_for_user,
-    GmailWatchConfigurationError,
     process_gmail_pubsub_notification,
     register_gmail_watch_for_account,
     scan_due_gmail_watch_renewals,
