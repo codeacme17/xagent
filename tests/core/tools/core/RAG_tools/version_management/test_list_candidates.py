@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -21,17 +21,62 @@ class TestListCandidates:
     """Test cases for list_candidates function."""
 
     def _patch_get_connection_from_env(self, mock_conn):
-        """Helper method to patch get_vector_store_raw_connection in the list_candidates module."""
+        """Patch the LanceDB connection at the store level (thread-safe).
+
+        The call path is:
+          list_candidates (public)
+          → facade.list_candidates
+          → coordinator.list_candidates_sync
+          → _run_in_separate_loop  ← NEW THREAD
+          → handle.list_candidates
+          → store.list_version_candidate_rows
+          → _vis_query_table (uses store._get_connection())
+
+        ``unittest.mock.patch`` context managers do NOT propagate across threads,
+        so patching ``get_connection_from_env`` at the provider level is
+        ineffective here.  Instead we patch
+        ``LanceDBVectorIndexStore._get_connection`` **at the class level** —
+        class-attribute patches are visible in any thread that uses the class.
+
+        The legacy ``get_vector_store_raw_connection`` patch is kept so that the
+        fallback path (coordinator is None → ``_list_candidates_impl``) still
+        works for tests that exercise error handling before any DB call.
+        """
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from xagent.core.tools.core.RAG_tools.storage import factory as _fac
+        from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+            LanceDBVectorIndexStore,
+        )
+
+        # Reset singletons so a fresh store instance is created for this test.
+        _fac.StorageFactory.get_factory().reset_all()
+
+        stack = ExitStack()
+        # Patch _get_connection at the CLASS level — propagates to all instances
+        # in all threads (class dict lookup; not instance-local).
+        stack.enter_context(
+            patch.object(
+                LanceDBVectorIndexStore,
+                "_get_connection",
+                return_value=mock_conn,
+            )
+        )
+        # Keep legacy path patched for fallback / error-handling tests.
         import importlib
 
         list_candidates_module = importlib.import_module(
             "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
         )
-        return patch.object(
-            list_candidates_module,
-            "get_vector_store_raw_connection",
-            return_value=mock_conn,
+        stack.enter_context(
+            patch.object(
+                list_candidates_module,
+                "get_vector_store_raw_connection",
+                return_value=mock_conn,
+            )
         )
+        return stack
 
     def setup_method(self):
         """Set up test fixtures."""
@@ -56,18 +101,7 @@ class TestListCandidates:
         """Test that function raises error for invalid step_type."""
         mock_conn = MagicMock(spec=["table_names", "open_table"])
 
-        # Import the actual module to patch using importlib
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-
-        with patch.object(
-            list_candidates_module, "get_vector_store_raw_connection"
-        ) as mock_get_db:
-            mock_get_db.return_value = mock_conn
-
+        with self._patch_get_connection_from_env(mock_conn):
             with pytest.raises(
                 VersionManagementError,
                 match="Invalid step_type string: 'invalid_step'.*Expected one of: 'parse', 'chunk', 'embed'",
@@ -79,18 +113,7 @@ class TestListCandidates:
         mock_conn = MagicMock(spec=["table_names", "open_table"])
         mock_conn.table_names.return_value = []
 
-        # Import the actual module to patch using importlib
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-
-        with patch.object(
-            list_candidates_module, "get_vector_store_raw_connection"
-        ) as mock_get_db:
-            mock_get_db.return_value = mock_conn
-
+        with self._patch_get_connection_from_env(mock_conn):
             result = list_candidates("test_collection", "test_doc", StepType.PARSE)
 
             assert result["candidates"] == []
@@ -133,18 +156,7 @@ class TestListCandidates:
         mock_where.to_pandas.return_value = mock_data
         mock_conn.open_table.return_value = mock_table
 
-        # Import the actual module to patch using importlib
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-
-        with patch.object(
-            list_candidates_module, "get_vector_store_raw_connection"
-        ) as mock_get_db:
-            mock_get_db.return_value = mock_conn
-
+        with self._patch_get_connection_from_env(mock_conn):
             result = list_candidates("test_collection", "test_doc", StepType.PARSE)
 
             assert len(result["candidates"]) == 2
@@ -201,18 +213,7 @@ class TestListCandidates:
         mock_where.to_pandas.return_value = mock_data
         mock_conn.open_table.return_value = mock_table
 
-        # Import the actual module to patch using importlib
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-
-        with patch.object(
-            list_candidates_module, "get_vector_store_raw_connection"
-        ) as mock_get_db:
-            mock_get_db.return_value = mock_conn
-
+        with self._patch_get_connection_from_env(mock_conn):
             result = list_candidates("test_collection", "test_doc", StepType.CHUNK)
 
             assert len(result["candidates"]) == 2  # Grouped by parse_hash
@@ -261,18 +262,7 @@ class TestListCandidates:
         mock_where.to_pandas.return_value = mock_data
         mock_conn.open_table.return_value = mock_table
 
-        # Import the actual module to patch using importlib
-        import importlib
-
-        list_candidates_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.list_candidates"
-        )
-
-        with patch.object(
-            list_candidates_module, "get_vector_store_raw_connection"
-        ) as mock_get_db:
-            mock_get_db.return_value = mock_conn
-
+        with self._patch_get_connection_from_env(mock_conn):
             result = list_candidates(
                 "test_collection", "test_doc", StepType.EMBED, model_tag="bge_large"
             )
@@ -510,14 +500,14 @@ class TestListCandidates:
         with self._patch_get_connection_from_env(mock_conn):
             result = list_candidates(collection_name, malicious_doc_id, StepType.PARSE)
 
-            # Assert that the where clause was called with the correctly escaped string
-            # Updated for Phase 1A: filter builder adds parentheses for better operator precedence
-            # Updated for PR #128 security: uses stable no-access filter
-            from xagent.core.tools.core.RAG_tools.core.config import (
-                UNAUTHENTICATED_NO_ACCESS_FILTER,
+            # Assert that the where clause was called with the correctly escaped string.
+            # New path (_vis_query_table) uses skip_user_filter=True (is_admin=True), so
+            # no user-access filter is appended — the expression is purely the two field
+            # conditions joined by AND.
+            expected_where_clause = (
+                f"(collection == '{collection_name}')"
+                f" AND (doc_id == 'test_doc'' OR 1=1 --')"
             )
-
-            expected_where_clause = f"((collection == '{collection_name}') AND (doc_id == 'test_doc'' OR 1=1 --')) AND ({UNAUTHENTICATED_NO_ACCESS_FILTER})"
 
             mock_table.search.assert_called_once()
             mock_table.search.return_value.where.assert_called_once_with(

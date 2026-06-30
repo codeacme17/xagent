@@ -11,6 +11,9 @@ import pytest
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import VersionManagementError
 from xagent.core.tools.core.RAG_tools.core.schemas import StepType
+from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+    LanceDBCollectionHandle,
+)
 from xagent.core.tools.core.RAG_tools.version_management.promote_version_main import (
     promote_version_main,
 )
@@ -39,51 +42,31 @@ class TestPromoteVersionMain:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _patch_list_candidates(self, mock_list_candidates):
-        """Helper method to patch list_candidates in the promote_version_main module."""
-        import importlib
-
-        promote_version_main_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
-        )
+        """Helper method to patch list_candidates on LanceDBCollectionHandle."""
         return patch.object(
-            promote_version_main_module, "list_candidates", mock_list_candidates
+            LanceDBCollectionHandle, "list_candidates", mock_list_candidates
         )
 
     def _patch_calculate_cleanup_plan(self, mock_calculate_cleanup_plan):
-        """Helper method to patch _calculate_cleanup_plan in the promote_version_main module."""
-        import importlib
-
-        promote_version_main_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
-        )
+        """Helper method to patch _calculate_cleanup_plan_for_step on LanceDBCollectionHandle."""
         return patch.object(
-            promote_version_main_module,
-            "_calculate_cleanup_plan",
+            LanceDBCollectionHandle,
+            "_calculate_cleanup_plan_for_step",
             mock_calculate_cleanup_plan,
         )
 
     def _patch_call_cleanup_cascade(self, mock_call_cleanup_cascade):
-        """Helper method to patch _call_cleanup_cascade in the promote_version_main module."""
-        import importlib
-
-        promote_version_main_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
-        )
+        """Helper method to patch _call_cleanup_cascade_for_step on LanceDBCollectionHandle."""
         return patch.object(
-            promote_version_main_module,
-            "_call_cleanup_cascade",
+            LanceDBCollectionHandle,
+            "_call_cleanup_cascade_for_step",
             mock_call_cleanup_cascade,
         )
 
     def _patch_set_main_pointer(self, mock_set_main_pointer):
-        """Helper method to patch set_main_pointer in the promote_version_main module."""
-        import importlib
-
-        promote_version_main_module = importlib.import_module(
-            "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
-        )
+        """Helper method to patch set_main_pointer on LanceDBCollectionHandle."""
         return patch.object(
-            promote_version_main_module, "set_main_pointer", mock_set_main_pointer
+            LanceDBCollectionHandle, "set_main_pointer", mock_set_main_pointer
         )
 
     def test_default_lancedb_dir_when_missing_env(self):

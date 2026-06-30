@@ -11,7 +11,12 @@ from enum import StrEnum
 from typing import Optional
 
 from ..core.schemas import CollectionInfo
-from ..storage.contracts import MetadataStore, VectorIndexStore
+from ..storage.contracts import (
+    IngestionStatusStore,
+    MainPointerStore,
+    MetadataStore,
+    VectorIndexStore,
+)
 
 
 class KBAccessMode(StrEnum):
@@ -98,6 +103,8 @@ class KBCollectionContext:
     hide_missing: bool
     metadata_store: MetadataStore
     vector_index_store: VectorIndexStore
+    ingestion_status_store: IngestionStatusStore
+    main_pointer_store: MainPointerStore
     backend: KBStorageBackend
     capabilities: KBBackendCapabilities
     collection_info: Optional[CollectionInfo] = None

@@ -1,7 +1,12 @@
 """Tests for main_pointer_manager functions.
 
-These tests mock the MainPointerStore returned by get_main_pointer_store
-to validate basic CRUD behaviors without touching real storage.
+These tests mock the MainPointerStore to validate basic CRUD behaviors
+without touching real storage.
+
+After the H06 refactor, public functions delegate to the coordinator, which
+calls the storage factory for the store. Tests therefore patch
+``StorageFactory.get_main_pointer_store`` (the canonical factory method) to
+inject the mock store at the right point in the call chain.
 """
 
 from __future__ import annotations
@@ -16,6 +21,13 @@ from xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager im
     get_main_pointer,
     list_main_pointers,
     set_main_pointer,
+)
+
+# Patch target: the method on StorageFactory used by the coordinator's storage
+# shim to return the MainPointerStore instance.
+_STORE_PATCH = (
+    "xagent.core.tools.core.RAG_tools.storage.factory.StorageFactory"
+    ".get_main_pointer_store"
 )
 
 
@@ -41,9 +53,7 @@ class TestMainPointerManager:
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_get_main_pointer_not_found(
         self,
         mock_get_store: MagicMock,
@@ -57,9 +67,7 @@ class TestMainPointerManager:
             collection="c", doc_id="d", step_type="parse", model_tag=None, user_id=None
         )
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_set_and_get_main_pointer_roundtrip(
         self,
         mock_get_store: MagicMock,
@@ -106,9 +114,7 @@ class TestMainPointerManager:
         assert result["semantic_id"] == "parse_123"
         assert result["technical_id"] == "hash_456"
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_list_and_delete_main_pointers(
         self,
         mock_get_store: MagicMock,
@@ -159,9 +165,7 @@ class TestMainPointerManager:
             collection="c", doc_id="d1", step_type="parse", model_tag=None, user_id=None
         )
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_get_main_pointer_backward_compatibility(
         self,
         mock_get_store: MagicMock,
@@ -187,9 +191,7 @@ class TestMainPointerManager:
         assert result is not None
         assert result["model_tag"] == ""
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_get_main_pointer_injection_attack_prevention(
         self,
         mock_get_store: MagicMock,
@@ -218,9 +220,7 @@ class TestMainPointerManager:
         call_args = mock_store.get_main_pointer.call_args
         assert call_args[1]["doc_id"] == "doc' OR '1'='1"
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_set_main_pointer_preserves_created_at(
         self,
         mock_get_store: MagicMock,
@@ -255,9 +255,7 @@ class TestMainPointerManager:
         # Verify store was called to set the pointer
         mock_store.set_main_pointer.assert_called_once()
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_set_main_pointer_new_record_created_at(
         self,
         mock_get_store: MagicMock,
@@ -279,9 +277,7 @@ class TestMainPointerManager:
 
         mock_store.set_main_pointer.assert_called_once()
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_set_main_pointer_normalizes_null_model_tag(
         self,
         mock_get_store: MagicMock,
@@ -304,9 +300,7 @@ class TestMainPointerManager:
         call_args = mock_store.set_main_pointer.call_args
         assert call_args[1]["model_tag"] is None  # Store handles normalization
 
-    @patch(
-        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager.get_main_pointer_store"
-    )
+    @patch(_STORE_PATCH)
     def test_set_main_pointer_always_attempts_normalization(
         self,
         mock_get_store: MagicMock,

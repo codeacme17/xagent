@@ -321,3 +321,50 @@ async def _clear_ingestion_status_async_impl(
         user_id=user_id,
         is_admin=is_admin,
     )
+
+
+def _rename_collection_status_impl(
+    old_name: str,
+    new_name: str,
+    *,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[str]:
+    store = get_ingestion_status_store()
+    try:
+        return store.rename_collection_status(
+            old_name=old_name,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "rename_collection_status(%r -> %r) failed: %s", old_name, new_name, exc
+        )
+        return [str(exc)]
+
+
+async def _rename_collection_status_async_impl(
+    old_name: str,
+    new_name: str,
+    *,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[str]:
+    store = get_ingestion_status_store()
+    try:
+        return await store.rename_collection_status_async(
+            old_name=old_name,
+            new_name=new_name,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "rename_collection_status_async(%r -> %r) failed: %s",
+            old_name,
+            new_name,
+            exc,
+        )
+        return [str(exc)]

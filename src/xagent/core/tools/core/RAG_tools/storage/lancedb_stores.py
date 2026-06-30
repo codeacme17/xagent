@@ -2343,10 +2343,716 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
 
+    # --- Version candidate listing (#513 Task 4) ---
+
+    @staticmethod
+    def _vis_query_table(
+        connection: Any,
+        table_name: str,
+        filters: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Query a table with given filters; return List[Dict]. Returns [] if table missing.
+
+        Uses ``skip_user_filter=True`` because this is an internal store-level
+        query with no user authentication context (admin-level candidate scan).
+        """
+        from ..LanceDB.schema_manager import _safe_close_table as _sct
+
+        if table_name not in list_table_names(connection):
+            return []
+        tbl = None
+        try:
+            tbl = connection.open_table(table_name)
+            filter_expr = build_lancedb_filter_expression(
+                filters, skip_user_filter=True
+            )
+            return query_to_list(tbl.search().where(filter_expr))
+        finally:
+            _sct(tbl)
+
+    @staticmethod
+    def _vis_generate_semantic_id(
+        step_type_str: str, technical_id: str, params: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Generate a semantic ID from technical ID and parameters."""
+        hash_prefix = technical_id[:8] if technical_id else "unknown"
+        if step_type_str == "parse":
+            method = params.get("parse_method", "unknown") if params else "unknown"
+            return f"parse_{method}_{hash_prefix}"
+        elif step_type_str == "chunk":
+            strategy = params.get("chunk_strategy", "unknown") if params else "unknown"
+            size = params.get("chunk_size", "unknown") if params else "unknown"
+            return f"chunk_{strategy}_{size}_{hash_prefix}"
+        elif step_type_str == "embed":
+            model = params.get("model", "unknown") if params else "unknown"
+            return f"embed_{model}_{hash_prefix}"
+        else:
+            return f"{step_type_str}_{hash_prefix}"
+
+    def _vis_get_parse_candidates(
+        self, connection: Any, filters: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Get parse candidates from the database."""
+        result = self._vis_query_table(connection, "parses", filters)
+        if not result:
+            return []
+        parse_candidates: List[Dict[str, Any]] = []
+        for row in result:
+            parse_method = row.get("parse_method", "unknown")
+            parser = row.get("parser", "unknown")
+            merged_params: Dict[str, Any] = {
+                "parse_method": parse_method,
+                "parser": parser,
+            }
+            semantic_id = self._vis_generate_semantic_id(
+                "parse", row["parse_hash"], merged_params
+            )
+            stats: Dict[str, Any] = {
+                "paragraphs_count": 0,
+                "elapsed_ms": 0,
+                "parse_method": parse_method,
+                "parser": parser,
+            }
+            parse_candidates.append(
+                {
+                    "semantic_id": semantic_id,
+                    "technical_id": row["parse_hash"],
+                    "params_brief": merged_params,
+                    "stats": stats,
+                    "state": "candidate",
+                    "created_at": row.get(
+                        "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
+                    ),
+                    "operator": "unknown",
+                }
+            )
+        return parse_candidates
+
+    def _vis_get_chunk_candidates(
+        self, connection: Any, filters: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Get chunk candidates from the database."""
+        result = self._vis_query_table(connection, "chunks", filters)
+        if not result:
+            return []
+        chunk_configs: Dict[str, Dict[str, Any]] = {}
+        for row in result:
+            parse_hash = row["parse_hash"]
+            if parse_hash not in chunk_configs:
+                chunk_configs[parse_hash] = {
+                    "chunk_count": 0,
+                    "avg_length": 0,
+                    "created_at": row.get(
+                        "created_at", datetime.now(timezone.utc).replace(tzinfo=None)
+                    ),
+                }
+            chunk_configs[parse_hash]["chunk_count"] += 1
+            text_len = len(row.get("text") or "")
+            cfg = chunk_configs[parse_hash]
+            cfg["avg_length"] = (
+                cfg["avg_length"] * (cfg["chunk_count"] - 1) + text_len
+            ) / cfg["chunk_count"]
+
+        chunk_candidates: List[Dict[str, Any]] = []
+        for parse_hash, cfg in chunk_configs.items():
+            semantic_id = self._vis_generate_semantic_id(
+                "chunk", parse_hash, {"chunk_count": cfg["chunk_count"]}
+            )
+            stats = {
+                "chunks_count": cfg["chunk_count"],
+                "avg_length": int(cfg["avg_length"]),
+                "parse_hash": parse_hash,
+            }
+            chunk_candidates.append(
+                {
+                    "semantic_id": semantic_id,
+                    "technical_id": parse_hash,
+                    "params_brief": {"chunk_count": cfg["chunk_count"]},
+                    "stats": stats,
+                    "state": "candidate",
+                    "created_at": cfg["created_at"],
+                    "operator": "unknown",
+                }
+            )
+        return chunk_candidates
+
+    def _vis_get_embed_candidates(
+        self, connection: Any, filters: Dict[str, Any], model_tag: str
+    ) -> List[Dict[str, Any]]:
+        """Get embedding candidates from the database."""
+        table_names = list_table_names(connection)
+        embed_tables = [name for name in table_names if name.startswith("embeddings_")]
+        if not embed_tables:
+            return []
+        embed_candidates: List[Dict[str, Any]] = []
+        for table_name in embed_tables:
+            table_model_tag = table_name.replace("embeddings_", "")
+            if model_tag != table_model_tag:
+                continue
+            result = self._vis_query_table(connection, table_name, filters)
+            if not result:
+                continue
+            embed_configs: Dict[tuple, Dict[str, Any]] = {}
+            for row in result:
+                model = row.get("model", "unknown")
+                parse_hash = row.get("parse_hash", "unknown")
+                key = (model, parse_hash)
+                if key not in embed_configs:
+                    embed_configs[key] = {
+                        "vector_count": 0,
+                        "vector_dim": 0,
+                        "created_at": row.get(
+                            "created_at",
+                            datetime.now(timezone.utc).replace(tzinfo=None),
+                        ),
+                    }
+                embed_configs[key]["vector_count"] += 1
+                vector = row.get("vector", [])
+                if vector is not None and embed_configs[key]["vector_dim"] == 0:
+                    embed_configs[key]["vector_dim"] = len(vector)
+
+            for (model, parse_hash), cfg in embed_configs.items():
+                semantic_id = self._vis_generate_semantic_id(
+                    "embed", parse_hash, {"model": model, "model_tag": model_tag}
+                )
+                stats = {
+                    "upsert_count": cfg["vector_count"],
+                    "vector_dim": cfg["vector_dim"],
+                    "model": model,
+                    "model_tag": model_tag,
+                    "parse_hash": parse_hash,
+                }
+                embed_candidates.append(
+                    {
+                        "semantic_id": semantic_id,
+                        "technical_id": parse_hash,
+                        "params_brief": {"model": model, "model_tag": model_tag},
+                        "stats": stats,
+                        "state": "candidate",
+                        "created_at": cfg["created_at"],
+                        "operator": "unknown",
+                    }
+                )
+        return embed_candidates
+
+    def list_version_candidate_rows(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for a document/stage (unsorted, unlimited, unfiltered by state).
+
+        Raises:
+            DatabaseOperationError: If a database operation fails.
+            VersionManagementError: If step_type is unknown or model_tag missing for embed.
+        """
+        from ..core.exceptions import DatabaseOperationError, VersionManagementError
+
+        try:
+            connection = self._get_connection()
+            filters: Dict[str, Any] = {"collection": collection, "doc_id": doc_id}
+
+            if step_type == "parse":
+                return self._vis_get_parse_candidates(connection, filters)
+            elif step_type == "chunk":
+                return self._vis_get_chunk_candidates(connection, filters)
+            elif step_type == "embed":
+                if not model_tag:
+                    raise VersionManagementError("model_tag is required for embed step")
+                return self._vis_get_embed_candidates(connection, filters, model_tag)
+            else:
+                raise VersionManagementError(f"Unknown step_type: {step_type}")
+        except (DatabaseOperationError, VersionManagementError):
+            raise
+        except Exception as e:
+            raise DatabaseOperationError(f"Failed to get candidates: {e}") from e
+
+    def cleanup_cascade_by_scope(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        # NOTE: The predicate pipeline below (_vis_plan_by_predicates, etc.) is a TEMPORARY
+        # DUPLICATION of cascade_cleaner.py helpers, intentionally accepted until the #494
+        # follow-up migrates the collection-delete path.
+        # Do NOT refactor the two into one yet.
+        from ..core.exceptions import CascadeCleanupError
+        from ..kb.cleanup_filters import (
+            KBCleanupScope,
+            build_embedding_cleanup_filters,
+        )
+        from ..LanceDB.schema_manager import (
+            ensure_chunks_table,
+            ensure_documents_table,
+            ensure_main_pointers_table,
+            ensure_parses_table,
+        )
+        from ..version_management.main_pointer_manager import (
+            _get_main_pointer_impl as get_main_pointer,
+        )
+
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        ensure_parses_table(conn)
+        ensure_chunks_table(conn)
+        ensure_main_pointers_table(conn)
+
+        if scope == "document":
+            from ..version_management.cascade_cleaner import _cascade_delete_impl
+
+            raw = _cascade_delete_impl(
+                target="document",
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                model_tag=model_tag,
+                preview_only=preview_only,
+                confirm=confirm,
+                conn=conn,
+            )
+            embeddings_total = sum(
+                int(v) for k, v in raw.items() if str(k).startswith("embeddings_")
+            )
+            return {
+                "embeddings": embeddings_total,
+                "chunks": int(raw.get("chunks", 0)),
+                "parses": int(raw.get("parses", 0)),
+                "main_pointers": int(raw.get("main_pointers", 0)),
+                "documents": int(raw.get("documents", 0)),
+                "ingestion_runs": int(raw.get("ingestion_runs", 0)),
+            }
+
+        predicates: Dict[str, list] = {}
+
+        if scope == "parse":
+            if old_parse_hash is None:
+                pointer = get_main_pointer(collection, doc_id, "parse")
+                old_parse_hash = pointer["technical_id"] if pointer else None
+
+            if old_parse_hash:
+                from ..utils.string_utils import build_lancedb_filter_expression
+
+                base_filters = {
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": old_parse_hash,
+                }
+                base = build_lancedb_filter_expression(
+                    base_filters,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    skip_user_filter=True,
+                )
+                _vis_replace_embedding_predicates(
+                    predicates=predicates,
+                    conn=conn,
+                    base_expr=base,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    model_tag=model_tag,
+                )
+                predicates["chunks"] = [
+                    _vis_append_user_filter_if_needed(
+                        conn=conn,
+                        table_name="chunks",
+                        base_expr=base,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ]
+            if new_parse_hash:
+                from ..utils.string_utils import escape_lancedb_string
+
+                escaped_collection = escape_lancedb_string(collection)
+                escaped_doc_id = escape_lancedb_string(doc_id)
+                escaped_new_parse_hash = escape_lancedb_string(new_parse_hash)
+                other = (
+                    f"collection == '{escaped_collection}' AND "
+                    f"doc_id == '{escaped_doc_id}' AND "
+                    f"parse_hash != '{escaped_new_parse_hash}'"
+                )
+                _vis_replace_embedding_predicates(
+                    predicates=predicates,
+                    conn=conn,
+                    base_expr=other,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    model_tag=model_tag,
+                )
+                predicates["chunks"] = [
+                    _vis_append_user_filter_if_needed(
+                        conn=conn,
+                        table_name="chunks",
+                        base_expr=other,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ]
+                predicates["parses"] = [
+                    _vis_append_user_filter_if_needed(
+                        conn=conn,
+                        table_name="parses",
+                        base_expr=other,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ]
+        elif scope == "chunk":
+            if old_parse_hash is None:
+                pointer = get_main_pointer(collection, doc_id, "chunk")
+                old_parse_hash = pointer["technical_id"] if pointer else None
+            if old_parse_hash:
+                from ..utils.string_utils import build_lancedb_filter_expression
+
+                base_filters = {
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "parse_hash": old_parse_hash,
+                }
+                base = build_lancedb_filter_expression(
+                    base_filters,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    skip_user_filter=True,
+                )
+                _vis_replace_embedding_predicates(
+                    predicates=predicates,
+                    conn=conn,
+                    base_expr=base,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    model_tag=model_tag,
+                )
+            if new_parse_hash:
+                from ..utils.string_utils import escape_lancedb_string
+
+                escaped_collection = escape_lancedb_string(collection)
+                escaped_doc_id = escape_lancedb_string(doc_id)
+                escaped_parse_hash = escape_lancedb_string(new_parse_hash)
+                other = (
+                    f"collection == '{escaped_collection}' AND "
+                    f"doc_id == '{escaped_doc_id}' AND "
+                    f"parse_hash != '{escaped_parse_hash}'"
+                )
+                _vis_replace_embedding_predicates(
+                    predicates=predicates,
+                    conn=conn,
+                    base_expr=other,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    model_tag=model_tag,
+                )
+                predicates["chunks"] = [
+                    _vis_append_user_filter_if_needed(
+                        conn=conn,
+                        table_name="chunks",
+                        base_expr=other,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ]
+        elif scope == "embeddings":
+            scope_obj = KBCleanupScope(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                model_tag=model_tag,
+            )
+            filters_by_table = build_embedding_cleanup_filters(conn, scope_obj)
+            for table_name, filter_exprs in filters_by_table.items():
+                if filter_exprs:
+                    predicates.setdefault(table_name, []).extend(filter_exprs)
+        elif scope == "pointers":
+            from ..version_management.cascade_cleaner import _build_document_filter
+
+            filt = _build_document_filter(
+                conn=conn,
+                table_name="main_pointers",
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            predicates["main_pointers"] = [filt]
+        else:
+            raise CascadeCleanupError(f"Unsupported scope: {scope}")
+
+        result = _vis_execute_or_plan_by_predicates(
+            conn,
+            predicates,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=model_tag,
+        )
+        if scope in {"parse", "chunk", "embeddings"}:
+            return _vis_collapse_embedding_table_counts(result)
+        return result
+
 
 # ============================================================================
 # Phase 1A Part 2: Additional LanceDB Store Implementations
 # ============================================================================
+
+# ---------------------------------------------------------------------------
+# _vis_* helpers: temporary duplication of cascade_cleaner.py predicate utils
+# (accepted until #494 follow-up; do NOT merge into one yet)
+# ---------------------------------------------------------------------------
+
+
+def _vis_count_rows_by_filters(table: Any, filter_exprs: list) -> int:
+    from ..utils.lancedb_query_utils import _safe_count_rows
+
+    return sum(_safe_count_rows(table, f) for f in filter_exprs)
+
+
+def _vis_delete_rows_by_filters(table: Any, filter_exprs: list) -> int:
+    from ..utils.lancedb_query_utils import _safe_count_rows
+
+    deleted_count = 0
+    for filter_expr in filter_exprs:
+        count = _safe_count_rows(table, filter_expr)
+        if count > 0:
+            table.delete(filter_expr)
+        deleted_count += count
+    return deleted_count
+
+
+def _vis_append_user_filter_if_needed(
+    *,
+    conn: Any,
+    table_name: str,
+    base_expr: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    from ..kb.cleanup_filters import (
+        append_user_filter_for_table,
+        append_user_filter_without_schema,
+    )
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        return append_user_filter_for_table(
+            table=table,
+            filter_expr=base_expr,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    except Exception:
+        return append_user_filter_without_schema(
+            filter_expr=base_expr,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_replace_embedding_predicates(
+    *,
+    predicates: Dict[str, list],
+    conn: Any,
+    base_expr: str,
+    user_id: Optional[int],
+    is_admin: bool,
+    model_tag: Optional[str] = None,
+) -> None:
+    from ..kb.cleanup_filters import build_embedding_cleanup_filters_from_base
+
+    table_filters = build_embedding_cleanup_filters_from_base(
+        conn,
+        base_filter=base_expr,
+        user_id=user_id,
+        is_admin=is_admin,
+        model_tag=model_tag,
+    )
+    for table_name, filter_exprs in table_filters.items():
+        if filter_exprs:
+            predicates[table_name] = list(filter_exprs)
+
+
+def _vis_get_table_names(conn: Any) -> list:
+    from ..utils.lancedb_query_utils import list_table_names
+
+    try:
+        return list(list_table_names(conn))
+    except Exception:
+        return []
+
+
+def _vis_plan_by_predicates(
+    conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
+) -> Dict[str, int]:
+    from ..kb.cleanup_filters import select_embedding_tables
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    counts: Dict[str, int] = {}
+    table_names = _vis_get_table_names(conn)
+
+    for t in table_names:
+        if t.startswith("embeddings_") and t in table_to_filter:
+            table = None
+            try:
+                table = conn.open_table(t)
+                counts[t] = _vis_count_rows_by_filters(table, table_to_filter[t])
+            finally:
+                _safe_close_table(table)
+
+    for table_name, filter_exprs in table_to_filter.items():
+        if table_name == "__embeddings__":
+            total = 0
+            target_tables = select_embedding_tables(conn, model_tag=model_tag)
+            for t in target_tables:
+                table = None
+                try:
+                    table = conn.open_table(t)
+                    total += _vis_count_rows_by_filters(table, filter_exprs)
+                finally:
+                    _safe_close_table(table)
+            counts[table_name] = total
+            continue
+        if table_name.startswith("embeddings_"):
+            continue
+        if table_name not in table_names:
+            counts[table_name] = 0
+            continue
+        table = None
+        try:
+            table = conn.open_table(table_name)
+            counts[table_name] = _vis_count_rows_by_filters(table, filter_exprs)
+        finally:
+            _safe_close_table(table)
+    return counts
+
+
+def _vis_delete_by_predicates(
+    conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
+) -> Dict[str, int]:
+    import logging as _logging
+
+    from ..kb.cleanup_filters import select_embedding_tables
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    _logger = _logging.getLogger(__name__)
+    deleted: Dict[str, int] = {}
+    table_names = _vis_get_table_names(conn)
+
+    for t in table_names:
+        if not t.startswith("embeddings_") or t not in table_to_filter:
+            continue
+        filter_exprs = table_to_filter[t]
+        table = None
+        try:
+            table = conn.open_table(t)
+            cnt = _vis_delete_rows_by_filters(table, filter_exprs)
+            if cnt > 0:
+                _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, t)
+            deleted[t] = cnt
+        finally:
+            _safe_close_table(table)
+
+    order = [
+        "__embeddings__",
+        "chunks",
+        "parses",
+        "main_pointers",
+        "ingestion_runs",
+        "documents",
+    ]
+
+    if "__embeddings__" in table_to_filter:
+        filter_exprs = table_to_filter["__embeddings__"]
+        total = 0
+        target_tables = select_embedding_tables(conn, model_tag=model_tag)
+        for t in target_tables:
+            table = None
+            try:
+                table = conn.open_table(t)
+                total += _vis_delete_rows_by_filters(table, filter_exprs)
+            finally:
+                _safe_close_table(table)
+        deleted["embeddings"] = total
+        if total > 0:
+            _logger.info(
+                "Cascade cleanup: deleted %s rows from embeddings tables", total
+            )
+
+    for name in order[1:]:
+        if name in table_to_filter and name in table_names:
+            table = None
+            try:
+                table = conn.open_table(name)
+                cnt = _vis_delete_rows_by_filters(table, table_to_filter[name])
+                if cnt > 0:
+                    _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
+                deleted[name] = cnt
+            finally:
+                _safe_close_table(table)
+
+    for name, filter_exprs in table_to_filter.items():
+        if name in (
+            "__embeddings__",
+            "chunks",
+            "parses",
+            "main_pointers",
+            "ingestion_runs",
+            "documents",
+        ) or name.startswith("embeddings_"):
+            continue
+        if name not in table_names:
+            deleted[name] = 0
+            continue
+        table = None
+        try:
+            table = conn.open_table(name)
+            cnt = _vis_delete_rows_by_filters(table, filter_exprs)
+            if cnt > 0:
+                _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
+            deleted[name] = cnt
+        finally:
+            _safe_close_table(table)
+
+    return deleted
+
+
+def _vis_execute_or_plan_by_predicates(
+    conn: Any,
+    predicates: Dict[str, list],
+    *,
+    preview_only: bool,
+    confirm: bool,
+    model_tag: Optional[str] = None,
+) -> Dict[str, int]:
+    if not (confirm and not preview_only):
+        return _vis_plan_by_predicates(conn, predicates, model_tag=model_tag)
+    return _vis_delete_by_predicates(conn, predicates, model_tag=model_tag)
+
+
+def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, int]:
+    collapsed = dict(counts)
+    embeddings_total = int(collapsed.pop("__embeddings__", 0)) + int(
+        collapsed.pop("embeddings", 0)
+    )
+    for table_name in list(collapsed):
+        if str(table_name).startswith("embeddings_"):
+            embeddings_total += int(collapsed.pop(table_name, 0))
+    collapsed["embeddings"] = embeddings_total
+    return collapsed
 
 
 class LanceDBIngestionStatusStore(IngestionStatusStore):

@@ -878,6 +878,111 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def list_version_candidate_rows(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List raw candidate rows for a document/stage (semantic, unsorted/unlimited).
+
+        Returns per-candidate dicts with keys:
+          ``semantic_id``, ``technical_id``, ``params_brief``, ``stats``,
+          ``state``, ``created_at``, ``operator``.
+
+        Args:
+            collection: Collection name.
+            doc_id: Document ID.
+            step_type: Processing stage as string (``"parse"``, ``"chunk"``, ``"embed"``).
+            model_tag: Required when ``step_type == "embed"``.
+
+        Returns:
+            List of candidate dicts, **unsorted, unlimited, unfiltered by state**.
+
+        Raises:
+            DatabaseOperationError: If a database operation fails.
+            VersionManagementError: If a version-management logic error occurs (e.g.
+                missing ``model_tag`` for embed).
+        """
+
+    async def list_version_candidate_rows_async(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Async variant — delegates to sync by default (Phase 1A pattern)."""
+        return self.list_version_candidate_rows(
+            collection, doc_id, step_type, model_tag
+        )
+
+    @abstractmethod
+    def cleanup_cascade_by_scope(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Execute version cascade cleanup for a document by scope.
+
+        Encapsulates the predicate pipeline, delete order, and count collapse.
+        Receives already-resolved user_id/is_admin (policy is in the handle layer).
+
+        Args:
+            collection: Collection name.
+            doc_id: Document ID.
+            scope: "document" | "parse" | "chunk" | "embeddings" | "pointers"
+            new_parse_hash: New main parse hash (parse/chunk scopes).
+            old_parse_hash: Old main parse hash (auto-filled from pointers if None).
+            model_tag: Optional embed model tag limiter.
+            user_id: Resolved user ID for tenant scoping.
+            is_admin: Resolved admin flag.
+            preview_only: If True, only plan counts.
+            confirm: If True, execute deletions.
+
+        Returns:
+            Deleted (or planned) counts per scope key.
+        """
+
+    async def cleanup_cascade_by_scope_async(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Async variant — delegates to sync by default (Phase 1A pattern)."""
+        return self.cleanup_cascade_by_scope(
+            collection,
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    @abstractmethod
     def search_vectors(
         self,
         table_name: str,

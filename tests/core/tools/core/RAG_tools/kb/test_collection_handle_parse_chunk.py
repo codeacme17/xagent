@@ -28,6 +28,8 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
     KBUserScope,
 )
 from xagent.core.tools.core.RAG_tools.storage.factory import (
+    get_ingestion_status_store,
+    get_main_pointer_store,
     get_metadata_store,
     get_vector_index_store,
 )
@@ -43,6 +45,8 @@ def make_handle(collection: str = "coll") -> LanceDBCollectionHandle:
         hide_missing=True,
         metadata_store=get_metadata_store(),
         vector_index_store=get_vector_index_store(),
+        ingestion_status_store=get_ingestion_status_store(),
+        main_pointer_store=get_main_pointer_store(),
         backend=KBStorageBackend.LANCEDB,
         capabilities=KBBackendCapabilities.lancedb(),
         collection_info=None,

@@ -13,10 +13,8 @@ from typing_extensions import Literal
 
 from ..core.exceptions import CascadeCleanupError
 from ..kb.cleanup_filters import (
-    KBCleanupScope,
     append_user_filter_for_table,
     append_user_filter_without_schema,
-    build_embedding_cleanup_filters,
     build_embedding_cleanup_filters_from_base,
     select_embedding_tables,
 )
@@ -38,9 +36,16 @@ from ..utils.string_utils import (
 )
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
-from .main_pointer_manager import _get_main_pointer_impl as get_main_pointer
 
 logger = logging.getLogger(__name__)
+
+# NOTE (#494): The cascade-cleanup predicate pipeline now lives authoritatively in
+# the vector_index_store (LanceDBVectorIndexStore.cleanup_cascade_by_scope). The
+# COLLECTION-DELETE path below (_cascade_delete_impl / cascade_delete /
+# cascade_delete_documents / _build_collection_filter) intentionally keeps its own
+# copy for now; that duplication is tracked by #494. The version-cleanup
+# _cleanup_cascade_impl is now a thin shell that routes through the
+# version-compatibility facade (-> coordinator -> handle -> store).
 
 if TYPE_CHECKING:
     from ..kb import KBVersionCompatibilityFacade
@@ -684,191 +689,18 @@ def _cleanup_cascade_impl(
     Returns:
         Deleted (or planned) counts per table scope
     """
-    if is_admin is None:
-        is_admin = True
-    user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-    user_id = user_scope.user_id
-    is_admin = user_scope.is_admin
-
-    conn = get_vector_store_raw_connection()
-    ensure_documents_table(conn)
-    ensure_parses_table(conn)
-    ensure_chunks_table(conn)
-    ensure_main_pointers_table(conn)
-
-    if scope == "document":
-        raw = _cascade_delete_impl(
-            target="document",
-            collection=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
-            model_tag=model_tag,
-            preview_only=preview_only,
-            confirm=confirm,
-        )
-        embeddings_total = sum(
-            int(v) for k, v in raw.items() if str(k).startswith("embeddings_")
-        )
-        return {
-            "embeddings": embeddings_total,
-            "chunks": int(raw.get("chunks", 0)),
-            "parses": int(raw.get("parses", 0)),
-            "main_pointers": int(raw.get("main_pointers", 0)),
-            "documents": int(raw.get("documents", 0)),
-            "ingestion_runs": int(raw.get("ingestion_runs", 0)),
-        }
-
-    predicates: FilterPredicateMap = {}
-
-    if scope == "parse":
-        if old_parse_hash is None:
-            pointer = get_main_pointer(collection, doc_id, "parse")
-            old_parse_hash = pointer["technical_id"] if pointer else None
-
-        if old_parse_hash:
-            base_filters = {
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": old_parse_hash,
-            }
-            base = build_lancedb_filter_expression(
-                base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-            )
-            _replace_embedding_predicates(
-                predicates=predicates,
-                conn=conn,
-                base_expr=base,
-                user_id=user_id,
-                is_admin=is_admin,
-                model_tag=model_tag,
-            )
-            _replace_predicate(
-                predicates,
-                "chunks",
-                _append_user_filter_if_needed(
-                    conn=conn,
-                    table_name="chunks",
-                    base_expr=base,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                ),
-            )
-        if new_parse_hash:
-            escaped_collection = escape_lancedb_string(collection)
-            escaped_doc_id = escape_lancedb_string(doc_id)
-            escaped_new_parse_hash = escape_lancedb_string(new_parse_hash)
-            other = f"collection == '{escaped_collection}' AND doc_id == '{escaped_doc_id}' AND parse_hash != '{escaped_new_parse_hash}'"
-            _replace_embedding_predicates(
-                predicates=predicates,
-                conn=conn,
-                base_expr=other,
-                user_id=user_id,
-                is_admin=is_admin,
-                model_tag=model_tag,
-            )
-            _replace_predicate(
-                predicates,
-                "chunks",
-                _append_user_filter_if_needed(
-                    conn=conn,
-                    table_name="chunks",
-                    base_expr=other,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                ),
-            )
-            _replace_predicate(
-                predicates,
-                "parses",
-                _append_user_filter_if_needed(
-                    conn=conn,
-                    table_name="parses",
-                    base_expr=other,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                ),
-            )
-    elif scope == "chunk":
-        if old_parse_hash is None:
-            pointer = get_main_pointer(collection, doc_id, "chunk")
-            old_parse_hash = pointer["technical_id"] if pointer else None
-        if old_parse_hash:
-            base_filters = {
-                "collection": collection,
-                "doc_id": doc_id,
-                "parse_hash": old_parse_hash,
-            }
-            base = build_lancedb_filter_expression(
-                base_filters, user_id=user_id, is_admin=is_admin, skip_user_filter=True
-            )
-            _replace_embedding_predicates(
-                predicates=predicates,
-                conn=conn,
-                base_expr=base,
-                user_id=user_id,
-                is_admin=is_admin,
-                model_tag=model_tag,
-            )
-        if new_parse_hash:
-            escaped_collection = escape_lancedb_string(collection)
-            escaped_doc_id = escape_lancedb_string(doc_id)
-            escaped_parse_hash = escape_lancedb_string(new_parse_hash)
-            other = f"collection == '{escaped_collection}' AND doc_id == '{escaped_doc_id}' AND parse_hash != '{escaped_parse_hash}'"
-            _replace_embedding_predicates(
-                predicates=predicates,
-                conn=conn,
-                base_expr=other,
-                user_id=user_id,
-                is_admin=is_admin,
-                model_tag=model_tag,
-            )
-            _replace_predicate(
-                predicates,
-                "chunks",
-                _append_user_filter_if_needed(
-                    conn=conn,
-                    table_name="chunks",
-                    base_expr=other,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                ),
-            )
-    elif scope == "embeddings":
-        scope_obj = KBCleanupScope(
-            collection=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
-            model_tag=model_tag,
-        )
-        filters_by_table = build_embedding_cleanup_filters(conn, scope_obj)
-        for table_name, filter_exprs in filters_by_table.items():
-            if filter_exprs:
-                _append_predicates(predicates, table_name, filter_exprs)
-    elif scope == "pointers":
-        filt = _build_document_filter(
-            conn=conn,
-            table_name="main_pointers",
-            collection=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        _replace_predicate(predicates, "main_pointers", filt)
-    else:
-        raise CascadeCleanupError(f"Unsupported scope: {scope}")
-
-    result = _execute_or_plan_by_predicates(
-        conn,
-        predicates,
+    return _get_version_compatibility_facade().cleanup_cascade(
+        collection=collection,
+        doc_id=doc_id,
+        scope=scope,
+        new_parse_hash=new_parse_hash,
+        old_parse_hash=old_parse_hash,
+        model_tag=model_tag,
+        user_id=user_id,
+        is_admin=is_admin,
         preview_only=preview_only,
         confirm=confirm,
-        model_tag=model_tag,
     )
-    if scope in {"parse", "chunk", "embeddings"}:
-        return _collapse_embedding_table_counts(result)
-    return result
 
 
 def _collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, int]:

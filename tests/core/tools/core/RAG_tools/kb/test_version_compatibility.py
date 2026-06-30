@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from typing import Any, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -652,13 +652,15 @@ def test_cleanup_count_shape_is_preserved_through_version_facade(monkeypatch) ->
     ]
 
 
-def test_failed_promotion_does_not_advance_main_pointer(monkeypatch) -> None:
+def test_failed_promotion_does_not_advance_main_pointer() -> None:
     """Failed cleanup during promotion does not call set_main_pointer."""
     from xagent.core.tools.core.RAG_tools.core.exceptions import VersionManagementError
     from xagent.core.tools.core.RAG_tools.core.schemas import StepType
-
-    promote_version_main = importlib.import_module(
-        "xagent.core.tools.core.RAG_tools.version_management.promote_version_main"
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+    from xagent.core.tools.core.RAG_tools.version_management.promote_version_main import (
+        promote_version_main,
     )
 
     mock_list_candidates = MagicMock(
@@ -685,21 +687,24 @@ def test_failed_promotion_does_not_advance_main_pointer(monkeypatch) -> None:
     mock_cleanup = MagicMock(side_effect=RuntimeError("cleanup failed"))
     mock_set_main_pointer = MagicMock()
 
-    monkeypatch.setattr(promote_version_main, "list_candidates", mock_list_candidates)
-    monkeypatch.setattr(
-        promote_version_main, "_calculate_cleanup_plan", mock_cleanup_plan
-    )
-    monkeypatch.setattr(promote_version_main, "cleanup_cascade", mock_cleanup)
-    monkeypatch.setattr(promote_version_main, "set_main_pointer", mock_set_main_pointer)
-
-    with pytest.raises(VersionManagementError, match="cleanup failed"):
-        promote_version_main.promote_version_main(
-            "docs",
-            "doc-1",
-            StepType.PARSE,
-            "parse_new",
-            operator="tester",
-            confirm=True,
-        )
+    with patch.object(LanceDBCollectionHandle, "list_candidates", mock_list_candidates):
+        with patch.object(
+            LanceDBCollectionHandle,
+            "_calculate_cleanup_plan_for_step",
+            mock_cleanup_plan,
+        ):
+            with patch.object(LanceDBCollectionHandle, "cleanup_cascade", mock_cleanup):
+                with patch.object(
+                    LanceDBCollectionHandle, "set_main_pointer", mock_set_main_pointer
+                ):
+                    with pytest.raises(VersionManagementError, match="cleanup failed"):
+                        promote_version_main(
+                            "docs",
+                            "doc-1",
+                            StepType.PARSE,
+                            "parse_new",
+                            operator="tester",
+                            confirm=True,
+                        )
 
     mock_set_main_pointer.assert_not_called()
