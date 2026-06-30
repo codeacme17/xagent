@@ -12,6 +12,7 @@ import {
     MessageSquare,
     Bot,
     Box,
+    ClipboardList,
     LayoutTemplate,
     Globe,
 } from "lucide-react"
@@ -62,7 +63,7 @@ const baseMoreResourceItems: NavigationItem[] = [
         name: "Conversation Logs",
         nameKey: "nav.conversationLogs",
         href: "/conversation-logs",
-        icon: MessageSquare,
+        icon: ClipboardList,
         color: "text-blue-400"
     },
     {

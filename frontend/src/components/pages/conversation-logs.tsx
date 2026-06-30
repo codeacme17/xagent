@@ -30,14 +30,9 @@ const SOURCE_TABS: Array<{
 
 const PER_PAGE = 20
 
-const sourceBadgeClass: Record<string, string> = {
-  rest_api: "border-blue-100 bg-blue-50 text-blue-700",
-  webhook: "border-blue-100 bg-blue-50 text-blue-700",
-  widget: "border-blue-100 bg-blue-50 text-blue-700",
-  shared_link: "border-blue-100 bg-blue-50 text-blue-700",
-}
+const SOURCE_BADGE_CLASS = "border-blue-100 bg-blue-50 text-blue-700"
 
-function formatRelativeTime(value?: string | null): string {
+function formatRelativeTime(value: string | null | undefined, locale: string): string {
   if (!value) return "-"
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
@@ -52,7 +47,7 @@ function formatRelativeTime(value?: string | null): string {
   ] as const
   const deltaSeconds = Math.round((date.getTime() - Date.now()) / 1000)
   const absoluteSeconds = Math.abs(deltaSeconds)
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
+  const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" })
 
   for (const [unit, seconds] of units) {
     if (absoluteSeconds >= seconds) {
@@ -71,7 +66,7 @@ function conversationTitle(log: ConversationLogSummary): string {
 }
 
 export function ConversationLogsPage() {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const [source, setSource] = useState<ConversationLogSource>("all")
   const [agentId, setAgentId] = useState<number | null>(null)
   const [search, setSearch] = useState("")
@@ -304,10 +299,7 @@ export function ConversationLogsPage() {
                           </span>
                           <Badge
                             variant="outline"
-                            className={cn(
-                              "h-5 rounded px-1.5 text-[11px]",
-                              sourceBadgeClass[log.source]
-                            )}
+                            className={cn("h-5 rounded px-1.5 text-[11px]", SOURCE_BADGE_CLASS)}
                           >
                             {sourceLabel(log)}
                           </Badge>
@@ -316,7 +308,7 @@ export function ConversationLogsPage() {
                           suppressHydrationWarning
                           className="whitespace-nowrap text-xs text-slate-500"
                         >
-                          {formatRelativeTime(log.last_activity_at || log.updated_at)}
+                          {formatRelativeTime(log.last_activity_at || log.updated_at, locale)}
                         </span>
                       </div>
                     </button>
@@ -375,7 +367,7 @@ export function ConversationLogsPage() {
 }
 
 function ConversationLogDetail({ detail }: { detail: ConversationLogDetailResponse }) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const log = detail.log
 
   return (
@@ -388,7 +380,7 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
           </h2>
           <Badge
             variant="outline"
-            className={cn("h-5 rounded px-1.5 text-[11px]", sourceBadgeClass[log.source])}
+            className={cn("h-5 rounded px-1.5 text-[11px]", SOURCE_BADGE_CLASS)}
           >
             {sourceLabel(log)}
           </Badge>
@@ -396,7 +388,7 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
         <p className="mt-2 text-sm text-slate-600">
           {t("conversationLogs.lastActivity")}{" "}
           <span suppressHydrationWarning className="text-slate-500">
-            {formatRelativeTime(log.last_activity_at || log.updated_at)}
+            {formatRelativeTime(log.last_activity_at || log.updated_at, locale)}
           </span>
         </p>
       </div>

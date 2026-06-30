@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -98,26 +99,33 @@ def _create_task_row(
     output_text: str | None = None,
     agent_config: dict[str, Any] | None = None,
     channel_name: str | None = None,
+    created_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
-        task = Task(
-            user_id=user_id,
-            title=title,
-            description=description or title,
-            status=TaskStatus.COMPLETED,
-            source=source,
-            is_visible=is_visible,
-            agent_id=agent_id,
-            input=input_text,
-            output=output_text,
-            agent_config=agent_config,
-            channel_name=channel_name,
-            input_tokens=3,
-            output_tokens=5,
-            total_tokens=8,
-            llm_calls=1,
-        )
+        task_kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "title": title,
+            "description": description or title,
+            "status": TaskStatus.COMPLETED,
+            "source": source,
+            "is_visible": is_visible,
+            "agent_id": agent_id,
+            "input": input_text,
+            "output": output_text,
+            "agent_config": agent_config,
+            "channel_name": channel_name,
+            "input_tokens": 3,
+            "output_tokens": 5,
+            "total_tokens": 8,
+            "llm_calls": 1,
+        }
+        if created_at is not None:
+            task_kwargs["created_at"] = created_at
+        if updated_at is not None:
+            task_kwargs["updated_at"] = updated_at
+        task = Task(**task_kwargs)
         db.add(task)
         db.commit()
         db.refresh(task)
@@ -170,18 +178,20 @@ def _add_chat_message(
     role: str,
     content: str,
     message_type: str = "chat",
+    created_at: datetime | None = None,
 ) -> None:
     db = _direct_db_session()
     try:
-        db.add(
-            TaskChatMessage(
-                task_id=task_id,
-                user_id=user_id,
-                role=role,
-                content=content,
-                message_type=message_type,
-            )
-        )
+        message_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "role": role,
+            "content": content,
+            "message_type": message_type,
+        }
+        if created_at is not None:
+            message_kwargs["created_at"] = created_at
+        db.add(TaskChatMessage(**message_kwargs))
         db.commit()
     finally:
         db.close()
@@ -397,6 +407,31 @@ def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata
     assert body["read_only"] is True
 
 
+def test_conversation_log_detail_returns_404_for_non_webhook_trigger_tasks() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Scheduled Agent")
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Scheduled digest",
+        source="trigger",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"trigger_type": "scheduled"},
+    )
+    _attach_trigger_run(
+        user_id=user_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        trigger_type="scheduled",
+        source_event_id="evt-scheduled",
+    )
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+
+    assert response.status_code == 404, response.text
+
+
 def test_public_widget_and_share_task_creation_classifies_hidden_external_logs() -> (
     None
 ):
@@ -461,6 +496,56 @@ def test_public_widget_and_share_task_creation_classifies_hidden_external_logs()
     assert {item["source"] for item in logs} == {"widget", "shared_link"}
 
 
+def test_conversation_logs_list_sorts_by_last_message_activity() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Activity Agent")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    stale_activity_task_id = _create_task_row(
+        user_id=user_id,
+        title="Recently updated row",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=base.replace(hour=8),
+        updated_at=base.replace(hour=11),
+    )
+    fresh_activity_task_id = _create_task_row(
+        user_id=user_id,
+        title="Recent conversation turn",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=base.replace(hour=8),
+        updated_at=base.replace(hour=9),
+    )
+    _add_chat_message(
+        task_id=stale_activity_task_id,
+        user_id=user_id,
+        role="user",
+        content="older turn",
+        created_at=base.replace(hour=10),
+    )
+    _add_chat_message(
+        task_id=fresh_activity_task_id,
+        user_id=user_id,
+        role="user",
+        content="newer turn",
+        created_at=base.replace(hour=12),
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+
+    assert response.status_code == 200, response.text
+    logs = response.json()["logs"]
+    assert [item["task_id"] for item in logs[:2]] == [
+        fresh_activity_task_id,
+        stale_activity_task_id,
+    ]
+    assert logs[0]["last_activity_at"] == "2026-01-01T12:00:00+00:00"
+
+
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:
     headers = _admin_headers()
     user_id = _user_id("admin")
@@ -497,7 +582,9 @@ def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:
         and "task_chat_messages.task_id IN" in statement
         and isinstance(parameters, tuple)
     ]
-    assert message_query_param_counts
+    assert message_query_param_counts, (
+        "Expected message queries to fire but none matched the SQL filter"
+    )
     assert max(message_query_param_counts) <= 5
 
 
@@ -538,4 +625,4 @@ def test_conversation_logs_list_batches_trigger_type_lookup() -> None:
         for statement, _parameters in statements
         if "FROM trigger_runs" in statement or "FROM agent_triggers" in statement
     ]
-    assert len(trigger_lookup_queries) <= 4
+    assert len(trigger_lookup_queries) <= 2

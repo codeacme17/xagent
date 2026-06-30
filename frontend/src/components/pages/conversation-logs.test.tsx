@@ -24,10 +24,11 @@ vi.mock("@/lib/utils", async () => {
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string, vars?: Record<string, string | number>) => {
+    locale: "zh",
+    setLocale: vi.fn(),
+    t: (key: string) => {
       const labels: Record<string, string> = {
         "conversationLogs.title": "Conversation Logs",
-        "conversationLogs.logs": "logs",
         "conversationLogs.searchPlaceholder": "Search conversations",
         "conversationLogs.agentFilterAll": "All agents",
         "conversationLogs.readOnly": "Read-only",
@@ -39,9 +40,6 @@ vi.mock("@/contexts/i18n-context", () => ({
         "conversationLogs.sources.sharedLink": "Shareable Link",
         "conversationLogs.sources.webhook": "Webhook",
       }
-      if (key === "conversationLogs.pagination.summary" && vars) {
-        return `Showing ${vars.from}-${vars.to} of ${vars.total}`
-      }
       return labels[key] || key
     },
   }),
@@ -51,21 +49,16 @@ vi.mock("lucide-react", () => {
   const Icon = (props: React.SVGProps<SVGSVGElement>) => <svg {...props} />
   return {
     Bot: Icon,
-    CalendarClock: Icon,
     ChevronLeft: Icon,
     ChevronRight: Icon,
-    Clock3: Icon,
-    Filter: Icon,
     Inbox: Icon,
-    MessageSquare: Icon,
-    MessageSquareText: Icon,
     Search: Icon,
-    ShieldCheck: Icon,
-    Tags: Icon,
   }
 })
 
 import { ConversationLogsPage } from "./conversation-logs"
+
+const NativeRelativeTimeFormat = Intl.RelativeTimeFormat
 
 const listPayload = {
   logs: [
@@ -202,6 +195,7 @@ describe("ConversationLogsPage", () => {
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
   })
 
   it("loads logs, source tabs, and a read-only selected transcript", async () => {
@@ -217,6 +211,27 @@ describe("ConversationLogsPage", () => {
     expect(screen.getByText("Read-only")).toBeInTheDocument()
     expect(screen.queryByText("Upload")).not.toBeInTheDocument()
     expect(screen.queryByText("Send")).not.toBeInTheDocument()
+  })
+
+  it("formats relative times with the app locale", async () => {
+    const relativeTimeFormatMock = vi.fn(
+      (locale?: Intl.LocalesArgument, options?: Intl.RelativeTimeFormatOptions) =>
+        new NativeRelativeTimeFormat(locale, options)
+    )
+    vi.stubGlobal("Intl", {
+      ...Intl,
+      RelativeTimeFormat: relativeTimeFormatMock,
+    })
+
+    render(<ConversationLogsPage />)
+
+    await screen.findByText("Conversation Logs")
+    await waitFor(() => {
+      expect(relativeTimeFormatMock).toHaveBeenCalled()
+    })
+    expect(relativeTimeFormatMock.mock.calls.every(([locale]) => locale === "zh")).toBe(
+      true
+    )
   })
 
   it("sends source tab and search state to the list API", async () => {

@@ -35,7 +35,15 @@ SOURCE_ORDER = [
     SOURCE_SHARED_LINK,
     SOURCE_WEBHOOK,
 ]
-EXTERNAL_TASK_SOURCES = {"sdk", "trigger", "widget", "shared_link"}
+DIRECT_SOURCE_TO_UI_SOURCE = {
+    "sdk": SOURCE_REST_API,
+    "widget": SOURCE_WIDGET,
+    "shared_link": SOURCE_SHARED_LINK,
+}
+TRIGGER_TYPE_TO_UI_SOURCE = {
+    "webhook": SOURCE_WEBHOOK,
+}
+EXTERNAL_TASK_SOURCES = {*DIRECT_SOURCE_TO_UI_SOURCE, "trigger"}
 
 
 def _status_value(task: Task) -> str:
@@ -69,17 +77,17 @@ def _trigger_type_for_task(db: Session, task: Task) -> str | None:
     return None
 
 
+def _ui_source_from_values(source: str, trigger_type: str | None) -> str | None:
+    if source in DIRECT_SOURCE_TO_UI_SOURCE:
+        return DIRECT_SOURCE_TO_UI_SOURCE[source]
+    if source == "trigger" and trigger_type:
+        return TRIGGER_TYPE_TO_UI_SOURCE.get(trigger_type)
+    return None
+
+
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
     source = str(getattr(task, "source", "") or "")
-    if source == "sdk":
-        return SOURCE_REST_API
-    if source == "widget":
-        return SOURCE_WIDGET
-    if source == "shared_link":
-        return SOURCE_SHARED_LINK
-    if source == "trigger" and _trigger_type_for_task(db, task) == "webhook":
-        return SOURCE_WEBHOOK
-    return None
+    return _ui_source_from_values(source, _trigger_type_for_task(db, task))
 
 
 def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
@@ -91,6 +99,7 @@ def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
 
 
 def _apply_external_task_scope(query: Any, user: User) -> Any:
+    """Admins can inspect hidden external conversation logs across all users."""
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
@@ -153,13 +162,17 @@ def _conversation_source_query(
         latest_trigger.type,
     )
     ui_source = case(
-        (Task.source == "sdk", SOURCE_REST_API),
-        (Task.source == "widget", SOURCE_WIDGET),
-        (Task.source == "shared_link", SOURCE_SHARED_LINK),
-        (
-            and_(Task.source == "trigger", trigger_type == "webhook"),
-            SOURCE_WEBHOOK,
-        ),
+        *[
+            (Task.source == source, ui_source)
+            for source, ui_source in DIRECT_SOURCE_TO_UI_SOURCE.items()
+        ],
+        *[
+            (
+                and_(Task.source == "trigger", trigger_type == trigger_type_value),
+                ui_source,
+            )
+            for trigger_type_value, ui_source in TRIGGER_TYPE_TO_UI_SOURCE.items()
+        ],
         else_=None,
     ).label("ui_source")
 
@@ -189,7 +202,7 @@ def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
         "description": task.description,
         "status": _status_value(task),
         "source": ui_source,
-        "source_label": SOURCE_LABELS[ui_source],
+        "source_label": SOURCE_LABELS.get(ui_source, ui_source),
         "stored_source": task.source,
         "agent_id": int(task.agent_id) if task.agent_id is not None else None,
         "agent_name": agent.name if agent else None,
@@ -264,30 +277,27 @@ def _serialize_public_context(task: Task, ui_source: str) -> dict[str, Any] | No
     return None
 
 
-def _source_counts_from_query(query: Any, ui_source: Any) -> dict[str, int]:
+def _source_summary_from_query(
+    query: Any, ui_source: Any
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
     counts = {source: 0 for source in SOURCE_ORDER}
-    rows = (
-        query.with_entities(ui_source, func.count(Task.id))
-        .filter(ui_source.isnot(None))
-        .group_by(ui_source)
-        .all()
-    )
-    for source, count in rows:
-        if source in counts:
-            counts[source] = int(count)
-    return {"all": sum(counts.values()), **counts}
-
-
-def _agent_options_from_query(query: Any, ui_source: Any) -> list[dict[str, Any]]:
     options: dict[int, dict[str, Any]] = {}
     rows = (
         query.outerjoin(Agent, Agent.id == Task.agent_id)
-        .with_entities(Task.agent_id, Agent.name, Agent.logo_url)
-        .filter(Task.agent_id.isnot(None), ui_source.isnot(None))
-        .distinct()
+        .with_entities(
+            ui_source,
+            Task.agent_id,
+            Agent.name,
+            Agent.logo_url,
+            func.count(Task.id),
+        )
+        .filter(ui_source.isnot(None))
+        .group_by(ui_source, Task.agent_id, Agent.name, Agent.logo_url)
         .all()
     )
-    for task_agent_id, agent_name, agent_logo_url in rows:
+    for source, task_agent_id, agent_name, agent_logo_url, count in rows:
+        if source in counts:
+            counts[source] += int(count)
         if task_agent_id is None:
             continue
         option_agent_id = int(task_agent_id)
@@ -298,7 +308,20 @@ def _agent_options_from_query(query: Any, ui_source: Any) -> list[dict[str, Any]
             "agent_name": agent_name or f"Agent {option_agent_id}",
             "agent_logo_url": agent_logo_url,
         }
-    return sorted(options.values(), key=lambda item: item["agent_name"].casefold())
+    return {"all": sum(counts.values()), **counts}, sorted(
+        options.values(), key=lambda item: item["agent_name"].casefold()
+    )
+
+
+def _latest_message_activity_subquery(db: Session) -> Any:
+    return (
+        db.query(
+            TaskChatMessage.task_id.label("task_id"),
+            func.max(TaskChatMessage.created_at).label("last_message_at"),
+        )
+        .group_by(TaskChatMessage.task_id)
+        .subquery()
+    )
 
 
 def _load_tasks_by_id(db: Session, user: User, task_ids: list[int]) -> dict[int, Task]:
@@ -330,18 +353,27 @@ async def list_conversation_logs(
         agent_id=agent_id,
         search=search_value,
     )
-    source_counts = _source_counts_from_query(source_query, ui_source)
-    agent_options = _agent_options_from_query(source_query, ui_source)
+    source_counts, agent_options = _source_summary_from_query(source_query, ui_source)
 
     filtered_query = source_query.filter(ui_source.isnot(None))
     if normalized_source != "all":
         filtered_query = filtered_query.filter(ui_source == normalized_source)
 
-    total = int(filtered_query.count())
+    total = int(source_counts[normalized_source])
     start = (page - 1) * per_page
+    latest_message_activity = _latest_message_activity_subquery(db)
+    last_activity_at = func.coalesce(
+        latest_message_activity.c.last_message_at,
+        Task.updated_at,
+        Task.created_at,
+    )
     page_rows = (
-        filtered_query.with_entities(Task.id, ui_source)
-        .order_by(Task.updated_at.desc(), Task.id.desc())
+        filtered_query.outerjoin(
+            latest_message_activity,
+            latest_message_activity.c.task_id == Task.id,
+        )
+        .with_entities(Task.id, ui_source)
+        .order_by(last_activity_at.desc(), Task.id.desc())
         .offset(start)
         .limit(per_page)
         .all()

@@ -77,9 +77,6 @@ const zh = {
     title: "会话日志",
     subtitle:
       "来自已部署 Agent 的终端用户会话，覆盖 Widget、REST API、分享链接和 Webhook 渠道。你自己的工作区任务仍保留在全部任务中。",
-    logs: "条日志",
-    listTitle: "会话",
-    transcript: "对话记录",
     readOnly: "只读",
     lastActivity: "最近活动：",
     searchPlaceholder: "搜索会话",
@@ -93,22 +90,6 @@ const zh = {
       restApi: "REST API",
       sharedLink: "分享链接",
       webhook: "Webhook",
-    },
-    metrics: {
-      taskId: "任务",
-      tokens: "Tokens",
-      messages: "消息",
-    },
-    metadata: {
-      source: "来源",
-      created: "创建时间",
-      updated: "更新时间",
-      triggerRun: "触发运行",
-      sourceEvent: "来源事件",
-      publicContext: "公开上下文",
-    },
-    pagination: {
-      summary: "显示 {from}-{to} / 共 {total}",
     },
     empty: {
       title: "暂无会话日志",

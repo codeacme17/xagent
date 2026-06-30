@@ -17,5 +17,11 @@ describe("sidebar navigation", () => {
         }),
       ])
     )
+
+    const channels = more?.children?.find((item) => item.href === "/channels")
+    const conversationLogs = more?.children?.find(
+      (item) => item.href === "/conversation-logs"
+    )
+    expect(conversationLogs?.icon).not.toBe(channels?.icon)
   })
 })

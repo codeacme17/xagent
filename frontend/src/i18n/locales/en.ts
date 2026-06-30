@@ -77,9 +77,6 @@ const en = {
     title: "Conversation Logs",
     subtitle:
       "End-user conversations from your deployed agents - across Widget, REST API, Shareable Link, and Webhook channels. Your own workspace tasks stay under All Tasks.",
-    logs: "logs",
-    listTitle: "Conversations",
-    transcript: "Transcript",
     readOnly: "Read-only",
     lastActivity: "Last activity:",
     searchPlaceholder: "Search conversations",
@@ -93,22 +90,6 @@ const en = {
       restApi: "REST API",
       sharedLink: "Shareable Link",
       webhook: "Webhook",
-    },
-    metrics: {
-      taskId: "Task",
-      tokens: "Tokens",
-      messages: "Messages",
-    },
-    metadata: {
-      source: "Source",
-      created: "Created",
-      updated: "Updated",
-      triggerRun: "Trigger run",
-      sourceEvent: "Source event",
-      publicContext: "Public context",
-    },
-    pagination: {
-      summary: "Showing {from}-{to} of {total}",
     },
     empty: {
       title: "No conversation logs yet",

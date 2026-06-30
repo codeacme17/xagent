@@ -16,6 +16,9 @@ down_revision: str | tuple[str, str] | None = "20260627_seed_meta_connectors"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+LEGACY_WIDGET_CHANNEL_NAME = "Web Widget"
+LEGACY_SHARED_LINK_CHANNEL_NAME = "Shared Agent"
+
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -54,7 +57,7 @@ def upgrade() -> None:
         .where(
             legacy_public_source,
             tasks.c.is_visible.is_(True),
-            tasks.c.channel_name == "Web Widget",
+            tasks.c.channel_name == LEGACY_WIDGET_CHANNEL_NAME,
         )
         .values(source="widget", is_visible=False)
     )
@@ -63,12 +66,15 @@ def upgrade() -> None:
         .where(
             legacy_public_source,
             tasks.c.is_visible.is_(True),
-            tasks.c.channel_name == "Shared Agent",
+            tasks.c.channel_name == LEGACY_SHARED_LINK_CHANNEL_NAME,
         )
         .values(source="shared_link", is_visible=False)
     )
 
 
 def downgrade() -> None:
-    # Data migration is intentionally not reversed.
+    # Irreversible data migration: upgrade() rewrites matching tasks.source from
+    # NULL/internal to widget/shared_link and flips matching visible external
+    # tasks to hidden. The original NULL-vs-internal value is not retained, so
+    # operators must restore those rows manually if a rollback needs old data.
     pass
