@@ -45,6 +45,25 @@ SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> Any:
+    from ..services.gmail_triggers import ensure_gmail_watches_for_user as _ensure
+
+    return _ensure(db, user_id=user_id)
+
+
+def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
+    try:
+        ensure_gmail_watches_for_user(db, user_id=user_id)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to ensure Gmail watches for user %s after OAuth callback: %s",
+            user_id,
+            exc,
+            exc_info=True,
+        )
+
+
 def _oauth_env_name(provider: str, suffix: str) -> str:
     return f"{provider.upper()}_{suffix}"
 
@@ -1359,6 +1378,8 @@ def generic_oauth_callback(
                     _ensure_user_mcp_server(db, user_id, app_info)
 
             db.commit()
+            if (app_id or provider) == "gmail":
+                _best_effort_ensure_gmail_watches_for_user(db, user_id=int(user_id))
 
         import json
         from urllib.parse import urlparse

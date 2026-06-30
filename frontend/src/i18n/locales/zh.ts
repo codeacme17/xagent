@@ -3118,10 +3118,6 @@ Build when you need.`,
         title: "Gmail",
         description: "当 Gmail 收到新邮件时运行 Agent"
       },
-      appWidget: {
-        title: "App Widget",
-        description: "在任意网站或应用中嵌入聊天气泡"
-      },
       activeCount: "{count} Active"
     },
     builder: {
@@ -3166,6 +3162,7 @@ Build when you need.`,
       secretEditPlaceholder: "留空则保留当前 secret",
       watchLabel: "监听标签 / 文件夹",
       watchLabelPlaceholder: "INBOX",
+      watchLabelHelp: "使用 * 或 all 可匹配任意标签。该值不区分大小写。",
       senderFilter: "按发件人过滤（可选）",
       senderFilterPlaceholder: "例如 @acme.com 或 boss@company.com",
       subjectKeyword: "按主题关键词过滤（可选）",
@@ -3197,20 +3194,6 @@ Build when you need.`,
       notConnected: "连接 Gmail 后才能启用此触发器",
       notConnectedDescription: "依赖新邮件事件前，请先连接官方 Gmail Connector。",
       connect: "连接 Gmail"
-    },
-    appWidget: {
-      info: "App Widget 允许访客通过嵌入式聊天气泡与此 Agent 对话。",
-      allowedDomains: "允许的域名",
-      allowedDomainsDescription: "限制 Widget 只能在可信域名访问。使用 * 允许所有域名。",
-      domainPlaceholder: "例如 example.com",
-      addDomain: "添加",
-      removeDomain: "移除域名",
-      noDomains: "还没有配置域名。添加域名或 * 前，Widget 请求会被拦截。",
-      embedTitle: "嵌入代码",
-      embedDescription: "将这段 script 复制到需要显示聊天气泡的页面。",
-      copySnippet: "复制代码",
-      updated: "Widget 配置已更新",
-      updateFailed: "更新 Widget 配置失败"
     },
     test: {
       title: "测试运行",

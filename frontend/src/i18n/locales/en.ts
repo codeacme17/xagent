@@ -3118,10 +3118,6 @@ Build when you need.`,
         title: "Gmail",
         description: "Run the agent when a new email arrives in Gmail"
       },
-      appWidget: {
-        title: "App Widget",
-        description: "Embed a chat bubble on any website or app"
-      },
       activeCount: "{count} Active"
     },
     builder: {
@@ -3166,6 +3162,7 @@ Build when you need.`,
       secretEditPlaceholder: "Leave blank to keep the current secret",
       watchLabel: "Watch label / folder",
       watchLabelPlaceholder: "INBOX",
+      watchLabelHelp: "Use * or all to match any label. Value is case-insensitive.",
       senderFilter: "Filter by sender (optional)",
       senderFilterPlaceholder: "e.g. @acme.com or boss@company.com",
       subjectKeyword: "Filter by subject keyword (optional)",
@@ -3197,20 +3194,6 @@ Build when you need.`,
       notConnected: "Connect Gmail to activate this trigger",
       notConnectedDescription: "Connect the official Gmail connector before relying on incoming email events.",
       connect: "Connect Gmail"
-    },
-    appWidget: {
-      info: "The app widget lets visitors start a chat with this agent from an embedded bubble.",
-      allowedDomains: "Allowed domains",
-      allowedDomainsDescription: "Restrict widget access to trusted domains. Use * to allow any domain.",
-      domainPlaceholder: "e.g. example.com",
-      addDomain: "Add",
-      removeDomain: "Remove domain",
-      noDomains: "No domains configured. Widget requests are blocked until a domain or * is added.",
-      embedTitle: "Embed snippet",
-      embedDescription: "Copy this script into the page where the chat bubble should appear.",
-      copySnippet: "Copy snippet",
-      updated: "Widget configuration updated",
-      updateFailed: "Failed to update widget configuration"
     },
     test: {
       title: "Test run",

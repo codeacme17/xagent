@@ -54,6 +54,25 @@ class TriggerSecretError(PermissionError):
     """Raised when a webhook secret does not match."""
 
 
+def ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> Any:
+    from .gmail_triggers import ensure_gmail_watches_for_user as _ensure
+
+    return _ensure(db, user_id=user_id)
+
+
+def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
+    try:
+        ensure_gmail_watches_for_user(db, user_id=user_id)
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to ensure Gmail watches for user %s: %s",
+            user_id,
+            exc,
+            exc_info=True,
+        )
+
+
 @dataclass(frozen=True)
 class _PreparedTriggerStart:
     run_id: int
@@ -290,6 +309,8 @@ def create_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
+    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
+        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
     return trigger, plain_secret
 
 
@@ -338,6 +359,8 @@ def update_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
+    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
+        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
     return trigger, plain_secret
 
 

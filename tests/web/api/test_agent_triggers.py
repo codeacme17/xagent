@@ -9,6 +9,7 @@ import pytest
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
+from xagent.web.models.user import User
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
 from xagent.web.services.triggers import (
     _compute_next_run_at,
@@ -274,6 +275,86 @@ def test_gmail_trigger_crud_persists_filters() -> None:
         "sender_filter": "",
         "subject_keyword": "invoice",
     }
+
+
+def test_enabled_gmail_trigger_create_best_effort_registers_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
+        calls.append(user_id)
+        raise RuntimeError("watch registration unavailable")
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.ensure_gmail_watches_for_user",
+        fake_ensure_gmail_watches_for_user,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX"},
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        assert calls == [int(admin.id)]
+    finally:
+        db.close()
+
+
+def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
+        calls.append(user_id)
+        raise RuntimeError("watch registration unavailable")
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.ensure_gmail_watches_for_user",
+        fake_ensure_gmail_watches_for_user,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "enabled": False,
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX"},
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert calls == []
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={"enabled": True},
+    )
+
+    assert patched.status_code == 200, patched.text
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        assert calls == [int(admin.id)]
+    finally:
+        db.close()
 
 
 def test_gmail_trigger_requires_watch_label() -> None:

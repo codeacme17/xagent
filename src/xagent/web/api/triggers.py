@@ -4,10 +4,11 @@ import base64
 import binascii
 import json
 import logging
+import secrets
 from datetime import datetime
 from typing import Any, Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -428,6 +429,7 @@ async def receive_webhook_trigger(
 )
 async def receive_gmail_pubsub_trigger(
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
 ) -> GmailPubsubResponse:
     expected_token = get_gmail_pubsub_push_token()
@@ -439,7 +441,7 @@ async def receive_gmail_pubsub_trigger(
     provided_token = request.headers.get(
         "x-xagent-gmail-pubsub-token"
     ) or request.query_params.get("token")
-    if provided_token != expected_token:
+    if not secrets.compare_digest(provided_token or "", expected_token):
         raise HTTPException(status_code=401, detail="Invalid Gmail Pub/Sub token")
 
     try:
@@ -452,8 +454,9 @@ async def receive_gmail_pubsub_trigger(
         result = await process_gmail_pubsub_notification(db, notification)
     except GmailTriggerError as exc:
         logger.warning("Gmail Pub/Sub notification rejected: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    response.status_code = result.status_code
     return GmailPubsubResponse(
         processed=result.processed,
         duplicates=result.duplicates,
