@@ -50,7 +50,7 @@ export function AgentWidgetSettingsDialog({
   onWidgetConfigUpdated,
 }: AgentWidgetSettingsDialogProps) {
   const { t } = useI18n()
-  const [appOrigin, setAppOrigin] = useState("")
+  const [appOrigin, setAppOrigin] = useState(() => getBrowserLocationOrigin())
   const [widgetState, setWidgetState] = useState<AgentWidgetConfig>(widgetConfig)
   const [newDomain, setNewDomain] = useState("")
   const [isUpdating, setIsUpdating] = useState(false)
@@ -77,10 +77,9 @@ export function AgentWidgetSettingsDialog({
     : []
 
   const widgetSnippet = useMemo(() => {
-    if (!agentId) return ""
-    const origin = appOrigin || getApiUrl()
+    if (!agentId || !appOrigin) return ""
     return `<script
-  src="${origin}/widget.js"
+  src="${appOrigin}/widget.js"
   data-agent-id="${agentId}"
   data-button-size="60px"
   data-button-color="#000"
@@ -133,10 +132,10 @@ export function AgentWidgetSettingsDialog({
   }
 
   const handleAddDomain = () => {
-    const domain = newDomain.trim()
+    const domain = newDomain.trim().toLowerCase()
     if (!domain) return
     const existingDomains = new Set(allowedDomains.map((item) => item.toLowerCase()))
-    if (existingDomains.has(domain.toLowerCase())) {
+    if (existingDomains.has(domain)) {
       setNewDomain("")
       return
     }

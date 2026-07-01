@@ -111,11 +111,11 @@ describe("AgentWidgetSettingsDialog", () => {
     expect(toastSuccessMock).toHaveBeenCalledWith("appWidget.messages.updated")
   })
 
-  it("adds an allowed domain through the agent update endpoint", async () => {
+  it("adds a normalized allowed domain through the agent update endpoint", async () => {
     const { onWidgetConfigUpdated } = renderDialog()
 
     fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
-      target: { value: "docs.example.com" },
+      target: { value: "Docs.Example.com" },
     })
     fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
 
@@ -149,7 +149,7 @@ describe("AgentWidgetSettingsDialog", () => {
     renderDialog()
 
     fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
-      target: { value: "example.com" },
+      target: { value: "Example.com" },
     })
     fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
 
@@ -180,6 +180,8 @@ describe("AgentWidgetSettingsDialog", () => {
     await waitFor(() => {
       expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining("widget.js"))
     })
+    expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('src="http://app.local/widget.js"'))
+    expect(copyToClipboardMock).not.toHaveBeenCalledWith(expect.stringContaining("http://api.local/widget.js"))
     expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('data-agent-id="42"'))
     expect(toastSuccessMock).toHaveBeenCalledWith("common.copied")
   })
