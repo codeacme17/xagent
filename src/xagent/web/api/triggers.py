@@ -455,6 +455,18 @@ async def receive_gmail_pubsub_trigger(
     except GmailTriggerError as exc:
         logger.warning("Gmail Pub/Sub notification rejected: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(
+            "Unexpected error processing Gmail Pub/Sub notification for %s"
+            " (historyId=%s): %s",
+            notification.email_address,
+            notification.history_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail="Failed to process Gmail Pub/Sub notification"
+        ) from exc
 
     response.status_code = result.status_code
     return GmailPubsubResponse(

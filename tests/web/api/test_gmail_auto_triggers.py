@@ -1075,6 +1075,66 @@ def test_process_gmail_pubsub_notification_skips_deleted_message_and_advances_cu
         db.close()
 
 
+def test_process_gmail_pubsub_notification_skips_forbidden_message_and_advances_cursor(
+    mock_bg_scheduler,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-forbidden-message-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(db, user)
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [
+                    {
+                        "messagesAdded": [
+                            {"message": {"id": "forbidden-msg"}},
+                            {"message": {"id": "msg-2", "threadId": "thread-2"}},
+                        ]
+                    }
+                ]
+            },
+            messages={
+                "forbidden-msg": _FakeHttpError(403, "insufficient scope"),
+                "msg-2": _gmail_message("msg-2"),
+            },
+        )
+
+        result = asyncio.run(
+            process_gmail_pubsub_notification(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-forbidden",
+                ),
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert result.processed == 1
+        assert result.skipped == 1
+        run = (
+            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
+        )
+        assert run.source_event_id == "gmail:msg-2"
+        db.refresh(state)
+        assert state.history_id == "222"
+        assert state.last_error is None
+        assert mock_bg_scheduler.call_count == 1
+    finally:
+        db.close()
+
+
 def test_process_gmail_pubsub_notification_fails_batch_on_transient_message_error_and_holds_cursor(
     mock_bg_scheduler,
 ) -> None:

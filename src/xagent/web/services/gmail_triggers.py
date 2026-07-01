@@ -229,6 +229,17 @@ def _exception_status_code(exc: Exception) -> int | None:
         return None
 
 
+# Message-level failures in this set are permanent for a given message id
+# (deleted/inaccessible, malformed, unauthorized, or rate-limited) and should
+# be skipped rather than held for Pub/Sub redelivery, which would otherwise
+# re-hit the same error on every retry and wedge the history cursor.
+_NON_RETRIABLE_MESSAGE_STATUS_CODES = frozenset({400, 403, 404, 410, 429})
+
+
+def _is_non_retriable_message_error(exc: Exception) -> bool:
+    return _exception_status_code(exc) in _NON_RETRIABLE_MESSAGE_STATUS_CODES
+
+
 def _record_watch_state_error(
     db: Session,
     *,
@@ -678,7 +689,7 @@ async def process_gmail_pubsub_notification(
             try:
                 message = _get_gmail_message(service, message_id)
             except Exception as exc:
-                if _exception_status_code(exc) in (404, 410):
+                if _is_non_retriable_message_error(exc):
                     logger.warning(
                         "Skipping inaccessible Gmail message %s for %s: %s",
                         message_id,
@@ -696,6 +707,10 @@ async def process_gmail_pubsub_notification(
                 if not _trigger_matches_message(trigger, payload):
                     continue
                 matched = True
+                # Pub/Sub delivers at-least-once and a raised GmailTriggerError
+                # below causes the whole notification to be redelivered, so
+                # this source_event_id is the dedup key that keeps a retried
+                # batch from firing the same message twice.
                 run, created = await fire_trigger(
                     db,
                     trigger=trigger,
