@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest'
 import {
   getInlineFileDownloadUrl,
   getInlineFilePreviewKind,
+  getInlineFilePreviewMimeType,
   getInlineFilePreviewUrl,
   getPreviewUrlTrust,
+  resolveInlineFileId,
 } from './inline-file-preview-utils'
 
 describe('inline-file-preview-utils', () => {
@@ -205,5 +207,35 @@ describe('inline-file-preview-utils', () => {
 
   it('returns an empty string when no file id or preview URL is available', () => {
     expect(getInlineFileDownloadUrl({ filename: 'anon.bin' }, 'http://api.local')).toBe('')
+  })
+
+  it('extracts bare uuid from file paths that include a filename suffix', () => {
+    expect(
+      resolveInlineFileId('550e8400-e29b-41d4-a716-446655440000/linkedin.png')
+    ).toBe('550e8400-e29b-41d4-a716-446655440000')
+  })
+
+  it('extracts bare uuid from paths with leading slashes', () => {
+    expect(
+      resolveInlineFileId('/550e8400-e29b-41d4-a716-446655440000/linkedin.png')
+    ).toBe('550e8400-e29b-41d4-a716-446655440000')
+  })
+
+  it('returns legacy paths unchanged when the first segment is not a uuid', () => {
+    expect(resolveInlineFileId('output/screenshot.png')).toBe('output/screenshot.png')
+  })
+
+  it('maps preview kinds to default OOXML mime types', () => {
+    expect(getInlineFilePreviewMimeType('presentation')).toBe(
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    )
+    expect(getInlineFilePreviewMimeType('document')).toBe(
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    )
+    expect(getInlineFilePreviewMimeType('spreadsheet')).toBe(
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    expect(getInlineFilePreviewMimeType('image')).toBeUndefined()
+    expect(getInlineFilePreviewMimeType('file')).toBeUndefined()
   })
 })

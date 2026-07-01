@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -51,9 +51,13 @@ vi.mock("@/components/file/excel-preview-renderer", () => ({
 }))
 
 vi.mock("@/components/file/pptx-preview-renderer", () => ({
-  PptxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
-    <div data-testid="pptx-preview">{base64Content}</div>
-  ),
+  PptxPreviewRenderer: ({
+    base64Content,
+    fileId,
+  }: {
+    base64Content?: string
+    fileId?: string
+  }) => <div data-testid="pptx-preview">{base64Content ?? fileId ?? ""}</div>,
 }))
 
 import { TraceEventRenderer } from "./TraceEventRenderer"
@@ -70,6 +74,11 @@ describe("TraceEventRenderer", () => {
   })
 
   it("renders image artifacts inline from tool results", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(["image-bytes"], { type: "image/png" }),
+    })
+
     render(
       <TraceEventRenderer
         events={[
@@ -116,21 +125,17 @@ describe("TraceEventRenderer", () => {
       }),
     )
 
-    const image = screen.getByAltText("generated_image.png")
-    expect(image).toHaveAttribute(
-      "src",
-      "http://api.local/api/files/public/preview/582e7b79-4de9-4905-b73b-7d5a70ad64fe",
+    const image = await screen.findByAltText("generated_image.png")
+    await waitFor(() => {
+      expect(image.getAttribute("src")).toMatch(/^blob:/)
+    })
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/files/preview/582e7b79-4de9-4905-b73b-7d5a70ad64fe",
+      expect.objectContaining({ cache: "no-cache" }),
     )
   })
 
   it("renders pptx artifacts inline through PptxPreviewRenderer", async () => {
-    // Arbitrary sentinel bytes; base64 encodes to "AQI=". See
-    // inline-file-preview.test.tsx for why we avoid "PK" here.
-    apiRequestMock.mockResolvedValue({
-      ok: true,
-      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
-    })
-
     render(
       <TraceEventRenderer
         events={[
@@ -177,14 +182,12 @@ describe("TraceEventRenderer", () => {
       }),
     )
 
-    // Browsers can't render raw .pptx in an iframe, and the backend's
-    // /api/files/public/preview endpoint now returns the raw bytes, so
-    // we mirror the docx/xlsx path: fetch + base64 + canvas render
-    // via pptxviewjs.
-    expect(await screen.findByTestId("pptx-preview")).toHaveTextContent("AQI=")
-    expect(apiRequestMock).toHaveBeenCalledWith(
+    // Managed fileId path: mount PptxPreviewRenderer immediately and let it
+    // probe the PDF endpoint first instead of eagerly downloading raw bytes.
+    expect(await screen.findByTestId("pptx-preview")).toHaveTextContent("slides-file-id")
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
       "http://api.local/api/files/public/preview/slides-file-id",
-      expect.objectContaining({ cache: "no-cache" }),
+      expect.anything(),
     )
   })
 

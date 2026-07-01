@@ -39,6 +39,12 @@ class _FakeStorageFactory:
     def get_vector_index_store(self) -> object:
         return object()
 
+    def get_ingestion_status_store(self) -> object:
+        return object()
+
+    def get_main_pointer_store(self) -> object:
+        return object()
+
 
 class _StorageAccessSentinel:
     def get_metadata_store(self) -> object:
@@ -488,6 +494,8 @@ def test_open_collection_rejects_unsupported_backend() -> None:
         hide_missing=False,
         metadata_store=factory.get_metadata_store(),
         vector_index_store=factory.get_vector_index_store(),
+        ingestion_status_store=factory.get_ingestion_status_store(),
+        main_pointer_store=factory.get_main_pointer_store(),
         backend=cast(KBStorageBackend, UnsupportedBackend()),
         capabilities=KBBackendCapabilities.unsupported(),
         collection_info=None,
@@ -619,6 +627,25 @@ def test_storage_factory_reset_all_resets_kb_coordinator_state() -> None:
     second = get_kb_coordinator()
 
     assert second is not first
+
+
+@pytest.mark.asyncio
+async def test_get_context_carries_status_and_pointer_stores() -> None:
+    """Given a real coordinator, get_context carries ingestion-status and main-pointer stores."""
+    from xagent.core.tools.core.RAG_tools.kb import (
+        KBContextRequest,
+        get_kb_coordinator,
+    )
+
+    coordinator = get_kb_coordinator()
+    shim = coordinator.storage_shim
+
+    ctx = await coordinator.get_context(
+        KBContextRequest(collection="c", is_admin=True, hide_missing=True)
+    )
+
+    assert ctx.ingestion_status_store is shim.get_ingestion_status_store()
+    assert ctx.main_pointer_store is shim.get_main_pointer_store()
 
 
 def test_existing_rag_storage_and_management_imports_still_work() -> None:

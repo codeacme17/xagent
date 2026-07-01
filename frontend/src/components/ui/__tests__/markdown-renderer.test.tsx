@@ -10,6 +10,8 @@ vi.mock('@/lib/utils', () => ({
   getApiUrl: () => 'http://api.local',
   getFilePublicPreviewUrl: (fileId: string, apiUrl = 'http://api.local') =>
     `${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}`,
+  getFilePublicDownloadUrl: (fileId: string, apiUrl = 'http://api.local') =>
+    `${apiUrl}/api/files/public/download/${encodeURIComponent(fileId)}`,
 }))
 
 vi.mock('@/lib/api-wrapper', () => ({
@@ -29,9 +31,13 @@ vi.mock('@/components/file/excel-preview-renderer', () => ({
 }))
 
 vi.mock('@/components/file/pptx-preview-renderer', () => ({
-  PptxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
-    <div data-testid="pptx-preview">{base64Content}</div>
-  ),
+  PptxPreviewRenderer: ({
+    base64Content,
+    fileId,
+  }: {
+    base64Content?: string
+    fileId?: string
+  }) => <div data-testid="pptx-preview">{base64Content ?? fileId ?? ''}</div>,
 }))
 
 vi.mock('@/contexts/i18n-context', () => ({
@@ -85,6 +91,20 @@ describe('MarkdownRenderer', () => {
     expect(mathElements.length).toBe(0)
   })
 
+  it('passes resolved file id to onFileClick for non-previewable file links', () => {
+    const handleFileClick = vi.fn()
+    const content = '[archive.zip](file:550e8400-e29b-41d4-a716-446655440000/archive.zip)'
+
+    render(<MarkdownRenderer content={content} onFileClick={handleFileClick} />)
+
+    fireEvent.click(screen.getByText('archive.zip'))
+
+    expect(handleFileClick).toHaveBeenCalledWith(
+      '550e8400-e29b-41d4-a716-446655440000',
+      'archive.zip'
+    )
+  })
+
   it('handles file: links with onFileClick callback', () => {
     const handleFileClick = vi.fn()
     const content = '[open file](file:/tmp/test.txt)'
@@ -99,24 +119,17 @@ describe('MarkdownRenderer', () => {
   })
 
   it('renders pptx file links as inline previews', async () => {
-    // Arbitrary sentinel bytes; base64 encodes to "AQI=". See
-    // inline-file-preview.test.tsx for why we avoid "PK" here.
-    apiRequestMock.mockResolvedValue({
-      ok: true,
-      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
-    })
-
     const content = '[example_presentation.pptx](file:99fb81ab-b995-4976-be18-21b02f748768)'
     render(<MarkdownRenderer content={content} />)
 
-    // Browsers can't render raw .pptx in an iframe, and the backend's
-    // /api/files/public/preview endpoint now returns the raw bytes, so
-    // pptx inline previews are funnelled through PptxPreviewRenderer
-    // (canvas-based, pptxviewjs) — same fetch+base64 pattern as docx/xlsx.
-    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('AQI=')
-    expect(apiRequestMock).toHaveBeenCalledWith(
+    // Managed fileId path: mount PptxPreviewRenderer immediately and let it
+    // probe the PDF endpoint first instead of eagerly downloading raw bytes.
+    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent(
+      '99fb81ab-b995-4976-be18-21b02f748768'
+    )
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
       'http://api.local/api/files/public/preview/99fb81ab-b995-4976-be18-21b02f748768',
-      expect.objectContaining({ cache: 'no-cache' })
+      expect.anything()
     )
     expect(screen.queryByText('example_presentation.pptx')?.tagName.toLowerCase()).not.toBe('a')
   })
@@ -195,15 +208,61 @@ describe('MarkdownRenderer', () => {
     })
   })
 
-  it('does not run authenticated fallback for uuid file: images', async () => {
+  it('prefers link label over generic file id when determining preview kind', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[report.docx](file:doc-file-id)'
+
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('docx-preview')).toHaveTextContent('QUI=')
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/doc-file-id',
+      expect.objectContaining({ cache: 'no-cache' })
+    )
+  })
+
+  it('renders file links as image previews when the path has an image extension', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
+    const content = '[LinkedIn visual](file:550e8400-e29b-41d4-a716-446655440000/linkedin.png)'
+    render(<MarkdownRenderer content={content} />)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/550e8400-e29b-41d4-a716-446655440000',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const image = screen.getByAltText('LinkedIn visual')
+    await waitFor(() => {
+      expect(image.getAttribute('src')).toMatch(/^blob:/)
+    })
+  })
+
+  it('uses authenticated preview fallback for uuid file: images', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
     const content = '![uuid image](file:550e8400-e29b-41d4-a716-446655440000)'
     render(<MarkdownRenderer content={content} />)
 
     await waitFor(() => {
-      const image = screen.getByAltText('uuid image')
-      expect(image).toBeInTheDocument()
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/550e8400-e29b-41d4-a716-446655440000',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
     })
 
-    expect(apiRequestMock).not.toHaveBeenCalled()
+    const image = screen.getByAltText('uuid image')
+    await waitFor(() => {
+      expect(image.getAttribute('src')).toMatch(/^blob:/)
+    })
   })
 })

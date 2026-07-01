@@ -69,7 +69,7 @@ def _get_main_pointer_impl(
             user_id=None,
         )
     except Exception as e:
-        raise MainPointerError(f"Failed to get main pointer: {e}")
+        raise MainPointerError(f"Failed to get main pointer: {e}") from e
 
 
 def set_main_pointer(
@@ -139,9 +139,8 @@ def _set_main_pointer_impl(
             technical_id,
             semantic_id,
         )
-
     except Exception as e:
-        raise MainPointerError(f"Failed to set main pointer: {e}")
+        raise MainPointerError(f"Failed to set main pointer: {e}") from e
 
 
 def list_main_pointers(
@@ -176,9 +175,8 @@ def _list_main_pointers_impl(
             user_id=None,
             limit=100,
         )
-
     except Exception as e:
-        raise MainPointerError(f"Failed to list main pointers: {e}")
+        raise MainPointerError(f"Failed to list main pointers: {e}") from e
 
 
 def delete_main_pointer(
@@ -227,6 +225,5 @@ def _delete_main_pointer_impl(
                 "Deleted main pointer for %s/%s/%s", collection, doc_id, step_type
             )
         return result
-
     except Exception as e:
-        raise MainPointerError(f"Failed to delete main pointer: {e}")
+        raise MainPointerError(f"Failed to delete main pointer: {e}") from e

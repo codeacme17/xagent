@@ -10,7 +10,10 @@ import { useI18n } from '@/contexts/i18n-context'
 import { InlineFilePreview } from '@/components/file/inline-file-preview'
 import {
   getInlineFilePreviewKind,
+  getInlineFilePreviewMimeType,
   isPreviewableInlineFileKind,
+  resolveInlineFileId,
+  type PreviewableInlineFileKind,
 } from '@/components/file/inline-file-preview-utils'
 import { getApiUrl } from '@/lib/utils'
 
@@ -187,18 +190,6 @@ function hastText(node: any): string {
   return node.children.map(hastText).join('')
 }
 
-function containsPreviewFileLinkNode(node: any): boolean {
-  if (!node) return false
-  const href = node.properties?.href
-  if (typeof href === 'string' && href.startsWith('file:')) {
-    const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
-    const label = title || hastText(node)
-    if (isPreviewableInlineFileKind(getInlineFilePreviewKind({ filename: label }))) return true
-  }
-  if (!Array.isArray(node.children)) return false
-  return node.children.some(containsPreviewFileLinkNode)
-}
-
 const nodeText = (children: React.ReactNode): string => {
   return React.Children.toArray(children)
     .map((child) => {
@@ -211,6 +202,44 @@ const nodeText = (children: React.ReactNode): string => {
       return ''
     })
     .join('')
+}
+
+function resolvePreviewableFileLink({
+  fileNameFromPath,
+  fileName,
+}: {
+  fileNameFromPath: string
+  fileName: string
+}): { previewKind: PreviewableInlineFileKind; displayFilename: string } | null {
+  const pathKind = getInlineFilePreviewKind({ filename: fileNameFromPath })
+  if (isPreviewableInlineFileKind(pathKind)) {
+    return { previewKind: pathKind, displayFilename: fileName }
+  }
+
+  const labelKind = getInlineFilePreviewKind({ filename: fileName })
+  if (isPreviewableInlineFileKind(labelKind)) {
+    return { previewKind: labelKind, displayFilename: fileName }
+  }
+
+  return null
+}
+
+function containsPreviewFileLinkNode(node: any): boolean {
+  if (!node) return false
+  const href = node.properties?.href
+  if (typeof href === 'string' && href.startsWith('file:')) {
+    const filePath = href.replace(/^file:/, '')
+    const fileNameFromPath = filePath.split('/').pop() || filePath
+    const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
+    const label = title || hastText(node)
+    if (resolvePreviewableFileLink({ fileNameFromPath, fileName: label })) return true
+  }
+  const src = node.properties?.src
+  if (typeof src === 'string' && src.startsWith('file:')) {
+    return true
+  }
+  if (!Array.isArray(node.children)) return false
+  return node.children.some(containsPreviewFileLinkNode)
 }
 
 export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
@@ -238,13 +267,17 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
           const fileNameFromPath = filePath.split('/').pop() || filePath
           const linkText = nodeText(children).trim()
           const fileName = title || linkText || fileNameFromPath
+          const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+          const fileId = resolveInlineFileId(filePath)
 
-          if (isPreviewableInlineFileKind(getInlineFilePreviewKind({ filename: fileName }))) {
+          if (preview) {
             return (
               <InlineFilePreview
                 source={{
-                  fileId: filePath,
-                  filename: fileName,
+                  fileId,
+                  filename: preview.displayFilename,
+                  type: preview.previewKind,
+                  mimeType: getInlineFilePreviewMimeType(preview.previewKind),
                 }}
                 openLabel={t('files.previewDialog.buttons.open')}
                 loadErrorText={t('files.previewDialog.errors.loadFailed')}
@@ -257,7 +290,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
             if (onFileClick) {
               e.preventDefault()
               const fallbackTitle = title || linkText || fileNameFromPath
-              onFileClick(filePath, fallbackTitle)
+              onFileClick(fileId, fallbackTitle)
             }
           }
 
@@ -306,11 +339,12 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
       img({ node: _node, src, alt, title, ...props }) {
         if (src && src.startsWith('file:')) {
           const filePath = src.replace(/^file:/, '')
-          const fileName = title || alt || filePath.split('/').pop() || filePath
+          const fileNameFromPath = filePath.split('/').pop() || filePath
+          const fileName = title || alt || fileNameFromPath
           return (
             <InlineFilePreview
               source={{
-                fileId: filePath,
+                fileId: resolveInlineFileId(filePath),
                 filename: fileName,
                 type: 'image',
               }}

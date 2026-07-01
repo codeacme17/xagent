@@ -45,6 +45,23 @@ const SPREADSHEET_MIME_TYPES = new Set<string>([
   'text/csv',
 ])
 
+/** Default OOXML mime types for inline preview kinds (images vary by file). */
+export const INLINE_FILE_PREVIEW_MIME_BY_KIND: Partial<
+  Record<PreviewableInlineFileKind, string>
+> = {
+  presentation:
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  document: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  spreadsheet: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+}
+
+export const getInlineFilePreviewMimeType = (
+  kind: InlineFilePreviewKind
+): string | undefined => {
+  if (kind === 'file' || kind === 'image') return undefined
+  return INLINE_FILE_PREVIEW_MIME_BY_KIND[kind]
+}
+
 export const isPreviewableInlineFileKind = (
   kind: InlineFilePreviewKind
 ): kind is PreviewableInlineFileKind =>
@@ -196,3 +213,9 @@ export const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
 
 export const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/** When file refs use ``file:<uuid>/<filename>``, API routes expect the bare UUID. */
+export const resolveInlineFileId = (filePath: string): string => {
+  const firstSegment = filePath.split('/').find(Boolean) || ''
+  return UUID_PATTERN.test(firstSegment) ? firstSegment : filePath
+}

@@ -105,6 +105,19 @@ class KBVersionCompatibilityFacade:
         limit: int = 50,
         order_by: str = "created_at desc",
     ) -> Dict[str, Any]:
+        if self._coordinator is not None:
+            step_type_str = (
+                step_type.value if isinstance(step_type, StepType) else step_type
+            )
+            return self._coordinator.list_candidates_sync(
+                collection,
+                doc_id,
+                step_type_str,
+                model_tag=model_tag,
+                state=state,
+                limit=limit,
+                order_by=order_by,
+            )
         from ..version_management.list_candidates import _list_candidates_impl
 
         with self._storage_context():
@@ -129,6 +142,20 @@ class KBVersionCompatibilityFacade:
         confirm: bool = False,
         model_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._coordinator is not None:
+            step_type_str = (
+                step_type.value if isinstance(step_type, StepType) else step_type
+            )
+            return self._coordinator.promote_version_main_sync(
+                collection,
+                doc_id,
+                step_type_str,
+                selected_id,
+                operator=operator,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
         from ..version_management.promote_version_main import _promote_version_main_impl
 
         with self._storage_context():
@@ -150,6 +177,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if self._coordinator is not None:
+            return self._coordinator.get_main_pointer_sync(
+                collection, doc_id, step_type, model_tag=model_tag
+            )
         from ..version_management.main_pointer_manager import _get_main_pointer_impl
 
         with self._storage_context():
@@ -171,6 +202,18 @@ class KBVersionCompatibilityFacade:
         model_tag: Optional[str] = None,
         operator: Optional[str] = None,
     ) -> None:
+        if self._coordinator is not None:
+            # lancedb_dir is vestigial: drop it before delegating to the coordinator.
+            self._coordinator.set_main_pointer_sync(
+                collection,
+                doc_id,
+                step_type,
+                semantic_id,
+                technical_id,
+                model_tag=model_tag,
+                operator=operator,
+            )
+            return
         from ..version_management.main_pointer_manager import _set_main_pointer_impl
 
         with self._storage_context():
@@ -188,6 +231,8 @@ class KBVersionCompatibilityFacade:
     def list_main_pointers(
         self, collection: str, doc_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        if self._coordinator is not None:
+            return self._coordinator.list_main_pointers_sync(collection, doc_id=doc_id)
         from ..version_management.main_pointer_manager import _list_main_pointers_impl
 
         with self._storage_context():
@@ -200,6 +245,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.delete_main_pointer_sync(
+                collection, doc_id, step_type, model_tag=model_tag
+            )
         from ..version_management.main_pointer_manager import _delete_main_pointer_impl
 
         with self._storage_context():
@@ -217,6 +266,10 @@ class KBVersionCompatibilityFacade:
         step_type: str,
         model_tag: Optional[str] = None,
     ) -> KBMainPointerSnapshot:
+        if self._coordinator is not None:
+            return self._coordinator.capture_main_pointer_snapshot_sync(
+                collection, doc_id, step_type, model_tag
+            )
         return KBMainPointerSnapshot(
             collection=collection,
             doc_id=doc_id,
@@ -232,6 +285,10 @@ class KBVersionCompatibilityFacade:
         lancedb_dir: str = "",
         operator: Optional[str] = None,
     ) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.restore_main_pointer_snapshot_sync(
+                snapshot, operator=operator
+            )
         if snapshot.pointer is None:
             self.delete_main_pointer(
                 snapshot.collection,
@@ -276,6 +333,17 @@ class KBVersionCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: Optional[bool] = None,
     ) -> KBVersionCandidateCleanupSnapshot:
+        if self._coordinator is not None:
+            return self._coordinator.capture_candidate_cleanup_snapshot_sync(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
         cleanup_counts = self.cleanup_cascade(
             collection=collection,
             doc_id=doc_id,
@@ -306,6 +374,11 @@ class KBVersionCompatibilityFacade:
         *,
         cleanup_executed: bool = False,
     ) -> KBVersionCandidateRollbackResult:
+        if self._coordinator is not None:
+            return self._coordinator.restore_candidate_cleanup_snapshot_sync(
+                snapshot,
+                cleanup_executed=cleanup_executed,
+            )
         cleanup_counts = dict(snapshot.cleanup_counts)
         has_candidate_side_effects = any(
             int(count) > 0 for count in cleanup_counts.values()
@@ -375,6 +448,19 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_cascade_sync(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_cascade_impl
 
         with self._storage_context():
@@ -401,6 +487,16 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_document_cascade_sync(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_document_cascade_impl
 
         with self._storage_context():
@@ -425,6 +521,17 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_parse_cascade_sync(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_parse_cascade_impl
 
         with self._storage_context():
@@ -450,6 +557,17 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_chunk_cascade_sync(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_chunk_cascade_impl
 
         with self._storage_context():
@@ -476,6 +594,16 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        if self._coordinator is not None:
+            return self._coordinator.cleanup_embed_cascade_sync(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
         from ..version_management.cascade_cleaner import _cleanup_embed_cascade_impl
 
         with self._storage_context():

@@ -6,7 +6,7 @@ import asyncio
 import threading
 from collections.abc import Coroutine
 from contextvars import copy_context
-from typing import Any, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar
 
 from ..core.exceptions import (
     CascadeCleanupError,
@@ -25,7 +25,13 @@ from ..core.schemas import (
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
-from .collection_handle import KBHandleProvider, LanceDBCollectionHandle
+from .collection_handle import (
+    KBHandleProvider,
+    KBMainPointerSnapshot,
+    KBVersionCandidateCleanupSnapshot,
+    KBVersionCandidateRollbackResult,
+    LanceDBCollectionHandle,
+)
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
 from .maintenance_compatibility import KBMaintenanceCompatibilityFacade
@@ -280,6 +286,8 @@ class KBCoordinator:
         user_scope = self._resolve_user_scope(request)
         metadata_store = self._storage_shim.get_metadata_store()
         vector_index_store = self._storage_shim.get_vector_index_store()
+        ingestion_status_store = self._storage_shim.get_ingestion_status_store()
+        main_pointer_store = self._storage_shim.get_main_pointer_store()
 
         collection_info = None
         try:
@@ -301,6 +309,8 @@ class KBCoordinator:
             hide_missing=bool(request.hide_missing),
             metadata_store=metadata_store,
             vector_index_store=vector_index_store,
+            ingestion_status_store=ingestion_status_store,
+            main_pointer_store=main_pointer_store,
             backend=backend,
             capabilities=capabilities,
             collection_info=collection_info,
@@ -453,6 +463,244 @@ class KBCoordinator:
         return _run_in_separate_loop(
             self.delete_document_record(
                 collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    # --- Ingestion-status lifecycle (delegated to the collection handle) ---
+
+    async def write_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open the collection handle and write ingestion status (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.write_ingestion_status,
+            doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    def write_ingestion_status_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`write_ingestion_status`."""
+        _run_in_separate_loop(
+            self.write_ingestion_status(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+        )
+
+    async def write_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open the collection handle and write ingestion status (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                hide_missing=True,
+            )
+        )
+        await handle.write_ingestion_status_async(
+            doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    async def load_ingestion_status(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Delegate to the ingestion status store (async, collection-scoped).
+
+        # Status reads need no metadata/collection resolution; going direct keeps
+        # the nested-storage rebind test working and avoids an unnecessary collection
+        # lookup.
+        """
+        store = self._storage_shim.get_ingestion_status_store()
+        return await asyncio.to_thread(
+            store.load_ingestion_status,
+            collection=collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def load_ingestion_status_sync(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Synchronous wrapper for :meth:`load_ingestion_status`."""
+        return _run_in_separate_loop(
+            self.load_ingestion_status(
+                collection, doc_id=doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def load_ingestion_status_async(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Delegate to the ingestion status store (direct async, collection-scoped).
+
+        # Status reads need no metadata/collection resolution; going direct keeps
+        # the nested-storage rebind test working and avoids an unnecessary collection
+        # lookup.
+        """
+        store = self._storage_shim.get_ingestion_status_store()
+        return await store.load_ingestion_status_async(
+            collection=collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def clear_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Open the collection handle and clear ingestion status (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.clear_ingestion_status,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_ingestion_status_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Synchronous wrapper for :meth:`clear_ingestion_status`."""
+        _run_in_separate_loop(
+            self.clear_ingestion_status(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def clear_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Open the collection handle and clear ingestion status (direct async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        await handle.clear_ingestion_status_async(
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Open the old collection handle and rename status rows to ``new_name``."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=old_name,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.rename_collection_status,
+            new_name,
+            user_id,
+            is_admin,
+        )
+
+    def rename_collection_status_sync(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> list:
+        """Synchronous wrapper for :meth:`rename_collection_status`."""
+        return _run_in_separate_loop(
+            self.rename_collection_status(
+                old_name, new_name, user_id=user_id, is_admin=is_admin
             )
         )
 
@@ -731,6 +979,560 @@ class KBCoordinator:
 
         return warnings
 
+    # --- Main-pointer lifecycle (delegated to the collection handle) ---
+
+    async def get_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Open the collection handle and get a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.get_main_pointer, doc_id, step_type, model_tag
+        )
+
+    def get_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Synchronous wrapper for :meth:`get_main_pointer`."""
+        return _run_in_separate_loop(
+            self.get_main_pointer(collection, doc_id, step_type, model_tag=model_tag)
+        )
+
+    async def set_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Open the collection handle and set a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.set_main_pointer,
+            doc_id,
+            step_type,
+            semantic_id,
+            technical_id,
+            model_tag,
+            operator,
+        )
+
+    def set_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`set_main_pointer`."""
+        _run_in_separate_loop(
+            self.set_main_pointer(
+                collection,
+                doc_id,
+                step_type,
+                semantic_id,
+                technical_id,
+                model_tag=model_tag,
+                operator=operator,
+            )
+        )
+
+    async def list_main_pointers(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list:
+        """Open the collection handle and list main pointers (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(handle.list_main_pointers, doc_id, limit)
+
+    def list_main_pointers_sync(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list:
+        """Synchronous wrapper for :meth:`list_main_pointers`."""
+        return _run_in_separate_loop(
+            self.list_main_pointers(collection, doc_id=doc_id, limit=limit)
+        )
+
+    async def delete_main_pointer(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> bool:
+        """Open the collection handle and delete a main pointer (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.delete_main_pointer, doc_id, step_type, model_tag
+        )
+
+    def delete_main_pointer_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+    ) -> bool:
+        """Synchronous wrapper for :meth:`delete_main_pointer`."""
+        return _run_in_separate_loop(
+            self.delete_main_pointer(collection, doc_id, step_type, model_tag=model_tag)
+        )
+
+    async def list_candidates(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> dict:
+        """Open the collection handle and list version candidates (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.list_candidates,
+            doc_id,
+            step_type,
+            model_tag,
+            state,
+            limit,
+            order_by,
+        )
+
+    def list_candidates_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        *,
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> dict:
+        """Synchronous wrapper for :meth:`list_candidates`."""
+        return _run_in_separate_loop(
+            self.list_candidates(
+                collection,
+                doc_id,
+                step_type,
+                model_tag=model_tag,
+                state=state,
+                limit=limit,
+                order_by=order_by,
+            )
+        )
+
+    async def promote_version_main(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        selected_id: str,
+        *,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Open the collection handle and promote a version candidate to main (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=None,
+                is_admin=True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.promote_version_main,
+            doc_id,
+            step_type,
+            selected_id,
+            operator=operator,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=model_tag,
+        )
+
+    def promote_version_main_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        selected_id: str,
+        *,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`promote_version_main`."""
+        return _run_in_separate_loop(
+            self.promote_version_main(
+                collection,
+                doc_id,
+                step_type,
+                selected_id,
+                operator=operator,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
+        )
+
+    async def cleanup_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open the collection handle and run cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin if is_admin is not None else True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_cascade,
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_cascade(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_document_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run document cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_document_cascade,
+            doc_id,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_document_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_document_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_document_cascade(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_parse_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run parse cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_parse_cascade,
+            doc_id,
+            old_parse_hash=old_parse_hash,
+            new_parse_hash=new_parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_parse_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_parse_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_parse_cascade(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_chunk_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run chunk cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_chunk_cascade,
+            doc_id,
+            old_parse_hash=old_parse_hash,
+            new_parse_hash=new_parse_hash,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_chunk_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_chunk_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_chunk_cascade(
+                collection,
+                doc_id,
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
+    async def cleanup_embed_cascade(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Open collection handle and run embed cascade cleanup (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.cleanup_embed_cascade,
+            doc_id,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_embed_cascade_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for :meth:`cleanup_embed_cascade`."""
+        return _run_in_separate_loop(
+            self.cleanup_embed_cascade(
+                collection,
+                doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        )
+
     @staticmethod
     def _normalize_collection(collection: str) -> str:
         normalized = collection.strip() if isinstance(collection, str) else ""
@@ -801,6 +1603,287 @@ class KBCoordinator:
         if backend is KBStorageBackend.LANCEDB:
             return KBBackendCapabilities.lancedb()
         return KBBackendCapabilities.unsupported()
+
+    # --- Rollback snapshot/restore primitives (#513 Task 7) ---
+
+    async def capture_main_pointer_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> "KBMainPointerSnapshot":
+        """Open collection handle and capture a main-pointer snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_main_pointer_snapshot,
+            doc_id,
+            step_type,
+            model_tag,
+        )
+
+    def capture_main_pointer_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        step_type: str,
+        model_tag: Optional[str] = None,
+    ) -> "KBMainPointerSnapshot":
+        """Synchronous wrapper for :meth:`capture_main_pointer_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_main_pointer_snapshot(collection, doc_id, step_type, model_tag)
+        )
+
+    async def restore_main_pointer_snapshot(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: Optional[str] = None,
+    ) -> bool:
+        """Open collection handle and restore a main-pointer snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=snapshot.collection,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.restore_main_pointer_snapshot,
+            snapshot,
+            operator=operator,
+        )
+
+    def restore_main_pointer_snapshot_sync(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: Optional[str] = None,
+    ) -> bool:
+        """Synchronous wrapper for :meth:`restore_main_pointer_snapshot`."""
+        return _run_in_separate_loop(
+            self.restore_main_pointer_snapshot(snapshot, operator=operator)
+        )
+
+    async def capture_candidate_cleanup_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Open collection handle and capture a candidate-cleanup snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=bool(is_admin) if is_admin is not None else True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_candidate_cleanup_snapshot,
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def capture_candidate_cleanup_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Synchronous wrapper for :meth:`capture_candidate_cleanup_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_candidate_cleanup_snapshot(
+                collection,
+                doc_id,
+                scope,
+                new_parse_hash=new_parse_hash,
+                old_parse_hash=old_parse_hash,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        )
+
+    async def capture_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Open collection handle and capture an ingestion-status snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.capture_status_snapshot,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def capture_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Synchronous wrapper for :meth:`capture_status_snapshot`."""
+        return _run_in_separate_loop(
+            self.capture_status_snapshot(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def restore_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Open collection handle and restore an ingestion-status snapshot (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=True,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.restore_status_snapshot,
+            doc_id,
+            snapshot,
+            user_id=user_id,
+        )
+
+    def restore_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Synchronous wrapper for :meth:`restore_status_snapshot`."""
+        _run_in_separate_loop(
+            self.restore_status_snapshot(collection, doc_id, snapshot, user_id=user_id)
+        )
+
+    async def clear_status_snapshot(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Open collection handle and clear the ingestion-status row (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        await asyncio.to_thread(
+            handle.clear_status_snapshot,
+            doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_status_snapshot_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Synchronous wrapper for :meth:`clear_status_snapshot`."""
+        _run_in_separate_loop(
+            self.clear_status_snapshot(
+                collection, doc_id, user_id=user_id, is_admin=is_admin
+            )
+        )
+
+    async def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Open collection handle and assess rollback feasibility (async)."""
+        handle = await self.open_collection(
+            KBContextRequest(
+                collection=snapshot.collection,
+                user_id=snapshot.user_id,
+                is_admin=bool(snapshot.is_admin)
+                if snapshot.is_admin is not None
+                else True,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return await asyncio.to_thread(
+            handle.restore_candidate_cleanup_snapshot,
+            snapshot,
+            cleanup_executed=cleanup_executed,
+        )
+
+    def restore_candidate_cleanup_snapshot_sync(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Synchronous wrapper for :meth:`restore_candidate_cleanup_snapshot`."""
+        return _run_in_separate_loop(
+            self.restore_candidate_cleanup_snapshot(
+                snapshot, cleanup_executed=cleanup_executed
+            )
+        )
 
     def reset_compatibility_caches(self) -> None:
         """Clear coordinator-owned compatibility facade caches."""

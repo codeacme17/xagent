@@ -254,6 +254,16 @@ class KBCoreManagementCompatibilityFacade:
         parse_hash: Optional[str] = None,
         user_id: Optional[int] = None,
     ) -> None:
+        if self._coordinator is not None:
+            self._coordinator.write_ingestion_status_sync(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+            return
         from ..management import status as management_status
 
         with self._storage_context():
@@ -273,6 +283,15 @@ class KBCoreManagementCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
+        # When collection is None the caller wants ALL collections — a
+        # collection-bound handle cannot serve this case; keep the legacy path.
+        if self._coordinator is not None and collection is not None:
+            return self._coordinator.load_ingestion_status_sync(
+                collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
         from ..management import status as management_status
 
         with self._storage_context():
@@ -290,6 +309,14 @@ class KBCoreManagementCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> None:
+        if self._coordinator is not None:
+            self._coordinator.clear_ingestion_status_sync(
+                collection,
+                doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return
         from ..management import status as management_status
 
         with self._storage_context():
@@ -310,6 +337,16 @@ class KBCoreManagementCompatibilityFacade:
         parse_hash: Optional[str] = None,
         user_id: Optional[int] = None,
     ) -> None:
+        if self._coordinator is not None:
+            await self._coordinator.write_ingestion_status_async(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+            return
         from ..management import status as management_status
 
         with self._storage_context():
@@ -329,6 +366,15 @@ class KBCoreManagementCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
+        # When collection is None the caller wants ALL collections — a
+        # collection-bound handle cannot serve this case; keep the legacy path.
+        if self._coordinator is not None and collection is not None:
+            return await self._coordinator.load_ingestion_status_async(
+                collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
         from ..management import status as management_status
 
         with self._storage_context():
@@ -346,12 +392,75 @@ class KBCoreManagementCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> None:
+        if self._coordinator is not None:
+            await self._coordinator.clear_ingestion_status_async(
+                collection,
+                doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return
         from ..management import status as management_status
 
         with self._storage_context():
             await management_status._clear_ingestion_status_async_impl(
                 collection=collection,
                 doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows from ``old_name`` to ``new_name``.
+
+        Best-effort: never raises; returns a list of warning strings on failure.
+        """
+        if self._coordinator is not None:
+            return self._coordinator.rename_collection_status_sync(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return management_status._rename_collection_status_impl(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    async def rename_collection_status_async(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Async version of :meth:`rename_collection_status`."""
+        if self._coordinator is not None:
+            return await self._coordinator.rename_collection_status(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return await management_status._rename_collection_status_async_impl(
+                old_name,
+                new_name,
                 user_id=user_id,
                 is_admin=is_admin,
             )

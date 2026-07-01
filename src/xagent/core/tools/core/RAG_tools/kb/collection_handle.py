@@ -41,6 +41,7 @@ from ..core.exceptions import (
     DatabaseOperationError,
     DocumentValidationError,
     HashComputationError,
+    MainPointerError,
     VectorValidationError,
 )
 from ..core.schemas import (
@@ -74,6 +75,8 @@ from ..storage.contracts import (
     FilterCondition,
     FilterExpression,
     FilterOperator,
+    IngestionStatusStore,
+    MainPointerStore,
     MetadataStore,
     VectorIndexStore,
 )
@@ -83,6 +86,11 @@ from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
+from .version_compatibility import (
+    KBMainPointerSnapshot,
+    KBVersionCandidateCleanupSnapshot,
+    KBVersionCandidateRollbackResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -643,6 +651,76 @@ class KBCollectionHandle(ABC):
     ) -> int:
         """Idempotently delete newly created chunk rows (compensation)."""
 
+    @abstractmethod
+    def cleanup_cascade(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Version cascade cleanup for a document by scope (policy layer)."""
+
+    @abstractmethod
+    def cleanup_document_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup for all data of a document."""
+
+    @abstractmethod
+    def cleanup_parse_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting a parse version."""
+
+    @abstractmethod
+    def cleanup_chunk_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting a chunk version."""
+
+    @abstractmethod
+    def cleanup_embed_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade cleanup when promoting an embeddings version."""
+
     # --- Collection-level rename primitives (#H05 Phase 2) ---
 
     @abstractmethod
@@ -886,6 +964,16 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def vector_index_store(self) -> VectorIndexStore:
         """Return the vector index store bound to this collection context."""
         return self.context.vector_index_store
+
+    @property
+    def ingestion_status_store(self) -> IngestionStatusStore:
+        """Return the ingestion status store bound to this collection context."""
+        return self.context.ingestion_status_store
+
+    @property
+    def main_pointer_store(self) -> MainPointerStore:
+        """Return the main pointer store bound to this collection context."""
+        return self.context.main_pointer_store
 
     @property
     def backend(self) -> KBStorageBackend:
@@ -3208,6 +3296,195 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             is_admin=is_admin,
         )
 
+    # --- Version cascade cleanup (Task 5) ---
+
+    def cleanup_cascade(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: Optional[str] = None,
+        old_parse_hash: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Policy layer: is_admin=None → True, then delegate to store."""
+        from ..utils.user_scope import resolve_user_scope
+
+        if is_admin is None:
+            is_admin = True
+        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+        return self.vector_index_store.cleanup_cascade_by_scope(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            scope=scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_scope.user_id,
+            is_admin=user_scope.is_admin,
+            preview_only=preview_only,
+            confirm=confirm,
+        )
+
+    def cleanup_document_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "document",
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup document cascade: {e}") from e
+
+    def cleanup_parse_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "parse",
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup parse cascade: {e}") from e
+
+    def cleanup_chunk_cascade(
+        self,
+        doc_id: str,
+        *,
+        old_parse_hash: Optional[str] = None,
+        new_parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "chunk",
+                old_parse_hash=old_parse_hash,
+                new_parse_hash=new_parse_hash,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup chunk cascade: {e}") from e
+
+    def cleanup_embed_cascade(
+        self,
+        doc_id: str,
+        *,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = True,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+
+        try:
+            return self.cleanup_cascade(
+                doc_id,
+                "embeddings",
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        except Exception as e:
+            raise CascadeCleanupError(f"Failed to cleanup embed cascade: {e}") from e
+
+    # --- Ingestion-status data-plane (#513) ---
+
+    def write_ingestion_status(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Write ingestion status for a document in this collection (sync)."""
+        self.ingestion_status_store.write_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    def load_ingestion_status(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load ingestion status rows for this collection (sync)."""
+        return self.ingestion_status_store.load_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def clear_ingestion_status(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Remove ingestion status row for a document in this collection (sync)."""
+        self.ingestion_status_store.clear_ingestion_status(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
     # --- Collection-level cascade delete (#H05) ---
 
     def delete_collection_data(
@@ -3298,25 +3575,53 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         user_id: int | None,
         is_admin: bool,
     ) -> list[str]:
-        """Rename ingestion status rows in the ``ingestion_runs`` table.
+        """Rename ingestion status rows from this collection to ``new_name``.
 
-        Delegates to the ingestion status store's ``rename_collection_status``,
-        passing ``self.context.collection`` as the old name.  The coordinator
-        should call this via ``asyncio.to_thread`` when running in an async
-        context.
-
-        Returns:
-            List of warning messages on partial failure (empty on success).
+        Best-effort: never raises; returns a list of warning strings on
+        partial failures.
         """
-        from ..storage.factory import get_ingestion_status_store
+        try:
+            return self.ingestion_status_store.rename_collection_status(
+                old_name=self.context.collection,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "rename_collection_status(%r -> %r) failed: %s",
+                self.context.collection,
+                new_name,
+                exc,
+            )
+            return [str(exc)]
 
-        store = get_ingestion_status_store()
-        return store.rename_collection_status(
-            old_name=self.context.collection,
-            new_name=new_name,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+    async def rename_collection_status_async(
+        self,
+        new_name: str,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> List[str]:
+        """Rename ingestion status rows from this collection to ``new_name`` (async).
+
+        Best-effort: never raises; returns a list of warning strings on
+        partial failures.
+        """
+        try:
+            return await self.ingestion_status_store.rename_collection_status_async(
+                old_name=self.context.collection,
+                new_name=new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "rename_collection_status_async(%r -> %r) failed: %s",
+                self.context.collection,
+                new_name,
+                exc,
+            )
+            return [str(exc)]
 
     async def rename_collection_metadata(
         self,
@@ -3524,3 +3829,787 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         Returns a ``dict[str, int]`` mapping table names to deleted row counts.
         """
         return self.delete_collection_data(user_id=user_id, is_admin=is_admin)
+
+    # --- Rollback snapshot/restore/clear primitives (#513 Task 7) ---
+
+    def capture_status_snapshot(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Capture the current ingestion-status rows for ``doc_id`` (snapshot).
+
+        Returns the list of status rows as returned by ``load_ingestion_status``.
+        An empty list means no status row exists (snapshot of absence).
+        """
+        return self.load_ingestion_status(
+            doc_id=doc_id, user_id=user_id, is_admin=is_admin
+        )
+
+    def restore_status_snapshot(
+        self,
+        doc_id: str,
+        snapshot: List[Dict[str, Any]],
+        *,
+        user_id: int | None = None,
+    ) -> None:
+        """Restore an ingestion-status snapshot captured by ``capture_status_snapshot``.
+
+        If ``snapshot`` is empty the status row is cleared (restoring absence).
+        If ``snapshot`` contains a row it is re-written (restoring the prior state).
+        """
+        if not snapshot:
+            self.clear_ingestion_status(doc_id, user_id=user_id, is_admin=True)
+            return
+        for row in snapshot:
+            self.write_ingestion_status(
+                doc_id,
+                status=row.get("status", ""),
+                message=row.get("message"),
+                parse_hash=row.get("parse_hash"),
+                user_id=row.get("user_id"),
+            )
+
+    def clear_status_snapshot(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = True,
+    ) -> None:
+        """Clear the ingestion-status row for ``doc_id`` (post-rollback cleanup).
+
+        Thin wrapper over ``clear_ingestion_status`` for the rollback path.
+        """
+        self.clear_ingestion_status(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def capture_main_pointer_snapshot(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> "KBMainPointerSnapshot":
+        """Capture the current main-pointer row as a snapshot before mutation.
+
+        Returns a :class:`KBMainPointerSnapshot`; ``pointer`` is ``None`` when
+        no pointer exists (snapshot of absence).
+        """
+        return KBMainPointerSnapshot(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            step_type=step_type,
+            model_tag=model_tag,
+            pointer=self.get_main_pointer(doc_id, step_type, model_tag),
+        )
+
+    def restore_main_pointer_snapshot(
+        self,
+        snapshot: "KBMainPointerSnapshot",
+        *,
+        operator: str | None = None,
+    ) -> bool:
+        """Restore the main pointer to the state recorded in ``snapshot``.
+
+        If ``snapshot.pointer`` is ``None`` the pointer is deleted (restoring
+        absence).  Returns ``True`` on success, ``False`` when the snapshot
+        pointer is incomplete (missing ``semantic_id`` or ``technical_id``).
+        """
+        if snapshot.pointer is None:
+            self.delete_main_pointer(
+                snapshot.doc_id, snapshot.step_type, snapshot.model_tag
+            )
+            return True
+
+        semantic_id = snapshot.pointer.get("semantic_id")
+        technical_id = snapshot.pointer.get("technical_id")
+        if not semantic_id or not technical_id:
+            logger.warning(
+                "Failed to restore main pointer snapshot for %s/%s/%s: "
+                "missing semantic_id or technical_id",
+                snapshot.collection,
+                snapshot.doc_id,
+                snapshot.step_type,
+            )
+            return False
+
+        self.set_main_pointer(
+            snapshot.doc_id,
+            snapshot.step_type,
+            semantic_id,
+            technical_id,
+            model_tag=snapshot.model_tag,
+            operator=operator,
+        )
+        return True
+
+    def capture_candidate_cleanup_snapshot(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: str | None = None,
+        old_parse_hash: str | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool | None = None,
+    ) -> "KBVersionCandidateCleanupSnapshot":
+        """Capture a preview of what candidate cleanup would delete (preview_only=True).
+
+        The preview counts are stored in the snapshot; no rows are actually
+        deleted.  The snapshot can later be passed to
+        ``restore_candidate_cleanup_snapshot`` to determine rollback feasibility.
+        """
+        cleanup_counts = self.cleanup_cascade(
+            doc_id,
+            scope,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+            preview_only=True,
+            confirm=False,
+        )
+        return KBVersionCandidateCleanupSnapshot(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            scope=scope,
+            cleanup_counts=cleanup_counts,
+            new_parse_hash=new_parse_hash,
+            old_parse_hash=old_parse_hash,
+            model_tag=model_tag,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: "KBVersionCandidateCleanupSnapshot",
+        *,
+        cleanup_executed: bool = False,
+    ) -> "KBVersionCandidateRollbackResult":
+        """Assess rollback feasibility for a candidate-cleanup snapshot.
+
+        When ``cleanup_executed=True`` and the snapshot recorded side effects,
+        returns a result with ``status="incomplete"``, ``restorable=False``,
+        and ``side_effects_may_remain=True`` — the inspectable-incomplete
+        invariant.  Never issues further deletes; the state is left inspectable.
+        """
+        cleanup_counts = dict(snapshot.cleanup_counts)
+        has_candidate_side_effects = any(
+            int(count) > 0 for count in cleanup_counts.values()
+        )
+        if not cleanup_executed or not has_candidate_side_effects:
+            return KBVersionCandidateRollbackResult(
+                collection=snapshot.collection,
+                doc_id=snapshot.doc_id,
+                status="not_needed",
+                restorable=True,
+                cleanup_counts=cleanup_counts,
+            )
+
+        return KBVersionCandidateRollbackResult(
+            collection=snapshot.collection,
+            doc_id=snapshot.doc_id,
+            status="incomplete",
+            skipped=True,
+            restorable=False,
+            reason="candidate_cleanup_not_restorable",
+            cleanup_counts=cleanup_counts,
+            warnings=(
+                "Version candidate cleanup cannot be restored from the handle; "
+                "preserve visible rollback state and report remaining side effects.",
+            ),
+            side_effects_may_remain=True,
+        )
+
+    async def write_ingestion_status_async(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Write ingestion status for a document in this collection (async)."""
+        await self.ingestion_status_store.write_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            status=status,
+            message=message,
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+
+    async def load_ingestion_status_async(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load ingestion status rows for this collection (async)."""
+        return await self.ingestion_status_store.load_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def clear_ingestion_status_async(
+        self,
+        doc_id: str,
+        *,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        """Remove ingestion status row for a document in this collection (async)."""
+        await self.ingestion_status_store.clear_ingestion_status_async(
+            collection=self.context.collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    # --- Main-pointer data-plane (#513) ---
+
+    def get_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the main pointer for a document stage in this collection (sync)."""
+        try:
+            return self.main_pointer_store.get_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to get main pointer: {e}") from e
+
+    def set_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        model_tag: str | None = None,
+        operator: str | None = None,
+    ) -> None:
+        """Set or update the main pointer for a document stage in this collection (sync)."""
+        try:
+            self.main_pointer_store.set_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                semantic_id=semantic_id,
+                technical_id=technical_id,
+                model_tag=model_tag,
+                operator=operator,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to set main pointer: {e}") from e
+
+    def list_main_pointers(
+        self,
+        doc_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List main pointers for this collection (sync)."""
+        try:
+            return self.main_pointer_store.list_main_pointers(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                user_id=None,
+                limit=limit,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to list main pointers: {e}") from e
+
+    def delete_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> bool:
+        """Delete the main pointer for a document stage in this collection (sync)."""
+        try:
+            return self.main_pointer_store.delete_main_pointer(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to delete main pointer: {e}") from e
+
+    async def get_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the main pointer for a document stage in this collection (async)."""
+        try:
+            return await self.main_pointer_store.get_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to get main pointer: {e}") from e
+
+    async def set_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        model_tag: str | None = None,
+        operator: str | None = None,
+    ) -> None:
+        """Set or update the main pointer for a document stage in this collection (async)."""
+        try:
+            await self.main_pointer_store.set_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                semantic_id=semantic_id,
+                technical_id=technical_id,
+                model_tag=model_tag,
+                operator=operator,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to set main pointer: {e}") from e
+
+    async def list_main_pointers_async(
+        self,
+        doc_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List main pointers for this collection (async)."""
+        try:
+            return await self.main_pointer_store.list_main_pointers_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                user_id=None,
+                limit=limit,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to list main pointers: {e}") from e
+
+    async def delete_main_pointer_async(
+        self,
+        doc_id: str,
+        step_type: str,
+        model_tag: str | None = None,
+    ) -> bool:
+        """Delete the main pointer for a document stage in this collection (async)."""
+        try:
+            return await self.main_pointer_store.delete_main_pointer_async(
+                collection=self.context.collection,
+                doc_id=doc_id,
+                step_type=step_type,
+                model_tag=model_tag,
+                user_id=None,
+            )
+        except Exception as e:
+            raise MainPointerError(f"Failed to delete main pointer: {e}") from e
+
+    # --- Version candidate listing (#513 Task 4) ---
+
+    def list_candidates(
+        self,
+        doc_id: str,
+        step_type: "Any",
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> Dict[str, Any]:
+        """List version candidates for a document/stage within this collection.
+
+        Resolves ``step_type``, calls the vector index store's semantic method,
+        then applies state-filter / total-count capture / sort / limit /
+        result-dict assembly (the orchestration from ``_list_candidates_impl``).
+
+        Args:
+            doc_id: Document ID.
+            step_type: Processing stage as :class:`StepType` enum or string.
+            model_tag: Required for ``embed`` step.
+            state: Optional state filter (``"candidate"``, ``"main"``, etc.).
+            limit: Maximum candidates to return (default 50).
+            order_by: Sort order (``"created_at desc"`` or ``"created_at asc"``).
+
+        Returns:
+            Result dict with keys ``candidates``, ``total_count``,
+            ``returned_count``, ``step_type``, ``model_tag``, ``filters``.
+        """
+        from ..core.exceptions import DatabaseOperationError, VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        def _resolve(st: Any) -> "_StepType":
+            if isinstance(st, _StepType):
+                return st
+            elif isinstance(st, str):
+                try:
+                    return _StepType(st)
+                except ValueError:
+                    raise VersionManagementError(
+                        f"Invalid step_type string: '{st}'. Expected one of: "
+                        + ", ".join(["'" + s.value + "'" for s in _StepType])
+                    )
+            else:
+                raise VersionManagementError(
+                    f"Unsupported step_type type: {type(st)}. Expected StepType or str."
+                )
+
+        try:
+            resolved = _resolve(step_type)
+
+            candidates = self.vector_index_store.list_version_candidate_rows(
+                self.context.collection,
+                doc_id,
+                resolved.value,
+                model_tag,
+            )
+
+            # Apply state filter if specified
+            if state is not None:
+                candidates = [c for c in candidates if c["state"] == state]
+
+            # Record total count before limit (after state filter, matching _list_candidates_impl)
+            total_count = len(candidates)
+
+            # Sort by order_by (must happen before limit)
+            if order_by == "created_at desc":
+                candidates.sort(key=lambda x: x["created_at"], reverse=True)
+            elif order_by == "created_at asc":
+                candidates.sort(key=lambda x: x["created_at"], reverse=False)
+
+            # Apply limit after sorting
+            if limit > 0:
+                candidates = candidates[:limit]
+
+            return {
+                "candidates": candidates,
+                "total_count": total_count,
+                "returned_count": len(candidates),
+                "step_type": resolved.value,
+                "model_tag": model_tag,
+                "filters": {"state": state, "limit": limit, "order_by": order_by},
+            }
+
+        except (DatabaseOperationError, VersionManagementError):
+            raise
+        except Exception as e:
+            raise VersionManagementError(f"Failed to list candidates: {e}") from e
+
+    # --- Version promotion orchestration (#513 Task 6) ---
+
+    def _call_cleanup_cascade_for_step(
+        self,
+        doc_id: str,
+        step_type: Any,
+        technical_id: str,
+        old_technical_id: Optional[str] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Scope-mapping helper: route step_type → cleanup_cascade scope."""
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        if step_type == _StepType.PARSE:
+            return self.cleanup_cascade(
+                doc_id,
+                "parse",
+                new_parse_hash=technical_id,
+                old_parse_hash=old_technical_id,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        elif step_type == _StepType.CHUNK:
+            return self.cleanup_cascade(
+                doc_id,
+                "chunk",
+                new_parse_hash=technical_id,
+                old_parse_hash=old_technical_id,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        elif step_type == _StepType.EMBED:
+            if not model_tag:
+                raise VersionManagementError("model_tag is required for embed step")
+            return self.cleanup_cascade(
+                doc_id,
+                "embeddings",
+                model_tag=model_tag,
+                preview_only=preview_only,
+                confirm=confirm,
+            )
+        else:
+            step_type_str = (
+                step_type.value if isinstance(step_type, _StepType) else str(step_type)
+            )
+            raise VersionManagementError(f"Invalid step_type: {step_type_str}")
+
+    def _resolve_selected_id_from_candidates(
+        self,
+        doc_id: str,
+        step_type: Any,
+        selected_id: str,
+        model_tag: Optional[str] = None,
+    ) -> tuple:
+        """Resolve selected_id → (technical_id, semantic_id) via list_candidates."""
+        from ..core.exceptions import VersionManagementError
+
+        try:
+            candidates_result = self.list_candidates(
+                doc_id,
+                step_type,
+                model_tag=model_tag,
+            )
+            candidates = candidates_result.get("candidates", [])
+
+            if not candidates:
+                raise VersionManagementError(f"No candidates found for {step_type}")
+
+            for candidate in candidates:
+                if candidate["technical_id"] == selected_id:
+                    return candidate["technical_id"], candidate["semantic_id"]
+
+            for candidate in candidates:
+                if candidate["semantic_id"] == selected_id:
+                    return candidate["technical_id"], candidate["semantic_id"]
+
+            available_ids = [c["semantic_id"] for c in candidates]
+            raise VersionManagementError(
+                f"Selected ID '{selected_id}' not found. Available IDs: {available_ids}"
+            )
+
+        except Exception as e:
+            if isinstance(e, VersionManagementError):
+                raise
+            raise VersionManagementError(f"Failed to resolve selected_id: {e}")
+
+    def _calculate_cleanup_plan_for_step(
+        self,
+        doc_id: str,
+        step_type: Any,
+        technical_id: str,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Calculate cleanup plan for a version promotion (preview_only=True)."""
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        try:
+            current_pointer = self.get_main_pointer(doc_id, step_type.value, model_tag)
+            old_technical_id = None
+            if current_pointer:
+                old_technical_id = current_pointer["technical_id"]
+
+            deleted_counts = self._call_cleanup_cascade_for_step(
+                doc_id,
+                step_type,
+                technical_id,
+                old_technical_id=old_technical_id,
+                model_tag=model_tag,
+                preview_only=True,
+                confirm=False,
+            )
+
+            notes = []
+            if step_type == _StepType.PARSE and deleted_counts.get("chunks", 0) > 0:
+                notes.append("Requires re-chunk/embed")
+            elif (
+                step_type == _StepType.CHUNK and deleted_counts.get("embeddings", 0) > 0
+            ):
+                notes.append("Requires re-embed")
+
+            return {
+                "deleted_counts": deleted_counts,
+                "notes": notes,
+                "current_pointer": current_pointer,
+                "new_technical_id": technical_id,
+            }
+
+        except Exception as e:
+            raise VersionManagementError(f"Failed to calculate cleanup plan: {e}")
+
+    def promote_version_main(
+        self,
+        doc_id: str,
+        step_type: "Any",
+        selected_id: str,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Promote a candidate version to main for a document stage (pure orchestration).
+
+        Relocates ``_promote_version_main_impl`` body to the handle, calling
+        handle primitives (``list_candidates``, ``get_main_pointer``,
+        ``cleanup_cascade``, ``set_main_pointer``) instead of module-level fns.
+        The ``lancedb_dir`` resolution is dropped (no longer needed by the handle).
+
+        Args:
+            doc_id: Document ID.
+            step_type: Processing step type (:class:`StepType` or string).
+            selected_id: Technical or semantic ID of the candidate to promote.
+            operator: Operator name (default: ``$USER`` env var or ``"unknown"``).
+            preview_only: If True, only return preview without executing.
+            confirm: If True, execute the promotion.
+            model_tag: Required for embed step.
+
+        Returns:
+            Result dict with keys ``promoted``, ``preview``, ``main_pointer``,
+            ``deleted_counts``, ``notes``, and optionally ``message``/``operator``.
+
+        Raises:
+            VersionManagementError: Any error during the promotion flow.
+        """
+        from ..core.exceptions import VersionManagementError
+        from ..core.schemas import StepType as _StepType
+
+        def _resolve(st: "Any") -> "_StepType":
+            if isinstance(st, _StepType):
+                return st
+            elif isinstance(st, str):
+                try:
+                    return _StepType(st)
+                except ValueError:
+                    raise VersionManagementError(
+                        f"Invalid step_type string: '{st}'. Expected one of: "
+                        + ", ".join(["'" + s.value + "'" for s in _StepType])
+                    )
+            else:
+                raise VersionManagementError(
+                    f"Unsupported step_type type: {type(st)}. Expected StepType or str."
+                )
+
+        resolved_step_type = _resolve(step_type)
+
+        # Validate and set operator
+        if not operator:
+            operator = os.environ.get("USER", "unknown")
+        if len(operator) > 32:
+            raise VersionManagementError("Operator name too long (max 32 characters)")
+
+        try:
+            # Resolve selected_id to technical_id and semantic_id
+            technical_id, semantic_id = self._resolve_selected_id_from_candidates(
+                doc_id, resolved_step_type, selected_id, model_tag
+            )
+
+            # Calculate cleanup plan
+            cleanup_plan = self._calculate_cleanup_plan_for_step(
+                doc_id, resolved_step_type, technical_id, model_tag
+            )
+
+            if preview_only or not confirm:
+                message = (
+                    "Preview of promotion to be applied."
+                    if preview_only
+                    else "Set confirm=True to execute the promotion."
+                )
+                return {
+                    "promoted": False,
+                    "preview": True,
+                    "message": message,
+                    "main_pointer": {
+                        "step_type": resolved_step_type.value,
+                        "semantic_id": semantic_id,
+                        "technical_id": technical_id,
+                        "model_tag": model_tag,
+                    },
+                    "deleted_counts": cleanup_plan["deleted_counts"],
+                    "notes": cleanup_plan["notes"],
+                }
+
+            # Perform cascade cleanup
+            old_technical_id = None
+            if cleanup_plan["current_pointer"]:
+                old_technical_id = cleanup_plan["current_pointer"]["technical_id"]
+
+            deleted_counts = self._call_cleanup_cascade_for_step(
+                doc_id,
+                resolved_step_type,
+                technical_id,
+                old_technical_id=old_technical_id,
+                model_tag=model_tag,
+                preview_only=False,
+                confirm=True,
+            )
+
+            if not deleted_counts:
+                raise VersionManagementError(
+                    f"[Promotion] No records deleted for "
+                    f"{self.context.collection}/{doc_id}/{resolved_step_type.value}"
+                )
+
+            # Update main pointer
+            self.set_main_pointer(
+                doc_id,
+                resolved_step_type.value,
+                semantic_id,
+                technical_id,
+                model_tag,
+                operator,
+            )
+
+            # Generate notes
+            notes = []
+            if (
+                resolved_step_type == _StepType.PARSE
+                and deleted_counts.get("chunks", 0) > 0
+            ):
+                notes.append("Requires re-chunk/embed")
+            elif (
+                resolved_step_type == _StepType.CHUNK
+                and deleted_counts.get("embeddings", 0) > 0
+            ):
+                notes.append("Requires re-embed")
+
+            logger.info(
+                "Promoted version for %s/%s/%s to %s (operator: %s)",
+                self.context.collection,
+                doc_id,
+                resolved_step_type.value,
+                technical_id,
+                operator,
+            )
+
+            return {
+                "promoted": True,
+                "preview": False,
+                "main_pointer": {
+                    "step_type": resolved_step_type.value,
+                    "semantic_id": semantic_id,
+                    "technical_id": technical_id,
+                    "model_tag": model_tag,
+                },
+                "deleted_counts": deleted_counts,
+                "notes": notes,
+                "operator": operator,
+            }
+
+        except Exception as e:
+            if isinstance(e, VersionManagementError):
+                raise
+            raise VersionManagementError(f"Failed to promote version main: {e}") from e

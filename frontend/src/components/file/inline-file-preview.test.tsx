@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from 'react'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -47,17 +47,150 @@ describe('InlineFilePreview', () => {
     cleanup()
   })
 
-  it('renders image previews from file ids', () => {
+  it('falls back to authenticated preview for uuid image file ids', async () => {
+    const blob = new Blob(['image-bytes'], { type: 'image/png' })
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => blob,
+    })
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'image',
+          fileId: '550e8400-e29b-41d4-a716-446655440000',
+          filename: 'linkedin-visual.png',
+        }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/550e8400-e29b-41d4-a716-446655440000',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const image = screen.getByAltText('linkedin-visual.png')
+    await waitFor(() => {
+      expect(image.getAttribute('src')).toMatch(/^blob:/)
+    })
+  })
+
+  it('extracts uuid from file paths that include a filename suffix', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'image',
+          fileId: '550e8400-e29b-41d4-a716-446655440000/linkedin.png',
+          filename: 'linkedin.png',
+        }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/550e8400-e29b-41d4-a716-446655440000',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+  })
+
+  it('loads image previews through authenticated preview when file id is present', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
+
     render(
       <InlineFilePreview
         source={{ type: 'image', fileId: 'image-file-id', filename: 'plot.png' }}
       />
     )
 
-    expect(screen.getByAltText('plot.png')).toHaveAttribute(
-      'src',
-      'http://api.local/api/files/public/preview/image-file-id'
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/image-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const image = await screen.findByAltText('plot.png')
+    expect(image.getAttribute('src')).toMatch(/^blob:/)
+  })
+
+  it('passes resolved file id to onFileClick for uuid paths with filename suffix', () => {
+    const handleFileClick = vi.fn()
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'presentation',
+          fileId: '550e8400-e29b-41d4-a716-446655440000/slides.pptx',
+          filename: 'slides.pptx',
+        }}
+        onFileClick={handleFileClick}
+      />
     )
+
+    fireEvent.click(screen.getByText('Open'))
+
+    expect(handleFileClick).toHaveBeenCalledWith(
+      '550e8400-e29b-41d4-a716-446655440000',
+      'slides.pptx'
+    )
+  })
+
+  it('does not request public preview before authenticated image fallback', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'image',
+          fileId: '550e8400-e29b-41d4-a716-446655440000',
+          filename: 'plot.png',
+        }}
+      />
+    )
+
+    expect(screen.queryByAltText('plot.png')).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/550e8400-e29b-41d4-a716-446655440000',
+      expect.anything()
+    )
+
+    await waitFor(() => {
+      expect(screen.getByAltText('plot.png').getAttribute('src')).toMatch(/^blob:/)
+    })
+  })
+
+  it('renders image previews from file ids', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: false,
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'image', fileId: 'image-file-id', filename: 'plot.png' }}
+      />
+    )
+
+    const image = await screen.findByAltText('plot.png')
+    await waitFor(() => {
+      expect(image).toHaveAttribute(
+        'src',
+        'http://api.local/api/files/public/preview/image-file-id'
+      )
+    })
   })
 
   it('mounts PptxPreviewRenderer immediately with fileId without eager byte fetch', () => {
@@ -262,6 +395,73 @@ describe('InlineFilePreview', () => {
       'https://cdn.example.com/report.docx',
       expect.anything()
     )
+  })
+
+  it('uses authenticated preview for images with fileId even when previewUrl is set', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['image-bytes'], { type: 'image/png' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'image',
+          fileId: 'image-file-id',
+          previewUrl: 'https://cdn.example.com/plot.png',
+          filename: 'plot.png',
+        }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/image-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const image = await screen.findByAltText('plot.png')
+    expect(image.getAttribute('src')).toMatch(/^blob:/)
+  })
+
+  it('revokes blob URLs when unmounting during authenticated image fetch', async () => {
+    const createObjectUrlSpy = vi.spyOn(URL, 'createObjectURL')
+    const revokeObjectUrlSpy = vi.spyOn(URL, 'revokeObjectURL')
+    let resolveBlob: ((blob: Blob) => void) | undefined
+
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: () =>
+        new Promise<Blob>((resolve) => {
+          resolveBlob = resolve
+        }),
+    })
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{
+          type: 'image',
+          fileId: 'image-file-id',
+          filename: 'plot.png',
+        }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalled()
+    })
+
+    unmount()
+    resolveBlob?.(new Blob(['image-bytes'], { type: 'image/png' }))
+
+    await waitFor(() => {
+      expect(createObjectUrlSpy).not.toHaveBeenCalled()
+    })
+    expect(revokeObjectUrlSpy).not.toHaveBeenCalled()
+
+    createObjectUrlSpy.mockRestore()
+    revokeObjectUrlSpy.mockRestore()
   })
 
   it('does not automatically render cross-origin image preview URLs', () => {

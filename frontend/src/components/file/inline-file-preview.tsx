@@ -13,8 +13,8 @@ import {
   getInlineFilePreviewUrl,
   getPreviewUrlTrust,
   isPreviewableInlineFileKind,
+  resolveInlineFileId,
   type InlineFilePreviewSource,
-  UUID_PATTERN,
 } from './inline-file-preview-utils'
 
 type InlineFilePreviewProps = {
@@ -46,19 +46,20 @@ function InlineImagePreview({
   onFileClick?: (filePath: string, fileName: string) => void
 }) {
   const apiUrl = getApiUrl()
-  const [resolvedUrl, setResolvedUrl] = useState(previewUrl)
+  const shouldFallback = Boolean(source.fileId)
+  const [resolvedUrl, setResolvedUrl] = useState(shouldFallback ? '' : previewUrl)
 
   useEffect(() => {
     let objectUrl: string | null = null
     let isCancelled = false
 
-    setResolvedUrl(previewUrl)
+    setResolvedUrl(shouldFallback ? '' : previewUrl)
 
     const runFallback = async () => {
-      if (!source.fileId || source.previewUrl || UUID_PATTERN.test(source.fileId)) return
+      if (!shouldFallback) return
       try {
         const response = await apiRequest(
-          `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId)}`,
+          `${apiUrl}/api/files/preview/${encodeURIComponent(source.fileId!)}`,
           {
             cache: 'no-cache',
             headers: {
@@ -67,14 +68,24 @@ function InlineImagePreview({
             },
           }
         )
-        if (!response.ok) return
-        const blob = await response.blob()
-        objectUrl = URL.createObjectURL(blob)
-        if (!isCancelled) {
-          setResolvedUrl(objectUrl)
+        if (isCancelled) return
+        if (!response.ok) {
+          // Last-resort fallback: try the public preview URL when the
+          // authenticated route fails. On Agent Builder surfaces that
+          // route may also require auth, but a spinner with no recovery
+          // path is worse than attempting the anonymous endpoint.
+          setResolvedUrl(previewUrl)
+          return
         }
+        const blob = await response.blob()
+        if (isCancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedUrl(objectUrl)
       } catch {
-        return
+        if (!isCancelled) {
+          // See comment above: public preview is best-effort after auth errors.
+          setResolvedUrl(previewUrl)
+        }
       }
     }
 
@@ -84,12 +95,27 @@ function InlineImagePreview({
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [apiUrl, previewUrl, source.fileId, source.previewUrl])
+  }, [apiUrl, previewUrl, shouldFallback, source.fileId])
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
     event.preventDefault()
     onFileClick(source.fileId, filename)
+  }
+
+  if (!resolvedUrl) {
+    return (
+      <div
+        aria-label={filename}
+        data-inline-file-preview-wrapper
+        className={cn(
+          'flex min-h-[8rem] items-center justify-center text-muted-foreground',
+          imageClassName || 'max-w-full rounded-lg border border-border/50 bg-muted/20'
+        )}
+      >
+        <Loader2 className="h-4 w-4 animate-spin" />
+      </div>
+    )
   }
 
   return (
@@ -235,17 +261,20 @@ export function InlineFilePreview({
   loadErrorText = DEFAULT_LOAD_ERROR_TEXT,
 }: InlineFilePreviewProps) {
   const apiUrl = getApiUrl()
-  const kind = getInlineFilePreviewKind(source)
-  const previewUrl = getInlineFilePreviewUrl(source, apiUrl)
-  const downloadUrl = getInlineFileDownloadUrl(source, apiUrl)
-  const previewUrlTrust = getPreviewUrlTrust(source, apiUrl)
-  const filename = fileNameFromSource(source)
-  const canOpenFilePreview = Boolean(onFileClick && source.fileId)
+  const resolvedSource = source.fileId
+    ? { ...source, fileId: resolveInlineFileId(source.fileId) }
+    : source
+  const kind = getInlineFilePreviewKind(resolvedSource)
+  const previewUrl = getInlineFilePreviewUrl(resolvedSource, apiUrl)
+  const downloadUrl = getInlineFileDownloadUrl(resolvedSource, apiUrl)
+  const previewUrlTrust = getPreviewUrlTrust(resolvedSource, apiUrl)
+  const filename = fileNameFromSource(resolvedSource)
+  const canOpenFilePreview = Boolean(onFileClick && resolvedSource.fileId)
 
   const handleOpenPreview = (event: React.MouseEvent<HTMLElement>) => {
-    if (!onFileClick || !source.fileId) return
+    if (!onFileClick || !resolvedSource.fileId) return
     event.preventDefault()
-    onFileClick(source.fileId, filename)
+    onFileClick(resolvedSource.fileId, filename)
   }
 
   if (!previewUrl) return null
@@ -265,7 +294,7 @@ export function InlineFilePreview({
   if (kind === 'image') {
     return (
       <InlineImagePreview
-        source={source}
+        source={resolvedSource}
         previewUrl={previewUrl}
         filename={filename}
         imageClassName={imageClassName}
@@ -315,7 +344,7 @@ export function InlineFilePreview({
           kind={kind}
           previewUrl={previewUrl}
           loadErrorText={loadErrorText}
-          fileId={source.fileId}
+          fileId={resolvedSource.fileId}
         />
       </div>
     </div>

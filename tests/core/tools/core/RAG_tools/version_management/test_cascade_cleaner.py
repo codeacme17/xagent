@@ -7,6 +7,10 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_store
+from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+    LanceDBVectorIndexStore,
+)
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import (
     _append_predicates,
@@ -16,22 +20,43 @@ from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import 
     _should_execute_delete,
     cascade_delete,
     cascade_delete_documents,
-    cleanup_chunk_cascade,
-    cleanup_document_cascade,
-    cleanup_embed_cascade,
-    cleanup_parse_cascade,
 )
+
+# NOTE (#513 Task 5 / H06): The version-cleanup predicate pipeline was relocated
+# out of cascade_cleaner._cleanup_cascade_impl (now a thin shell routing through
+# the version-compatibility facade -> coordinator -> handle -> store) into
+# LanceDBVectorIndexStore.cleanup_cascade_by_scope. The category-B tests below
+# (formerly exercising cleanup_*_cascade wrappers via a coordinator-less facade
+# fixture) now target the store method directly, since that is where the logic
+# they validate (predicate building, per-table embedding expansion, count
+# collapse) authoritatively lives. The store's internal helpers live in
+# storage.lancedb_stores as `_vis_*` functions; `build_embedding_cleanup_filters`
+# and `get_main_pointer` are imported fresh inside the store method, so patches
+# target their definition modules.
+_STORE = "xagent.core.tools.core.RAG_tools.storage.lancedb_stores"
 
 
 @pytest.fixture(autouse=True)
 def _patch_ensure_tables(mocker) -> None:
-    """Avoid schema-manager side effects in unit tests (focus on filter logic)."""
+    """Avoid schema-manager side effects in unit tests (focus on filter logic).
+
+    Patches both the cascade_cleaner-level names (still used by the untouched
+    collection-delete path) and the schema_manager source module. The store's
+    cleanup_cascade_by_scope imports ensure_* fresh from
+    ``LanceDB.schema_manager``, so re-pointed category-B tests need those
+    patched at the source to avoid real table creation on the mock connection.
+    """
     base = "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner"
-    mocker.patch(f"{base}.ensure_documents_table", return_value=None)
-    mocker.patch(f"{base}.ensure_parses_table", return_value=None)
-    mocker.patch(f"{base}.ensure_chunks_table", return_value=None)
-    mocker.patch(f"{base}.ensure_main_pointers_table", return_value=None)
-    mocker.patch(f"{base}.ensure_ingestion_runs_table", return_value=None)
+    schema = "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager"
+    for name in (
+        "ensure_documents_table",
+        "ensure_parses_table",
+        "ensure_chunks_table",
+        "ensure_main_pointers_table",
+        "ensure_ingestion_runs_table",
+    ):
+        mocker.patch(f"{base}.{name}", return_value=None)
+        mocker.patch(f"{schema}.{name}", return_value=None)
 
 
 def _create_mock_table_with_schema() -> MagicMock:
@@ -88,9 +113,7 @@ def test_should_execute_delete_requires_confirm_and_non_preview() -> None:
     assert _should_execute_delete(preview_only=True, confirm=False) is False
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_document_preview_then_confirm(mock_get_conn: MagicMock) -> None:
     """Test document cascade cleanup with preview and confirm modes.
 
@@ -136,20 +159,24 @@ def test_cleanup_document_preview_then_confirm(mock_get_conn: MagicMock) -> None
     conn.open_table.side_effect = lambda name: table_map[name]
     mock_get_conn.return_value = conn
 
-    res = cleanup_document_cascade("c", "d", preview_only=True, confirm=False)
+    store = get_vector_index_store()
+    res = store.cleanup_cascade_by_scope(
+        "c", "d", "document", preview_only=True, confirm=False
+    )
     assert res["embeddings"] == 2 and res["chunks"] == 1
 
     # confirm: delete paths
-    res2 = cleanup_document_cascade("c", "d", preview_only=False, confirm=True)
+    res2 = store.cleanup_cascade_by_scope(
+        "c", "d", "document", preview_only=False, confirm=True
+    )
     assert res2["documents"] == 1
     assert table_map["documents"].delete.call_count >= 1
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_parse_preview(mock_get_conn: MagicMock) -> None:
     """Preview counts for parse scope (embeddings, chunks, parses)."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["chunks", "embeddings_m1", "parses"]
     table = _create_mock_table_with_schema()
@@ -158,17 +185,16 @@ def test_cleanup_parse_preview(mock_get_conn: MagicMock) -> None:
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
-    res_parse = cleanup_parse_cascade(
-        "c", "d", old_parse_hash="old", new_parse_hash="new"
+    res_parse = get_vector_index_store().cleanup_cascade_by_scope(
+        "c", "d", "parse", old_parse_hash="old", new_parse_hash="new"
     )
     assert isinstance(res_parse, dict)
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_chunk_preview(mock_get_conn: MagicMock) -> None:
     """Preview counts for chunk scope (embeddings, chunks)."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["chunks", "embeddings_m1", "parses"]
     table = _create_mock_table_with_schema()
@@ -177,15 +203,13 @@ def test_cleanup_chunk_preview(mock_get_conn: MagicMock) -> None:
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
-    res_chunk = cleanup_chunk_cascade(
-        "c", "d", old_parse_hash="old", new_parse_hash="new"
+    res_chunk = get_vector_index_store().cleanup_cascade_by_scope(
+        "c", "d", "chunk", old_parse_hash="old", new_parse_hash="new"
     )
     assert isinstance(res_chunk, dict)
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_embed(mock_get_conn: MagicMock) -> None:
     """Test embeddings cascade cleanup functionality.
 
@@ -195,6 +219,7 @@ def test_cleanup_embed(mock_get_conn: MagicMock) -> None:
     3. Cleanup is scoped to the specified model_tag only
     4. Handles cases where no embeddings exist (returns 0 count)
     """
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["embeddings_m1"]
     table = _create_mock_table_with_schema()
@@ -202,19 +227,20 @@ def test_cleanup_embed(mock_get_conn: MagicMock) -> None:
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
-    res = cleanup_embed_cascade("c", "d", model_tag="m1")
+    res = get_vector_index_store().cleanup_cascade_by_scope(
+        "c", "d", "embeddings", model_tag="m1"
+    )
     assert res["embeddings"] >= 0
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_handles_missing_tables(mock_get_conn: MagicMock) -> None:
     """Gracefully handle cases where required tables do not exist.
 
     Verifies that cleanup functions do not raise when tables are missing and
     return zero counts accordingly.
     """
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     # Simulate no tables present in the database
     conn.table_names.return_value = []
@@ -224,8 +250,12 @@ def test_cleanup_handles_missing_tables(mock_get_conn: MagicMock) -> None:
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
+    store = get_vector_index_store()
+
     # Document scope
-    r1 = cleanup_document_cascade("c", "d", preview_only=True, confirm=False)
+    r1 = store.cleanup_cascade_by_scope(
+        "c", "d", "document", preview_only=True, confirm=False
+    )
     assert r1 == {
         "embeddings": 0,
         "chunks": 0,
@@ -236,7 +266,9 @@ def test_cleanup_handles_missing_tables(mock_get_conn: MagicMock) -> None:
     }
 
     # Parse scope
-    r2 = cleanup_parse_cascade("c", "d", old_parse_hash="old", new_parse_hash="new")
+    r2 = store.cleanup_cascade_by_scope(
+        "c", "d", "parse", old_parse_hash="old", new_parse_hash="new"
+    )
     assert (
         r2["embeddings"] == 0
         and r2["chunks"] == 0
@@ -244,17 +276,17 @@ def test_cleanup_handles_missing_tables(mock_get_conn: MagicMock) -> None:
     )
 
     # Chunk scope
-    r3 = cleanup_chunk_cascade("c", "d", old_parse_hash="old", new_parse_hash="new")
+    r3 = store.cleanup_cascade_by_scope(
+        "c", "d", "chunk", old_parse_hash="old", new_parse_hash="new"
+    )
     assert r3["embeddings"] == 0 and r3.get("chunks", 0) in (0, r3.get("chunks", 0))
 
     # Embed scope
-    r4 = cleanup_embed_cascade("c", "d", model_tag="m1")
+    r4 = store.cleanup_cascade_by_scope("c", "d", "embeddings", model_tag="m1")
     assert r4["embeddings"] == 0
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_embed_with_multiple_models(mock_get_conn: MagicMock) -> None:
     """Test that cleanup_embed respects model_tag and doesn't touch other models.
 
@@ -296,9 +328,10 @@ def test_cleanup_embed_with_multiple_models(mock_get_conn: MagicMock) -> None:
     conn.open_table.side_effect = mock_open_table
     mock_get_conn.return_value = conn
 
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     # Action: Cleanup embeddings for doc1, but only for bge_large
-    result = cleanup_embed_cascade(
-        "c", "d", model_tag="bge_large", preview_only=False, confirm=True
+    result = get_vector_index_store().cleanup_cascade_by_scope(
+        "c", "d", "embeddings", model_tag="bge_large", preview_only=False, confirm=True
     )
 
     # Assert: Only deleted from bge_large (3 rows)
@@ -317,9 +350,7 @@ def test_cleanup_embed_with_multiple_models(mock_get_conn: MagicMock) -> None:
     assert "embeddings_bge_large" in deleted_tables
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_embed_without_model_tag_affects_all_tables(
     mock_get_conn: MagicMock,
 ) -> None:
@@ -344,8 +375,11 @@ def test_cleanup_embed_without_model_tag_affects_all_tables(
     conn.open_table.side_effect = mock_open_table
     mock_get_conn.return_value = conn
 
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     # Action: Cleanup without model_tag
-    result = cleanup_embed_cascade("c", "d", model_tag=None, confirm=True)
+    result = get_vector_index_store().cleanup_cascade_by_scope(
+        "c", "d", "embeddings", model_tag=None, confirm=True
+    )
 
     # Assert: Both tables affected (2 + 2 = 4 rows)
     assert result["embeddings"] == 4
@@ -355,9 +389,7 @@ def test_cleanup_embed_without_model_tag_affects_all_tables(
     assert "embeddings_minilm" in queried_tables
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_document_injection_attack_prevention(mock_get_conn: MagicMock) -> None:
     """Test that SQL injection attacks are properly prevented in document cleanup.
 
@@ -383,9 +415,14 @@ def test_cleanup_document_injection_attack_prevention(mock_get_conn: MagicMock) 
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     # Execute cleanup (preview mode is enough to test filter building)
-    cleanup_document_cascade(
-        malicious_collection, malicious_doc_id, preview_only=True, confirm=False
+    get_vector_index_store().cleanup_cascade_by_scope(
+        malicious_collection,
+        malicious_doc_id,
+        "document",
+        preview_only=True,
+        confirm=False,
     )
 
     # Assert: The filter expression should have properly escaped the malicious inputs
@@ -404,9 +441,7 @@ def test_cleanup_document_injection_attack_prevention(mock_get_conn: MagicMock) 
     assert "' OR 1=1 --" not in filter_expr.replace("''", "")
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_parse_injection_attack_prevention(mock_get_conn: MagicMock) -> None:
     """Test that SQL injection attacks are properly prevented in parse cleanup.
 
@@ -432,16 +467,18 @@ def test_cleanup_parse_injection_attack_prevention(mock_get_conn: MagicMock) -> 
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     # Mock get_main_pointer to return None (so old_parse_hash is None)
     with patch(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_main_pointer"
+        "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager._get_main_pointer_impl"
     ) as mock_pointer:
         mock_pointer.return_value = None
 
         # Execute cleanup with malicious parse_hash
-        cleanup_parse_cascade(
+        get_vector_index_store().cleanup_cascade_by_scope(
             collection,
             doc_id,
+            "parse",
             new_parse_hash=malicious_parse_hash,
             preview_only=True,
             confirm=False,
@@ -465,9 +502,7 @@ def test_cleanup_parse_injection_attack_prevention(mock_get_conn: MagicMock) -> 
     )
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_document_preview_respects_model_tag(mock_get_conn: MagicMock) -> None:
     """Test that preview mode respects model_tag filter and doesn't inflate counts.
 
@@ -505,9 +540,15 @@ def test_cleanup_document_preview_respects_model_tag(mock_get_conn: MagicMock) -
     conn.open_table.side_effect = mock_open_table
     mock_get_conn.return_value = conn
 
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     # Execute: Preview mode with model_tag specified
-    result = cleanup_document_cascade(
-        collection, doc_id, model_tag=target_model_tag, preview_only=True, confirm=False
+    result = get_vector_index_store().cleanup_cascade_by_scope(
+        collection,
+        doc_id,
+        "document",
+        model_tag=target_model_tag,
+        preview_only=True,
+        confirm=False,
     )
 
     # Assert: Preview should ONLY count embeddings_model_a (5 rows), NOT embeddings_model_b
@@ -1117,13 +1158,12 @@ def test_cascade_delete_document_model_tag_probe_error_without_user_id_denied(
     assert queried_tables == ["embeddings_m1"]
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_parse_cascade_probe_error_without_user_id_denied(
     mock_get_conn: MagicMock,
 ) -> None:
     """Parse cleanup should fail closed if table schema probing fails."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["chunks", "embeddings_m1"]
 
@@ -1137,13 +1177,18 @@ def test_cleanup_parse_cascade_probe_error_without_user_id_denied(
     conn.open_table.side_effect = mock_open_table
     mock_get_conn.return_value = conn
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
-    ) as mock_plan:
+    with (
+        patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager._get_main_pointer_impl",
+            return_value=None,
+        ),
+    ):
         mock_plan.return_value = {}
-        cleanup_parse_cascade(
+        get_vector_index_store().cleanup_cascade_by_scope(
             "c_probe",
             "d_probe",
+            "parse",
             new_parse_hash="new",
             user_id=None,
             is_admin=False,
@@ -1158,13 +1203,12 @@ def test_cleanup_parse_cascade_probe_error_without_user_id_denied(
     assert "user_id IS NOT NULL" in predicates["embeddings_m1"][0]
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_embed_without_user_scope_fails_closed(
     mock_get_conn: MagicMock,
 ) -> None:
     """Embeddings cleanup should not become document-wide without user scope."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["embeddings_m1"]
     table = _create_mock_table_with_columns(["collection", "doc_id", "user_id"])
@@ -1172,9 +1216,10 @@ def test_cleanup_embed_without_user_scope_fails_closed(
     conn.open_table.return_value = table
     mock_get_conn.return_value = conn
 
-    cleanup_embed_cascade(
+    get_vector_index_store().cleanup_cascade_by_scope(
         "c_denied",
         "d_denied",
+        "embeddings",
         user_id=None,
         is_admin=False,
         preview_only=True,
@@ -1190,16 +1235,13 @@ def test_cleanup_embed_without_user_scope_fails_closed(
 
 def test_cleanup_embed_cascade_preserves_multiple_predicates_per_table() -> None:
     """Embeddings cleanup should pass all per-table predicates to the executor."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     with (
+        patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-        ) as mock_get_conn,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
-        ) as mock_plan,
+        patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
     ):
         conn = MagicMock(spec=["table_names", "open_table"])
         mock_get_conn.return_value = conn
@@ -1208,9 +1250,10 @@ def test_cleanup_embed_cascade_preserves_multiple_predicates_per_table() -> None
         }
         mock_plan.return_value = {"embeddings_m1": 2}
 
-        result = cleanup_embed_cascade(
+        result = get_vector_index_store().cleanup_cascade_by_scope(
             "c_multi",
             "d_multi",
+            "embeddings",
             user_id=7,
             is_admin=False,
             preview_only=True,
@@ -1224,12 +1267,11 @@ def test_cleanup_embed_cascade_preserves_multiple_predicates_per_table() -> None
 
 def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
     """Confirm cleanup should execute every predicate in a table predicate list."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     with (
+        patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-        ) as mock_get_conn,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
     ):
         table = MagicMock()
@@ -1242,9 +1284,10 @@ def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
             "embeddings_m1": ["chunk_id == 'ch1'", "chunk_id == 'ch2'"],
         }
 
-        result = cleanup_embed_cascade(
+        result = get_vector_index_store().cleanup_cascade_by_scope(
             "c_multi",
             "d_multi",
+            "embeddings",
             user_id=7,
             is_admin=False,
             preview_only=False,
@@ -1262,13 +1305,12 @@ def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
     ]
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_parse_cascade_expands_embeddings_predicates_per_table(
     mock_get_conn: MagicMock,
 ) -> None:
     """Parse cleanup should use per-table embeddings predicates, not __embeddings__."""
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = [
         "chunks",
@@ -1293,13 +1335,18 @@ def test_cleanup_parse_cascade_expands_embeddings_predicates_per_table(
     conn.open_table.side_effect = lambda name: table_map[name]
     mock_get_conn.return_value = conn
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
-    ) as mock_plan:
+    with (
+        patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
+        patch(
+            "xagent.core.tools.core.RAG_tools.version_management.main_pointer_manager._get_main_pointer_impl",
+            return_value=None,
+        ),
+    ):
         mock_plan.return_value = {"embeddings_m1": 2, "embeddings_legacy": 3}
-        result = cleanup_parse_cascade(
+        result = get_vector_index_store().cleanup_cascade_by_scope(
             "c_parse",
             "d_parse",
+            "parse",
             new_parse_hash="new",
             user_id=7,
             is_admin=False,
@@ -1316,12 +1363,11 @@ def test_cleanup_parse_cascade_expands_embeddings_predicates_per_table(
     assert result["embeddings"] == 5
 
 
-@patch(
-    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-)
+@patch.object(LanceDBVectorIndexStore, "_get_connection")
 def test_cleanup_parse_cascade_replaces_superseded_predicates(
     mock_get_conn: MagicMock,
 ) -> None:
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     conn = MagicMock(spec=["table_names", "open_table"])
     conn.table_names.return_value = ["chunks", "parses", "embeddings_m1"]
     table_map = {
@@ -1338,13 +1384,12 @@ def test_cleanup_parse_cascade_replaces_superseded_predicates(
     conn.open_table.side_effect = lambda name: table_map[name]
     mock_get_conn.return_value = conn
 
-    with patch(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
-    ) as mock_plan:
+    with patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan:
         mock_plan.return_value = {"embeddings_m1": 1, "chunks": 1, "parses": 1}
-        cleanup_parse_cascade(
+        get_vector_index_store().cleanup_cascade_by_scope(
             "c_replace",
             "d_replace",
+            "parse",
             old_parse_hash="old",
             new_parse_hash="new",
             user_id=7,
@@ -1474,28 +1519,24 @@ def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
     preview_only: bool,
     confirm: bool,
 ) -> None:
+    # Re-pointed to the store method (logic relocated in #513 Task 5 / H06).
     with (
+        patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
-        ) as mock_get_conn,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.kb.cleanup_filters.build_embedding_cleanup_filters"
         ) as mock_build_filters,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
-        ) as mock_plan,
-        patch(
-            "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._delete_by_predicates"
-        ) as mock_delete,
+        patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
+        patch(f"{_STORE}._vis_delete_by_predicates") as mock_delete,
     ):
         conn = MagicMock(spec=["table_names", "open_table"])
         mock_get_conn.return_value = conn
         mock_build_filters.return_value = {"embeddings_m1": ["collection == 'c_gate'"]}
         mock_plan.return_value = {"embeddings_m1": 1}
 
-        result = cleanup_embed_cascade(
+        result = get_vector_index_store().cleanup_cascade_by_scope(
             "c_gate",
             "d_gate",
+            "embeddings",
             user_id=7,
             is_admin=False,
             preview_only=preview_only,

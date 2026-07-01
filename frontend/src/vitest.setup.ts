@@ -1,5 +1,12 @@
 import "@testing-library/jest-dom/vitest"
-import { beforeEach } from "vitest"
+import { beforeEach, vi } from "vitest"
+
+// jsdom does not implement blob URL APIs; InlineFilePreview authenticated image
+// previews rely on them in tests that assert blob: src values or spy on revoke.
+URL.createObjectURL = vi.fn(
+  (blob: Blob) => `blob:mock-${blob.size}`
+) as typeof URL.createObjectURL
+URL.revokeObjectURL = vi.fn() as typeof URL.revokeObjectURL
 
 class ResizeObserverMock {
   observe() {}

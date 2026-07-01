@@ -596,7 +596,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             .filter((c: string) => c.startsWith('mcp:'))
             .map((c: string) => c.replace('mcp:', ''))
 
-          let connectedMcpApps: string[] = [...explicitlyConfiguredMcps]
+          // _enrich_template merges connections into tool_categories as mcp: entries, so
+          // iterating both explicitlyConfiguredMcps and connections would add each
+          // connection-backed server twice (raw name + resolved name). Seed the list with
+          // only the explicitly configured MCPs that are NOT covered by connections (e.g.
+          // custom MCP servers), then let the connections loop below resolve and add the rest.
+          const connectionNames = (template.connections && Array.isArray(template.connections))
+            ? template.connections.map((conn: any) => typeof conn === 'string' ? conn : conn.name).filter(Boolean)
+            : []
+
+          let connectedMcpApps: string[] = explicitlyConfiguredMcps.filter(
+            (mcp: string) => !connectionNames.some((connName: string) => mcpNameMatches(mcp, connName))
+          )
 
           // Use the template's 'connections' to figure out which MCP apps to select
           if (template.connections && Array.isArray(template.connections)) {
@@ -607,7 +618,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               // Find the actual server object to use its exact name, to avoid case mismatches
               const server = findMatchingMcpServer(mcpServers, connName)
               const finalName = server ? server.name : connName;
-              if (!connectedMcpApps.includes(finalName)) {
+              if (!connectedMcpApps.some(existing => mcpNameMatches(existing, finalName) || mcpNameMatches(existing, connName))) {
                 connectedMcpApps.push(finalName)
               }
             });
