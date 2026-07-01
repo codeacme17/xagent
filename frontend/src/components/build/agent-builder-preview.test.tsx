@@ -303,4 +303,76 @@ describe("AgentBuilder preview", () => {
     })
     expect(closeFilePreviewMock).toHaveBeenCalledTimes(1)
   })
+
+  it("shows App Widget settings for an existing agent without adding it to trigger dialog", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents/42") {
+        return Promise.resolve(new Response(JSON.stringify({
+          id: 42,
+          name: "Widget Agent",
+          description: "Helps website visitors",
+          instructions: "Answer visitor questions",
+          execution_mode: "balanced",
+          suggested_prompts: [],
+          knowledge_bases: [],
+          skills: [],
+          tool_categories: [],
+          models: { general: 7 },
+          logo_url: null,
+          status: "draft",
+          widget_enabled: true,
+          allowed_domains: ["example.com"],
+        }), { status: 200 }))
+      }
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      if (url.endsWith("/api/kb/collections")) {
+        return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
+      }
+      if (url.endsWith("/api/skills/")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      if (url.endsWith("/api/tools/available")) {
+        return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
+      }
+      if (url.endsWith("/api/models/?category=llm")) {
+        return Promise.resolve(new Response(JSON.stringify([
+          { id: 7, model_id: "gpt-test", model_name: "GPT Test", model_provider: "test", category: "llm" },
+        ]), { status: 200 }))
+      }
+      if (url.endsWith("/api/models/user-default")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      if (url.endsWith("/api/mcp/servers")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+    })
+
+    render(<AgentBuilder agentId="42" />)
+
+    expect(await screen.findByText("appWidget.builder.title")).toBeInTheDocument()
+    expect(screen.getByRole("switch", { name: "appWidget.builder.toggle" })).toBeChecked()
+
+    fireEvent.click(screen.getByText("appWidget.builder.title"))
+
+    expect(await screen.findByText("appWidget.dialog.title")).toBeInTheDocument()
+    expect(screen.getByText("example.com")).toBeInTheDocument()
+    expect(screen.getByText((content) => content.includes("widget.js"))).toBeInTheDocument()
+    expect(screen.getByText((content) => content.includes('data-agent-id="42"'))).toBeInTheDocument()
+    expect(screen.queryByText("triggers.cards.appWidget.title")).not.toBeInTheDocument()
+  })
+
+  it("shows a save-first App Widget state before an agent exists", async () => {
+    render(<AgentBuilder />)
+
+    expect(await screen.findByText("appWidget.builder.title")).toBeInTheDocument()
+    expect(screen.getByText("appWidget.builder.saveFirst")).toBeInTheDocument()
+    expect(screen.getByTitle("appWidget.builder.configure")).toBeDisabled()
+
+    fireEvent.click(screen.getByTitle("appWidget.builder.configure"))
+
+    expect(screen.queryByText("appWidget.dialog.title")).not.toBeInTheDocument()
+  })
 })
