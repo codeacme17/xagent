@@ -79,6 +79,11 @@ BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SE
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
+GMAIL_PUBSUB_TOPIC = "XAGENT_GMAIL_PUBSUB_TOPIC"
+GMAIL_PUBSUB_PUSH_TOKEN = "XAGENT_GMAIL_PUBSUB_PUSH_TOKEN"
+GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
+GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
+GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
 SMTP_HOST = "XAGENT_SMTP_HOST"
@@ -452,6 +457,47 @@ def get_trigger_dispatcher_batch_size() -> int:
         TRIGGER_DISPATCHER_BATCH_SIZE,
         20,
         minimum=1,
+    )
+
+
+def get_gmail_pubsub_topic_name() -> str | None:
+    """Return the Gmail Pub/Sub topic name used for Gmail watches."""
+    value = os.getenv(GMAIL_PUBSUB_TOPIC)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_gmail_pubsub_push_token() -> str | None:
+    """Return the shared token accepted by the Gmail Pub/Sub push endpoint."""
+    value = os.getenv(GMAIL_PUBSUB_PUSH_TOKEN)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_gmail_watch_enabled() -> bool:
+    """Return whether Gmail automatic watch registration is enabled."""
+    return _get_bool_env(GMAIL_WATCH_ENABLED, False)
+
+
+def get_gmail_watch_renewal_interval_seconds() -> int:
+    """Return how often the backend scans Gmail watches for renewal."""
+    return _get_positive_int_env(
+        GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS,
+        3600,
+        minimum=60,
+    )
+
+
+def get_gmail_watch_renewal_lead_seconds() -> int:
+    """Return how early Gmail watches should be renewed before expiration."""
+    return _get_positive_int_env(
+        GMAIL_WATCH_RENEWAL_LEAD_SECONDS,
+        24 * 60 * 60,
+        minimum=60,
     )
 
 

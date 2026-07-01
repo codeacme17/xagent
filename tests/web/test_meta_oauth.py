@@ -87,6 +87,82 @@ def _meta_provider() -> SimpleNamespace:
     )
 
 
+def _google_provider() -> SimpleNamespace:
+    return SimpleNamespace(
+        provider_name="google",
+        client_id=encrypt_value("google-client-id"),
+        client_secret=encrypt_value("google-client-secret"),
+        token_url="https://oauth2.googleapis.com/token",
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+        userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+        user_id_path="sub",
+        email_path="email",
+        default_scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    )
+
+
+def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    calls: list[int] = []
+
+    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
+        calls.append(user_id)
+        raise RuntimeError("watch registration unavailable")
+
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
+        fake_ensure_gmail_watches_for_user,
+        raising=False,
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "gmail")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    assert calls == [int(user.id)]
+
+
 def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
     db_session, monkeypatch
 ):

@@ -16,6 +16,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_file_storage_startup_sync_enabled,
+    get_gmail_watch_enabled,
+    get_gmail_watch_renewal_interval_seconds,
     get_session_secret,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
@@ -191,10 +193,38 @@ async def _run_trigger_dispatcher(
     batch_size: int,
 ) -> None:
     from .models.database import get_session_local
+    from .services.gmail_triggers import scan_due_gmail_watch_renewals
     from .services.triggers import dispatch_pending_trigger_runs
 
+    def _scan_due_gmail_watch_renewals_tick() -> int:
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            return scan_due_gmail_watch_renewals(db)
+        finally:
+            db.close()
+
+    loop = asyncio.get_running_loop()
+    next_gmail_watch_scan_at = 0.0
     while True:
         try:
+            now = loop.time()
+            if now >= next_gmail_watch_scan_at:
+                try:
+                    if get_gmail_watch_enabled():
+                        renewed = await asyncio.to_thread(
+                            _scan_due_gmail_watch_renewals_tick
+                        )
+                        if renewed:
+                            logger.info(
+                                "Trigger dispatcher renewed %s Gmail watch(es)",
+                                renewed,
+                            )
+                finally:
+                    next_gmail_watch_scan_at = (
+                        now + get_gmail_watch_renewal_interval_seconds()
+                    )
+
             SessionLocal = get_session_local()
             db = SessionLocal()
             try:

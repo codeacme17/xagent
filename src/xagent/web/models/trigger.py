@@ -23,6 +23,7 @@ from .database import Base
 class TriggerType(str, enum.Enum):
     WEBHOOK = "webhook"
     SCHEDULED = "scheduled"
+    GMAIL = "gmail"
 
 
 class TriggerRunStatus(str, enum.Enum):

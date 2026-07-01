@@ -6,7 +6,7 @@ import os
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-from google import genai  # type: ignore[import-untyped]
+from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors  # type: ignore[import-untyped]
 
 from ....utils.security import redact_sensitive_text

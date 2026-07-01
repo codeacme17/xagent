@@ -11,6 +11,7 @@ import {
   Copy,
   Info,
   Loader2,
+  Mail,
   Play,
   Plus,
   RefreshCcw,
@@ -44,6 +45,11 @@ import {
 import { copyToClipboard } from "@/lib/clipboard"
 import { cn, getApiUrl } from "@/lib/utils"
 
+interface GmailConnectionState {
+  isConnected: boolean
+  connectedAccount?: string | null
+}
+
 interface AgentTriggersDialogProps {
   agentId: number | null
   agentName?: string
@@ -51,6 +57,8 @@ interface AgentTriggersDialogProps {
   onOpenChange: (open: boolean) => void
   onChanged?: () => void
   initialType?: AgentTriggerType | null
+  gmailConnection?: GmailConnectionState | null
+  onConnectGmail?: () => void
 }
 
 interface TriggerFormState {
@@ -61,9 +69,12 @@ interface TriggerFormState {
   nextRunAt: string
   secret: string
   promptTemplate: string
+  watchLabel: string
+  senderFilter: string
+  subjectKeyword: string
 }
 
-const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled"]
+const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
 const DEFAULT_TEST_PAYLOAD = "{\n  \"message\": \"test trigger\"\n}"
 
 function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
@@ -75,11 +86,16 @@ function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
     nextRunAt: "",
     secret: "",
     promptTemplate: "",
+    watchLabel: "INBOX",
+    senderFilter: "",
+    subjectKeyword: "",
   }
 }
 
 function defaultConfigForType(type: AgentTriggerType): Record<string, unknown> {
-  return type === "scheduled" ? { interval_seconds: 3600 } : {}
+  if (type === "scheduled") return { interval_seconds: 3600 }
+  if (type === "gmail") return { watch_label: "INBOX" }
+  return {}
 }
 
 function formatDateTime(value: string | null): string {
@@ -102,6 +118,11 @@ function configNumber(config: Record<string, unknown>, key: string): string {
   return typeof value === "number" || typeof value === "string" ? String(value) : ""
 }
 
+function configString(config: Record<string, unknown>, key: string): string {
+  const value = config[key]
+  return typeof value === "string" ? value : ""
+}
+
 function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
   return {
     type: trigger.type,
@@ -117,6 +138,10 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
         : "",
     secret: "",
     promptTemplate: trigger.prompt_template ?? "",
+    watchLabel:
+      trigger.type === "gmail" ? configString(trigger.config, "watch_label") || "INBOX" : "INBOX",
+    senderFilter: trigger.type === "gmail" ? configString(trigger.config, "sender_filter") : "",
+    subjectKeyword: trigger.type === "gmail" ? configString(trigger.config, "subject_keyword") : "",
   }
 }
 
@@ -147,6 +172,8 @@ export function AgentTriggersDialog({
   onOpenChange,
   onChanged,
   initialType = null,
+  gmailConnection = null,
+  onConnectGmail,
 }: AgentTriggersDialogProps) {
   const { t } = useI18n()
   const router = useRouter()
@@ -183,7 +210,7 @@ export function AgentTriggersDialog({
         acc[type] = triggers.filter((trigger) => trigger.type === type).sort(newestFirst)
         return acc
       },
-      { webhook: [], scheduled: [] },
+      { webhook: [], scheduled: [], gmail: [] },
     )
   }, [triggers])
 
@@ -200,9 +227,9 @@ export function AgentTriggersDialog({
   const selectedWebhookUrl = webhookUrl(selectedTrigger)
 
   const defaultNameForType = useCallback((type: AgentTriggerType) => {
-    return type === "webhook"
-      ? t("triggers.defaults.webhookName")
-      : t("triggers.defaults.scheduledName")
+    if (type === "webhook") return t("triggers.defaults.webhookName")
+    if (type === "gmail") return t("triggers.defaults.gmailName")
+    return t("triggers.defaults.scheduledName")
   }, [t])
 
   const loadTriggers = useCallback(async (preferredTriggerId?: number | null) => {
@@ -308,6 +335,19 @@ export function AgentTriggersDialog({
 
   const buildConfig = (): Record<string, unknown> => {
     if (form.type === "webhook") return {}
+
+    if (form.type === "gmail") {
+      const watchLabel = form.watchLabel.trim()
+      if (!watchLabel) {
+        throw new Error(t("triggers.validation.watchLabel"))
+      }
+      const config: Record<string, unknown> = { watch_label: watchLabel }
+      const senderFilter = form.senderFilter.trim()
+      const subjectKeyword = form.subjectKeyword.trim()
+      if (senderFilter) config.sender_filter = senderFilter
+      if (subjectKeyword) config.subject_keyword = subjectKeyword
+      return config
+    }
 
     const config: Record<string, unknown> = {}
     const intervalValue = form.intervalSeconds.trim()
@@ -538,11 +578,9 @@ export function AgentTriggersDialog({
   }
 
   const renderTypeIcon = (type: AgentTriggerType, className?: string) => {
-    return type === "webhook" ? (
-      <Webhook className={className} />
-    ) : (
-      <CalendarClock className={className} />
-    )
+    if (type === "webhook") return <Webhook className={className} />
+    if (type === "gmail") return <Mail className={className} />
+    return <CalendarClock className={className} />
   }
 
   const renderTypeCard = (type: AgentTriggerType) => {
@@ -553,7 +591,9 @@ export function AgentTriggersDialog({
     const iconClass =
       type === "webhook"
         ? "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300"
-        : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
+        : type === "gmail"
+          ? "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"
+          : "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300"
 
     return (
       <div
@@ -714,6 +754,17 @@ export function AgentTriggersDialog({
                 onChange={(event) => setFormValue("intervalSeconds", event.target.value)}
               />
             </div>
+          ) : activeType === "gmail" ? (
+            <div className="space-y-2">
+              <Label htmlFor="trigger-watch-label">{t("triggers.form.watchLabel")}</Label>
+              <Input
+                id="trigger-watch-label"
+                value={form.watchLabel}
+                onChange={(event) => setFormValue("watchLabel", event.target.value)}
+                placeholder={t("triggers.form.watchLabelPlaceholder")}
+              />
+              <p className="text-xs text-muted-foreground">{t("triggers.form.watchLabelHelp")}</p>
+            </div>
           ) : (
             <div className="space-y-2">
               <Label htmlFor="trigger-secret">{t("triggers.form.secret")}</Label>
@@ -738,6 +789,65 @@ export function AgentTriggersDialog({
               onChange={(event) => setFormValue("nextRunAt", event.target.value)}
             />
           </div>
+        )}
+
+        {activeType === "gmail" && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="trigger-sender-filter">{t("triggers.form.senderFilter")}</Label>
+              <Input
+                id="trigger-sender-filter"
+                value={form.senderFilter}
+                onChange={(event) => setFormValue("senderFilter", event.target.value)}
+                placeholder={t("triggers.form.senderFilterPlaceholder")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="trigger-subject-keyword">{t("triggers.form.subjectKeyword")}</Label>
+              <Input
+                id="trigger-subject-keyword"
+                value={form.subjectKeyword}
+                onChange={(event) => setFormValue("subjectKeyword", event.target.value)}
+                placeholder={t("triggers.form.subjectKeywordPlaceholder")}
+              />
+            </div>
+          </div>
+        )}
+
+        {activeType === "gmail" && (
+          <Alert
+            className={cn(
+              gmailConnection?.isConnected
+                ? "border-emerald-200 bg-emerald-50 text-emerald-950 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-100"
+                : "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-100",
+            )}
+          >
+            <Mail className="h-4 w-4" />
+            <AlertTitle>
+              {gmailConnection?.isConnected
+                ? t("triggers.gmail.connected")
+                : t("triggers.gmail.notConnected")}
+            </AlertTitle>
+            <AlertDescription>
+              <div className="mt-1 flex flex-wrap items-center justify-between gap-3 text-sm">
+                <span>
+                  {gmailConnection?.isConnected
+                    ? gmailConnection.connectedAccount || t("triggers.gmail.connectedDescription")
+                    : t("triggers.gmail.notConnectedDescription")}
+                </span>
+                {!gmailConnection?.isConnected && onConnectGmail && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    onClick={onConnectGmail}
+                  >
+                    {t("triggers.gmail.connect")}
+                  </Button>
+                )}
+              </div>
+            </AlertDescription>
+          </Alert>
         )}
 
         <div className="space-y-2">
