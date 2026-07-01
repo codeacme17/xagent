@@ -230,10 +230,15 @@ def _exception_status_code(exc: Exception) -> int | None:
 
 
 # Message-level failures in this set are permanent for a given message id
-# (deleted/inaccessible, malformed, unauthorized, or rate-limited) and should
-# be skipped rather than held for Pub/Sub redelivery, which would otherwise
-# re-hit the same error on every retry and wedge the history cursor.
-_NON_RETRIABLE_MESSAGE_STATUS_CODES = frozenset({400, 403, 404, 410, 429})
+# (deleted/inaccessible, malformed, or unauthorized) and should be skipped
+# rather than held for Pub/Sub redelivery, which would otherwise re-hit the
+# same error on every retry and wedge the history cursor.
+#
+# 429 is deliberately excluded: it is a transient rate limit, not a
+# permanent per-message failure. Treating it as non-retriable would drop the
+# message for good; instead it falls through to the "hold cursor, let
+# Pub/Sub redeliver" path so its built-in backoff can retry the batch.
+_NON_RETRIABLE_MESSAGE_STATUS_CODES = frozenset({400, 403, 404, 410})
 
 
 def _is_non_retriable_message_error(exc: Exception) -> bool:
