@@ -282,6 +282,33 @@ class TestProviderRegistry:
         assert get_trigger_provider(STUB_PROVIDER) is replacement
 
 
+class TestScheduledTriggerConfigValidation:
+    """Negative coverage for the scheduled discriminated-union variant."""
+
+    def test_non_positive_interval_is_rejected(self):
+        from pydantic import ValidationError
+
+        for bad_interval in (0, -60):
+            with pytest.raises(ValidationError, match="interval_seconds"):
+                parse_trigger_config("scheduled", {"interval_seconds": bad_interval})
+
+    def test_schedule_source_is_required(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="interval_seconds or next_run_at"):
+            parse_trigger_config("scheduled", {})
+        with pytest.raises(ValidationError, match="interval_seconds or next_run_at"):
+            parse_trigger_config("scheduled", {"next_run_at": "   "})
+
+    def test_valid_schedules_are_accepted(self):
+        by_interval = parse_trigger_config("scheduled", {"interval_seconds": 300})
+        assert by_interval.interval_seconds == 300
+        by_moment = parse_trigger_config(
+            "scheduled", {"next_run_at": "2026-07-03T00:00:00+00:00"}
+        )
+        assert by_moment.next_run_at == "2026-07-03T00:00:00+00:00"
+
+
 class TestCallbackPipeline:
     async def test_unknown_provider_is_audited(self, db_session):
         result = await process_trigger_callback(
@@ -357,33 +384,6 @@ class TestCallbackPipeline:
         assert audits[0].detail == {"reason": "bad stub token"}
         assert db_session.query(TriggerRun).count() == 0
 
-    async def test_disabled_trigger_is_rejected_after_verification(
-        self, db_session, stub_provider
-    ):
-        user = _create_user(db_session)
-        agent = _create_agent(db_session, user)
-        _create_stub_trigger(db_session, user, agent, enabled=False)
-
-        result = await process_trigger_callback(
-            db_session,
-            context=_context(headers=_good_headers()),
-            raw_body=_event_body(),
-        )
-        assert result.status_code == 409
-        assert result.outcome == TriggerAuditOutcome.REJECTED_DISABLED
-        assert [a.outcome for a in _audits(db_session)] == ["rejected_disabled"]
-        assert db_session.query(TriggerRun).count() == 0
-
-    async def test_unparseable_body_is_a_controlled_failure(
-        self, db_session, stub_provider
-    ):
-        user = _create_user(db_session)
-        agent = _create_agent(db_session, user)
-        _create_stub_trigger(db_session, user, agent)
-
-        result = await process_trigger_callback(
-            db_session,
-            context=_context(headers=_good_headers()),
     async def test_verification_error_keeps_redelivery_semantics(
         self, db_session, stub_provider
     ):
@@ -416,6 +416,33 @@ class TestCallbackPipeline:
         assert "ConnectionError" in audits[0].detail["error"]
         assert db_session.query(TriggerRun).count() == 0
 
+    async def test_disabled_trigger_is_rejected_after_verification(
+        self, db_session, stub_provider
+    ):
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, enabled=False)
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=_event_body(),
+        )
+        assert result.status_code == 409
+        assert result.outcome == TriggerAuditOutcome.REJECTED_DISABLED
+        assert [a.outcome for a in _audits(db_session)] == ["rejected_disabled"]
+        assert db_session.query(TriggerRun).count() == 0
+
+    async def test_unparseable_body_is_a_controlled_failure(
+        self, db_session, stub_provider
+    ):
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent)
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
             raw_body=b"\x00not-json",
         )
         assert result.status_code == 400
@@ -494,16 +521,21 @@ class TestCallbackPipeline:
         agent = _create_agent(db_session, user)
         trigger = _create_stub_trigger(db_session, user, agent, resource_id="res-1")
 
+        raw_body = json.dumps(
+            {"id": "evt-1", "type": "stub.event", "resource": "res-claimed"}
+        ).encode()
         result = await process_trigger_callback(
             db_session,
             context=_context(headers=_good_headers(resource="res-other")),
-            raw_body=_event_body(),
+            raw_body=raw_body,
         )
         assert result.status_code == 403
         assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
         audits = _audits(db_session)
         assert [a.outcome for a in audits] == ["rejected_resource"]
         assert audits[0].trigger_id == trigger.id
+        assert audits[0].detail["reason"] == "mismatch"
+        assert audits[0].detail["claimed_resource_id"] == "res-claimed"
         assert audits[0].detail["attested_resource_id"] == "res-other"
         assert audits[0].detail["trigger_resource_id"] == "res-1"
         assert db_session.query(TriggerRun).count() == 0
@@ -566,6 +598,8 @@ class TestCallbackPipeline:
         )
         assert result.status_code == 403
         assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
+        audits = _audits(db_session)
+        assert audits[-1].detail["reason"] == "no attested identity"
         assert db_session.query(TriggerRun).count() == 0
 
     async def test_cross_user_target_trigger_is_rejected(
@@ -643,6 +677,45 @@ class TestCallbackPipeline:
         assert result.outcome == TriggerAuditOutcome.ACCEPTED
         assert len(result.runs) == 1
         assert result.runs[0].trigger_id == sibling.id
+
+    async def test_disabled_sibling_only_callback_reports_disabled_outcome(
+        self, db_session, stub_provider
+    ):
+        """When every event targets a disabled sibling trigger, the terminal
+        result mirrors the per-event rejected_disabled audit rather than
+        mislabeling the callback as a resource rejection (whose ack status
+        can differ)."""
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+        sibling = _create_stub_trigger(
+            db_session,
+            user,
+            agent,
+            callback_id="cb-stub-disabled-sibling",
+            resource_id="res-1",
+            enabled=False,
+        )
+
+        raw_body = json.dumps(
+            {
+                "id": "evt-disabled-sibling",
+                "type": "stub.event",
+                "target_trigger_id": int(sibling.id),
+            }
+        ).encode()
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=raw_body,
+        )
+
+        assert result.status_code == stub_provider.ack_policy.disabled_status == 409
+        assert result.outcome == TriggerAuditOutcome.REJECTED_DISABLED
+        assert db_session.query(TriggerRun).count() == 0
+        audits = _audits(db_session)
+        assert [a.outcome for a in audits] == ["rejected_disabled"]
+        assert audits[0].trigger_id == sibling.id
 
     async def test_audit_rows_survive_trigger_deletion(self, db_session, stub_provider):
         user = _create_user(db_session)

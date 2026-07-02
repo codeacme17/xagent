@@ -234,12 +234,15 @@ async def process_trigger_callback(
     runs: list[TriggerRun] = []
     duplicates = 0
     rejected_events = 0
+    rejected_resource_events = 0
+    rejected_disabled_events = 0
     filtered_count = 0
     failures: list[str] = []
     for event in events:
         event_trigger = _resolve_event_trigger(db, trigger, event)
         if event_trigger is None:
             rejected_events += 1
+            rejected_resource_events += 1
             record_trigger_audit(
                 db,
                 outcome=TriggerAuditOutcome.REJECTED_RESOURCE,
@@ -258,6 +261,7 @@ async def process_trigger_callback(
 
         if not event_trigger.enabled:
             rejected_events += 1
+            rejected_disabled_events += 1
             record_trigger_audit(
                 db,
                 outcome=TriggerAuditOutcome.REJECTED_DISABLED,
@@ -280,6 +284,7 @@ async def process_trigger_callback(
             event_trigger, verification.attested_resource_id, event
         ):
             rejected_events += 1
+            rejected_resource_events += 1
             record_trigger_audit(
                 db,
                 outcome=TriggerAuditOutcome.REJECTED_RESOURCE,
@@ -287,6 +292,12 @@ async def process_trigger_callback(
                 callback_id=callback_id,
                 trigger_id=int(event_trigger.id),
                 detail={
+                    "reason": (
+                        "no attested identity"
+                        if verification.attested_resource_id is None
+                        else "mismatch"
+                    ),
+                    "claimed_resource_id": event.resource_id,
                     "attested_resource_id": verification.attested_resource_id,
                     "trigger_resource_id": event_trigger.resource_id,
                     "event_type": event.event_type,
@@ -380,6 +391,18 @@ async def process_trigger_callback(
             outcome=TriggerAuditOutcome.ACCEPTED,
             runs=runs,
             duplicates=duplicates,
+            rejected_events=rejected_events,
+            filtered_events=filtered_count,
+        )
+
+    if rejected_resource_events == 0 and rejected_disabled_events > 0:
+        # Every rejection was a disabled target trigger (sibling triggers
+        # selected via target_trigger_id); mirror the per-event audit outcome
+        # instead of mislabeling the callback as a resource rejection.
+        return CallbackResult(
+            status_code=ack.disabled_status,
+            outcome=TriggerAuditOutcome.REJECTED_DISABLED,
+            detail="Trigger is disabled",
             rejected_events=rejected_events,
             filtered_events=filtered_count,
         )
