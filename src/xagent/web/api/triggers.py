@@ -15,18 +15,20 @@ from sqlalchemy.orm import Session
 from ...config import get_gmail_pubsub_push_token
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
-from ..models.trigger import AgentTrigger, TriggerRun
+from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
 from ..services.gmail_triggers import (
     GmailPubsubNotification,
     GmailTriggerError,
     process_gmail_pubsub_notification,
 )
+from ..services.trigger_providers import record_trigger_audit
 from ..services.triggers import (
     TriggerNotFoundError,
     TriggerSecretError,
     TriggerServiceError,
     create_agent_trigger,
+    decrypt_trigger_run_payload,
     delete_agent_trigger,
     find_webhook_trigger,
     fire_trigger,
@@ -90,6 +92,8 @@ class TriggerRunResponse(BaseModel):
     status: str
     source_event_id: str | None
     payload_snapshot: dict[str, Any] | None
+    payload_stored: bool = False
+    payload: Any | None = None
     idempotency_key: str
     error_message: str | None
     started_at: str | None
@@ -141,8 +145,15 @@ def _serialize_trigger(
     )
 
 
-def _serialize_run(run: TriggerRun) -> TriggerRunResponse:
-    payload = run.payload_snapshot if isinstance(run.payload_snapshot, dict) else None
+def _serialize_run(
+    run: TriggerRun, *, payload: Any | None = None
+) -> TriggerRunResponse:
+    snapshot = run.payload_snapshot if isinstance(run.payload_snapshot, dict) else None
+    payload_stored = bool(snapshot and "encrypted_payload" in snapshot)
+    if snapshot and payload_stored:
+        # Never ship ciphertext to clients; decrypted content is only
+        # available through the audited include_payload read.
+        snapshot = {k: v for k, v in snapshot.items() if k != "encrypted_payload"}
     return TriggerRunResponse(
         id=int(run.id),
         trigger_id=int(run.trigger_id),
@@ -150,7 +161,9 @@ def _serialize_run(run: TriggerRun) -> TriggerRunResponse:
         background_job_id=run.background_job_id,
         status=str(run.status),
         source_event_id=run.source_event_id,
-        payload_snapshot=payload,
+        payload_snapshot=snapshot,
+        payload_stored=payload_stored,
+        payload=payload,
         idempotency_key=str(run.idempotency_key),
         error_message=run.error_message,
         started_at=_dt(getattr(run, "started_at", None)),
@@ -307,6 +320,54 @@ async def list_trigger_runs(
     return [_serialize_run(row) for row in rows]
 
 
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}",
+    response_model=TriggerRunResponse,
+)
+async def get_trigger_run(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    include_payload: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+
+    payload: Any | None = None
+    if include_payload:
+        try:
+            payload = decrypt_trigger_run_payload(run)
+        except Exception as exc:
+            raise _handle_service_error(exc)
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.PAYLOAD_READ,
+            provider=str(trigger.provider) if trigger.provider else None,
+            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+            trigger_id=int(trigger.id),
+            detail={
+                "trigger_run_id": int(run.id),
+                "user_id": int(current_user.id),
+            },
+            remote_ip=request.client.host if request.client else None,
+        )
+    return _serialize_run(run, payload=payload)
+
+
 @router.post(
     "/api/agents/{agent_id}/triggers/{trigger_id}/test",
     response_model=TriggerFireResponse,
@@ -331,6 +392,7 @@ async def test_trigger(
             event_payload=request.payload,
             source_event_id=request.source_event_id,
             test=True,
+            event_type="test",
         )
         return TriggerFireResponse(
             trigger_run=_serialize_run(run), duplicate=not created
@@ -412,6 +474,7 @@ async def receive_webhook_trigger(
             trigger=trigger,
             event_payload=payload,
             source_event_id=source_event_id,
+            event_type="webhook",
         )
         return PublicTriggerFireResponse(
             trigger_run_id=int(run.id),

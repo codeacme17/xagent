@@ -213,7 +213,10 @@ def test_public_webhook_invalid_utf8_body_falls_back_to_text(
     try:
         run_id = fired.json()["trigger_run_id"]
         run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
-        assert run.payload_snapshot == {"body": '\ufffd{"subject":"hello"}'}
+        # Conservative default: hash + metadata only, no payload content.
+        assert set(run.payload_snapshot) == {"payload_sha256", "metadata"}
+        assert run.payload_snapshot["metadata"]["event_type"] == "webhook"
+        assert '\ufffd{"subject":"hello"}' not in str(run.payload_snapshot)
     finally:
         db.close()
 

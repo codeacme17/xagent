@@ -722,6 +722,8 @@ async def process_gmail_pubsub_notification(
                     event_payload=payload,
                     source_event_id=f"gmail:{message_id}",
                     test=False,
+                    event_type="gmail.message",
+                    resource_id=email_address,
                 )
                 if created:
                     processed += 1

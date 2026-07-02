@@ -273,4 +273,7 @@ async def _fire_event(
         trigger=trigger,
         event_payload=event.payload,
         source_event_id=event.source_event_id,
+        event_type=event.event_type,
+        resource_id=event.resource_id,
+        received_at=event.received_at,
     )

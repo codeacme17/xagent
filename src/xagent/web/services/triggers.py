@@ -19,6 +19,7 @@ from ..models.agent import Agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
+from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
 from .trigger_providers.schemas import parse_trigger_config
@@ -40,7 +41,6 @@ _TRIGGER_SCOPE_PAYLOAD_KEYS = (
     "tenant_id",
 )
 
-_PAYLOAD_PREVIEW_LIMIT = 64_000
 _WEBHOOK_SECRET_BCRYPT_COST = 12
 _TRIGGER_NAME_MAX_LENGTH = 200
 
@@ -94,16 +94,56 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def _payload_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    encoded = _json_dumps(payload)
-    if len(encoded) <= _PAYLOAD_PREVIEW_LIMIT:
-        return payload
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return {
-        "truncated": True,
-        "sha256": digest,
-        "preview": encoded[:_PAYLOAD_PREVIEW_LIMIT],
+def _store_full_payload_enabled(trigger: AgentTrigger) -> bool:
+    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
+    return bool(config.get("store_full_payload"))
+
+
+def _payload_snapshot(
+    trigger: AgentTrigger,
+    payload: dict[str, Any],
+    *,
+    source_event_id: str | None,
+    event_type: str | None,
+    resource_id: str | None,
+    received_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Conservative trigger-run snapshot: stable hash plus allow-listed metadata.
+
+    Event content (e.g. Gmail sender/subject/snippet/body/headers) is never
+    stored by default. Full payload content is stored only when the trigger
+    explicitly opts in via store_full_payload, and then only encrypted.
+    """
+    snapshot: dict[str, Any] = {
+        "payload_sha256": _payload_hash(payload),
+        "metadata": {
+            "source_event_id": source_event_id,
+            "event_type": event_type,
+            "resource_id": resource_id,
+            "received_at": (received_at or _now()).isoformat(),
+        },
     }
+    if _store_full_payload_enabled(trigger):
+        snapshot["encrypted_payload"] = encrypt_value(_json_dumps(payload))
+    return snapshot
+
+
+def decrypt_trigger_run_payload(run: TriggerRun) -> Any:
+    """Return the decrypted original payload of a trigger run.
+
+    Raises TriggerServiceError when the run did not store an encrypted full
+    payload (full payload storage was not enabled at event time).
+    """
+    snapshot = run.payload_snapshot
+    if not isinstance(snapshot, dict) or "encrypted_payload" not in snapshot:
+        raise TriggerServiceError(
+            "Full payload storage was not enabled for this trigger run"
+        )
+    decrypted = decrypt_value(str(snapshot["encrypted_payload"]))
+    try:
+        return json.loads(decrypted)
+    except ValueError as exc:
+        raise TriggerServiceError("Failed to decrypt trigger run payload") from exc
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
@@ -493,6 +533,9 @@ def _get_or_create_trigger_run(
     source_event_id: str | None,
     background_job_id: str | None,
     test: bool,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     idempotency_key = _trigger_run_idempotency_key(
         trigger,
@@ -513,7 +556,16 @@ def _get_or_create_trigger_run(
         background_job_id=background_job_id,
         status=TriggerRunStatus.PENDING.value,
         source_event_id=source_event_id,
-        payload_snapshot=_payload_snapshot(event_payload),
+        payload_snapshot=_payload_snapshot(
+            trigger,
+            event_payload,
+            source_event_id=source_event_id,
+            event_type=event_type,
+            resource_id=resource_id
+            if resource_id is not None
+            else (str(trigger.resource_id) if trigger.resource_id else None),
+            received_at=received_at,
+        ),
         idempotency_key=idempotency_key,
     )
     db.add(run)
@@ -623,6 +675,9 @@ def prepare_trigger_run(
     source_event_id: str | None = None,
     background_job_id: str | None = None,
     test: bool = False,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     """Persist a trigger run and hidden task without starting agent execution."""
     if not test and not trigger.enabled:
@@ -635,6 +690,9 @@ def prepare_trigger_run(
         source_event_id=source_event_id,
         background_job_id=background_job_id,
         test=test,
+        event_type=event_type,
+        resource_id=resource_id,
+        received_at=received_at,
     )
     if not created and run.task_id is not None:
         return run, False
@@ -919,6 +977,9 @@ async def fire_trigger(
     background_job_id: str | None = None,
     test: bool = False,
     wait_for_completion: bool = False,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     """Prepare a trigger event and start it in the current backend process."""
     run, created = prepare_trigger_run(
@@ -928,6 +989,9 @@ async def fire_trigger(
         source_event_id=source_event_id,
         background_job_id=background_job_id,
         test=test,
+        event_type=event_type,
+        resource_id=resource_id,
+        received_at=received_at,
     )
     if created:
         await start_prepared_trigger_run(
@@ -1033,6 +1097,7 @@ def scan_due_scheduled_triggers(
             source_event_id=source_event_id,
             background_job_id=None,
             test=False,
+            event_type="scheduled",
         )
 
         config = dict(trigger.config or {})

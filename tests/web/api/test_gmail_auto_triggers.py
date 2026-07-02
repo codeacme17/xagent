@@ -571,8 +571,13 @@ def test_process_gmail_pubsub_notification_fires_matching_gmail_trigger(
             db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
         )
         assert run.source_event_id == "gmail:msg-1"
-        assert run.payload_snapshot["from"] == "boss@company.com"
-        assert run.payload_snapshot["subject"] == "urgent: e2e"
+        # Conservative default snapshot: sender/subject/snippet content is no
+        # longer persisted, only a stable hash plus allow-listed metadata.
+        assert set(run.payload_snapshot) == {"payload_sha256", "metadata"}
+        assert run.payload_snapshot["metadata"]["event_type"] == "gmail.message"
+        assert run.payload_snapshot["metadata"]["resource_id"] == "codeacme17@gmail.com"
+        assert "boss@company.com" not in str(run.payload_snapshot)
+        assert "urgent: e2e" not in str(run.payload_snapshot)
         db.refresh(state)
         assert state.history_id == "222"
         assert mock_bg_scheduler.call_count == 1
