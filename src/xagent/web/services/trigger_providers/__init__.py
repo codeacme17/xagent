@@ -8,6 +8,7 @@ from .base import (
     TriggerProvider,
     TriggerProviderError,
 )
+from .gmail import GmailProvider
 from .pipeline import CallbackResult, process_trigger_callback
 from .registry import (
     UnknownTriggerProviderError,
@@ -31,7 +32,6 @@ from .schemas import (
     dump_trigger_config,
     parse_trigger_config,
 )
-from .gmail import GmailProvider
 from .webhook import WebhookProvider, sign_webhook_payload
 
 __all__ = [

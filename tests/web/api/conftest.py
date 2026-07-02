@@ -130,7 +130,7 @@ def _reset_trigger_rate_limiter() -> Iterator[None]:
     """Fresh rate-limit window per test.
 
     The trigger rate limiter is a process-wide singleton with an in-memory
-    moving window; without a reset, fast suites re-using the same user id
+    moving window; without a reset, fast suites reusing the same user id
     would eventually trip the CRUD limit across unrelated tests.
     """
     from xagent.web.services.trigger_rate_limit import reset_trigger_rate_limiter

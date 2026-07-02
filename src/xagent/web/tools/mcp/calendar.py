@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Any
 
-from google.oauth2.credentials import Credentials  # type: ignore
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from mcp.server.fastmcp import FastMCP
 

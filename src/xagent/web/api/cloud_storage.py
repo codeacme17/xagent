@@ -5,8 +5,8 @@ import os
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from google.auth.transport.requests import Request  # type: ignore
-from google.oauth2.credentials import Credentials  # type: ignore
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from sqlalchemy.orm import Session
 
@@ -84,7 +84,7 @@ def get_google_credentials(
         try:
             creds.refresh(Request())
             # Update token in DB
-            oauth_account.access_token = creds.token
+            setattr(oauth_account, "access_token", creds.token)
             if creds.expiry:
                 oauth_account.expires_at = creds.expiry
             db.commit()

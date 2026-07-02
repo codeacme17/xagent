@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any
 
-from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import (  # type: ignore[import-not-found]
     MediaIoBaseDownload,

@@ -14,18 +14,17 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.agent import Agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
-from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
 from .gmail_provisioning import (
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
 )
-from .trigger_providers.schemas import parse_trigger_config
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
@@ -33,6 +32,7 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
 )
+from .trigger_providers.schemas import parse_trigger_config
 
 logger = logging.getLogger(__name__)
 
