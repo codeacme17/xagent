@@ -50,11 +50,21 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   })
 }
 
+const GMAIL_ACCOUNTS_URL = "http://api.local/api/cloud/accounts?provider=gmail"
+
 describe("AgentTriggersDialog", () => {
+  let gmailAccounts: Array<{ id: number; provider: string; email: string | null }>
+
   beforeEach(() => {
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
+    gmailAccounts = [
+      { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
+    ]
     apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse(gmailAccounts))
+      }
       if (url === "http://api.local/api/agents/42/triggers") {
         return Promise.resolve(
           jsonResponse([
@@ -69,6 +79,7 @@ describe("AgentTriggersDialog", () => {
                 watch_label: "INBOX",
                 sender_filter: "boss@company.com",
                 subject_keyword: "urgent",
+                oauth_account_id: 7,
               },
               prompt_template: "Reply to {{payload}}",
               webhook_token: null,
@@ -117,7 +128,8 @@ describe("AgentTriggersDialog", () => {
     expect(screen.getByLabelText("triggers.form.senderFilter")).toHaveValue("boss@company.com")
     expect(screen.getByLabelText("triggers.form.subjectKeyword")).toHaveValue("urgent")
     expect(screen.getByText("triggers.gmail.connected")).toBeInTheDocument()
-    expect(screen.getByText("gerard.santos@gmail.com")).toBeInTheDocument()
+    // Shown both in the account selector and the connection banner.
+    expect(screen.getAllByText("gerard.santos@gmail.com").length).toBeGreaterThan(0)
   })
 
   it("prompts for Gmail connection when the connector is missing", async () => {
@@ -144,4 +156,112 @@ describe("AgentTriggersDialog", () => {
     expect(onConnectGmail).toHaveBeenCalledTimes(1)
   })
 
+  it("shows the bound Gmail account for an existing trigger", async () => {
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        agentName="Inbox Agent"
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+
+    expect(await screen.findByText("triggers.form.gmailAccount")).toBeInTheDocument()
+    expect(await screen.findByText("gerard.santos@gmail.com")).toBeInTheDocument()
+    expect(screen.queryByText("triggers.gmail.accountMissing")).not.toBeInTheDocument()
+  })
+
+  it("auto-selects the only connected account for a new Gmail trigger", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(
+          jsonResponse([{ id: 3, provider: "gmail", email: "solo@gmail.com" }]),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        initialType="gmail"
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    expect(await screen.findByText("solo@gmail.com")).toBeInTheDocument()
+  })
+
+  it("requires an explicit choice when several accounts are connected", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(
+          jsonResponse([
+            { id: 3, provider: "gmail", email: "first@gmail.com" },
+            { id: 4, provider: "gmail", email: "second@gmail.com" },
+          ]),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        initialType="gmail"
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    expect(
+      await screen.findByText("triggers.form.gmailAccountPlaceholder"),
+    ).toBeInTheDocument()
+    expect(screen.queryByText("first@gmail.com")).not.toBeInTheDocument()
+    expect(screen.queryByText("second@gmail.com")).not.toBeInTheDocument()
+  })
+
+  it("disables the account selector when no Gmail accounts are connected", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) {
+        return Promise.resolve(jsonResponse([]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        initialType="gmail"
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+
+    expect(await screen.findByText("triggers.gmail.noAccounts")).toBeInTheDocument()
+  })
+
+  it("warns when the bound Gmail account is no longer connected", async () => {
+    gmailAccounts = [{ id: 8, provider: "gmail", email: "other@gmail.com" }]
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+
+    expect(await screen.findByText("triggers.gmail.accountMissing")).toBeInTheDocument()
+  })
 })

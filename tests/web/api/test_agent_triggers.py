@@ -10,6 +10,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
 from xagent.web.services.triggers import (
     _compute_next_run_at,
@@ -45,6 +46,29 @@ def _create_agent(headers: dict[str, str], name: str = "Trigger Agent") -> int:
     )
     assert resp.status_code == 200, resp.text
     return int(resp.json()["id"])
+
+
+def _connect_gmail_account(
+    username: str = "admin",
+    *,
+    email: str = "owner@gmail.example",
+    provider: str = "gmail",
+) -> int:
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == username).one()
+        account = UserOAuth(
+            user_id=int(user.id),
+            provider=provider,
+            access_token="access-token",
+            email=email,
+        )
+        db.add(account)
+        db.commit()
+        db.refresh(account)
+        return int(account.id)
+    finally:
+        db.close()
 
 
 def test_webhook_trigger_crud_returns_secret_once() -> None:
@@ -232,6 +256,7 @@ def test_trigger_name_validation_rejects_empty_and_oversized() -> None:
 def test_gmail_trigger_crud_persists_filters() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account(email="Owner@Gmail.Example")
 
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
@@ -243,6 +268,7 @@ def test_gmail_trigger_crud_persists_filters() -> None:
                 "watch_label": "INBOX",
                 "sender_filter": "boss@company.com",
                 "subject_keyword": "urgent",
+                "oauth_account_id": account_id,
             },
             "prompt_template": "Handle Gmail message {{payload}}",
         },
@@ -256,7 +282,16 @@ def test_gmail_trigger_crud_persists_filters() -> None:
         "watch_label": "INBOX",
         "sender_filter": "boss@company.com",
         "subject_keyword": "urgent",
+        "oauth_account_id": account_id,
     }
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == body["id"]).one()
+        assert trigger.provider == "gmail"
+        assert trigger.resource_id == "owner@gmail.example"
+    finally:
+        db.close()
 
     patched = client.patch(
         f"/api/agents/{agent_id}/triggers/{body['id']}",
@@ -266,6 +301,7 @@ def test_gmail_trigger_crud_persists_filters() -> None:
                 "watch_label": "CATEGORY_PRIMARY",
                 "sender_filter": "",
                 "subject_keyword": "invoice",
+                "oauth_account_id": account_id,
             }
         },
     )
@@ -274,7 +310,66 @@ def test_gmail_trigger_crud_persists_filters() -> None:
         "watch_label": "CATEGORY_PRIMARY",
         "sender_filter": "",
         "subject_keyword": "invoice",
+        "oauth_account_id": account_id,
     }
+
+
+def test_gmail_trigger_requires_oauth_account() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "No account",
+            "config": {"watch_label": "INBOX"},
+        },
+    )
+    assert created.status_code == 400
+    assert "oauth_account_id" in created.json()["detail"]
+
+
+def test_gmail_trigger_rejects_foreign_oauth_account() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    from .conftest import _register_second_user
+
+    _register_second_user()
+    foreign_account_id = _connect_gmail_account("bob", email="bob@gmail.example")
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Foreign account",
+            "config": {"watch_label": "INBOX", "oauth_account_id": foreign_account_id},
+        },
+    )
+    assert created.status_code == 400
+    assert "not found" in created.json()["detail"].lower()
+
+
+def test_gmail_trigger_rejects_non_gmail_oauth_account() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    drive_account_id = _connect_gmail_account(
+        email="owner@gmail.example", provider="google-drive"
+    )
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Wrong provider",
+            "config": {"watch_label": "INBOX", "oauth_account_id": drive_account_id},
+        },
+    )
+    assert created.status_code == 400
+    assert "not a gmail account" in created.json()["detail"].lower()
 
 
 def test_enabled_gmail_trigger_create_best_effort_registers_watch(
@@ -293,6 +388,7 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
     )
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
 
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
@@ -300,7 +396,7 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
         json={
             "type": "gmail",
             "name": "Support inbox",
-            "config": {"watch_label": "INBOX"},
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
         },
     )
 
@@ -333,6 +429,7 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
     )
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
         headers=headers,
@@ -340,7 +437,7 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
             "type": "gmail",
             "enabled": False,
             "name": "Support inbox",
-            "config": {"watch_label": "INBOX"},
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
         },
     )
     assert created.status_code == 200, created.text
@@ -385,13 +482,14 @@ def test_gmail_trigger_requires_watch_label() -> None:
 def test_gmail_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
         headers=headers,
         json={
             "type": "gmail",
             "name": "Gmail support",
-            "config": {"watch_label": "INBOX"},
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
             "prompt_template": "Triage this email: {{payload}}",
         },
     )

@@ -60,6 +60,12 @@ export interface AgentTriggerTestResponse {
   duplicate: boolean
 }
 
+export interface GmailAccount {
+  id: number
+  provider: string
+  email: string | null
+}
+
 function jsonHeaders(): HeadersInit {
   return {
     "Content-Type": "application/json",
@@ -98,6 +104,16 @@ async function parseApiError(response: Response, fallback: string): Promise<Erro
   } catch {
     return new Error(fallback)
   }
+}
+
+export async function listGmailAccounts(): Promise<GmailAccount[]> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/cloud/accounts?provider=gmail`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load Gmail accounts")
+  }
+  return response.json()
 }
 
 export async function listAgentTriggers(

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import bcrypt
+from pydantic import ValidationError
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -18,7 +19,9 @@ from ..models.agent import Agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
+from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
+from .trigger_providers.schemas import parse_trigger_config
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
@@ -208,23 +211,64 @@ def _compute_next_run_at(
     return candidate
 
 
-def _validate_config(trigger_type: str, config: dict[str, Any]) -> None:
+def _typed_config_error(trigger_type: str, exc: ValidationError) -> TriggerServiceError:
+    parts: list[str] = []
+    for error in exc.errors():
+        location = ".".join(
+            str(item) for item in error.get("loc", []) if item != "config"
+        )
+        message = str(error.get("msg", "invalid value"))
+        message = message.removeprefix("Value error, ")
+        parts.append(f"{location}: {message}" if location else message)
+    detail = "; ".join(parts) or "invalid config"
+    return TriggerServiceError(f"{trigger_type} trigger config invalid: {detail}")
+
+
+def _resolve_gmail_resource(
+    db: Session, *, user_id: int, oauth_account_id: int | None
+) -> str:
+    """Validate the bound Gmail account and return the normalized mailbox."""
+    if oauth_account_id is None:
+        raise TriggerServiceError("gmail trigger requires oauth_account_id")
+    account = db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account_id)).first()
+    if account is None or int(account.user_id) != int(user_id):
+        raise TriggerServiceError("Gmail account not found")
+    if str(account.provider) != "gmail":
+        raise TriggerServiceError("Selected account is not a Gmail account")
+    email = str(account.email or "").strip().lower()
+    if not email:
+        raise TriggerServiceError("Gmail account has no email address")
+    return email
+
+
+def _validate_config(
+    db: Session,
+    *,
+    user_id: int,
+    trigger_type: str,
+    config: dict[str, Any],
+) -> str | None:
+    """Validate config against the typed schema; return the resource identity.
+
+    The stored config keeps the caller-provided JSON shape; validation is
+    performed on the typed model without normalizing persisted fields.
+    """
     if not isinstance(config, dict):
         raise TriggerServiceError("config must be an object")
+    try:
+        typed = parse_trigger_config(trigger_type, config)
+    except ValidationError as exc:
+        raise _typed_config_error(trigger_type, exc) from exc
+
     if trigger_type == TriggerType.SCHEDULED.value:
-        if "interval_seconds" not in config and "next_run_at" not in config:
-            raise TriggerServiceError(
-                "scheduled trigger requires interval_seconds or next_run_at"
-            )
         _compute_next_run_at(config)
     if trigger_type == TriggerType.GMAIL.value:
-        watch_label = config.get("watch_label")
-        if not isinstance(watch_label, str) or not watch_label.strip():
-            raise TriggerServiceError("gmail trigger requires watch_label")
-        for key in ("sender_filter", "subject_keyword"):
-            value = config.get(key)
-            if value is not None and not isinstance(value, str):
-                raise TriggerServiceError(f"gmail trigger {key} must be a string")
+        return _resolve_gmail_resource(
+            db,
+            user_id=user_id,
+            oauth_account_id=getattr(typed, "oauth_account_id", None),
+        )
+    return None
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
@@ -269,7 +313,12 @@ def create_agent_trigger(
 
     resolved_type = _normalize_trigger_type(trigger_type)
     resolved_config = dict(config or {})
-    _validate_config(resolved_type, resolved_config)
+    resource_id = _validate_config(
+        db,
+        user_id=user_id,
+        trigger_type=resolved_type,
+        config=resolved_config,
+    )
 
     plain_secret: str | None = None
     webhook_token: str | None = None
@@ -295,6 +344,8 @@ def create_agent_trigger(
         prompt_template=prompt_template,
         webhook_token=webhook_token,
         secret_hash=secret_hash,
+        provider=resolved_type,
+        resource_id=resource_id,
         next_run_at=next_run_at,
     )
     db.add(trigger)
@@ -329,8 +380,16 @@ def update_agent_trigger(
         setattr(trigger, "prompt_template", updates["prompt_template"])
     if "config" in updates and updates["config"] is not None:
         config = dict(updates["config"])
-        _validate_config(str(trigger.type), config)
+        resource_id = _validate_config(
+            db,
+            user_id=user_id,
+            trigger_type=str(trigger.type),
+            config=config,
+        )
         setattr(trigger, "config", config)
+        setattr(trigger, "resource_id", resource_id)
+    if trigger.provider is None:
+        setattr(trigger, "provider", str(trigger.type))
     if "secret" in updates and updates["secret"]:
         plain_secret = str(updates["secret"])
         setattr(trigger, "secret_hash", _hash_secret(plain_secret))

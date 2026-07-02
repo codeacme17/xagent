@@ -3190,6 +3190,9 @@ Build when you need.`,
       watchLabel: "监听标签 / 文件夹",
       watchLabelPlaceholder: "INBOX",
       watchLabelHelp: "使用 * 或 all 可匹配任意标签。该值不区分大小写。",
+      gmailAccount: "Gmail 账号",
+      gmailAccountPlaceholder: "选择要监听的 Gmail 账号",
+      gmailAccountHelp: "此触发器只会响应所选邮箱中的邮件。",
       senderFilter: "按发件人过滤（可选）",
       senderFilterPlaceholder: "例如 @acme.com 或 boss@company.com",
       subjectKeyword: "按主题关键词过滤（可选）",
@@ -3220,7 +3223,9 @@ Build when you need.`,
       connectedDescription: "当前工作区已有可用的 Gmail 账号连接。",
       notConnected: "连接 Gmail 后才能启用此触发器",
       notConnectedDescription: "依赖新邮件事件前，请先连接官方 Gmail Connector。",
-      connect: "连接 Gmail"
+      connect: "连接 Gmail",
+      noAccounts: "尚未连接 Gmail 账号",
+      accountMissing: "之前选择的 Gmail 账号已断开连接，请重新选择。"
     },
     test: {
       title: "测试运行",
@@ -3245,6 +3250,7 @@ Build when you need.`,
       nextRunAt: "首次运行时间无效",
       scheduleRequired: "定时 Trigger 需要重复间隔或首次运行时间",
       watchLabel: "Gmail Trigger 需要监听的标签或文件夹",
+      gmailAccount: "请选择此 Trigger 要监听的 Gmail 账号",
       testPayload: "测试 payload 必须是 JSON object"
     },
     messages: {

@@ -3190,6 +3190,9 @@ Build when you need.`,
       watchLabel: "Watch label / folder",
       watchLabelPlaceholder: "INBOX",
       watchLabelHelp: "Use * or all to match any label. Value is case-insensitive.",
+      gmailAccount: "Gmail account",
+      gmailAccountPlaceholder: "Select a Gmail account",
+      gmailAccountHelp: "This trigger only fires for email in the selected mailbox.",
       senderFilter: "Filter by sender (optional)",
       senderFilterPlaceholder: "e.g. @acme.com or boss@company.com",
       subjectKeyword: "Filter by subject keyword (optional)",
@@ -3220,7 +3223,9 @@ Build when you need.`,
       connectedDescription: "A Gmail account is connected for this workspace.",
       notConnected: "Connect Gmail to activate this trigger",
       notConnectedDescription: "Connect the official Gmail connector before relying on incoming email events.",
-      connect: "Connect Gmail"
+      connect: "Connect Gmail",
+      noAccounts: "No Gmail accounts connected",
+      accountMissing: "The selected Gmail account is no longer connected. Choose another account."
     },
     test: {
       title: "Test run",
@@ -3245,6 +3250,7 @@ Build when you need.`,
       nextRunAt: "First run time is invalid",
       scheduleRequired: "Scheduled triggers need an interval or a first run time",
       watchLabel: "Gmail triggers need a label or folder to watch",
+      gmailAccount: "Select the Gmail account this trigger should watch",
       testPayload: "Test payload must be a JSON object"
     },
     messages: {
