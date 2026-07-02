@@ -84,6 +84,12 @@ TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
 TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
 GMAIL_PUBSUB_TOPIC = "XAGENT_GMAIL_PUBSUB_TOPIC"
 GMAIL_PUBSUB_PUSH_TOKEN = "XAGENT_GMAIL_PUBSUB_PUSH_TOKEN"
+GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
+GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
+GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
+GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
+GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
+PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
@@ -521,6 +527,81 @@ def get_gmail_pubsub_push_token() -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def get_gmail_pubsub_project_id() -> str | None:
+    """GCP project id used for per-mailbox Gmail Pub/Sub provisioning.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_PROJECT_ID environment variable
+        2. None (Gmail provisioning is not configured)
+    """
+    value = (os.getenv(GMAIL_PUBSUB_PROJECT_ID) or "").strip()
+    return value or None
+
+
+def get_gmail_pubsub_topic_prefix() -> str:
+    """Prefix for deterministic per-mailbox Gmail Pub/Sub topic names.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX environment variable
+        2. Default "xagent-gmail"
+    """
+    value = (os.getenv(GMAIL_PUBSUB_TOPIC_PREFIX) or "").strip()
+    return value or "xagent-gmail"
+
+
+def get_gmail_pubsub_subscription_prefix() -> str:
+    """Prefix for deterministic per-mailbox Gmail push subscription names.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX environment variable
+        2. Default "xagent-gmail-push"
+    """
+    value = (os.getenv(GMAIL_PUBSUB_SUBSCRIPTION_PREFIX) or "").strip()
+    return value or "xagent-gmail-push"
+
+
+def get_gmail_pubsub_push_service_account() -> str | None:
+    """Service-account email used for Pub/Sub push OIDC tokens.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT environment variable
+        2. None
+
+    Used both when provisioning the push subscription (oidc_token identity)
+    and, optionally, to validate the pushing service account on delivery.
+    """
+    value = (os.getenv(GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT) or "").strip()
+    return value or None
+
+
+def get_gmail_registration_timeout_seconds() -> int:
+    """How long a trigger create/update waits for Gmail provisioning.
+
+    Priority:
+        1. XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS environment variable
+        2. Default 10 seconds
+
+    Slow registration returns a pending state after this timeout while the
+    reconcile flow converges to active or failed in the background.
+    """
+    return _get_positive_int_env(GMAIL_REGISTRATION_TIMEOUT_SECONDS, 10)
+
+
+def get_public_api_base_url() -> str | None:
+    """Public base URL of the backend API for provider callbacks.
+
+    Priority:
+        1. XAGENT_PUBLIC_API_BASE_URL environment variable
+        2. None (Gmail registration fails explicitly)
+
+    Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
+    e.g. password-reset emails): Pub/Sub OIDC audiences must match backend
+    callback URLs, so the frontend base URL is never a valid substitute.
+    """
+    value = (os.getenv(PUBLIC_API_BASE_URL) or "").strip()
+    return value.rstrip("/") or None
 
 
 def get_gmail_watch_enabled() -> bool:

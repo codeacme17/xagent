@@ -85,6 +85,8 @@ class TriggerResponse(BaseModel):
     webhook_token: str | None
     webhook_secret: str | None = None
     callback_id: str | None = None
+    provisioning_status: str | None = None
+    provisioning_error: str | None = None
     next_run_at: str | None
     last_run_at: str | None
     last_error: str | None
@@ -140,6 +142,8 @@ def _serialize_trigger(
         webhook_token=trigger.webhook_token,
         webhook_secret=webhook_secret,
         callback_id=trigger.callback_id,
+        provisioning_status=trigger.provisioning_status,
+        provisioning_error=trigger.provisioning_error,
         next_run_at=_dt(cast(datetime | None, trigger.next_run_at)),
         last_run_at=_dt(cast(datetime | None, trigger.last_run_at)),
         last_error=trigger.last_error,

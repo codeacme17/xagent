@@ -31,6 +31,7 @@ from .schemas import (
     dump_trigger_config,
     parse_trigger_config,
 )
+from .gmail import GmailProvider
 from .webhook import WebhookProvider, sign_webhook_payload
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "CallbackResult",
     "ChallengeResponse",
     "GmailTriggerConfig",
+    "GmailProvider",
     "NormalizedEvent",
     "RegistrationResult",
     "ScheduledTriggerConfig",

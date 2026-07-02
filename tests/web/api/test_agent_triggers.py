@@ -13,6 +13,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
+    TriggerProvisioningStatus,
     TriggerRun,
     TriggerRunStatus,
 )
@@ -553,18 +554,30 @@ def test_gmail_trigger_rejects_non_gmail_oauth_account() -> None:
     assert "not a gmail account" in created.json()["detail"].lower()
 
 
-def test_enabled_gmail_trigger_create_best_effort_registers_watch(
+def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
 
-    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
-        calls.append(user_id)
-        raise RuntimeError("watch registration unavailable")
+    def fail_old_watch_path(*args, **kwargs):
+        pytest.fail("legacy Gmail watch registration path should not run")
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        calls.append((int(trigger.id), int(trigger.config["oauth_account_id"])))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
         "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
-        fake_ensure_gmail_watches_for_user,
+        fail_old_watch_path,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
         raising=False,
     )
     headers = _admin_headers()
@@ -582,30 +595,34 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
     )
 
     assert created.status_code == 200, created.text
-    assert (
-        created.json()["last_error"]
-        == "Gmail watch registration failed: watch registration unavailable"
-    )
+    assert created.json()["provisioning_status"] == "active"
+    assert created.json()["provisioning_error"] is None
     db = _direct_db_session()
     try:
-        admin = db.query(User).filter(User.username == "admin").one()
-        assert calls == [int(admin.id)]
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == created.json()["id"]).one()
+        )
+        assert calls == [(int(trigger.id), account_id)]
     finally:
         db.close()
 
 
-def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
+def test_enabling_existing_gmail_trigger_provisions_bound_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[int] = []
 
-    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
-        calls.append(user_id)
-        raise RuntimeError("watch registration unavailable")
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        calls.append(int(trigger.id))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
-        fake_ensure_gmail_watches_for_user,
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
         raising=False,
     )
     headers = _admin_headers()
@@ -631,16 +648,120 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
     )
 
     assert patched.status_code == 200, patched.text
-    assert (
-        patched.json()["last_error"]
-        == "Gmail watch registration failed: watch registration unavailable"
+    assert patched.json()["provisioning_status"] == "active"
+    assert calls == [created.json()["id"]]
+
+
+def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
     )
-    db = _direct_db_session()
-    try:
-        admin = db.query(User).filter(User.username == "admin").one()
-        assert calls == [int(admin.id)]
-    finally:
-        db.close()
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_account_id = _connect_gmail_account(email="first@gmail.example")
+    second_account_id = _connect_gmail_account(email="second@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": first_account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": second_account_id,
+            }
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert provisioned == [first_account_id, second_account_id]
+    assert released == [first_account_id]
+
+
+def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        assert db.query(AgentTrigger).count() == 0
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    deleted = client.delete(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    assert provisioned == [account_id]
+    assert released == [account_id]
 
 
 def test_gmail_trigger_requires_watch_label() -> None:

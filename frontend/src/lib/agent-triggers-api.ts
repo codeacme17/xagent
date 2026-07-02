@@ -18,6 +18,8 @@ export interface AgentTrigger {
   webhook_token: string | null
   webhook_secret?: string | null
   callback_id?: string | null
+  provisioning_status?: "pending" | "active" | "failed" | null
+  provisioning_error?: string | null
   next_run_at: string | null
   last_run_at: string | null
   last_error: string | null

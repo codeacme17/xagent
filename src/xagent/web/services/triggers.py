@@ -21,6 +21,10 @@ from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, Trigger
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
+from .gmail_provisioning import (
+    provision_gmail_trigger,
+    release_gmail_mailbox_if_unused,
+)
 from .trigger_providers.schemas import parse_trigger_config
 from .task_orchestrator import (
     TaskTurnError,
@@ -53,16 +57,6 @@ class TriggerNotFoundError(LookupError):
 
 class TriggerSecretError(PermissionError):
     """Raised when a webhook secret does not match."""
-
-
-def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from .gmail_triggers import best_effort_ensure_gmail_watches_for_user
-
-    best_effort_ensure_gmail_watches_for_user(
-        db,
-        user_id=user_id,
-        context="after trigger save",
-    )
 
 
 @dataclass(frozen=True)
@@ -285,6 +279,30 @@ def _validate_config(
     return None
 
 
+def _gmail_oauth_account_id(config: Any) -> int | None:
+    if not isinstance(config, dict):
+        return None
+    value = config.get("oauth_account_id")
+    if value is None:
+        return None
+    return int(value)
+
+
+def _provision_gmail_trigger_if_enabled(db: Session, trigger: AgentTrigger) -> None:
+    if str(trigger.type) != TriggerType.GMAIL.value or not bool(trigger.enabled):
+        return
+    provision_gmail_trigger(db, trigger)
+    db.refresh(trigger)
+
+
+def _release_gmail_mailbox_if_bound(
+    db: Session, trigger_type: str, oauth_account_id: int | None
+) -> None:
+    if trigger_type != TriggerType.GMAIL.value or oauth_account_id is None:
+        return
+    release_gmail_mailbox_if_unused(db, oauth_account_id)
+
+
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
     return (
         db.query(Agent).filter(Agent.id == agent_id, Agent.user_id == user_id).first()
@@ -365,9 +383,7 @@ def create_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
-        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
-        db.refresh(trigger)
+    _provision_gmail_trigger_if_enabled(db, trigger)
     return trigger, plain_secret
 
 
@@ -384,6 +400,10 @@ def update_agent_trigger(
     )
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
+
+    old_type = str(trigger.type)
+    old_enabled = bool(trigger.enabled)
+    old_oauth_account_id = _gmail_oauth_account_id(trigger.config)
 
     plain_secret: str | None = None
     if "name" in updates and updates["name"] is not None:
@@ -426,9 +446,12 @@ def update_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
-        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
-        db.refresh(trigger)
+    new_oauth_account_id = _gmail_oauth_account_id(trigger.config)
+    if old_enabled and (
+        not bool(trigger.enabled) or old_oauth_account_id != new_oauth_account_id
+    ):
+        _release_gmail_mailbox_if_bound(db, old_type, old_oauth_account_id)
+    _provision_gmail_trigger_if_enabled(db, trigger)
     return trigger, plain_secret
 
 
@@ -444,8 +467,11 @@ def delete_agent_trigger(
     )
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
+    trigger_type = str(trigger.type)
+    oauth_account_id = _gmail_oauth_account_id(trigger.config)
     db.delete(trigger)
     db.commit()
+    _release_gmail_mailbox_if_bound(db, trigger_type, oauth_account_id)
 
 
 def render_trigger_prompt(
