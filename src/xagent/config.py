@@ -79,6 +79,9 @@ BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SE
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
+TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
+TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
+TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
 GMAIL_PUBSUB_TOPIC = "XAGENT_GMAIL_PUBSUB_TOPIC"
 GMAIL_PUBSUB_PUSH_TOKEN = "XAGENT_GMAIL_PUBSUB_PUSH_TOKEN"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
@@ -458,6 +461,48 @@ def get_trigger_dispatcher_batch_size() -> int:
         20,
         minimum=1,
     )
+
+
+def get_trigger_callback_rate_limit() -> str:
+    """Rate limit for the public trigger callback endpoint.
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_RATE_LIMIT environment variable
+        2. Default "120/minute"
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "120/minute".
+    """
+    value = (os.getenv(TRIGGER_CALLBACK_RATE_LIMIT) or "").strip()
+    return value or "120/minute"
+
+
+def get_trigger_crud_rate_limit() -> str:
+    """Rate limit for trigger create/update/delete API calls per user.
+
+    Priority:
+        1. XAGENT_TRIGGER_CRUD_RATE_LIMIT environment variable
+        2. Default "60/minute"
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "60/minute".
+    """
+    value = (os.getenv(TRIGGER_CRUD_RATE_LIMIT) or "").strip()
+    return value or "60/minute"
+
+
+def get_trusted_proxy_hops() -> int:
+    """Number of trusted reverse-proxy hops in front of the backend.
+
+    Priority:
+        1. XAGENT_TRUSTED_PROXY_HOPS environment variable
+        2. Default 0 (forwarded headers are not trusted)
+
+    Returns:
+        How many trailing X-Forwarded-For entries were appended by trusted
+        proxies. 0 means the raw peer address is used.
+    """
+    return _get_positive_int_env(TRUSTED_PROXY_HOPS, 0, minimum=0)
 
 
 def get_gmail_pubsub_topic_name() -> str | None:

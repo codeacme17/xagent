@@ -576,6 +576,10 @@ async def startup_event() -> None:
     start_file_storage_startup_sync_task(app)
     start_trigger_dispatcher_task(app)
 
+    from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
+
+    warn_if_rate_limits_are_per_process()
+
     initialize_langfuse()
 
     # Initialize skill manager

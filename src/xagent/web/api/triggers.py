@@ -27,6 +27,11 @@ from ..services.trigger_providers import (
     process_trigger_callback,
     record_trigger_audit,
 )
+from ..services.trigger_rate_limit import (
+    check_callback_rate_limit,
+    check_trigger_crud_rate_limit,
+    remote_ip_from_request,
+)
 from ..services.triggers import (
     TriggerNotFoundError,
     TriggerSecretError,
@@ -191,6 +196,13 @@ def _trigger_or_404(
     return trigger
 
 
+def _enforce_crud_rate_limit(user_id: int) -> None:
+    if not check_trigger_crud_rate_limit(user_id):
+        raise HTTPException(
+            status_code=429, detail="Too many trigger management requests"
+        )
+
+
 def _handle_service_error(exc: Exception) -> HTTPException:
     if isinstance(exc, TriggerNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
@@ -232,6 +244,7 @@ async def create_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
         trigger, secret = create_agent_trigger(
             db,
@@ -260,6 +273,7 @@ async def update_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
         trigger, secret = update_agent_trigger(
             db,
@@ -280,6 +294,7 @@ async def delete_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
         delete_agent_trigger(
             db,
@@ -443,6 +458,11 @@ def _decode_gmail_pubsub_notification(
     )
 
 
+_SECRET_QUERY_PARAMS = frozenset(
+    {"token", "secret", "signature", "key", "apikey", "api_key", "auth"}
+)
+
+
 class TriggerCallbackResponse(BaseModel):
     outcome: str | None
     detail: str | None = None
@@ -467,6 +487,21 @@ async def receive_trigger_callback(
     provider pipeline via provider-specific proof (e.g. HMAC signature
     headers). The raw body is preserved for signature verification.
     """
+    remote_ip = remote_ip_from_request(request)
+    # Rate limiting runs before any parsing or audit write, so hostile or
+    # garbage traffic cannot amplify database writes.
+    if not check_callback_rate_limit(callback_id, remote_ip):
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    # Secrets are accepted only via headers. A request that smuggles its
+    # proof through the query string is rejected outright.
+    for query_key in request.query_params:
+        if query_key.lower() in _SECRET_QUERY_PARAMS:
+            raise HTTPException(
+                status_code=400,
+                detail="Callback credentials must be sent via headers",
+            )
+
     raw_body = await request.body()
     context = CallbackRequestContext(
         provider=provider,
@@ -475,7 +510,7 @@ async def receive_trigger_callback(
         url_path=request.url.path,
         headers=dict(request.headers),
         query_params=dict(request.query_params),
-        remote_ip=request.client.host if request.client else None,
+        remote_ip=remote_ip,
     )
     result = await process_trigger_callback(db, context=context, raw_body=raw_body)
     if result.challenge is not None:

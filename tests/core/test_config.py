@@ -1253,3 +1253,55 @@ class TestSandboxConcurrencyConfig:
         assert get_sandbox_max_concurrency() == 3
         monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONCURRENCY", "0")
         assert get_sandbox_max_concurrency() == 3
+
+
+class TestTriggerRateLimitConfig:
+    """Config for trigger callback and CRUD rate limits."""
+
+    def test_callback_rate_limit_default(self, monkeypatch):
+        from xagent.config import get_trigger_callback_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", raising=False)
+        assert get_trigger_callback_rate_limit() == "120/minute"
+
+    def test_callback_rate_limit_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_callback_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", "10/second")
+        assert get_trigger_callback_rate_limit() == "10/second"
+
+    def test_crud_rate_limit_default(self, monkeypatch):
+        from xagent.config import get_trigger_crud_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CRUD_RATE_LIMIT", raising=False)
+        assert get_trigger_crud_rate_limit() == "60/minute"
+
+    def test_crud_rate_limit_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_crud_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CRUD_RATE_LIMIT", "5/minute")
+        assert get_trigger_crud_rate_limit() == "5/minute"
+
+
+class TestTrustedProxyHopsConfig:
+    """Config for proxy-aware remote IP derivation."""
+
+    def test_default_is_zero(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.delenv("XAGENT_TRUSTED_PROXY_HOPS", raising=False)
+        assert get_trusted_proxy_hops() == 0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "2")
+        assert get_trusted_proxy_hops() == 2
+
+    def test_invalid_value_falls_back_to_zero(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "not-a-number")
+        assert get_trusted_proxy_hops() == 0
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "-1")
+        assert get_trusted_proxy_hops() == 0
