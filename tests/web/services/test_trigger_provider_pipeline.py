@@ -115,6 +115,8 @@ class StubProvider:
     async def parse_events(
         self,
         context: CallbackRequestContext,
+        *,
+        db: Session,
         trigger: AgentTrigger | None,
         raw_body: bytes,
     ) -> list[NormalizedEvent]:
@@ -127,6 +129,7 @@ class StubProvider:
             NormalizedEvent(
                 event_type=str(item.get("type", "stub.event")),
                 source_event_id=item.get("id"),
+                target_trigger_id=item.get("target_trigger_id"),
                 resource_id=item.get("resource"),
                 payload=item,
             )
@@ -521,6 +524,82 @@ class TestCallbackPipeline:
         assert result.status_code == 403
         assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
         assert db_session.query(TriggerRun).count() == 0
+
+    async def test_cross_user_target_trigger_is_rejected(
+        self, db_session, stub_provider
+    ):
+        """Events may only be re-targeted at triggers of the same user."""
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+
+        other_user = User(
+            username="pipeline-other", password_hash="hash", is_admin=False
+        )
+        db_session.add(other_user)
+        db_session.commit()
+        db_session.refresh(other_user)
+        other_agent = _create_agent(db_session, other_user)
+        other_trigger = _create_stub_trigger(
+            db_session,
+            other_user,
+            other_agent,
+            callback_id="cb-stub-other",
+            resource_id="res-1",
+        )
+
+        raw_body = json.dumps(
+            {
+                "id": "evt-cross",
+                "type": "stub.event",
+                "target_trigger_id": int(other_trigger.id),
+            }
+        ).encode()
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=raw_body,
+        )
+
+        assert result.status_code == 403
+        assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
+        assert db_session.query(TriggerRun).count() == 0
+        audits = _audits(db_session)
+        assert audits[-1].outcome == "rejected_resource"
+        assert audits[-1].detail["reason"] == "unknown_event_trigger"
+        assert audits[-1].detail["target_trigger_id"] == other_trigger.id
+
+    async def test_same_user_target_trigger_is_resolved(
+        self, db_session, stub_provider
+    ):
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+        sibling = _create_stub_trigger(
+            db_session,
+            user,
+            agent,
+            callback_id="cb-stub-sibling",
+            resource_id="res-1",
+        )
+
+        raw_body = json.dumps(
+            {
+                "id": "evt-sibling",
+                "type": "stub.event",
+                "target_trigger_id": int(sibling.id),
+            }
+        ).encode()
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=raw_body,
+        )
+
+        assert result.status_code == 200
+        assert result.outcome == TriggerAuditOutcome.ACCEPTED
+        assert len(result.runs) == 1
+        assert result.runs[0].trigger_id == sibling.id
 
     async def test_audit_rows_survive_trigger_deletion(self, db_session, stub_provider):
         user = _create_user(db_session)

@@ -150,6 +150,47 @@ def _new_webhook_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+def find_webhook_trigger(db: Session, webhook_token: str) -> AgentTrigger | None:
+    """Resolve a legacy webhook trigger by its pre-pipeline webhook token.
+
+    Deprecated: only serves triggers created before the unified callback
+    pipeline. New triggers carry a callback_id instead of a webhook token.
+    """
+    return (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.webhook_token == webhook_token,
+            AgentTrigger.type == TriggerType.WEBHOOK.value,
+        )
+        .first()
+    )
+
+
+def verify_webhook_secret(trigger: AgentTrigger, provided_secret: str | None) -> None:
+    """Verify the legacy bcrypt-hashed webhook secret.
+
+    Deprecated alongside find_webhook_trigger. Unlike the historical
+    behavior, a trigger without a stored secret hash is rejected instead of
+    accepted, so the legacy route can never run unauthenticated.
+    """
+    import bcrypt
+
+    expected = trigger.secret_hash
+    if not expected:
+        raise TriggerSecretError("Webhook trigger has no legacy secret")
+    if not provided_secret:
+        raise TriggerSecretError("Missing webhook secret")
+    try:
+        matched = bcrypt.checkpw(
+            provided_secret.encode("utf-8"),
+            str(expected).encode("utf-8"),
+        )
+    except (TypeError, ValueError):
+        matched = False
+    if not matched:
+        raise TriggerSecretError("Invalid webhook secret")
+
+
 def _normalize_trigger_type(trigger_type: str) -> str:
     try:
         normalized = TriggerType(trigger_type).value

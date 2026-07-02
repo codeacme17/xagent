@@ -129,6 +129,8 @@ class TriggerProvider(Protocol):
     async def parse_events(
         self,
         context: CallbackRequestContext,
+        *,
+        db: Session,
         trigger: AgentTrigger | None,
         raw_body: bytes,
     ) -> list[NormalizedEvent]:

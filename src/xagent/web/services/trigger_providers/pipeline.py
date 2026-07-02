@@ -62,6 +62,7 @@ def _resolve_event_trigger(
         db.query(AgentTrigger)
         .filter(
             AgentTrigger.id == int(target_trigger_id),
+            AgentTrigger.user_id == int(default_trigger.user_id),
             AgentTrigger.type == default_trigger.type,
             AgentTrigger.provider == default_trigger.provider,
         )
@@ -172,7 +173,9 @@ async def process_trigger_callback(
         )
 
     try:
-        events = await provider.parse_events(context, trigger, raw_body)
+        events = await provider.parse_events(
+            context, db=db, trigger=trigger, raw_body=raw_body
+        )
     except TriggerEventParseError as exc:
         record_trigger_audit(
             db,

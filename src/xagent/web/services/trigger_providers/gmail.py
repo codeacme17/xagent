@@ -12,7 +12,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
 from pydantic import ValidationError
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session
 
 from ....config import get_gmail_pubsub_push_service_account
 from ...models.gmail_watch import GmailWatchState
@@ -310,13 +310,11 @@ class GmailProvider:
     async def parse_events(
         self,
         context: CallbackRequestContext,
+        *,
+        db: Session,
         trigger: AgentTrigger | None,
         raw_body: bytes,
     ) -> list[NormalizedEvent]:
-        db = object_session(trigger) if trigger is not None else None
-        if db is None:
-            raise TriggerEventParseError("Gmail trigger is not attached to a session")
-
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
             raise TriggerEventParseError("Gmail callback state was not found")

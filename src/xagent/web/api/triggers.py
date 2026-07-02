@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any, Literal, cast
@@ -30,10 +31,12 @@ from ..services.triggers import (
     create_agent_trigger,
     decrypt_trigger_run_payload,
     delete_agent_trigger,
+    find_webhook_trigger,
     fire_trigger,
     get_owned_agent,
     get_owned_trigger,
     update_agent_trigger,
+    verify_webhook_secret,
 )
 
 logger = logging.getLogger(__name__)
@@ -475,4 +478,98 @@ async def receive_trigger_callback(
         detail=result.detail,
         trigger_run_ids=[int(run.id) for run in result.runs],
         duplicates=result.duplicates,
+    )
+
+
+class PublicTriggerFireResponse(BaseModel):
+    trigger_run_id: int
+    status: str
+    duplicate: bool = False
+
+
+async def _read_legacy_payload(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {"body": body.decode("utf-8", errors="replace")}
+    if isinstance(decoded, dict):
+        return decoded
+    return {"value": decoded}
+
+
+@router.post(
+    "/api/triggers/webhook/{webhook_token}",
+    response_model=PublicTriggerFireResponse,
+    deprecated=True,
+)
+async def receive_legacy_webhook_trigger(
+    webhook_token: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PublicTriggerFireResponse:
+    """Deprecated pre-pipeline webhook endpoint, kept for migration.
+
+    Serves only triggers created before the unified callback pipeline
+    (bcrypt-hashed shared secret in the x-xagent-trigger-secret header).
+    Re-saving such a trigger assigns a callback id and rotating its secret
+    moves callers to /api/triggers/callback/webhook/{callback_id}.
+    """
+    remote_ip = remote_ip_from_request(request)
+    if not check_callback_rate_limit(webhook_token, remote_ip):
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    response.headers["Deprecation"] = "true"
+    trigger = find_webhook_trigger(db, webhook_token)
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    if not trigger.enabled:
+        raise HTTPException(status_code=409, detail="Trigger is disabled")
+
+    secret = request.headers.get("x-xagent-trigger-secret")
+    try:
+        verify_webhook_secret(trigger, secret)
+    except TriggerSecretError as exc:
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.REJECTED_SIGNATURE,
+            provider=str(trigger.type),
+            trigger_id=int(trigger.id),
+            detail={"route": "legacy_webhook", "reason": str(exc)},
+            remote_ip=remote_ip,
+        )
+        raise _handle_service_error(exc)
+
+    try:
+        payload = await _read_legacy_payload(request)
+        source_event_id = (
+            request.headers.get("x-xagent-event-id")
+            or request.headers.get("x-event-id")
+            or request.headers.get("x-request-id")
+        )
+        run, created = await fire_trigger(
+            db,
+            trigger=trigger,
+            event_payload=payload,
+            source_event_id=source_event_id,
+        )
+    except Exception as exc:
+        logger.warning("Legacy webhook trigger %s rejected: %s", trigger.id, exc)
+        raise _handle_service_error(exc)
+
+    record_trigger_audit(
+        db,
+        outcome=TriggerAuditOutcome.ACCEPTED,
+        provider=str(trigger.type),
+        trigger_id=int(trigger.id),
+        detail={"route": "legacy_webhook", "run_ids": [int(run.id)]},
+        remote_ip=remote_ip,
+    )
+    return PublicTriggerFireResponse(
+        trigger_run_id=int(run.id),
+        status=str(run.status),
+        duplicate=not created,
     )

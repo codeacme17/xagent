@@ -85,7 +85,7 @@ class TestUpgrade:
         assert trigger_fk["referred_table"] == "agent_triggers"
         assert trigger_fk["options"].get("ondelete") == "SET NULL"
 
-    def test_upgrade_requires_no_backfill_for_existing_rows(self, engine):
+    def test_upgrade_backfills_provider_from_type(self, engine):
         _upgrade(engine, PREVIOUS_REVISION)
         with engine.begin() as conn:
             conn.execute(
@@ -106,7 +106,52 @@ class TestUpgrade:
                     "FROM agent_triggers WHERE name = 'Legacy'"
                 )
             ).one()
-        assert tuple(row) == (None, None, None, None, None, None)
+        assert tuple(row) == ("webhook", None, None, None, None, None)
+
+    def test_upgrade_backfills_gmail_resource_id_from_oauth_account(self, engine):
+        _upgrade(engine, PREVIOUS_REVISION)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth "
+                    "(id, user_id, provider, access_token, email) "
+                    "VALUES (7, 1, 'gmail', 'token', 'Legacy.User@Gmail.com')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO agent_triggers "
+                    "(user_id, agent_id, type, name, enabled, config) "
+                    "VALUES (1, 1, 'gmail', 'Legacy Gmail', 1, "
+                    "'{\"oauth_account_id\": 7}')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO agent_triggers "
+                    "(user_id, agent_id, type, name, enabled, config) "
+                    "VALUES (1, 1, 'gmail', 'Orphan Gmail', 1, "
+                    "'{\"oauth_account_id\": 999}')"
+                )
+            )
+
+        _upgrade(engine, FOUNDATION_REVISION)
+
+        with engine.begin() as conn:
+            backfilled = conn.execute(
+                text(
+                    "SELECT provider, resource_id FROM agent_triggers "
+                    "WHERE name = 'Legacy Gmail'"
+                )
+            ).one()
+            orphan = conn.execute(
+                text(
+                    "SELECT provider, resource_id FROM agent_triggers "
+                    "WHERE name = 'Orphan Gmail'"
+                )
+            ).one()
+        assert tuple(backfilled) == ("gmail", "legacy.user@gmail.com")
+        assert tuple(orphan) == ("gmail", None)
 
     def test_upgrade_is_idempotent_when_rerun_against_same_schema(self, engine):
         _upgrade(engine, FOUNDATION_REVISION)

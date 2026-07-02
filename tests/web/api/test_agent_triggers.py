@@ -267,6 +267,67 @@ def test_public_webhook_rejects_stale_timestamp(mock_bg_scheduler) -> None:
         db.close()
 
 
+def test_legacy_webhook_route_verifies_bcrypt_secret(mock_bg_scheduler) -> None:
+    """Pre-pipeline webhooks keep working on the deprecated token route."""
+    import bcrypt
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Legacy webhook"},
+    )
+    trigger_id = created.json()["id"]
+
+    # Rewrite the row into its pre-migration shape: webhook token plus
+    # bcrypt secret hash, none of the unified pipeline identity fields.
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.webhook_token = "legacy-token-1"
+        trigger.secret_hash = bcrypt.hashpw(
+            b"legacy-secret", bcrypt.gensalt(rounds=4)
+        ).decode("utf-8")
+        trigger.callback_id = None
+        trigger.secret_encrypted = None
+        trigger.provider = None
+        db.commit()
+    finally:
+        db.close()
+
+    url = "/api/triggers/webhook/legacy-token-1"
+    payload = {"subject": "hello"}
+
+    unknown = client.post("/api/triggers/webhook/unknown-token", json=payload)
+    assert unknown.status_code == 404
+
+    missing = client.post(url, json=payload)
+    assert missing.status_code == 401
+
+    wrong = client.post(
+        url, json=payload, headers={"x-xagent-trigger-secret": "wrong-secret"}
+    )
+    assert wrong.status_code == 401
+
+    accepted = client.post(
+        url, json=payload, headers={"x-xagent-trigger-secret": "legacy-secret"}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.headers.get("deprecation") == "true"
+    assert accepted.json()["trigger_run_id"] > 0
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 1
+        audits = db.query(TriggerAudit).order_by(TriggerAudit.id.asc()).all()
+        outcomes = [str(a.outcome) for a in audits if a.trigger_id == trigger_id]
+        assert "rejected_signature" in outcomes
+        assert "accepted" in outcomes
+    finally:
+        db.close()
+
+
 def test_public_callback_unknown_provider_and_callback_are_controlled(
     mock_bg_scheduler,
 ) -> None:

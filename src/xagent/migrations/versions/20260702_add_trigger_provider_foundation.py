@@ -7,10 +7,13 @@ Create Date: 2026-07-02 00:00:00.000000
 Adds the unified TriggerProvider identity fields on agent_triggers, the
 trigger_audits table with a nullable SET NULL trigger reference, and the
 per-mailbox Gmail provisioning fields on gmail_watch_states. All new columns
-are nullable; no historical data backfill is performed.
+are nullable. Existing triggers are backfilled so the unified pipeline can
+resolve them: provider defaults to the trigger type, and Gmail triggers get
+resource_id resolved from their bound OAuth account's email.
 """
 
-from typing import Sequence, Union
+import json
+from typing import Any, Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
@@ -63,6 +66,60 @@ def _gmail_watch_columns() -> tuple[sa.Column, ...]:
     )
 
 
+def _trigger_config_oauth_account_id(config: Any) -> int | None:
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            return None
+    if not isinstance(config, dict):
+        return None
+    value = config.get("oauth_account_id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _backfill_trigger_identity() -> None:
+    """Backfill provider and Gmail resource_id on pre-existing triggers.
+
+    Legacy rows predate the unified pipeline: provider mirrors the trigger
+    type, and Gmail triggers resolve resource_id (the watched mailbox email)
+    from the OAuth account referenced by config.oauth_account_id. Without
+    this, provider lookup, resource authorization, and mailbox reference
+    counting would all skip legacy triggers.
+    """
+    bind = op.get_bind()
+    bind.execute(
+        sa.text("UPDATE agent_triggers SET provider = type WHERE provider IS NULL")
+    )
+
+    if "user_oauth" not in _inspector().get_table_names():
+        return
+    gmail_rows = bind.execute(
+        sa.text(
+            "SELECT id, config FROM agent_triggers "
+            "WHERE type = 'gmail' AND resource_id IS NULL"
+        )
+    ).fetchall()
+    for trigger_id, config in gmail_rows:
+        oauth_account_id = _trigger_config_oauth_account_id(config)
+        if oauth_account_id is None:
+            continue
+        email_row = bind.execute(
+            sa.text("SELECT email FROM user_oauth WHERE id = :oauth_id"),
+            {"oauth_id": oauth_account_id},
+        ).fetchone()
+        email = str(email_row[0] or "").strip().lower() if email_row else ""
+        if not email:
+            continue
+        bind.execute(
+            sa.text("UPDATE agent_triggers SET resource_id = :email WHERE id = :id"),
+            {"email": email, "id": trigger_id},
+        )
+
+
 def upgrade() -> None:
     inspector = _inspector()
     existing_tables = inspector.get_table_names()
@@ -72,6 +129,7 @@ def upgrade() -> None:
         for column in _agent_trigger_columns():
             if column.name not in existing_columns:
                 op.add_column("agent_triggers", column)
+        _backfill_trigger_identity()
 
     if "gmail_watch_states" in existing_tables:
         existing_columns = _column_names("gmail_watch_states")
