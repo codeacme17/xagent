@@ -10,7 +10,12 @@ import pytest
 from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerAudit,
+    TriggerRun,
+    TriggerRunStatus,
+)
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
@@ -194,6 +199,19 @@ def test_public_webhook_validates_signature_and_deduplicates(
     forged = client.post(url, headers=forged_headers, content=raw_body)
     assert forged.status_code == 401
 
+    db = _direct_db_session()
+    try:
+        rejected_audits = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_signature")
+            .all()
+        )
+        assert len(rejected_audits) >= 1
+        assert rejected_audits[-1].trigger_id == body["id"]
+        assert rejected_audits[-1].provider == "webhook"
+    finally:
+        db.close()
+
     event_headers = _signed_webhook_headers(
         body["webhook_secret"], raw_body, event_id="evt-1"
     )
@@ -296,6 +314,19 @@ def test_public_callback_disabled_trigger_is_rejected_after_verification(
     )
     assert fired.status_code == 409
     assert fired.json()["outcome"] == "rejected_disabled"
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 0
+        disabled_audits = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_disabled")
+            .all()
+        )
+        assert len(disabled_audits) == 1
+        assert disabled_audits[0].trigger_id == body["id"]
+    finally:
+        db.close()
 
 
 def test_public_callback_filters_events_against_allow_list(

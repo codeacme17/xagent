@@ -84,7 +84,10 @@ class StubProvider:
     ) -> bool:
         if trigger.resource_id is None:
             return True
-        return attested_resource_id == trigger.resource_id
+        return (
+            attested_resource_id is not None
+            and attested_resource_id.lower() == str(trigger.resource_id).lower()
+        )
 
     async def verify(
         self,
@@ -457,6 +460,66 @@ class TestCallbackPipeline:
         assert audits[0].trigger_id == trigger.id
         assert audits[0].detail["attested_resource_id"] == "res-other"
         assert audits[0].detail["trigger_resource_id"] == "res-1"
+        assert db_session.query(TriggerRun).count() == 0
+
+    async def test_permissive_provider_cannot_bypass_resource_matching(
+        self, db_session
+    ):
+        """The pipeline owns persisted-vs-attested matching, not providers."""
+
+        class PermissiveProvider(StubProvider):
+            def authorize_resource(self, trigger, attested_resource_id, event):
+                return True
+
+        register_trigger_provider(PermissiveProvider(), replace=True)
+        try:
+            user = _create_user(db_session)
+            agent = _create_agent(db_session, user)
+            _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+
+            result = await process_trigger_callback(
+                db_session,
+                context=_context(headers=_good_headers(resource="res-other")),
+                raw_body=_event_body(),
+            )
+        finally:
+            unregister_trigger_provider(STUB_PROVIDER)
+
+        assert result.status_code == 403
+        assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
+        assert db_session.query(TriggerRun).count() == 0
+        assert [a.outcome for a in _audits(db_session)] == ["rejected_resource"]
+
+    async def test_resource_matching_is_case_insensitive(
+        self, db_session, stub_provider
+    ):
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="mailbox@example.com")
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers(resource="Mailbox@Example.COM")),
+            raw_body=_event_body(),
+        )
+        assert result.status_code == 200
+        assert result.outcome == TriggerAuditOutcome.ACCEPTED
+        assert len(result.runs) == 1
+
+    async def test_missing_attested_identity_is_rejected_for_bound_trigger(
+        self, db_session, stub_provider
+    ):
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers(resource=None)),
+            raw_body=_event_body(),
+        )
+        assert result.status_code == 403
+        assert result.outcome == TriggerAuditOutcome.REJECTED_RESOURCE
         assert db_session.query(TriggerRun).count() == 0
 
     async def test_audit_rows_survive_trigger_deletion(self, db_session, stub_provider):

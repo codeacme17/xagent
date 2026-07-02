@@ -56,6 +56,25 @@ def _filter_events(
     return allowed, len(events) - len(allowed)
 
 
+def _attested_resource_matches(
+    trigger: AgentTrigger, attested_resource_id: str | None
+) -> bool:
+    """Enforce persisted trigger resource identity against attested identity.
+
+    This check belongs to the pipeline, not to providers: a trigger bound to
+    a resource may only fire for events whose resource identity was proven by
+    the provider's trust model. Payload-claimed identity never reaches here.
+    Triggers without a bound resource (e.g. webhooks) skip the check.
+    """
+    if trigger.resource_id is None:
+        return True
+    if attested_resource_id is None:
+        return False
+    return (
+        attested_resource_id.strip().lower() == str(trigger.resource_id).strip().lower()
+    )
+
+
 async def process_trigger_callback(
     db: Session,
     *,
@@ -163,8 +182,11 @@ async def process_trigger_callback(
     duplicates = 0
     rejected_events = 0
     failures: list[str] = []
+    resource_matches = _attested_resource_matches(
+        trigger, verification.attested_resource_id
+    )
     for event in events:
-        if not provider.authorize_resource(
+        if not resource_matches or not provider.authorize_resource(
             trigger, verification.attested_resource_id, event
         ):
             rejected_events += 1
