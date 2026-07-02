@@ -559,9 +559,6 @@ def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
 ) -> None:
     calls: list[tuple[int, int]] = []
 
-    def fail_old_watch_path(*args, **kwargs):
-        pytest.fail("legacy Gmail watch registration path should not run")
-
     def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
         calls.append((int(trigger.id), int(trigger.config["oauth_account_id"])))
         setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
@@ -570,11 +567,6 @@ def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
         db.commit()
         return TriggerProvisioningStatus.ACTIVE.value
 
-    monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
-        fail_old_watch_path,
-        raising=False,
-    )
     monkeypatch.setattr(
         "xagent.web.services.triggers.provision_gmail_trigger",
         fake_provision_gmail_trigger,

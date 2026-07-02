@@ -10,8 +10,6 @@ import pytest
 from google.auth.exceptions import RefreshError
 
 from xagent.config import (
-    get_gmail_pubsub_push_token,
-    get_gmail_pubsub_topic_name,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
     get_gmail_watch_renewal_lead_seconds,
@@ -27,15 +25,13 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.gmail_provisioning import gmail_topic_path
 from xagent.web.services.gmail_triggers import (
     GmailPubsubNotification,
-    GmailPubsubProcessResult,
     GmailWatchConfigurationError,
     _get_google_oauth_config,
     build_gmail_service,
-    ensure_gmail_watches_for_user,
-    process_gmail_pubsub_notification,
-    register_gmail_watch_for_account,
+    collect_gmail_pubsub_events,
     scan_due_gmail_watch_renewals,
 )
 from xagent.web.services.trigger_providers import (
@@ -156,6 +152,58 @@ def mock_bg_scheduler():
         new=MagicMock(),
     ) as mocked:
         yield mocked
+
+
+class _FakePubsubPublisher:
+    def __init__(self) -> None:
+        self.topics: set[str] = set()
+
+    def create_topic(self, *, request: dict[str, str]) -> None:
+        self.topics.add(request["name"])
+
+    def get_iam_policy(self, *, request: dict[str, str]):
+        from types import SimpleNamespace
+
+        class _Bindings(list):
+            def add(self, *, role: str, members: list[str]) -> None:
+                self.append(SimpleNamespace(role=role, members=members))
+
+        return SimpleNamespace(bindings=_Bindings())
+
+    def set_iam_policy(self, *, request: dict[str, object]) -> None:
+        return None
+
+    def delete_topic(self, *, request: dict[str, str]) -> None:
+        self.topics.discard(request["topic"])
+
+
+class _FakePubsubSubscriber:
+    def __init__(self) -> None:
+        self.subscriptions: dict[str, dict[str, object]] = {}
+
+    def create_subscription(self, *, request: dict[str, object]) -> None:
+        self.subscriptions[str(request["name"])] = request
+
+    def delete_subscription(self, *, request: dict[str, str]) -> None:
+        self.subscriptions.pop(request["subscription"], None)
+
+
+@pytest.fixture()
+def per_mailbox_pubsub_env(monkeypatch: pytest.MonkeyPatch):
+    """Per-mailbox Gmail provisioning config with fake Pub/Sub clients."""
+    from xagent.web.services import gmail_provisioning
+
+    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", "demo-project")
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "pubsub-push@demo-project.iam.gserviceaccount.com",
+    )
+    publisher = _FakePubsubPublisher()
+    subscriber = _FakePubsubSubscriber()
+    monkeypatch.setattr(gmail_provisioning, "_default_publisher", lambda: publisher)
+    monkeypatch.setattr(gmail_provisioning, "_default_subscriber", lambda: subscriber)
+    return publisher, subscriber
 
 
 def _create_user(db, username: str = "gmail-watch-user") -> User:
@@ -594,31 +642,50 @@ def test_gmail_unified_callback_rejects_resource_mismatch_without_trusting_paylo
 
 
 def test_gmail_watch_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_TOPIC", raising=False)
-    monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", raising=False)
     monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
     monkeypatch.delenv("XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS", raising=False)
     monkeypatch.delenv("XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS", raising=False)
 
-    assert get_gmail_pubsub_topic_name() is None
-    assert get_gmail_pubsub_push_token() is None
     assert get_gmail_watch_enabled() is False
     assert get_gmail_watch_renewal_interval_seconds() == 3600
     assert get_gmail_watch_renewal_lead_seconds() == 24 * 60 * 60
 
 
 def test_gmail_watch_config_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS", "120")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS", "60")
 
-    assert get_gmail_pubsub_topic_name() == "projects/demo/topics/xagent-gmail"
-    assert get_gmail_pubsub_push_token() == "push-secret"
     assert get_gmail_watch_enabled() is True
     assert get_gmail_watch_renewal_interval_seconds() == 120
     assert get_gmail_watch_renewal_lead_seconds() == 60
+
+
+def test_legacy_gmail_shared_token_config_is_removed() -> None:
+    """The shared push token and global topic helpers are gone for good."""
+    import xagent.config as config
+
+    assert not hasattr(config, "get_gmail_pubsub_push_token")
+    assert not hasattr(config, "get_gmail_pubsub_topic_name")
+    assert not hasattr(config, "GMAIL_PUBSUB_PUSH_TOKEN")
+    assert not hasattr(config, "GMAIL_PUBSUB_TOPIC")
+
+
+def test_legacy_gmail_pubsub_route_is_removed() -> None:
+    """The shared-token push endpoint is no longer a supported API."""
+    data = base64.b64encode(
+        json.dumps({"emailAddress": "codeacme17@gmail.com", "historyId": "1"}).encode(
+            "utf-8"
+        )
+    ).decode("ascii")
+    payload = {"message": {"data": data, "messageId": "pubsub-legacy"}}
+
+    response = client.post(
+        "/api/triggers/gmail/pubsub?token=push-secret",
+        headers={"x-xagent-gmail-pubsub-token": "push-secret"},
+        json=payload,
+    )
+    assert response.status_code == 404
 
 
 def test_gmail_oauth_config_falls_back_to_env_when_db_provider_is_blank(
@@ -756,119 +823,41 @@ def test_gmail_watch_state_model_can_persist() -> None:
         db.close()
 
 
-def test_register_gmail_watch_for_account_persists_google_watch_state(
+def test_best_effort_provisioning_targets_only_referenced_mailboxes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-watch-registration")
-        oauth = _create_gmail_oauth(db, user)
-        fake_service = _FakeGmailService(
-            {"historyId": "321", "expiration": "1782864000000"}
-        )
+    """After OAuth, only mailboxes bound to enabled Gmail triggers are provisioned."""
+    from xagent.web.services import gmail_provisioning
 
-        state = register_gmail_watch_for_account(
-            db,
-            oauth,
-            service_factory=lambda _db, _oauth: fake_service,
-        )
+    calls: list[str] = []
 
-        assert fake_service.calls == [
-            {
-                "userId": "me",
-                "body": {
-                    "topicName": "projects/demo/topics/xagent-gmail",
-                    "labelIds": ["INBOX"],
-                },
-            }
-        ]
-        assert state.history_id == "321"
-        assert state.email == "codeacme17@gmail.com"
-        assert state.topic_name == "projects/demo/topics/xagent-gmail"
-        assert state.watch_expiration is not None
-        assert state.watch_expiration.replace(tzinfo=timezone.utc) == datetime(
-            2026, 7, 1, tzinfo=timezone.utc
-        )
-    finally:
-        db.close()
+    def fake_ensure(_db, account, **_kwargs):
+        calls.append(str(account.email).lower())
+        return None
 
-
-def test_register_gmail_watch_for_account_requires_real_gmail_email(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-watch-missing-email")
-        oauth = _create_gmail_oauth(db, user)
-        oauth.email = None
-        oauth.provider_user_id = "123456789012345678901"
-        db.add(oauth)
-        db.commit()
-        fake_service = _FakeGmailService({"historyId": "321"})
-
-        with pytest.raises(
-            GmailWatchConfigurationError,
-            match="Gmail account email is required",
-        ):
-            register_gmail_watch_for_account(
-                db,
-                oauth,
-                service_factory=lambda _db, _oauth: fake_service,
-            )
-
-        assert fake_service.calls == []
-        assert db.query(GmailWatchState).count() == 0
-    finally:
-        db.close()
-
-
-def test_ensure_gmail_watches_for_user_registers_only_when_gmail_trigger_exists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
+    monkeypatch.setattr(
+        gmail_provisioning, "ensure_gmail_mailbox_provisioned", fake_ensure
+    )
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-watch-needed")
         _create_gmail_oauth(db, user)
-        fake_service = _FakeGmailService({"historyId": "456"})
 
-        assert (
-            ensure_gmail_watches_for_user(
-                db,
-                user_id=int(user.id),
-                service_factory=lambda _db, _oauth: fake_service,
-            )
-            == []
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+            db, user_id=int(user.id), context="test"
         )
-        assert fake_service.calls == []
+        assert calls == []
 
-        _create_gmail_trigger(db, user)
-        states = ensure_gmail_watches_for_user(
-            db,
-            user_id=int(user.id),
-            service_factory=lambda _db, _oauth: fake_service,
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+            db, user_id=int(user.id), context="test"
         )
-
-        assert len(states) == 1
-        assert states[0].history_id == "456"
-        assert fake_service.calls == [
-            {
-                "userId": "me",
-                "body": {
-                    "topicName": "projects/demo/topics/xagent-gmail",
-                    "labelIds": ["INBOX"],
-                },
-            }
-        ]
+        assert calls == ["codeacme17@gmail.com"]
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_fires_matching_gmail_trigger(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-history-user")
@@ -910,7 +899,7 @@ def test_process_gmail_pubsub_notification_fires_matching_gmail_trigger(
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -921,8 +910,14 @@ def test_process_gmail_pubsub_notification_fires_matching_gmail_trigger(
             )
         )
 
-        assert result.processed == 1
-        assert result.duplicates == 0
+        assert len(result.events) == 1
+        event = result.events[0]
+        assert event.trigger_id == int(trigger.id)
+        assert event.source_event_id == "gmail:msg-1"
+        assert event.event_type == "gmail.message"
+        assert event.resource_id == "codeacme17@gmail.com"
+        assert event.payload["from"] == "boss@company.com"
+        assert event.payload["subject"] == "urgent: e2e"
         assert fake_service.history_resource.calls == [
             {
                 "userId": "me",
@@ -930,30 +925,18 @@ def test_process_gmail_pubsub_notification_fires_matching_gmail_trigger(
                 "historyTypes": ["messageAdded"],
             }
         ]
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-1"
-        # Conservative default snapshot: sender/subject/snippet content is no
-        # longer persisted, only a stable hash plus allow-listed metadata.
-        assert set(run.payload_snapshot) == {"payload_sha256", "metadata"}
-        assert run.payload_snapshot["metadata"]["event_type"] == "gmail.message"
-        assert run.payload_snapshot["metadata"]["resource_id"] == "codeacme17@gmail.com"
-        assert "boss@company.com" not in str(run.payload_snapshot)
-        assert "urgent: e2e" not in str(run.payload_snapshot)
         db.refresh(state)
         assert state.history_id == "222"
-        assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_label_mismatch() -> None:
+def test_collect_gmail_pubsub_events_skips_label_mismatch() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-label-mismatch-user")
         oauth = _create_gmail_oauth(db, user)
-        trigger = _create_gmail_trigger(db, user, config={"watch_label": "INBOX"})
+        _create_gmail_trigger(db, user, config={"watch_label": "INBOX"})
         state = GmailWatchState(
             user_id=int(user.id),
             oauth_account_id=int(oauth.id),
@@ -976,7 +959,7 @@ def test_process_gmail_pubsub_notification_skips_label_mismatch() -> None:
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -987,23 +970,15 @@ def test_process_gmail_pubsub_notification_skips_label_mismatch() -> None:
             )
         )
 
-        assert result.processed == 0
+        assert result.events == []
         assert result.skipped == 1
-        assert (
-            db.query(TriggerRun)
-            .filter(TriggerRun.trigger_id == int(trigger.id))
-            .count()
-            == 0
-        )
         db.refresh(state)
         assert state.history_id == "222"
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_accepts_case_insensitive_all_label(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_accepts_case_insensitive_all_label() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-all-label-user")
@@ -1031,7 +1006,7 @@ def test_process_gmail_pubsub_notification_accepts_case_insensitive_all_label(
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1042,20 +1017,15 @@ def test_process_gmail_pubsub_notification_accepts_case_insensitive_all_label(
             )
         )
 
-        assert result.processed == 1
+        assert len(result.events) == 1
         assert result.skipped == 0
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-all"
-        assert mock_bg_scheduler.call_count == 1
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.events[0].source_event_id == "gmail:msg-all"
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_accepts_wildcard_star_label(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_accepts_wildcard_star_label() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-star-label-user")
@@ -1083,7 +1053,7 @@ def test_process_gmail_pubsub_notification_accepts_wildcard_star_label(
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1094,18 +1064,15 @@ def test_process_gmail_pubsub_notification_accepts_wildcard_star_label(
             )
         )
 
-        assert result.processed == 1
+        assert len(result.events) == 1
         assert result.skipped == 0
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-star"
-        assert mock_bg_scheduler.call_count == 1
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.events[0].source_event_id == "gmail:msg-star"
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_sender_mismatch() -> None:
+def test_collect_gmail_pubsub_events_skips_sender_mismatch() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-sender-mismatch-user")
@@ -1137,7 +1104,7 @@ def test_process_gmail_pubsub_notification_skips_sender_mismatch() -> None:
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1148,19 +1115,14 @@ def test_process_gmail_pubsub_notification_skips_sender_mismatch() -> None:
             )
         )
 
-        assert result.processed == 0
+        assert result.events == []
         assert result.skipped == 1
-        assert (
-            db.query(TriggerRun)
-            .filter(TriggerRun.trigger_id == int(trigger.id))
-            .count()
-            == 0
-        )
+        assert trigger.enabled is True
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_subject_mismatch() -> None:
+def test_collect_gmail_pubsub_events_skips_subject_mismatch() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-subject-mismatch-user")
@@ -1192,7 +1154,7 @@ def test_process_gmail_pubsub_notification_skips_subject_mismatch() -> None:
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1203,81 +1165,16 @@ def test_process_gmail_pubsub_notification_skips_subject_mismatch() -> None:
             )
         )
 
-        assert result.processed == 0
+        assert result.events == []
         assert result.skipped == 1
-        assert (
-            db.query(TriggerRun)
-            .filter(TriggerRun.trigger_id == int(trigger.id))
-            .count()
-            == 0
-        )
+        assert trigger.enabled is True
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_deduplicates_repeated_message(
-    mock_bg_scheduler,
+def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-duplicate-user")
-        oauth = _create_gmail_oauth(db, user)
-        trigger = _create_gmail_trigger(db, user)
-        state = GmailWatchState(
-            user_id=int(user.id),
-            oauth_account_id=int(oauth.id),
-            email="codeacme17@gmail.com",
-            history_id="100",
-            topic_name="projects/demo/topics/xagent-gmail",
-        )
-        db.add(state)
-        db.commit()
-        fake_service = _FakeGmailService(
-            history_response={
-                "history": [{"messagesAdded": [{"message": {"id": "msg-dup"}}]}]
-            },
-            messages={"msg-dup": _gmail_message("msg-dup")},
-        )
-        notification = GmailPubsubNotification(
-            email_address="codeacme17@gmail.com",
-            history_id="222",
-            pubsub_message_id="pubsub-dup",
-        )
-
-        first = asyncio.run(
-            process_gmail_pubsub_notification(
-                db,
-                notification,
-                service_factory=lambda _db, _oauth: fake_service,
-            )
-        )
-        second = asyncio.run(
-            process_gmail_pubsub_notification(
-                db,
-                notification,
-                service_factory=lambda _db, _oauth: fake_service,
-            )
-        )
-
-        assert first.processed == 1
-        assert first.duplicates == 0
-        assert second.processed == 0
-        assert second.duplicates == 1
-        assert (
-            db.query(TriggerRun)
-            .filter(TriggerRun.trigger_id == int(trigger.id))
-            .count()
-            == 1
-        )
-        assert mock_bg_scheduler.call_count == 1
-    finally:
-        db.close()
-
-
-def test_process_gmail_pubsub_notification_reregisters_expired_history_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-expired-history-user")
@@ -1300,7 +1197,7 @@ def test_process_gmail_pubsub_notification_reregisters_expired_history_id(
         services = iter([expired_history_service, renewed_watch_service])
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1311,28 +1208,27 @@ def test_process_gmail_pubsub_notification_reregisters_expired_history_id(
             )
         )
 
-        assert result.processed == 0
-        assert result.duplicates == 0
+        assert result.events == []
         assert result.skipped == 1
         db.refresh(state)
         assert state.history_id == "333"
         assert state.last_error is None
+        expected_topic = gmail_topic_path("demo-project", "codeacme17@gmail.com")
         assert renewed_watch_service.calls == [
             {
                 "userId": "me",
                 "body": {
-                    "topicName": "projects/demo/topics/xagent-gmail",
+                    "topicName": expected_topic,
                     "labelIds": ["INBOX"],
                 },
             }
         ]
+        assert state.topic_name == expected_topic
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_records_service_configuration_error() -> (
-    None
-):
+def test_collect_gmail_pubsub_events_records_service_configuration_error() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-service-error-user")
@@ -1355,7 +1251,7 @@ def test_process_gmail_pubsub_notification_records_service_configuration_error()
             match="Gmail credential refresh failed",
         ):
             asyncio.run(
-                process_gmail_pubsub_notification(
+                collect_gmail_pubsub_events(
                     db,
                     GmailPubsubNotification(
                         email_address="codeacme17@gmail.com",
@@ -1372,9 +1268,9 @@ def test_process_gmail_pubsub_notification_records_service_configuration_error()
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_deleted_message_and_advances_cursor(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_skips_deleted_message_and_advances_cursor() -> (
+    None
+):
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-message-error-user")
@@ -1418,7 +1314,7 @@ def test_process_gmail_pubsub_notification_skips_deleted_message_and_advances_cu
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1429,23 +1325,20 @@ def test_process_gmail_pubsub_notification_skips_deleted_message_and_advances_cu
             )
         )
 
-        assert result.processed == 1
+        assert len(result.events) == 1
         assert result.skipped == 1
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-2"
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.events[0].source_event_id == "gmail:msg-2"
         db.refresh(state)
         assert state.history_id == "222"
         assert state.last_error is None
-        assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_skips_forbidden_message_and_advances_cursor(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_skips_forbidden_message_and_advances_cursor() -> (
+    None
+):
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-forbidden-message-user")
@@ -1478,7 +1371,7 @@ def test_process_gmail_pubsub_notification_skips_forbidden_message_and_advances_
         )
 
         result = asyncio.run(
-            process_gmail_pubsub_notification(
+            collect_gmail_pubsub_events(
                 db,
                 GmailPubsubNotification(
                     email_address="codeacme17@gmail.com",
@@ -1489,28 +1382,25 @@ def test_process_gmail_pubsub_notification_skips_forbidden_message_and_advances_
             )
         )
 
-        assert result.processed == 1
+        assert len(result.events) == 1
         assert result.skipped == 1
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-2"
+        assert result.events[0].trigger_id == int(trigger.id)
+        assert result.events[0].source_event_id == "gmail:msg-2"
         db.refresh(state)
         assert state.history_id == "222"
         assert state.last_error is None
-        assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_fails_batch_on_transient_message_error_and_holds_cursor(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_fails_batch_on_transient_message_error_and_holds_cursor() -> (
+    None
+):
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-transient-message-error-user")
         oauth = _create_gmail_oauth(db, user)
-        trigger = _create_gmail_trigger(db, user)
+        _create_gmail_trigger(db, user)
         state = GmailWatchState(
             user_id=int(user.id),
             oauth_account_id=int(oauth.id),
@@ -1539,7 +1429,7 @@ def test_process_gmail_pubsub_notification_fails_batch_on_transient_message_erro
 
         with pytest.raises(Exception, match="Failed to process Gmail message"):
             asyncio.run(
-                process_gmail_pubsub_notification(
+                collect_gmail_pubsub_events(
                     db,
                     GmailPubsubNotification(
                         email_address="codeacme17@gmail.com",
@@ -1550,26 +1440,19 @@ def test_process_gmail_pubsub_notification_fails_batch_on_transient_message_erro
                 )
             )
 
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-2"
         db.refresh(state)
         assert state.history_id == "100"
         assert "transient-msg" in str(state.last_error)
-        assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
 
 
-def test_process_gmail_pubsub_notification_holds_cursor_on_rate_limited_message(
-    mock_bg_scheduler,
-) -> None:
+def test_collect_gmail_pubsub_events_holds_cursor_on_rate_limited_message() -> None:
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-rate-limited-message-user")
         oauth = _create_gmail_oauth(db, user)
-        trigger = _create_gmail_trigger(db, user)
+        _create_gmail_trigger(db, user)
         state = GmailWatchState(
             user_id=int(user.id),
             oauth_account_id=int(oauth.id),
@@ -1598,7 +1481,7 @@ def test_process_gmail_pubsub_notification_holds_cursor_on_rate_limited_message(
 
         with pytest.raises(Exception, match="Failed to process Gmail message"):
             asyncio.run(
-                process_gmail_pubsub_notification(
+                collect_gmail_pubsub_events(
                     db,
                     GmailPubsubNotification(
                         email_address="codeacme17@gmail.com",
@@ -1609,195 +1492,16 @@ def test_process_gmail_pubsub_notification_holds_cursor_on_rate_limited_message(
                 )
             )
 
-        run = (
-            db.query(TriggerRun).filter(TriggerRun.trigger_id == int(trigger.id)).one()
-        )
-        assert run.source_event_id == "gmail:msg-2"
         db.refresh(state)
         assert state.history_id == "100"
         assert "rate-limited-msg" in str(state.last_error)
-        assert mock_bg_scheduler.call_count == 1
     finally:
         db.close()
 
 
-def test_gmail_pubsub_endpoint_validates_token_and_decodes_notification(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
-    seen: dict[str, GmailPubsubNotification] = {}
-
-    async def fake_process(
-        _db,
-        notification: GmailPubsubNotification,
-    ) -> GmailPubsubProcessResult:
-        seen["notification"] = notification
-        return GmailPubsubProcessResult(processed=1, duplicates=0, skipped=0)
-
-    monkeypatch.setattr(
-        "xagent.web.api.triggers.process_gmail_pubsub_notification",
-        fake_process,
-        raising=False,
-    )
-    data = base64.b64encode(
-        json.dumps({"emailAddress": "codeacme17@gmail.com", "historyId": "222"}).encode(
-            "utf-8"
-        )
-    ).decode("ascii")
-    payload = {"message": {"data": data, "messageId": "pubsub-1"}}
-
-    rejected = client.post("/api/triggers/gmail/pubsub", json=payload)
-    assert rejected.status_code == 401
-
-    accepted_with_header = client.post(
-        "/api/triggers/gmail/pubsub",
-        headers={"x-xagent-gmail-pubsub-token": "push-secret"},
-        json=payload,
-    )
-
-    assert accepted_with_header.status_code == 200, accepted_with_header.text
-    assert accepted_with_header.json() == {
-        "processed": 1,
-        "duplicates": 0,
-        "skipped": 0,
-    }
-
-    accepted_with_query_token = client.post(
-        "/api/triggers/gmail/pubsub?token=push-secret",
-        json=payload,
-    )
-
-    assert accepted_with_query_token.status_code == 200, accepted_with_query_token.text
-    assert accepted_with_query_token.json() == {
-        "processed": 1,
-        "duplicates": 0,
-        "skipped": 0,
-    }
-    assert seen["notification"].email_address == "codeacme17@gmail.com"
-    assert seen["notification"].history_id == "222"
-    assert seen["notification"].pubsub_message_id == "pubsub-1"
-
-
-def test_gmail_pubsub_endpoint_decodes_urlsafe_notification_without_padding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
-    seen: dict[str, GmailPubsubNotification] = {}
-
-    async def fake_process(
-        _db,
-        notification: GmailPubsubNotification,
-    ) -> GmailPubsubProcessResult:
-        seen["notification"] = notification
-        return GmailPubsubProcessResult(processed=1, duplicates=0, skipped=0)
-
-    monkeypatch.setattr(
-        "xagent.web.api.triggers.process_gmail_pubsub_notification",
-        fake_process,
-        raising=False,
-    )
-    data = base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "emailAddress": "codeacme17@gmail.com",
-                "historyId": "222",
-                "extra": '">',
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).decode("ascii")
-    data = data.rstrip("=")
-    assert "-" in data or "_" in data
-    payload = {"message": {"data": data, "messageId": "pubsub-urlsafe"}}
-
-    response = client.post(
-        "/api/triggers/gmail/pubsub",
-        headers={"x-xagent-gmail-pubsub-token": "push-secret"},
-        json=payload,
-    )
-
-    assert response.status_code == 200, response.text
-    assert seen["notification"].email_address == "codeacme17@gmail.com"
-    assert seen["notification"].history_id == "222"
-    assert seen["notification"].pubsub_message_id == "pubsub-urlsafe"
-
-
-def test_gmail_pubsub_endpoint_uses_constant_time_token_comparison(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
-    data = base64.b64encode(
-        json.dumps({"emailAddress": "missing@gmail.com", "historyId": "222"}).encode(
-            "utf-8"
-        )
-    ).decode("ascii")
-    payload = {"message": {"data": data, "messageId": "pubsub-constant-time"}}
-
-    with patch("secrets.compare_digest", return_value=False) as compare_digest:
-        response = client.post(
-            "/api/triggers/gmail/pubsub",
-            headers={"x-xagent-gmail-pubsub-token": "push-secret"},
-            json=payload,
-        )
-
-    assert response.status_code == 401
-    compare_digest.assert_called_once_with("push-secret", "push-secret")
-
-
-def test_gmail_pubsub_endpoint_returns_202_for_unknown_watch_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
-    data = base64.b64encode(
-        json.dumps({"emailAddress": "missing@gmail.com", "historyId": "222"}).encode(
-            "utf-8"
-        )
-    ).decode("ascii")
-    payload = {"message": {"data": data, "messageId": "pubsub-unknown"}}
-
-    response = client.post(
-        "/api/triggers/gmail/pubsub",
-        headers={"x-xagent-gmail-pubsub-token": "push-secret"},
-        json=payload,
-    )
-
-    assert response.status_code == 202
-    assert response.json() == {"processed": 0, "duplicates": 0, "skipped": 1}
-
-
-def test_gmail_pubsub_endpoint_returns_500_for_retryable_processing_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_TOKEN", "push-secret")
-
-    async def fake_process(_db, _notification: GmailPubsubNotification):
-        raise RuntimeError("temporary Gmail failure")
-
-    monkeypatch.setattr(
-        "xagent.web.api.triggers.process_gmail_pubsub_notification",
-        fake_process,
-        raising=False,
-    )
-    data = base64.b64encode(
-        json.dumps({"emailAddress": "codeacme17@gmail.com", "historyId": "222"}).encode(
-            "utf-8"
-        )
-    ).decode("ascii")
-    payload = {"message": {"data": data, "messageId": "pubsub-retry"}}
-
-    response = client.post(
-        "/api/triggers/gmail/pubsub",
-        headers={"x-xagent-gmail-pubsub-token": "push-secret"},
-        json=payload,
-    )
-
-    assert response.status_code == 500
-
-
 def test_scan_due_gmail_watch_renewals_respects_enabled_flag_and_expiration(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
     monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
     db = _direct_db_session()
     try:
@@ -1858,9 +1562,8 @@ def test_scan_due_gmail_watch_renewals_respects_enabled_flag_and_expiration(
 
 
 def test_scan_due_gmail_watch_renewals_applies_batch_limit(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db = _direct_db_session()
     try:
@@ -1893,9 +1596,8 @@ def test_scan_due_gmail_watch_renewals_applies_batch_limit(
 
 
 def test_scan_due_gmail_watch_renewals_prioritizes_missing_and_earliest_expiration(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db = _direct_db_session()
     try:
@@ -1954,9 +1656,8 @@ def test_scan_due_gmail_watch_renewals_prioritizes_missing_and_earliest_expirati
 
 
 def test_scan_due_gmail_watch_renewals_records_failure_and_continues(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC", "projects/demo/topics/xagent-gmail")
     monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db = _direct_db_session()
     try:

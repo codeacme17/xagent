@@ -82,8 +82,6 @@ TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
 TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
 TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
-GMAIL_PUBSUB_TOPIC = "XAGENT_GMAIL_PUBSUB_TOPIC"
-GMAIL_PUBSUB_PUSH_TOKEN = "XAGENT_GMAIL_PUBSUB_PUSH_TOKEN"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
 GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
 GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
@@ -509,24 +507,6 @@ def get_trusted_proxy_hops() -> int:
         proxies. 0 means the raw peer address is used.
     """
     return _get_positive_int_env(TRUSTED_PROXY_HOPS, 0, minimum=0)
-
-
-def get_gmail_pubsub_topic_name() -> str | None:
-    """Return the Gmail Pub/Sub topic name used for Gmail watches."""
-    value = os.getenv(GMAIL_PUBSUB_TOPIC)
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
-
-
-def get_gmail_pubsub_push_token() -> str | None:
-    """Return the shared token accepted by the Gmail Pub/Sub push endpoint."""
-    value = os.getenv(GMAIL_PUBSUB_PUSH_TOKEN)
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
 
 
 def get_gmail_pubsub_project_id() -> str | None:

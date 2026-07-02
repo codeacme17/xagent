@@ -46,9 +46,11 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from ..services.gmail_triggers import best_effort_ensure_gmail_watches_for_user
+    from ..services.gmail_provisioning import (
+        best_effort_provision_gmail_watches_for_user,
+    )
 
-    best_effort_ensure_gmail_watches_for_user(
+    best_effort_provision_gmail_watches_for_user(
         db,
         user_id=user_id,
         context="after OAuth callback",

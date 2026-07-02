@@ -557,3 +557,49 @@ def sweep_gmail_provisioning(
         )
         attempts += 1
     return attempts
+
+
+def best_effort_provision_gmail_watches_for_user(
+    db: Session,
+    *,
+    user_id: int,
+    context: str,
+) -> None:
+    """Provision watches for a user's Gmail accounts referenced by triggers.
+
+    Used after OAuth (re)connects a Gmail account: any enabled Gmail trigger
+    already bound to that mailbox gets its delivery resources re-ensured.
+    Failures are recorded on the watch state, never raised.
+    """
+    accounts = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
+        .all()
+    )
+    for account in accounts:
+        email = str(account.email or "").strip().lower()
+        if not email:
+            continue
+        referenced = (
+            db.query(AgentTrigger.id)
+            .filter(
+                AgentTrigger.type == TriggerType.GMAIL.value,
+                AgentTrigger.enabled.is_(True),
+                func.lower(AgentTrigger.resource_id) == email,
+            )
+            .first()
+            is not None
+        )
+        if not referenced:
+            continue
+        try:
+            ensure_gmail_mailbox_provisioned(db, account)
+        except Exception as exc:
+            db.rollback()
+            logger.warning(
+                "Failed to provision Gmail watch for %s %s: %s",
+                email,
+                context,
+                exc,
+                exc_info=True,
+            )

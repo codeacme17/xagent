@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import logging
-import secrets
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -12,16 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ...config import get_gmail_pubsub_push_token
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
-from ..services.gmail_triggers import (
-    GmailPubsubNotification,
-    GmailTriggerError,
-    process_gmail_pubsub_notification,
-)
 from ..services.trigger_providers import (
     CallbackRequestContext,
     process_trigger_callback,
@@ -115,12 +105,6 @@ class TriggerRunResponse(BaseModel):
 class TriggerFireResponse(BaseModel):
     trigger_run: TriggerRunResponse
     duplicate: bool = False
-
-
-class GmailPubsubResponse(BaseModel):
-    processed: int
-    duplicates: int
-    skipped: int
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -418,50 +402,6 @@ async def test_trigger(
         raise _handle_service_error(exc)
 
 
-async def _read_payload(request: Request) -> dict[str, Any]:
-    body = await request.body()
-    if not body:
-        return {}
-    try:
-        decoded = json.loads(body.decode("utf-8"))
-    except ValueError:
-        return {"body": body.decode("utf-8", errors="replace")}
-    if isinstance(decoded, dict):
-        return decoded
-    return {"value": decoded}
-
-
-def _decode_gmail_pubsub_notification(
-    payload: dict[str, Any],
-) -> GmailPubsubNotification:
-    message = payload.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("Missing Pub/Sub message")
-
-    data = message.get("data")
-    if not isinstance(data, str) or not data:
-        raise ValueError("Missing Pub/Sub message data")
-    try:
-        padded_data = data + "=" * ((4 - len(data) % 4) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(padded_data).decode("utf-8"))
-    except (binascii.Error, UnicodeDecodeError, ValueError, TypeError) as exc:
-        raise ValueError("Invalid Pub/Sub message data") from exc
-    if not isinstance(decoded, dict):
-        raise ValueError("Invalid Pub/Sub message payload")
-
-    email_address = decoded.get("emailAddress")
-    history_id = decoded.get("historyId")
-    if not email_address or not history_id:
-        raise ValueError("Gmail notification requires emailAddress and historyId")
-
-    message_id = message.get("messageId") or message.get("message_id")
-    return GmailPubsubNotification(
-        email_address=str(email_address),
-        history_id=str(history_id),
-        pubsub_message_id=str(message_id) if message_id else None,
-    )
-
-
 _SECRET_QUERY_PARAMS = frozenset(
     {"token", "secret", "signature", "key", "apikey", "api_key", "auth"}
 )
@@ -529,57 +469,4 @@ async def receive_trigger_callback(
         detail=result.detail,
         trigger_run_ids=[int(run.id) for run in result.runs],
         duplicates=result.duplicates,
-    )
-
-
-@router.post(
-    "/api/triggers/gmail/pubsub",
-    response_model=GmailPubsubResponse,
-)
-async def receive_gmail_pubsub_trigger(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-) -> GmailPubsubResponse:
-    expected_token = get_gmail_pubsub_push_token()
-    if not expected_token:
-        raise HTTPException(
-            status_code=503,
-            detail="Gmail Pub/Sub push token is not configured",
-        )
-    provided_token = request.headers.get(
-        "x-xagent-gmail-pubsub-token"
-    ) or request.query_params.get("token")
-    if not secrets.compare_digest(provided_token or "", expected_token):
-        raise HTTPException(status_code=401, detail="Invalid Gmail Pub/Sub token")
-
-    try:
-        payload = await _read_payload(request)
-        notification = _decode_gmail_pubsub_notification(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        result = await process_gmail_pubsub_notification(db, notification)
-    except GmailTriggerError as exc:
-        logger.warning("Gmail Pub/Sub notification rejected: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.error(
-            "Unexpected error processing Gmail Pub/Sub notification for %s"
-            " (historyId=%s): %s",
-            notification.email_address,
-            notification.history_id,
-            exc,
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=500, detail="Failed to process Gmail Pub/Sub notification"
-        ) from exc
-
-    response.status_code = result.status_code
-    return GmailPubsubResponse(
-        processed=result.processed,
-        duplicates=result.duplicates,
-        skipped=result.skipped,
     )

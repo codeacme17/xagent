@@ -621,3 +621,23 @@ def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(
     assert refreshed.status == TriggerProvisioningStatus.ACTIVE.value
     assert refreshed.history_id == "hist-renewed"
     assert gmail.watch_calls[-1]["body"]["topicName"] == expected_topic
+
+
+def test_provisioning_requires_account_email(db_session: Session) -> None:
+    from xagent.web.services.gmail_provisioning import GmailProvisioningError
+
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    setattr(account, "email", None)
+    db_session.add(account)
+    db_session.commit()
+
+    with pytest.raises(GmailProvisioningError, match="email is required"):
+        ensure_gmail_mailbox_provisioned(
+            db_session,
+            account,
+            service_factory=lambda _db, _account: FakeGmailService(),
+            publisher_factory=lambda: FakePublisher(),
+            subscriber_factory=lambda: FakeSubscriber(),
+        )
+    assert db_session.query(GmailWatchState).count() == 0
