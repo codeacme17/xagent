@@ -10,10 +10,14 @@ import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
+import {
+  buildWidgetSnippet,
+  isValidAllowedDomain,
+  normalizeAllowedDomain,
+  updateAgentWidgetConfig,
+} from "@/lib/agent-widget-config"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
 import { copyToClipboard } from "@/lib/clipboard"
-import { getApiUrl } from "@/lib/utils"
 
 export interface AgentWidgetConfig {
   widget_enabled: boolean
@@ -29,18 +33,6 @@ interface AgentWidgetSettingsDialogProps {
   onWidgetConfigUpdated?: (updatedAgent: Record<string, unknown>) => void
 }
 
-async function parseWidgetConfigError(response: Response): Promise<Error> {
-  try {
-    const data = await response.json()
-    if (typeof data?.detail === "string" && data.detail.trim()) {
-      return new Error(data.detail)
-    }
-  } catch {
-    // Use the generic fallback below.
-  }
-  return new Error("Failed to update widget configuration")
-}
-
 export function AgentWidgetSettingsDialog({
   agentId,
   agentName,
@@ -53,6 +45,7 @@ export function AgentWidgetSettingsDialog({
   const [appOrigin, setAppOrigin] = useState(() => getBrowserLocationOrigin())
   const [widgetState, setWidgetState] = useState<AgentWidgetConfig>(widgetConfig)
   const [newDomain, setNewDomain] = useState("")
+  const [domainError, setDomainError] = useState<string | null>(null)
   const [isUpdating, setIsUpdating] = useState(false)
   const [copiedSnippet, setCopiedSnippet] = useState(false)
 
@@ -69,6 +62,7 @@ export function AgentWidgetSettingsDialog({
       allowed_domains: Array.isArray(widgetConfig.allowed_domains) ? widgetConfig.allowed_domains : [],
     })
     setNewDomain("")
+    setDomainError(null)
     setCopiedSnippet(false)
   }, [open, widgetConfig.allowed_domains, widgetConfig.widget_enabled])
 
@@ -76,31 +70,20 @@ export function AgentWidgetSettingsDialog({
     ? widgetState.allowed_domains
     : []
 
-  const widgetSnippet = useMemo(() => {
-    if (!agentId || !appOrigin) return ""
-    return `<script
-  src="${appOrigin}/widget.js"
-  data-agent-id="${agentId}"
-  data-button-size="60px"
-  data-button-color="#000"
-  data-icon-color="#fff"
-  data-panel-bg-color="#fff">
-</script>`
-  }, [agentId, appOrigin])
+  const widgetSnippet = useMemo(
+    () => buildWidgetSnippet(agentId ?? "", appOrigin),
+    [agentId, appOrigin],
+  )
 
-  const handleWidgetConfigUpdate = async (updates: Partial<AgentWidgetConfig>) => {
-    if (!agentId) return
+  const handleWidgetConfigUpdate = async (updates: Partial<AgentWidgetConfig>): Promise<boolean> => {
+    if (!agentId) return false
     setIsUpdating(true)
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updates),
-      })
-      if (!response.ok) {
-        throw await parseWidgetConfigError(response)
-      }
-      const updatedAgent = await response.json()
+      const updatedAgent = await updateAgentWidgetConfig(
+        agentId,
+        updates,
+        t("appWidget.messages.updateFailed"),
+      )
       const nextState = {
         widget_enabled:
           typeof updatedAgent.widget_enabled === "boolean"
@@ -113,8 +96,10 @@ export function AgentWidgetSettingsDialog({
       setWidgetState(nextState)
       onWidgetConfigUpdated?.(updatedAgent)
       toast.success(t("appWidget.messages.updated"))
+      return true
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("appWidget.messages.updateFailed"))
+      return false
     } finally {
       setIsUpdating(false)
     }
@@ -131,18 +116,24 @@ export function AgentWidgetSettingsDialog({
     }
   }
 
-  const handleAddDomain = () => {
-    const domain = newDomain.trim().toLowerCase()
+  const handleAddDomain = async () => {
+    const domain = normalizeAllowedDomain(newDomain)
     if (!domain) return
+    if (!isValidAllowedDomain(domain)) {
+      setDomainError(t("appWidget.dialog.invalidDomain"))
+      return
+    }
     const existingDomains = new Set(allowedDomains.map((item) => item.toLowerCase()))
     if (existingDomains.has(domain)) {
       setNewDomain("")
       return
     }
-    setNewDomain("")
-    void handleWidgetConfigUpdate({
+    const updated = await handleWidgetConfigUpdate({
       allowed_domains: [...allowedDomains, domain],
     })
+    if (updated) {
+      setNewDomain("")
+    }
   }
 
   const handleRemoveDomain = (domain: string) => {
@@ -201,25 +192,34 @@ export function AgentWidgetSettingsDialog({
               <div className="flex gap-2">
                 <Input
                   value={newDomain}
-                  onChange={(event) => setNewDomain(event.target.value)}
+                  onChange={(event) => {
+                    setNewDomain(event.target.value)
+                    setDomainError(null)
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault()
-                      handleAddDomain()
+                      void handleAddDomain()
                     }
                   }}
                   placeholder={t("appWidget.dialog.domainPlaceholder")}
                   disabled={isUpdating || !agentId}
+                  aria-invalid={domainError ? true : undefined}
                 />
                 <Button
                   type="button"
                   variant="secondary"
-                  onClick={handleAddDomain}
+                  onClick={() => void handleAddDomain()}
                   disabled={isUpdating || !agentId || !newDomain.trim()}
                 >
                   {t("appWidget.dialog.addDomain")}
                 </Button>
               </div>
+              {domainError && (
+                <p className="text-xs text-destructive" role="alert">
+                  {domainError}
+                </p>
+              )}
               <div className="flex flex-wrap gap-2">
                 {allowedDomains.length > 0 ? (
                   allowedDomains.map((domain) => (

@@ -42,6 +42,7 @@ import { TaskConversationPanel } from "@/components/task/task-conversation-panel
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentTrigger, AgentTriggerType, listAgentTriggers } from "@/lib/agent-triggers-api"
 import { AgentWidgetSettingsDialog } from "./agent-widget-settings-dialog"
+import { updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 interface KnowledgeBase {
   name: string
@@ -223,31 +224,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setCreatedAgent((current: any) => current ? { ...current, ...updatedAgent } : current)
   }, [])
 
-  const parseAgentUpdateError = useCallback(async (response: Response) => {
-    try {
-      const data = await response.json()
-      if (typeof data?.detail === "string" && data.detail.trim()) {
-        return new Error(data.detail)
-      }
-    } catch {
-      // Fall through to the localized fallback below.
-    }
-    return new Error(t("appWidget.messages.updateFailed"))
-  }, [t])
-
   const handleWidgetEnabledChange = useCallback(async (checked: boolean) => {
     if (!localAgentId) return
     setIsWidgetUpdating(true)
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ widget_enabled: checked }),
-      })
-      if (!response.ok) {
-        throw await parseAgentUpdateError(response)
-      }
-      const updatedAgent = await response.json()
+      const updatedAgent = await updateAgentWidgetConfig(
+        localAgentId,
+        { widget_enabled: checked },
+        t("appWidget.messages.updateFailed"),
+      )
       mergeWidgetAgentData(updatedAgent)
       toast.success(t("appWidget.messages.updated"))
     } catch (error) {
@@ -255,7 +240,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     } finally {
       setIsWidgetUpdating(false)
     }
-  }, [localAgentId, mergeWidgetAgentData, parseAgentUpdateError, t])
+  }, [localAgentId, mergeWidgetAgentData, t])
 
   const gmailConnection = useMemo(() => {
     const gmailApp = findMatchingMcpApp(officialApps, "gmail")

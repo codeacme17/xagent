@@ -129,6 +129,56 @@ describe("AgentWidgetSettingsDialog", () => {
     expect(onWidgetConfigUpdated).toHaveBeenCalledWith(expect.objectContaining({
       allowed_domains: ["example.com", "docs.example.com"],
     }))
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder")).toHaveValue("")
+    })
+  })
+
+  it("rejects domains with a scheme, path, or wildcard and shows an inline error", () => {
+    renderDialog()
+
+    for (const invalidValue of ["https://example.com", "example.com/path", "*.example.com"]) {
+      fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
+        target: { value: invalidValue },
+      })
+      fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
+
+      expect(apiRequestMock).not.toHaveBeenCalled()
+      expect(screen.getByText("appWidget.dialog.invalidDomain")).toBeInTheDocument()
+      expect(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder")).toHaveValue(invalidValue)
+    }
+  })
+
+  it("clears the inline domain error once the input changes", () => {
+    renderDialog()
+
+    fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
+      target: { value: "https://example.com" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
+    expect(screen.getByText("appWidget.dialog.invalidDomain")).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
+      target: { value: "docs.example.com" },
+    })
+    expect(screen.queryByText("appWidget.dialog.invalidDomain")).not.toBeInTheDocument()
+  })
+
+  it("accepts the * wildcard entry", async () => {
+    renderDialog()
+
+    fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
+      target: { value: "*" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents/42", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allowed_domains: ["example.com", "*"] }),
+      })
+    })
   })
 
   it("removes an allowed domain through the agent update endpoint", async () => {
@@ -170,6 +220,8 @@ describe("AgentWidgetSettingsDialog", () => {
     })
     expect(onWidgetConfigUpdated).not.toHaveBeenCalled()
     expect(screen.queryByText("docs.example.com")).not.toBeInTheDocument()
+    // The typed value is kept so the user can retry without retyping.
+    expect(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder")).toHaveValue("docs.example.com")
   })
 
   it("copies the embed snippet for the selected agent", async () => {

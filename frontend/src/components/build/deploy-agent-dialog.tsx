@@ -18,6 +18,7 @@ import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
+import { buildWidgetSnippet, isValidAllowedDomain, normalizeAllowedDomain } from "@/lib/agent-widget-config"
 
 export interface Agent {
   id: number
@@ -183,10 +184,15 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   }
 
   const handleAddDomain = () => {
-    if (!newDomain.trim() || !deployAgent) return
-    const domain = newDomain.trim()
+    if (!deployAgent) return
+    const domain = normalizeAllowedDomain(newDomain)
+    if (!domain) return
+    if (!isValidAllowedDomain(domain)) {
+      toast.error(t("appWidget.dialog.invalidDomain"))
+      return
+    }
     const currentDomains = deployAgent.allowed_domains || []
-    if (currentDomains.includes(domain)) {
+    if (currentDomains.some((item) => item.toLowerCase() === domain)) {
       setNewDomain("")
       return
     }
@@ -202,14 +208,8 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   const handleCopySnippet = () => {
     if (!deployAgent) return
-    const snippet = `<script
-  src="${appOrigin}/widget.js"
-  data-agent-id="${deployAgent.id}"
-  data-button-size="60px"
-  data-button-color="#000"
-  data-icon-color="#fff"
-  data-panel-bg-color="#fff">
-</script>`
+    const snippet = buildWidgetSnippet(deployAgent.id, appOrigin)
+    if (!snippet) return
     navigator.clipboard.writeText(snippet)
     setCopiedSnippet(true)
     toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
@@ -515,14 +515,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
               </div>
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                  {`<script
-  src="${appOrigin}/widget.js"
-  data-agent-id="${deployAgent?.id}"
-  data-button-size="60px"
-  data-button-color="#000"
-  data-icon-color="#fff"
-  data-panel-bg-color="#fff">
-</script>`}
+                  {buildWidgetSnippet(deployAgent?.id ?? "", appOrigin)}
                 </pre>
                 <Button
                   variant="secondary"

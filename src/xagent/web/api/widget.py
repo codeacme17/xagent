@@ -80,18 +80,24 @@ async def authenticate_widget(
             # Try origin/referer
             if origin:
                 parsed = urlparse(origin)
-                origin_domain = parsed.netloc or parsed.path
+                origin_domain = (parsed.netloc or parsed.path).lower()
 
             # If origin_domain is localhost:3000 but host is localhost:8001
             # Next.js might be rewriting the request. Let's use the origin_domain.
 
-            # Check if origin matches any allowed domain
+            # Check if origin matches any allowed domain. Domains are
+            # case-insensitive, so compare both sides lowercased regardless of
+            # how the entry was stored.
             is_allowed = False
             for domain in allowed_domains:
+                normalized_domain = domain.strip().lower()
                 if (
-                    domain == "*"
-                    or domain == origin_domain
-                    or (origin_domain and origin_domain.endswith("." + domain))
+                    normalized_domain == "*"
+                    or normalized_domain == origin_domain
+                    or (
+                        origin_domain
+                        and origin_domain.endswith("." + normalized_domain)
+                    )
                 ):
                     is_allowed = True
                     break
