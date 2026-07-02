@@ -3216,7 +3216,7 @@ Build when you need.`,
     },
     webhook: {
       title: "Webhook 地址",
-      secretHeader: "调用时通过 x-xagent-trigger-secret header 传入 secret。"
+      secretHeader: "每次请求需用 HMAC-SHA256 签名：以 secret 为密钥对 `{timestamp}.{原始请求体}` 计算十六进制摘要放入 x-xagent-signature header，并在 x-xagent-timestamp header 传入 Unix 时间戳。"
     },
     gmail: {
       connected: "Gmail 已连接",

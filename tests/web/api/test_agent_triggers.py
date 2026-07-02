@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
+from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
     _compute_next_run_at,
     _start_prepared_trigger_run_id,
@@ -88,14 +91,19 @@ def test_webhook_trigger_crud_returns_secret_once() -> None:
     assert created.status_code == 200, created.text
     body = created.json()
     assert body["type"] == "webhook"
-    assert body["webhook_token"]
+    assert body["callback_id"]
     assert body["webhook_secret"]
 
     db = _direct_db_session()
     try:
         trigger = db.query(AgentTrigger).filter(AgentTrigger.id == body["id"]).one()
-        assert str(trigger.secret_hash).startswith("$2")
-        assert trigger.secret_hash != body["webhook_secret"]
+        # New rows store only the encrypted HMAC secret; no bcrypt hash.
+        assert trigger.secret_hash is None
+        assert trigger.secret_encrypted
+        assert trigger.secret_encrypted != body["webhook_secret"]
+        assert decrypt_value(str(trigger.secret_encrypted)) == body["webhook_secret"]
+        assert trigger.provider == "webhook"
+        assert trigger.callback_id == body["callback_id"]
     finally:
         db.close()
 
@@ -152,7 +160,22 @@ def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
         db.close()
 
 
-def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> None:
+def _signed_webhook_headers(
+    secret: str, raw_body: bytes, *, event_id: str | None = None
+) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    headers = {
+        "x-xagent-signature": sign_webhook_payload(secret, timestamp, raw_body),
+        "x-xagent-timestamp": timestamp,
+    }
+    if event_id:
+        headers["x-xagent-event-id"] = event_id
+    return headers
+
+
+def test_public_webhook_validates_signature_and_deduplicates(
+    mock_bg_scheduler,
+) -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     created = client.post(
@@ -161,24 +184,29 @@ def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> 
         json={"type": "webhook", "name": "Public webhook"},
     )
     body = created.json()
-    url = f"/api/triggers/webhook/{body['webhook_token']}"
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'{"subject": "hello"}'
 
-    rejected = client.post(url, json={"subject": "hello"})
-    assert rejected.status_code == 401
+    unsigned = client.post(url, content=raw_body)
+    assert unsigned.status_code == 401
 
-    event_headers = {
-        "x-xagent-trigger-secret": body["webhook_secret"],
-        "x-xagent-event-id": "evt-1",
-    }
-    first = client.post(url, headers=event_headers, json={"subject": "hello"})
+    forged_headers = _signed_webhook_headers("wrong-secret", raw_body, event_id="evt-1")
+    forged = client.post(url, headers=forged_headers, content=raw_body)
+    assert forged.status_code == 401
+
+    event_headers = _signed_webhook_headers(
+        body["webhook_secret"], raw_body, event_id="evt-1"
+    )
+    first = client.post(url, headers=event_headers, content=raw_body)
     assert first.status_code == 200, first.text
-    assert set(first.json()) == {"trigger_run_id", "status", "duplicate"}
-    assert first.json()["duplicate"] is False
+    assert first.json()["outcome"] == "accepted"
+    assert len(first.json()["trigger_run_ids"]) == 1
+    assert first.json()["duplicates"] == 0
 
-    second = client.post(url, headers=event_headers, json={"subject": "hello"})
+    second = client.post(url, headers=event_headers, content=raw_body)
     assert second.status_code == 200, second.text
-    assert second.json()["duplicate"] is True
-    assert second.json()["trigger_run_id"] == first.json()["trigger_run_id"]
+    assert second.json()["duplicates"] == 1
+    assert second.json()["trigger_run_ids"] == []
     assert mock_bg_scheduler.call_count == 1
 
     db = _direct_db_session()
@@ -189,7 +217,130 @@ def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> 
         db.close()
 
 
-def test_public_webhook_invalid_utf8_body_falls_back_to_text(
+def test_public_webhook_rejects_stale_timestamp(mock_bg_scheduler) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Replay webhook"},
+    )
+    body = created.json()
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'{"subject": "hello"}'
+
+    stale_timestamp = str(int(time.time()) - 3600)
+    stale = client.post(
+        url,
+        headers={
+            "x-xagent-signature": sign_webhook_payload(
+                body["webhook_secret"], stale_timestamp, raw_body
+            ),
+            "x-xagent-timestamp": stale_timestamp,
+        },
+        content=raw_body,
+    )
+    assert stale.status_code == 401
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 0
+    finally:
+        db.close()
+
+
+def test_public_callback_unknown_provider_and_callback_are_controlled(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Known webhook"},
+    )
+    body = created.json()
+    raw_body = b"{}"
+
+    unknown_provider = client.post(
+        f"/api/triggers/callback/ghost/{body['callback_id']}",
+        content=raw_body,
+    )
+    assert unknown_provider.status_code == 404
+    assert unknown_provider.json()["outcome"] == "unknown_provider"
+
+    unknown_callback = client.post(
+        "/api/triggers/callback/webhook/does-not-exist",
+        content=raw_body,
+    )
+    assert unknown_callback.status_code == 404
+    assert unknown_callback.json()["outcome"] == "unknown_callback"
+
+
+def test_public_callback_disabled_trigger_is_rejected_after_verification(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Disabled webhook", "enabled": False},
+    )
+    body = created.json()
+    raw_body = b'{"subject": "hello"}'
+
+    fired = client.post(
+        f"/api/triggers/callback/webhook/{body['callback_id']}",
+        headers=_signed_webhook_headers(body["webhook_secret"], raw_body),
+        content=raw_body,
+    )
+    assert fired.status_code == 409
+    assert fired.json()["outcome"] == "rejected_disabled"
+
+
+def test_public_callback_filters_events_against_allow_list(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Filtered webhook",
+            "config": {"event_types": ["order.created"]},
+        },
+    )
+    body = created.json()
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+
+    ignored_body = b'{"event_type": "order.deleted", "id": "evt-a"}'
+    ignored = client.post(
+        url,
+        headers=_signed_webhook_headers(body["webhook_secret"], ignored_body),
+        content=ignored_body,
+    )
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["trigger_run_ids"] == []
+
+    matched_body = b'{"event_type": "order.created", "id": "evt-b"}'
+    matched = client.post(
+        url,
+        headers=_signed_webhook_headers(body["webhook_secret"], matched_body),
+        content=matched_body,
+    )
+    assert matched.status_code == 200, matched.text
+    assert len(matched.json()["trigger_run_ids"]) == 1
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 1
+    finally:
+        db.close()
+
+
+def test_public_webhook_invalid_utf8_body_is_a_controlled_parse_failure(
     mock_bg_scheduler,
 ) -> None:
     headers = _admin_headers()
@@ -200,27 +351,23 @@ def test_public_webhook_invalid_utf8_body_falls_back_to_text(
         json={"type": "webhook", "name": "Invalid UTF-8 webhook"},
     )
     body = created.json()
-    url = f"/api/triggers/webhook/{body['webhook_token']}"
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'\xff{"subject":"hello"}'
 
     fired = client.post(
         url,
-        headers={"x-xagent-trigger-secret": body["webhook_secret"]},
-        content=b'\xff{"subject":"hello"}',
+        headers=_signed_webhook_headers(body["webhook_secret"], raw_body),
+        content=raw_body,
     )
-    assert fired.status_code == 200, fired.text
+    assert fired.status_code == 400
+    assert fired.json()["outcome"] == "execution_failure"
 
     db = _direct_db_session()
     try:
-        run_id = fired.json()["trigger_run_id"]
-        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
-        # Conservative default: hash + metadata only, no payload content.
-        assert set(run.payload_snapshot) == {"payload_sha256", "metadata"}
-        assert run.payload_snapshot["metadata"]["event_type"] == "webhook"
-        assert '\ufffd{"subject":"hello"}' not in str(run.payload_snapshot)
+        assert db.query(TriggerRun).count() == 0
     finally:
         db.close()
-
-    assert mock_bg_scheduler.call_count == 1
+    assert mock_bg_scheduler.call_count == 0
 
 
 def test_trigger_name_validation_rejects_empty_and_oversized() -> None:

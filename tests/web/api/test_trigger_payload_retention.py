@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from xagent.web.models.trigger import TriggerAudit, TriggerRun
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.trigger_providers import sign_webhook_payload
 
 from .conftest import (
     _admin_headers,
@@ -67,16 +69,23 @@ def _create_webhook_trigger(
 
 
 def _fire_webhook(trigger: dict, payload: dict, event_id: str = "evt-1") -> int:
+    raw_body = json.dumps(payload).encode("utf-8")
+    timestamp = str(int(time.time()))
     fired = client.post(
-        f"/api/triggers/webhook/{trigger['webhook_token']}",
+        f"/api/triggers/callback/webhook/{trigger['callback_id']}",
         headers={
-            "x-xagent-trigger-secret": trigger["webhook_secret"],
+            "x-xagent-signature": sign_webhook_payload(
+                trigger["webhook_secret"], timestamp, raw_body
+            ),
+            "x-xagent-timestamp": timestamp,
             "x-xagent-event-id": event_id,
         },
-        json=payload,
+        content=raw_body,
     )
     assert fired.status_code == 200, fired.text
-    return int(fired.json()["trigger_run_id"])
+    run_ids = fired.json()["trigger_run_ids"]
+    assert len(run_ids) == 1
+    return int(run_ids[0])
 
 
 SENSITIVE_PAYLOAD = {

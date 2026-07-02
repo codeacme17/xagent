@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import bcrypt
 from pydantic import ValidationError
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
@@ -41,7 +40,6 @@ _TRIGGER_SCOPE_PAYLOAD_KEYS = (
     "tenant_id",
 )
 
-_WEBHOOK_SECRET_BCRYPT_COST = 12
 _TRIGGER_NAME_MAX_LENGTH = 200
 
 
@@ -150,32 +148,8 @@ def _payload_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
 
 
-def _hash_secret(secret: str) -> str:
-    return bcrypt.hashpw(
-        secret.encode("utf-8"),
-        bcrypt.gensalt(rounds=_WEBHOOK_SECRET_BCRYPT_COST),
-    ).decode("utf-8")
-
-
-def verify_webhook_secret(trigger: AgentTrigger, provided_secret: str | None) -> None:
-    expected = trigger.secret_hash
-    if not expected:
-        return
-    if not provided_secret:
-        raise TriggerSecretError("Missing webhook secret")
-    try:
-        matched = bcrypt.checkpw(
-            provided_secret.encode("utf-8"),
-            str(expected).encode("utf-8"),
-        )
-    except (TypeError, ValueError):
-        matched = False
-    if not matched:
-        raise TriggerSecretError("Invalid webhook secret")
-
-
-def _new_webhook_token() -> str:
-    return secrets.token_urlsafe(32)
+def _new_callback_id() -> str:
+    return secrets.token_urlsafe(24)
 
 
 def _new_webhook_secret() -> str:
@@ -361,12 +335,12 @@ def create_agent_trigger(
     )
 
     plain_secret: str | None = None
-    webhook_token: str | None = None
-    secret_hash: str | None = None
+    callback_id: str | None = None
+    secret_encrypted: str | None = None
     if resolved_type == TriggerType.WEBHOOK.value:
-        webhook_token = _new_webhook_token()
+        callback_id = _new_callback_id()
         plain_secret = secret or _new_webhook_secret()
-        secret_hash = _hash_secret(plain_secret)
+        secret_encrypted = encrypt_value(plain_secret)
 
     next_run_at = None
     if resolved_type == TriggerType.SCHEDULED.value and enabled:
@@ -382,10 +356,10 @@ def create_agent_trigger(
         enabled=enabled,
         config=resolved_config,
         prompt_template=prompt_template,
-        webhook_token=webhook_token,
-        secret_hash=secret_hash,
         provider=resolved_type,
+        callback_id=callback_id,
         resource_id=resource_id,
+        secret_encrypted=secret_encrypted,
         next_run_at=next_run_at,
     )
     db.add(trigger)
@@ -430,12 +404,14 @@ def update_agent_trigger(
         setattr(trigger, "resource_id", resource_id)
     if trigger.provider is None:
         setattr(trigger, "provider", str(trigger.type))
+    if str(trigger.type) == TriggerType.WEBHOOK.value and trigger.callback_id is None:
+        setattr(trigger, "callback_id", _new_callback_id())
     if "secret" in updates and updates["secret"]:
         plain_secret = str(updates["secret"])
-        setattr(trigger, "secret_hash", _hash_secret(plain_secret))
+        setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
     elif updates.get("rotate_secret"):
         plain_secret = _new_webhook_secret()
-        setattr(trigger, "secret_hash", _hash_secret(plain_secret))
+        setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
 
     if trigger.type == TriggerType.SCHEDULED.value:
         if trigger.enabled:
@@ -1048,17 +1024,6 @@ async def dispatch_pending_trigger_runs(
         ):
             started_count += 1
     return started_count
-
-
-def find_webhook_trigger(db: Session, webhook_token: str) -> AgentTrigger | None:
-    return (
-        db.query(AgentTrigger)
-        .filter(
-            AgentTrigger.webhook_token == webhook_token,
-            AgentTrigger.type == TriggerType.WEBHOOK.value,
-        )
-        .first()
-    )
 
 
 def scan_due_scheduled_triggers(

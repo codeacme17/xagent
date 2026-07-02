@@ -22,7 +22,11 @@ from ..services.gmail_triggers import (
     GmailTriggerError,
     process_gmail_pubsub_notification,
 )
-from ..services.trigger_providers import record_trigger_audit
+from ..services.trigger_providers import (
+    CallbackRequestContext,
+    process_trigger_callback,
+    record_trigger_audit,
+)
 from ..services.triggers import (
     TriggerNotFoundError,
     TriggerSecretError,
@@ -30,12 +34,10 @@ from ..services.triggers import (
     create_agent_trigger,
     decrypt_trigger_run_payload,
     delete_agent_trigger,
-    find_webhook_trigger,
     fire_trigger,
     get_owned_agent,
     get_owned_trigger,
     update_agent_trigger,
-    verify_webhook_secret,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,7 @@ class TriggerResponse(BaseModel):
     prompt_template: str | None
     webhook_token: str | None
     webhook_secret: str | None = None
+    callback_id: str | None = None
     next_run_at: str | None
     last_run_at: str | None
     last_error: str | None
@@ -107,12 +110,6 @@ class TriggerFireResponse(BaseModel):
     duplicate: bool = False
 
 
-class PublicTriggerFireResponse(BaseModel):
-    trigger_run_id: int
-    status: str
-    duplicate: bool = False
-
-
 class GmailPubsubResponse(BaseModel):
     processed: int
     duplicates: int
@@ -137,6 +134,7 @@ def _serialize_trigger(
         prompt_template=trigger.prompt_template,
         webhook_token=trigger.webhook_token,
         webhook_secret=webhook_secret,
+        callback_id=trigger.callback_id,
         next_run_at=_dt(cast(datetime | None, trigger.next_run_at)),
         last_run_at=_dt(cast(datetime | None, trigger.last_run_at)),
         last_error=trigger.last_error,
@@ -445,45 +443,54 @@ def _decode_gmail_pubsub_notification(
     )
 
 
-@router.post(
-    "/api/triggers/webhook/{webhook_token}",
-    response_model=PublicTriggerFireResponse,
-)
-async def receive_webhook_trigger(
-    webhook_token: str,
-    request: Request,
-    db: Session = Depends(get_db),
-) -> PublicTriggerFireResponse:
-    trigger = find_webhook_trigger(db, webhook_token)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found")
-    if not trigger.enabled:
-        raise HTTPException(status_code=409, detail="Trigger is disabled")
+class TriggerCallbackResponse(BaseModel):
+    outcome: str | None
+    detail: str | None = None
+    trigger_run_ids: list[int] = Field(default_factory=list)
+    duplicates: int = 0
 
-    secret = request.headers.get("x-xagent-trigger-secret")
-    try:
-        verify_webhook_secret(trigger, secret)
-        payload = await _read_payload(request)
-        source_event_id = (
-            request.headers.get("x-xagent-event-id")
-            or request.headers.get("x-event-id")
-            or request.headers.get("x-request-id")
+
+@router.post(
+    "/api/triggers/callback/{provider}/{callback_id}",
+    response_model=TriggerCallbackResponse,
+)
+async def receive_trigger_callback(
+    provider: str,
+    callback_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Response | TriggerCallbackResponse:
+    """Public unified trigger callback endpoint.
+
+    The callback id is only a locator; authentication happens inside the
+    provider pipeline via provider-specific proof (e.g. HMAC signature
+    headers). The raw body is preserved for signature verification.
+    """
+    raw_body = await request.body()
+    context = CallbackRequestContext(
+        provider=provider,
+        callback_id=callback_id,
+        method=request.method,
+        url_path=request.url.path,
+        headers=dict(request.headers),
+        query_params=dict(request.query_params),
+        remote_ip=request.client.host if request.client else None,
+    )
+    result = await process_trigger_callback(db, context=context, raw_body=raw_body)
+    if result.challenge is not None:
+        return Response(
+            content=result.challenge.body,
+            media_type=result.challenge.media_type,
+            status_code=result.challenge.status_code,
         )
-        run, created = await fire_trigger(
-            db,
-            trigger=trigger,
-            event_payload=payload,
-            source_event_id=source_event_id,
-            event_type="webhook",
-        )
-        return PublicTriggerFireResponse(
-            trigger_run_id=int(run.id),
-            status=str(run.status),
-            duplicate=not created,
-        )
-    except Exception as exc:
-        logger.warning("Webhook trigger %s rejected: %s", trigger.id, exc)
-        raise _handle_service_error(exc)
+    response.status_code = result.status_code
+    return TriggerCallbackResponse(
+        outcome=result.outcome.value if result.outcome else None,
+        detail=result.detail,
+        trigger_run_ids=[int(run.id) for run in result.runs],
+        duplicates=result.duplicates,
+    )
 
 
 @router.post(

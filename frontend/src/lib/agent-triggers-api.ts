@@ -17,6 +17,7 @@ export interface AgentTrigger {
   prompt_template: string | null
   webhook_token: string | null
   webhook_secret?: string | null
+  callback_id?: string | null
   next_run_at: string | null
   last_run_at: string | null
   last_error: string | null

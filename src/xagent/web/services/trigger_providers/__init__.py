@@ -31,6 +31,7 @@ from .schemas import (
     dump_trigger_config,
     parse_trigger_config,
 )
+from .webhook import WebhookProvider, sign_webhook_payload
 
 __all__ = [
     "AckPolicy",
@@ -49,8 +50,10 @@ __all__ = [
     "TriggerProviderError",
     "UnknownTriggerProviderError",
     "VerificationResult",
+    "WebhookProvider",
     "WebhookTriggerConfig",
     "dump_trigger_config",
+    "sign_webhook_payload",
     "get_trigger_provider",
     "maybe_get_trigger_provider",
     "parse_trigger_config",

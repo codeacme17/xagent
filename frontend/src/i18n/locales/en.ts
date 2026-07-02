@@ -3216,7 +3216,7 @@ Build when you need.`,
     },
     webhook: {
       title: "Webhook endpoint",
-      secretHeader: "Send the secret with the x-xagent-trigger-secret header."
+      secretHeader: "Sign each request with HMAC-SHA256: put the hex digest of `{timestamp}.{raw body}` keyed by the secret in the x-xagent-signature header, and the unix timestamp in x-xagent-timestamp."
     },
     gmail: {
       connected: "Gmail connected",

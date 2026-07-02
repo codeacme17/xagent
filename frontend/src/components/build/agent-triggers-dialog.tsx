@@ -158,8 +158,8 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
 }
 
 function webhookUrl(trigger: AgentTrigger | null): string {
-  if (!trigger?.webhook_token) return ""
-  return `${getApiUrl()}/api/triggers/webhook/${trigger.webhook_token}`
+  if (!trigger?.callback_id) return ""
+  return `${getApiUrl()}/api/triggers/callback/webhook/${trigger.callback_id}`
 }
 
 function runStatusClass(status: string): string {
