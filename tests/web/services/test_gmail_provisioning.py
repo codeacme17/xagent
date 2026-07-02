@@ -423,3 +423,201 @@ async def test_gmail_provider_register_unregister_offload_sync_sdk_work(
         "to_thread:fake_release",
         f"release:{account.id}",
     ]
+
+
+def test_slow_registration_returns_pending_then_reconciles_to_active(
+    db_session: Session,
+) -> None:
+    """Slow cloud provisioning yields pending; the thread converges later."""
+    import threading
+
+    from xagent.web.services.gmail_provisioning import provision_gmail_trigger
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+
+    release = threading.Event()
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    gmail = FakeGmailService(history_id="hist-slow")
+    threads: list[threading.Thread] = []
+
+    def slow_provision(account_id: int) -> None:
+        release.wait(timeout=10)
+        from xagent.web.models.database import get_session_local
+
+        db2 = get_session_local()()
+        try:
+            slow_account = db2.query(UserOAuth).filter(UserOAuth.id == account_id).one()
+            ensure_gmail_mailbox_provisioned(
+                db2,
+                slow_account,
+                service_factory=lambda _db, _account: gmail,
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+        finally:
+            db2.close()
+
+    def run_in_thread(account_id: int) -> threading.Thread:
+        thread = threading.Thread(target=slow_provision, args=(account_id,))
+        thread.start()
+        threads.append(thread)
+        return thread
+
+    status = provision_gmail_trigger(
+        db_session,
+        trigger,
+        timeout_seconds=0,
+        run_in_thread=run_in_thread,
+    )
+    assert status == TriggerProvisioningStatus.PENDING.value
+    assert trigger.provisioning_status == TriggerProvisioningStatus.PENDING.value
+
+    release.set()
+    threads[0].join(timeout=10)
+    assert not threads[0].is_alive()
+
+    db_session.expire_all()
+    state = (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == int(account.id))
+        .one()
+    )
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    assert state.history_id == "hist-slow"
+
+    # A later reconcile pass reflects the converged state on the trigger.
+    status = provision_gmail_trigger(
+        db_session,
+        trigger,
+        timeout_seconds=5,
+        run_in_thread=run_in_thread,
+    )
+    for thread in threads:
+        thread.join(timeout=10)
+    assert status == TriggerProvisioningStatus.ACTIVE.value
+    assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    assert trigger.provisioning_error is None
+
+
+class ResyncFakeSubscriber(FakeSubscriber):
+    """FakeSubscriber that behaves like Pub/Sub for existing subscriptions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.modify_calls: list[dict[str, Any]] = []
+
+    def create_subscription(self, *, request: dict[str, Any]) -> None:
+        if request["name"] in self.subscriptions:
+            from google.api_core.exceptions import AlreadyExists
+
+            raise AlreadyExists("subscription exists")
+        super().create_subscription(request=request)
+
+    def get_subscription(self, *, request: dict[str, str]) -> Any:
+        from types import SimpleNamespace
+
+        stored = self.subscriptions[request["subscription"]]
+        return SimpleNamespace(
+            push_config=SimpleNamespace(
+                push_endpoint=stored["push_config"]["push_endpoint"]
+            )
+        )
+
+    def modify_push_config(self, *, request: dict[str, Any]) -> None:
+        self.modify_calls.append(request)
+        self.subscriptions[request["subscription"]]["push_config"] = request[
+            "push_config"
+        ]
+
+
+def test_existing_subscription_endpoint_resyncs_after_base_url_change(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = ResyncFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    old_audience = str(first.push_audience)
+    assert subscriber.modify_calls == []
+
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    new_audience = (
+        f"https://api-v2.example.com/api/triggers/callback/gmail/{second.callback_id}"
+    )
+    assert second.push_audience == new_audience
+    assert new_audience != old_audience
+    assert len(subscriber.modify_calls) == 1
+    stored = subscriber.subscriptions[str(second.subscription_name)]
+    assert stored["push_config"]["push_endpoint"] == new_audience
+    assert stored["push_config"]["oidc_token"]["audience"] == new_audience
+
+
+def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Watch renewal must not point per-mailbox states back at the global topic."""
+    from xagent.web.services import gmail_provisioning
+    from xagent.web.services.gmail_triggers import scan_due_gmail_watch_renewals
+
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_TOPIC", raising=False)
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+    stale = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="old",
+        topic_name="projects/demo-project/topics/legacy-global",
+        watch_expiration=datetime.now(timezone.utc) - timedelta(hours=1),
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(stale)
+    db_session.commit()
+
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    monkeypatch.setattr(gmail_provisioning, "_default_publisher", lambda: publisher)
+    monkeypatch.setattr(gmail_provisioning, "_default_subscriber", lambda: subscriber)
+    gmail = FakeGmailService(history_id="hist-renewed")
+
+    renewed = scan_due_gmail_watch_renewals(
+        db_session,
+        service_factory=lambda _db, _account: gmail,
+    )
+
+    assert renewed == 1
+    refreshed = (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == int(account.id))
+        .one()
+    )
+    expected_topic = gmail_topic_path("demo-project", "owner@gmail.example")
+    assert refreshed.topic_name == expected_topic
+    assert refreshed.status == TriggerProvisioningStatus.ACTIVE.value
+    assert refreshed.history_id == "hist-renewed"
+    assert gmail.watch_calls[-1]["body"]["topicName"] == expected_topic

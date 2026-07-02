@@ -19,7 +19,12 @@ from xagent.config import (
 from xagent.web.models.agent import Agent
 from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.oauth_provider import OAuthProvider
-from xagent.web.models.trigger import AgentTrigger, TriggerAudit, TriggerRun, TriggerType
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerAudit,
+    TriggerRun,
+    TriggerType,
+)
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_triggers import (
@@ -33,7 +38,10 @@ from xagent.web.services.gmail_triggers import (
     register_gmail_watch_for_account,
     scan_due_gmail_watch_renewals,
 )
-from xagent.web.services.trigger_providers import GmailProvider, register_trigger_provider
+from xagent.web.services.trigger_providers import (
+    GmailProvider,
+    register_trigger_provider,
+)
 
 from .conftest import _direct_db_session, client
 
@@ -323,9 +331,11 @@ def test_gmail_provider_verifies_oidc_with_stored_audience_and_service_account(
                     {
                         "callback_id": "cb-oidc",
                         "url_path": "/api/triggers/callback/gmail/cb-oidc",
-                        "header": lambda _self, name: "Bearer oidc-token"
-                        if name.lower() == "authorization"
-                        else None,
+                        "header": lambda _self, name: (
+                            "Bearer oidc-token"
+                            if name.lower() == "authorization"
+                            else None
+                        ),
                     },
                 )(),
                 db=db,
@@ -371,9 +381,11 @@ def test_gmail_provider_rejects_unverified_push_service_account_email(
                     (),
                     {
                         "callback_id": "cb-unverified",
-                        "header": lambda _self, name: "Bearer oidc-token"
-                        if name.lower() == "authorization"
-                        else None,
+                        "header": lambda _self, name: (
+                            "Bearer oidc-token"
+                            if name.lower() == "authorization"
+                            else None
+                        ),
                     },
                 )(),
                 db=db,
@@ -1996,4 +2008,106 @@ def test_scan_due_gmail_watch_renewals_records_failure_and_continues(
         assert "revoked credentials" in str(first_state.last_error)
         assert second_state.history_id == "999"
     finally:
+        db.close()
+
+
+def test_gmail_finalize_never_rolls_history_cursor_backwards() -> None:
+    """Stale or redelivered notifications must not rewind the watch cursor.
+
+    Guards the expired-history recovery path: re-registration resets the
+    cursor to a fresh watch historyId, and the stale notification that
+    triggered recovery must not clobber it afterwards.
+    """
+    from xagent.web.services.trigger_providers import CallbackRequestContext
+
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-cursor-guard-user")
+        oauth = _create_gmail_oauth(db, user)
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-cursor")
+        setattr(state, "history_id", "300")
+        db.add(state)
+        db.commit()
+
+        provider = GmailProvider()
+        context = CallbackRequestContext(provider="gmail", callback_id="cb-cursor")
+
+        stale_body = _gmail_pubsub_push_body(
+            claimed_email="codeacme17@gmail.com", history_id="222"
+        )
+        asyncio.run(
+            provider.finalize_callback(
+                db=db,
+                context=context,
+                trigger=None,
+                events=[],
+                raw_body=stale_body,
+            )
+        )
+        db.refresh(state)
+        assert state.history_id == "300"
+
+        advancing_body = _gmail_pubsub_push_body(
+            claimed_email="codeacme17@gmail.com", history_id="400"
+        )
+        asyncio.run(
+            provider.finalize_callback(
+                db=db,
+                context=context,
+                trigger=None,
+                events=[],
+                raw_body=advancing_body,
+            )
+        )
+        db.refresh(state)
+        assert state.history_id == "400"
+    finally:
+        db.close()
+
+
+def test_gmail_unified_callback_ingestion_failure_is_controlled_and_audited(
+    mock_bg_scheduler,
+) -> None:
+    """Transient ingestion errors return the provider failure status with an
+    audit row instead of an unhandled 500, so Pub/Sub redelivery can retry."""
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-ingest-failure-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        _create_gmail_watch_state(db, user, oauth, callback_id="cb-ingest-fail")
+
+        def broken_service_factory(_db, _oauth):
+            raise GmailWatchConfigurationError("Gmail credential refresh failed")
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=broken_service_factory,
+                oidc_verifier=lambda _token, audience: {
+                    "iss": "https://accounts.google.com",
+                    "aud": audience,
+                },
+            ),
+            replace=True,
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-ingest-fail",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=_gmail_pubsub_push_body(claimed_email="codeacme17@gmail.com"),
+        )
+
+        assert response.status_code == 500
+        assert response.json()["outcome"] == "execution_failure"
+        assert db.query(TriggerRun).count() == 0
+        audit = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "execution_failure")
+            .one()
+        )
+        assert audit.trigger_id == trigger.id
+        assert audit.detail["stage"] == "ingest"
+        assert mock_bg_scheduler.call_count == 0
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
         db.close()

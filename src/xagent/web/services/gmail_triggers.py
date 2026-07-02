@@ -428,6 +428,41 @@ def best_effort_ensure_gmail_watches_for_user(
     return states
 
 
+def _renew_watch_for_account(
+    db: Session,
+    oauth_account: UserOAuth,
+    *,
+    service_factory: GmailServiceFactory,
+) -> GmailWatchState:
+    """Renew one mailbox watch through whichever delivery model is configured.
+
+    Per-mailbox deployments (XAGENT_GMAIL_PUBSUB_PROJECT_ID set) must renew
+    through the provisioning state machine: the legacy path would point the
+    Gmail watch back at the deprecated global topic and clobber the
+    per-mailbox topic and push subscription routing.
+    """
+    from ...config import get_gmail_pubsub_project_id
+
+    if get_gmail_pubsub_project_id():
+        from .gmail_provisioning import ensure_gmail_mailbox_provisioned
+
+        state = ensure_gmail_mailbox_provisioned(
+            db,
+            oauth_account,
+            service_factory=service_factory,
+        )
+        if str(state.status or "") != "active":
+            raise GmailTriggerError(
+                str(state.last_error or "Gmail per-mailbox provisioning failed")
+            )
+        return state
+    return register_gmail_watch_for_account(
+        db,
+        oauth_account,
+        service_factory=service_factory,
+    )
+
+
 def scan_due_gmail_watch_renewals(
     db: Session,
     *,
@@ -479,7 +514,7 @@ def scan_due_gmail_watch_renewals(
         user_id = int(oauth_account.user_id)
 
         try:
-            register_gmail_watch_for_account(
+            _renew_watch_for_account(
                 db,
                 oauth_account,
                 service_factory=service_factory,
@@ -676,7 +711,7 @@ async def collect_gmail_pubsub_events(
         )
         db.rollback()
         try:
-            register_gmail_watch_for_account(
+            _renew_watch_for_account(
                 db,
                 oauth_account,
                 service_factory=service_factory,
@@ -830,7 +865,7 @@ async def process_gmail_pubsub_notification(
         )
         db.rollback()
         try:
-            register_gmail_watch_for_account(
+            _renew_watch_for_account(
                 db,
                 oauth_account,
                 service_factory=service_factory,

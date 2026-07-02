@@ -205,6 +205,42 @@ def _ensure_push_subscription(
     except Exception as exc:
         if not _is_already_exists(exc):
             raise
+        # The deterministic name survives config changes; make sure an
+        # existing subscription still pushes to the current audience
+        # (e.g. after XAGENT_PUBLIC_API_BASE_URL was changed).
+        _sync_push_endpoint(
+            subscriber,
+            subscription_path=subscription_path,
+            push_config=push_config,
+        )
+
+
+def _sync_push_endpoint(
+    subscriber: Any,
+    *,
+    subscription_path: str,
+    push_config: dict[str, Any],
+) -> None:
+    try:
+        existing = subscriber.get_subscription(
+            request={"subscription": subscription_path}
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not inspect existing subscription %s: %s", subscription_path, exc
+        )
+        return
+    current_endpoint = str(
+        getattr(getattr(existing, "push_config", None), "push_endpoint", "") or ""
+    )
+    if current_endpoint == push_config["push_endpoint"]:
+        return
+    subscriber.modify_push_config(
+        request={
+            "subscription": subscription_path,
+            "push_config": push_config,
+        }
+    )
 
 
 def _register_gmail_watch(service: Any, topic_path: str) -> tuple[str, datetime | None]:
@@ -235,15 +271,18 @@ def ensure_gmail_mailbox_provisioned(
     db: Session,
     oauth_account: UserOAuth,
     *,
-    service_factory: Callable[[Session, UserOAuth], Any] = _default_gmail_service,
-    publisher_factory: PublisherFactory = _default_publisher,
-    subscriber_factory: SubscriberFactory = _default_subscriber,
+    service_factory: Callable[[Session, UserOAuth], Any] | None = None,
+    publisher_factory: PublisherFactory | None = None,
+    subscriber_factory: SubscriberFactory | None = None,
 ) -> GmailWatchState:
     """Idempotently provision Pub/Sub resources and a Gmail watch for a mailbox.
 
     Never raises for provisioning failures: the watch state converges to
     failed with a clear last_error, and later reconcile attempts retry.
     """
+    service_factory = service_factory or _default_gmail_service
+    publisher_factory = publisher_factory or _default_publisher
+    subscriber_factory = subscriber_factory or _default_subscriber
     email = str(oauth_account.email or "").strip().lower()
     if not email:
         raise GmailProvisioningError("Gmail account email is required")
@@ -382,9 +421,9 @@ def release_gmail_mailbox_if_unused(
     db: Session,
     oauth_account_id: int,
     *,
-    service_factory: Callable[[Session, UserOAuth], Any] = _default_gmail_service,
-    publisher_factory: PublisherFactory = _default_publisher,
-    subscriber_factory: SubscriberFactory = _default_subscriber,
+    service_factory: Callable[[Session, UserOAuth], Any] | None = None,
+    publisher_factory: PublisherFactory | None = None,
+    subscriber_factory: SubscriberFactory | None = None,
 ) -> bool:
     """Reference-counted teardown of one mailbox's delivery resources.
 
@@ -393,6 +432,9 @@ def release_gmail_mailbox_if_unused(
     deletes the per-mailbox subscription, topic, and watch state.
     Returns True when resources were released.
     """
+    service_factory = service_factory or _default_gmail_service
+    publisher_factory = publisher_factory or _default_publisher
+    subscriber_factory = subscriber_factory or _default_subscriber
     state = (
         db.query(GmailWatchState)
         .filter(GmailWatchState.oauth_account_id == int(oauth_account_id))
@@ -459,9 +501,9 @@ def sweep_gmail_provisioning(
     now: datetime | None = None,
     stale_pending_seconds: int = 300,
     limit: int = 100,
-    service_factory: Callable[[Session, UserOAuth], Any] = _default_gmail_service,
-    publisher_factory: PublisherFactory = _default_publisher,
-    subscriber_factory: SubscriberFactory = _default_subscriber,
+    service_factory: Callable[[Session, UserOAuth], Any] | None = None,
+    publisher_factory: PublisherFactory | None = None,
+    subscriber_factory: SubscriberFactory | None = None,
 ) -> int:
     """Retry stale pending and failed Gmail registrations.
 

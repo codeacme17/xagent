@@ -188,6 +188,25 @@ async def process_trigger_callback(
             outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
             detail=str(exc) or "Malformed callback payload",
         )
+    except Exception as exc:
+        # Transient ingestion failures (e.g. upstream API errors while
+        # expanding events) get a controlled failure status so providers
+        # with redelivery semantics can retry, and an audit trail either way.
+        logger.exception("Provider %s failed to ingest callback events", provider_name)
+        record_trigger_audit_best_effort(
+            db,
+            outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+            provider=provider_name,
+            callback_id=callback_id,
+            trigger_id=int(trigger.id),
+            detail={"stage": "ingest", "error": f"{type(exc).__name__}: {exc}"},
+            remote_ip=context.remote_ip,
+        )
+        return CallbackResult(
+            status_code=ack.failure_status,
+            outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+            detail="Event ingestion failed",
+        )
 
     runs: list[TriggerRun] = []
     duplicates = 0

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
 from pydantic import ValidationError
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session, object_session
 
 from ....config import get_gmail_pubsub_push_service_account
@@ -85,6 +86,20 @@ def _claim_email_verified(value: object) -> bool:
     return False
 
 
+def _history_cursor_advances(current: object, incoming: str) -> bool:
+    """True when incoming historyId moves the watch cursor forward.
+
+    Gmail history ids are monotonically increasing integers. Rejecting
+    non-advancing ids keeps out-of-order Pub/Sub redeliveries - and stale
+    notifications processed right after an expired-history re-registration
+    reset the cursor - from rolling the cursor backwards.
+    """
+    try:
+        return int(incoming) > int(str(current or "0") or "0")
+    except (TypeError, ValueError):
+        return True
+
+
 def verify_google_oidc_token(token: str, audience: str) -> Mapping[str, Any]:
     """Verify a Google OIDC token signature and audience."""
     claims = id_token.verify_oauth2_token(token, GoogleAuthRequest(), audience)
@@ -99,7 +114,9 @@ def _decode_pubsub_notification(
     try:
         envelope = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise TriggerEventParseError("Gmail Pub/Sub envelope is not valid JSON") from exc
+        raise TriggerEventParseError(
+            "Gmail Pub/Sub envelope is not valid JSON"
+        ) from exc
     if not isinstance(envelope, dict):
         raise TriggerEventParseError("Gmail Pub/Sub envelope must be an object")
 
@@ -162,6 +179,17 @@ class GmailProvider:
         state = _watch_state_for_callback(db, callback_id)
         if state is None:
             return None
+        # Prefer triggers bound to this callback's mailbox so the disabled
+        # check applies to the right binding; fall back to the user's other
+        # Gmail triggers so cross-mailbox events still surface as audited
+        # rejected_resource outcomes instead of unknown callbacks.
+        mailbox_matches = case(
+            (
+                func.lower(AgentTrigger.resource_id) == _normalized_email(state.email),
+                0,
+            ),
+            else_=1,
+        )
         return (
             db.query(AgentTrigger)
             .filter(
@@ -169,7 +197,11 @@ class GmailProvider:
                 AgentTrigger.type == self.name,
                 AgentTrigger.provider == self.name,
             )
-            .order_by(AgentTrigger.enabled.desc(), AgentTrigger.id.asc())
+            .order_by(
+                mailbox_matches,
+                AgentTrigger.enabled.desc(),
+                AgentTrigger.id.asc(),
+            )
             .first()
         )
 
@@ -205,7 +237,9 @@ class GmailProvider:
 
         audience = str(state.push_audience or "").strip()
         if not audience:
-            return VerificationResult.reject("Gmail callback audience is not configured")
+            return VerificationResult.reject(
+                "Gmail callback audience is not configured"
+            )
 
         token = _bearer_token(context)
         if token is None:
@@ -314,6 +348,8 @@ class GmailProvider:
             raw_body,
             attested_email=_normalized_email(state.email),
         )
+        if not _history_cursor_advances(state.history_id, notification.history_id):
+            return
         setattr(state, "history_id", notification.history_id)
         setattr(state, "last_error", None)
         db.add(state)
