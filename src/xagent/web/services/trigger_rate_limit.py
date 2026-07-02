@@ -4,8 +4,10 @@ Backed by the ``limits`` package: Redis storage when ``XAGENT_REDIS_URL`` is
 configured (shared limits across workers), in-memory storage otherwise
 (per-process limits, fine for development and single-process deployments).
 
-Rate limiting runs before audit writes so hostile callback traffic cannot
-amplify database writes.
+Rate limiting runs before per-request audit writes so hostile callback
+traffic cannot amplify database writes; rate-limited requests leave a
+deduplicated rate_limited audit trail (at most one row per source per
+window) via should_audit_rate_limited.
 """
 
 from __future__ import annotations
@@ -31,6 +33,13 @@ logger = logging.getLogger(__name__)
 _CALLBACK_NAMESPACE = "trigger-callback"
 _CALLBACK_IP_NAMESPACE = "trigger-callback-ip"
 _CRUD_NAMESPACE = "trigger-crud"
+_RATE_LIMITED_AUDIT_NAMESPACE = "trigger-callback-429-audit"
+_RATE_LIMITED_AUDIT_IP_NAMESPACE = "trigger-callback-429-audit-ip"
+
+# One rate_limited audit row per source per this window: enough signal to see
+# that a caller is being throttled without turning sustained 429 traffic into
+# sustained database writes.
+_RATE_LIMITED_AUDIT_WINDOW = "1/5minutes"
 
 _WORKER_COUNT_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS")
 
@@ -56,6 +65,7 @@ class TriggerRateLimiter:
         self._crud_limit = _parse_rate(
             get_trigger_crud_rate_limit(), fallback="60/minute"
         )
+        self._rate_limited_audit_window = parse(_RATE_LIMITED_AUDIT_WINDOW)
 
     def hit_callback(self, callback_id: str, remote_ip: str | None) -> bool:
         """Count one callback request; False when the limit is exceeded.
@@ -76,6 +86,25 @@ class TriggerRateLimiter:
     def hit_crud(self, user_id: int) -> bool:
         """Count one trigger CRUD request; False when the limit is exceeded."""
         return self._limiter.hit(self._crud_limit, _CRUD_NAMESPACE, str(user_id))
+
+    def should_audit_rate_limited(
+        self, callback_id: str, remote_ip: str | None
+    ) -> bool:
+        """Admit at most one rate_limited audit write per source per window.
+
+        The IP-only gate is checked first so an attacker rotating garbage
+        callback ids cannot mint a fresh dedup bucket per request: whatever
+        the callback id, one IP gets at most one audited 429 per window.
+        """
+        ip_key = remote_ip or "unknown"
+        if not self._limiter.hit(
+            self._rate_limited_audit_window, _RATE_LIMITED_AUDIT_IP_NAMESPACE, ip_key
+        ):
+            return False
+        key = f"{callback_id}:{ip_key}"
+        return self._limiter.hit(
+            self._rate_limited_audit_window, _RATE_LIMITED_AUDIT_NAMESPACE, key
+        )
 
 
 def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
@@ -110,6 +139,10 @@ def reset_trigger_rate_limiter() -> None:
 
 def check_callback_rate_limit(callback_id: str, remote_ip: str | None) -> bool:
     return get_trigger_rate_limiter().hit_callback(callback_id, remote_ip)
+
+
+def should_audit_rate_limited_callback(callback_id: str, remote_ip: str | None) -> bool:
+    return get_trigger_rate_limiter().should_audit_rate_limited(callback_id, remote_ip)
 
 
 def check_trigger_crud_rate_limit(user_id: int) -> bool:

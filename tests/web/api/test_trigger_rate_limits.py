@@ -101,9 +101,11 @@ class TestCallbackRateLimit:
         )
         assert limited.status_code == 429
 
-    def test_rate_limited_garbage_creates_no_audit_rows(
+    def test_rate_limited_requests_leave_one_deduplicated_audit_row(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """429s are audited (#722 AC) but deduplicated per source per window,
+        so sustained throttled traffic cannot amplify database writes."""
         monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", "1/minute")
         reset_trigger_rate_limiter()
 
@@ -124,7 +126,16 @@ class TestCallbackRateLimit:
 
         db = _direct_db_session()
         try:
-            assert db.query(TriggerAudit).count() == audits_after_first
+            # Exactly one rate_limited row for the whole 429 burst.
+            rate_limited = (
+                db.query(TriggerAudit)
+                .filter(TriggerAudit.outcome == "rate_limited")
+                .all()
+            )
+            assert len(rate_limited) == 1
+            assert rate_limited[0].callback_id == "garbage-callback-id"
+            assert rate_limited[0].detail == {"route": "unified_callback"}
+            assert db.query(TriggerAudit).count() == audits_after_first + 1
             assert db.query(TriggerRun).count() == 0
         finally:
             db.close()
@@ -320,7 +331,15 @@ class TestCallbackIpCeiling:
 
         db = _direct_db_session()
         try:
-            # No audit-write amplification once the IP ceiling kicks in.
-            assert db.query(TriggerAudit).count() == audits_at_ceiling
+            # No audit-write amplification once the IP ceiling kicks in:
+            # rotating callback ids share the per-IP dedup bucket, so the
+            # whole 429 burst produces exactly one rate_limited row.
+            assert db.query(TriggerAudit).count() == audits_at_ceiling + 1
+            assert (
+                db.query(TriggerAudit)
+                .filter(TriggerAudit.outcome == "rate_limited")
+                .count()
+                == 1
+            )
         finally:
             db.close()

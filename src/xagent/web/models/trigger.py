@@ -53,6 +53,7 @@ class TriggerAuditOutcome(str, enum.Enum):
     NOT_FOUND = "not_found"
     EXECUTION_FAILURE = "execution_failure"
     PAYLOAD_READ = "payload_read"
+    RATE_LIMITED = "rate_limited"
 
 
 class AgentTrigger(Base):  # type: ignore

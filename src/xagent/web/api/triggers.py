@@ -19,11 +19,13 @@ from ..services.trigger_providers import (
     CallbackRequestContext,
     process_trigger_callback,
     record_trigger_audit,
+    record_trigger_audit_best_effort,
 )
 from ..services.trigger_rate_limit import (
     check_callback_rate_limit,
     check_trigger_crud_rate_limit,
     remote_ip_from_request,
+    should_audit_rate_limited_callback,
 )
 from ..services.triggers import (
     TriggerNotFoundError,
@@ -229,11 +231,11 @@ async def list_triggers(
         .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
         .all()
     )
-    return [_serialize_trigger(row) for row in rows]
-
     # Gmail provisioning converges in background threads/sweeps that only
     # write the watch state; fold that convergence into the reported status.
     await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
+    return [_serialize_trigger(row) for row in rows]
+
 
 @router.post(
     "/api/agents/{agent_id}/triggers",
@@ -450,9 +452,19 @@ async def receive_trigger_callback(
     headers). The raw body is preserved for signature verification.
     """
     remote_ip = remote_ip_from_request(request)
-    # Rate limiting runs before any parsing or audit write, so hostile or
-    # garbage traffic cannot amplify database writes.
+    # Rate limiting runs before any parsing, so hostile or garbage traffic
+    # cannot amplify database writes; throttling is still observable through
+    # one deduplicated rate_limited audit row per source per window.
     if not check_callback_rate_limit(callback_id, remote_ip):
+        if should_audit_rate_limited_callback(callback_id, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider=provider,
+                callback_id=callback_id,
+                remote_ip=remote_ip,
+                detail={"route": "unified_callback"},
+            )
         raise HTTPException(status_code=429, detail="Too many callback requests")
 
     # Secrets are accepted only via headers. A request that smuggles its
@@ -529,6 +541,14 @@ async def receive_legacy_webhook_trigger(
     """
     remote_ip = remote_ip_from_request(request)
     if not check_callback_rate_limit(webhook_token, remote_ip):
+        if should_audit_rate_limited_callback(webhook_token, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider="webhook",
+                remote_ip=remote_ip,
+                detail={"route": "legacy_webhook"},
+            )
         raise HTTPException(status_code=429, detail="Too many callback requests")
 
     response.headers["Deprecation"] = "true"
