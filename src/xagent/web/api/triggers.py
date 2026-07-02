@@ -14,6 +14,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
+from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
     process_trigger_callback,
@@ -230,6 +231,9 @@ async def list_triggers(
     )
     return [_serialize_trigger(row) for row in rows]
 
+    # Gmail provisioning converges in background threads/sweeps that only
+    # write the watch state; fold that convergence into the reported status.
+    await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
 
 @router.post(
     "/api/agents/{agent_id}/triggers",

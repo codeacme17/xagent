@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -20,6 +22,7 @@ from xagent.web.services.gmail_provisioning import (
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
+    reconcile_gmail_trigger_provisioning,
     release_gmail_mailbox_if_unused,
     sweep_gmail_provisioning,
 )
@@ -489,18 +492,65 @@ def test_slow_registration_returns_pending_then_reconciles_to_active(
     assert state.status == TriggerProvisioningStatus.ACTIVE.value
     assert state.history_id == "hist-slow"
 
-    # A later reconcile pass reflects the converged state on the trigger.
-    status = provision_gmail_trigger(
+    # The periodic sweep - not another user-initiated create/update - must
+    # surface the converged state on the trigger the API serves.
+    attempts = sweep_gmail_provisioning(
         db_session,
-        trigger,
-        timeout_seconds=5,
-        run_in_thread=run_in_thread,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
     )
-    for thread in threads:
-        thread.join(timeout=10)
-    assert status == TriggerProvisioningStatus.ACTIVE.value
+    assert attempts == 0  # state is active; nothing to re-register
+    db_session.refresh(trigger)
     assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
     assert trigger.provisioning_error is None
+
+
+def test_reconcile_copies_watch_state_status_onto_triggers(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    disabled = _create_gmail_trigger(db_session, user, agent, account, enabled=False)
+    setattr(trigger, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
+    setattr(disabled, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
+    db_session.add_all([trigger, disabled])
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    updated = reconcile_gmail_trigger_provisioning(db_session)
+
+    assert updated == 1
+    db_session.refresh(trigger)
+    db_session.refresh(disabled)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    assert trigger.provisioning_error is None
+    # Disabled triggers hold no watch reference; their status is not touched.
+    assert disabled.provisioning_status == TriggerProvisioningStatus.PENDING.value
+
+    # Failures propagate too, including the error message.
+    setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
+    setattr(state, "last_error", "watch registration denied")
+    db_session.add(state)
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session) == 1
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == "watch registration denied"
+
+    # Idempotent: nothing to update on a second pass.
+    assert reconcile_gmail_trigger_provisioning(db_session) == 0
 
 
 class ResyncFakeSubscriber(FakeSubscriber):
@@ -621,6 +671,124 @@ def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(
     assert refreshed.status == TriggerProvisioningStatus.ACTIVE.value
     assert refreshed.history_id == "hist-renewed"
     assert gmail.watch_calls[-1]["body"]["topicName"] == expected_topic
+
+
+@pytest.fixture()
+def pg_session():
+    """Session against a real Postgres, where SELECT ... FOR UPDATE locks.
+
+    SQLite silently no-ops row locks, so the provisioning/release contention
+    path can only be exercised here. Set XAGENT_TEST_POSTGRES_URL to run
+    (CI provides it in the PostgreSQL job).
+    """
+    url = os.getenv("XAGENT_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    init_db(db_url=url)
+    engine = get_engine()
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = next(get_db())
+    try:
+        yield db
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_release_and_reprovision_contend_on_the_watch_state_lock(
+    pg_session: Session,
+) -> None:
+    """Unregister-of-last-trigger and a concurrent provision serialize.
+
+    While release_gmail_mailbox_if_unused holds the watch-state row lock,
+    _get_or_create_watch_state must block instead of updating a row that is
+    about to be deleted (which strands the new trigger at PENDING via
+    StaleDataError on the losing commit).
+    """
+    from xagent.web.models.database import get_session_local
+
+    db = pg_session
+    user = _create_user(db)
+    account = _create_oauth(db, user)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    gmail = FakeGmailService()
+    state = ensure_gmail_mailbox_provisioned(
+        db,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    old_callback_id = str(state.callback_id)
+    account_id = int(account.id)
+
+    release_holds_lock = threading.Event()
+    release_may_finish = threading.Event()
+    results: dict[str, Any] = {}
+
+    def blocking_service_factory(_db: Session, _account: UserOAuth) -> FakeGmailService:
+        # Called by release after it has taken FOR UPDATE on the state row.
+        release_holds_lock.set()
+        release_may_finish.wait(timeout=30)
+        return gmail
+
+    def do_release() -> None:
+        db_a = get_session_local()()
+        try:
+            results["released"] = release_gmail_mailbox_if_unused(
+                db_a,
+                account_id,
+                service_factory=blocking_service_factory,
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+        finally:
+            db_a.close()
+
+    def do_provision() -> None:
+        db_b = get_session_local()()
+        try:
+            account_b = db_b.query(UserOAuth).filter(UserOAuth.id == account_id).one()
+            fresh = ensure_gmail_mailbox_provisioned(
+                db_b,
+                account_b,
+                service_factory=lambda _db, _account: gmail,
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+            results["status"] = str(fresh.status)
+            results["callback_id"] = str(fresh.callback_id)
+        finally:
+            db_b.close()
+
+    releaser = threading.Thread(target=do_release)
+    releaser.start()
+    assert release_holds_lock.wait(timeout=30)
+
+    provisioner = threading.Thread(target=do_provision)
+    provisioner.start()
+    provisioner.join(timeout=1.0)
+    # Provisioning is parked on the row lock, not racing the delete.
+    assert provisioner.is_alive()
+
+    release_may_finish.set()
+    releaser.join(timeout=30)
+    provisioner.join(timeout=30)
+    assert not releaser.is_alive() and not provisioner.is_alive()
+
+    assert results["released"] is True
+    assert results["status"] == TriggerProvisioningStatus.ACTIVE.value
+    # The mailbox was fully released first, then provisioned from scratch.
+    assert results["callback_id"] != old_callback_id
+    rows = (
+        db.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == account_id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].status == TriggerProvisioningStatus.ACTIVE.value
 
 
 def test_provisioning_requires_account_email(db_session: Session) -> None:

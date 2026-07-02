@@ -750,6 +750,74 @@ def test_enabling_existing_gmail_trigger_provisions_bound_mailbox(
     assert calls == [created.json()["id"]]
 
 
+def test_listing_triggers_reflects_background_provisioning_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status reported by the API self-resolves once the watch state converges,
+    without requiring another user-initiated create/update."""
+    from xagent.web.models.gmail_watch import GmailWatchState
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.PENDING.value
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["provisioning_status"] == "pending"
+
+    # Simulate the background thread converging the mailbox to active.
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        db.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=account_id,
+                email="owner@gmail.example",
+                history_id="hist-1",
+                topic_name="projects/demo/topics/xagent-gmail-abc",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    listed = client.get(f"/api/agents/{agent_id}/triggers", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["provisioning_status"] == "active"
+    assert listed.json()[0]["provisioning_error"] is None
+
+    db = _direct_db_session()
+    try:
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == created.json()["id"]).one()
+        )
+        assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    finally:
+        db.close()
+
+
 def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -16,6 +16,7 @@ import hashlib
 import logging
 import secrets
 import threading
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -135,9 +136,14 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
 def _get_or_create_watch_state(
     db: Session, oauth_account: UserOAuth, email: str
 ) -> GmailWatchState:
+    # Locked so create/reconcile serializes against the FOR UPDATE taken by
+    # release_gmail_mailbox_if_unused: without it, unregistering the last
+    # trigger can delete the row a concurrent provisioning run is updating,
+    # stranding the new trigger at PENDING until the sweep retries.
     state = (
         db.query(GmailWatchState)
         .filter(GmailWatchState.oauth_account_id == int(oauth_account.id))
+        .with_for_update()
         .first()
     )
     if state is None:
@@ -417,6 +423,74 @@ def provision_gmail_trigger(
     return status
 
 
+def reconcile_gmail_trigger_provisioning(
+    db: Session,
+    triggers: Sequence[AgentTrigger] | None = None,
+) -> int:
+    """Refresh Gmail triggers' provisioning status from their watch states.
+
+    The background provisioning thread and the periodic sweep converge
+    GmailWatchState without touching AgentTrigger, so the status the API
+    reports would otherwise stay frozen at whatever the original synchronous
+    create/update call observed. One batched IN() lookup joins each enabled
+    Gmail trigger to its mailbox's watch state and copies status/last_error
+    over when they diverge. Returns the number of triggers updated.
+    """
+    if triggers is None:
+        candidates = (
+            db.query(AgentTrigger)
+            .filter(
+                AgentTrigger.type == TriggerType.GMAIL.value,
+                AgentTrigger.enabled.is_(True),
+                AgentTrigger.resource_id.isnot(None),
+            )
+            .all()
+        )
+    else:
+        candidates = [
+            trigger
+            for trigger in triggers
+            if str(trigger.type) == TriggerType.GMAIL.value
+            and bool(trigger.enabled)
+            and trigger.resource_id
+        ]
+    if not candidates:
+        return 0
+
+    emails = {str(trigger.resource_id).strip().lower() for trigger in candidates}
+    states = (
+        db.query(GmailWatchState)
+        .filter(func.lower(GmailWatchState.email).in_(emails))
+        .all()
+    )
+    states_by_key = {
+        (int(state.user_id), str(state.email or "").strip().lower()): state
+        for state in states
+    }
+
+    updated = 0
+    for trigger in candidates:
+        key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
+        state = states_by_key.get(key)
+        if state is None:
+            continue
+        status = str(state.status or TriggerProvisioningStatus.PENDING.value)
+        last_error = getattr(state, "last_error", None)
+        error = str(last_error) if last_error else None
+        if (
+            str(trigger.provisioning_status or "") == status
+            and (trigger.provisioning_error or None) == error
+        ):
+            continue
+        setattr(trigger, "provisioning_status", status)
+        setattr(trigger, "provisioning_error", error)
+        db.add(trigger)
+        updated += 1
+    if updated:
+        db.commit()
+    return updated
+
+
 def release_gmail_mailbox_if_unused(
     db: Session,
     oauth_account_id: int,
@@ -556,6 +630,10 @@ def sweep_gmail_provisioning(
             subscriber_factory=subscriber_factory,
         )
         attempts += 1
+    # Watch states that converged in a background thread (pending -> active)
+    # are not sweep candidates, so the trigger-facing status is reconciled
+    # here unconditionally.
+    reconcile_gmail_trigger_provisioning(db)
     return attempts
 
 
