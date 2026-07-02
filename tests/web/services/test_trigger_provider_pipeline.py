@@ -384,6 +384,38 @@ class TestCallbackPipeline:
         result = await process_trigger_callback(
             db_session,
             context=_context(headers=_good_headers()),
+    async def test_verification_error_keeps_redelivery_semantics(
+        self, db_session, stub_provider
+    ):
+        """A verify() exception is a transient failure, not a rejection.
+
+        Rejections can be ACKed by providers whose ack policy maps them to
+        2xx (Gmail); an errored verification must instead answer with the
+        failure status so the source redelivers.
+        """
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        trigger = _create_stub_trigger(db_session, user, agent)
+
+        async def _broken_verify(context, *, db, trigger, raw_body):
+            raise ConnectionError("JWKS fetch timed out")
+
+        stub_provider.verify = _broken_verify
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=_event_body(),
+        )
+        assert result.status_code == stub_provider.ack_policy.failure_status
+        assert result.outcome == TriggerAuditOutcome.EXECUTION_FAILURE
+        audits = _audits(db_session)
+        assert [a.outcome for a in audits] == ["execution_failure"]
+        assert audits[0].trigger_id == trigger.id
+        assert audits[0].detail["stage"] == "verify"
+        assert "ConnectionError" in audits[0].detail["error"]
+        assert db_session.query(TriggerRun).count() == 0
+
             raw_body=b"\x00not-json",
         )
         assert result.status_code == 400

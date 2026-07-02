@@ -137,9 +137,30 @@ async def process_trigger_callback(
             detail="Unknown callback",
         )
 
-    verification = await provider.verify(
-        context, db=db, trigger=trigger, raw_body=raw_body
-    )
+    try:
+        verification = await provider.verify(
+            context, db=db, trigger=trigger, raw_body=raw_body
+        )
+    except Exception as exc:
+        # Verification errored without proving the request invalid (e.g. a
+        # transient failure fetching the provider's signing keys). Answer with
+        # the failure status so redelivery-based sources retry; rejecting here
+        # would let providers that ack rejections drop the event permanently.
+        logger.exception("Provider %s failed to verify callback", provider_name)
+        record_trigger_audit_best_effort(
+            db,
+            outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+            provider=provider_name,
+            callback_id=callback_id,
+            trigger_id=int(trigger.id),
+            detail={"stage": "verify", "error": f"{type(exc).__name__}: {exc}"},
+            remote_ip=context.remote_ip,
+        )
+        return CallbackResult(
+            status_code=ack.failure_status,
+            outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+            detail="Callback verification errored",
+        )
     if not verification.verified:
         record_trigger_audit(
             db,

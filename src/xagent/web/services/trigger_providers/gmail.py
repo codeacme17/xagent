@@ -9,6 +9,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from google.auth.exceptions import TransportError as GoogleTransportError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
 from pydantic import ValidationError
@@ -107,6 +108,10 @@ def _history_cursor_advances(current: object, incoming: str) -> bool:
 # instead of a fresh session (and TLS handshake) per callback.
 _GOOGLE_AUTH_REQUEST = GoogleAuthRequest()
 
+# Pub/Sub push and this host may drift by a few seconds; without tolerance a
+# fresh token can fail iat validation and the rejection would be ACKed.
+_OIDC_CLOCK_SKEW_SECONDS = 10
+
 
 def verify_google_oidc_token(token: str, audience: str) -> Mapping[str, Any]:
     """Verify a Google OIDC token signature and audience.
@@ -114,7 +119,12 @@ def verify_google_oidc_token(token: str, audience: str) -> Mapping[str, Any]:
     Performs blocking HTTP (Google cert fetch); call via asyncio.to_thread
     from async code.
     """
-    claims = id_token.verify_oauth2_token(token, _GOOGLE_AUTH_REQUEST, audience)
+    claims = id_token.verify_oauth2_token(
+        token,
+        _GOOGLE_AUTH_REQUEST,
+        audience,
+        clock_skew_in_seconds=_OIDC_CLOCK_SKEW_SECONDS,
+    )
     return claims if isinstance(claims, Mapping) else {}
 
 
@@ -264,6 +274,12 @@ class GmailProvider:
 
         try:
             claims = await asyncio.to_thread(self.oidc_verifier, token, audience)
+        except GoogleTransportError:
+            # Fetching Google's JWKS certs failed; nothing about the token was
+            # proven invalid. Propagate so the pipeline answers with
+            # failure_status and Pub/Sub redelivers, instead of rejecting -
+            # Gmail's rejected_status=200 would drop the event permanently.
+            raise
         except Exception as exc:
             return VerificationResult.reject(
                 f"Gmail OIDC token verification failed: {type(exc).__name__}"

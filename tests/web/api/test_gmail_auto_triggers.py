@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 
 from xagent.config import (
     get_gmail_watch_enabled,
@@ -586,6 +586,99 @@ def test_gmail_unified_callback_holds_history_cursor_when_execution_fails() -> N
     finally:
         register_trigger_provider(GmailProvider(), replace=True)
         db.close()
+
+
+def test_gmail_oidc_transport_error_returns_500_for_redelivery() -> None:
+    """A JWKS fetch failure must not be ACKed like a forged token.
+
+    Gmail's ack policy maps rejections to 200 (stop redelivery), so treating
+    a transient network error as a rejection would drop the push permanently.
+    """
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-transport-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-transport")
+
+        def transport_failure(_token: str, _audience: str) -> dict[str, object]:
+            raise TransportError("failed to fetch Google JWKS certs")
+
+        register_trigger_provider(
+            GmailProvider(oidc_verifier=transport_failure), replace=True
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-transport",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=_gmail_pubsub_push_body(claimed_email="codeacme17@gmail.com"),
+        )
+
+        assert response.status_code == 500, response.text
+        db.refresh(state)
+        assert state.history_id == "100"
+        assert db.query(TriggerRun).count() == 0
+        audit = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "execution_failure")
+            .one()
+        )
+        assert audit.trigger_id == trigger.id
+        assert audit.detail["stage"] == "verify"
+        assert "TransportError" in audit.detail["error"]
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_oidc_invalid_token_is_rejected_and_acked() -> None:
+    """Signature/claims failures stay rejections: audited and ACKed with 200."""
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-invalid-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-invalid")
+
+        def invalid_token(_token: str, _audience: str) -> dict[str, object]:
+            raise ValueError("Token has wrong audience")
+
+        register_trigger_provider(
+            GmailProvider(oidc_verifier=invalid_token), replace=True
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-invalid",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=_gmail_pubsub_push_body(claimed_email="codeacme17@gmail.com"),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["outcome"] == "rejected_signature"
+        db.refresh(state)
+        assert state.history_id == "100"
+        audit = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_signature")
+            .one()
+        )
+        assert "ValueError" in str(audit.detail["reason"])
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_oidc_verifier_allows_clock_skew() -> None:
+    from xagent.web.services.trigger_providers.gmail import verify_google_oidc_token
+
+    with patch(
+        "xagent.web.services.trigger_providers.gmail.id_token.verify_oauth2_token",
+        return_value={"iss": "https://accounts.google.com"},
+    ) as mock_verify:
+        claims = verify_google_oidc_token("token", "audience")
+
+    assert claims == {"iss": "https://accounts.google.com"}
+    assert mock_verify.call_args.kwargs["clock_skew_in_seconds"] > 0
 
 
 def test_gmail_unified_callback_rejects_resource_mismatch_without_trusting_payload_email(
