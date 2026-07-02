@@ -139,3 +139,21 @@ class TriggerProvider(Protocol):
         Raises TriggerEventParseError for malformed bodies.
         """
         ...
+
+    async def finalize_callback(
+        self,
+        *,
+        db: Session,
+        context: CallbackRequestContext,
+        trigger: AgentTrigger | None,
+        events: list[NormalizedEvent],
+        raw_body: bytes,
+    ) -> None:
+        """Advance provider delivery state after a fully successful callback.
+
+        The pipeline calls this only when every event fired without failure,
+        so providers advance delivery cursors here (e.g. the Gmail history
+        id); a skipped call must leave the source able to redeliver.
+        Providers without delivery state implement this as a no-op.
+        """
+        ...

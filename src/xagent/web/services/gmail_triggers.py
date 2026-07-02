@@ -474,13 +474,15 @@ async def collect_gmail_pubsub_events(
     *,
     state: GmailWatchState,
     service_factory: GmailServiceFactory = build_gmail_service,
-    advance_cursor: bool = True,
 ) -> GmailPubsubEventCollection:
     """Decode Gmail history into provider-normalized events without firing.
 
     The unified TriggerProvider pipeline owns authorization, idempotency,
     audit, and execution. This helper keeps Gmail-specific history traversal
-    and trigger filter matching in the Gmail module.
+    and trigger filter matching in the Gmail module. It never advances the
+    watch cursor: ``GmailProvider.finalize_callback`` moves ``history_id``
+    only after every collected event fired successfully, so a failed batch
+    stays redeliverable.
 
     ``state`` must be the watch state the callback was addressed to (resolved
     by callback id). GmailWatchState.email is not unique — two accounts can
@@ -624,9 +626,4 @@ async def collect_gmail_pubsub_events(
         )
         raise GmailTriggerError(error_message)
 
-    if advance_cursor:
-        setattr(state, "history_id", str(notification.history_id))
-        setattr(state, "last_error", None)
-        db.add(state)
-        db.commit()
     return GmailPubsubEventCollection(events=events, skipped=skipped)

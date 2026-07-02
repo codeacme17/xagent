@@ -112,6 +112,17 @@ class StubProvider:
     async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
         self.unregister_calls.append(int(trigger.id))
 
+    async def finalize_callback(
+        self,
+        *,
+        db: Session,
+        context: CallbackRequestContext,
+        trigger: AgentTrigger | None,
+        events: list[NormalizedEvent],
+        raw_body: bytes,
+    ) -> None:
+        """Stub delivery has no cursor state to advance."""
+
     async def parse_events(
         self,
         context: CallbackRequestContext,
@@ -690,3 +701,69 @@ class TestPartialFailureAcknowledgement:
         assert failure_audits[0].detail["stage"] == "fire"
         # No accepted audit row: the delivery as a whole was not acknowledged.
         assert all(a.outcome != "accepted" for a in _audits(db_session))
+
+    async def test_task_attach_failure_blocks_ack_and_allows_redelivery(
+        self, db_session, stub_provider, monkeypatch
+    ):
+        """A run created without a task is a preparation failure, not a
+        success: the callback must return the failure status (so the source
+        redelivers) and finalize must not run (so provider cursors do not
+        advance past the lost event). Redelivery then repairs the run via
+        its idempotency key."""
+        import xagent.web.services.triggers as triggers_module
+
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent)
+
+        finalized: list[bytes] = []
+
+        async def tracking_finalize(*, db, context, trigger, events, raw_body):
+            finalized.append(raw_body)
+
+        monkeypatch.setattr(stub_provider, "finalize_callback", tracking_finalize)
+
+        original_attach = triggers_module._attach_task_to_trigger_run
+
+        def broken_attach(*args, **kwargs):
+            raise RuntimeError("task table unavailable")
+
+        monkeypatch.setattr(
+            triggers_module, "_attach_task_to_trigger_run", broken_attach
+        )
+
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=_event_body("evt-lost"),
+        )
+
+        assert result.status_code == 500
+        assert result.outcome == TriggerAuditOutcome.EXECUTION_FAILURE
+        assert result.runs == []
+        assert finalized == []
+        run = db_session.query(TriggerRun).one()
+        assert run.status == "failed"
+        assert run.task_id is None
+        failure_audits = [
+            a for a in _audits(db_session) if a.outcome == "execution_failure"
+        ]
+        assert len(failure_audits) == 1
+        assert failure_audits[0].detail["stage"] == "fire"
+
+        # Redelivery of the same event repairs the run once attachment works.
+        monkeypatch.setattr(
+            triggers_module, "_attach_task_to_trigger_run", original_attach
+        )
+        retry = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=_event_body("evt-lost"),
+        )
+        assert retry.status_code == 200
+        assert retry.outcome == TriggerAuditOutcome.ACCEPTED
+        assert retry.duplicates == 1
+        assert finalized  # the provider may now advance its cursor
+        repaired = db_session.query(TriggerRun).one()
+        assert repaired.task_id is not None
+        assert repaired.status == "pending"

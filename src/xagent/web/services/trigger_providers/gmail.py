@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,8 @@ from .schemas import (
 
 if TYPE_CHECKING:
     from ..gmail_triggers import GmailPubsubNotification, GmailServiceFactory
+
+logger = logging.getLogger(__name__)
 
 OidcVerifier = Callable[[str, str], Mapping[str, Any]]
 
@@ -284,6 +287,16 @@ class GmailProvider:
                     "Gmail OIDC email claim must match configured service account "
                     "and email_verified must be true"
                 )
+        else:
+            # Provisioning requires this env var, so its absence here means
+            # config drift between the provisioning and callback processes;
+            # only issuer/audience/signature checks remain in that case.
+            logger.warning(
+                "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not configured; "
+                "skipping Gmail OIDC service-account email verification for "
+                "callback %s",
+                context.callback_id,
+            )
 
         attested_email = _normalized_email(state.email)
         if not attested_email:
@@ -331,7 +344,6 @@ class GmailProvider:
             notification,
             state=state,
             service_factory=self.service_factory or build_gmail_service,
-            advance_cursor=False,
         )
         return [
             NormalizedEvent(

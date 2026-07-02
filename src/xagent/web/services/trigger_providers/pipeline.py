@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from inspect import isawaitable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -416,15 +415,10 @@ async def _finalize_provider_callback(
     events: list[NormalizedEvent],
     raw_body: bytes,
 ) -> None:
-    finalize = getattr(provider, "finalize_callback", None)
-    if finalize is None:
-        return
-    result = finalize(
+    await provider.finalize_callback(
         db=db,
         context=context,
         trigger=trigger,
         events=events,
         raw_body=raw_body,
     )
-    if isawaitable(result):
-        await result

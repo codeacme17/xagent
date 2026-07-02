@@ -926,8 +926,10 @@ def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
                 "historyTypes": ["messageAdded"],
             }
         ]
+        # Collection never advances the cursor; GmailProvider.finalize_callback
+        # does, only after all events fired.
         db.refresh(state)
-        assert state.history_id == "222"
+        assert state.history_id == "100"
     finally:
         db.close()
 
@@ -975,7 +977,7 @@ def test_collect_gmail_pubsub_events_skips_label_mismatch() -> None:
         assert result.events == []
         assert result.skipped == 1
         db.refresh(state)
-        assert state.history_id == "222"
+        assert state.history_id == "100"
     finally:
         db.close()
 
@@ -1276,7 +1278,7 @@ def test_collect_gmail_pubsub_events_records_service_configuration_error() -> No
         db.close()
 
 
-def test_collect_gmail_pubsub_events_skips_deleted_message_and_advances_cursor() -> (
+def test_collect_gmail_pubsub_events_skips_deleted_message_without_failing_batch() -> (
     None
 ):
     db = _direct_db_session()
@@ -1339,13 +1341,13 @@ def test_collect_gmail_pubsub_events_skips_deleted_message_and_advances_cursor()
         assert result.events[0].trigger_id == int(trigger.id)
         assert result.events[0].source_event_id == "gmail:msg-2"
         db.refresh(state)
-        assert state.history_id == "222"
+        assert state.history_id == "100"
         assert state.last_error is None
     finally:
         db.close()
 
 
-def test_collect_gmail_pubsub_events_skips_forbidden_message_and_advances_cursor() -> (
+def test_collect_gmail_pubsub_events_skips_forbidden_message_without_failing_batch() -> (
     None
 ):
     db = _direct_db_session()
@@ -1397,7 +1399,7 @@ def test_collect_gmail_pubsub_events_skips_forbidden_message_and_advances_cursor
         assert result.events[0].trigger_id == int(trigger.id)
         assert result.events[0].source_event_id == "gmail:msg-2"
         db.refresh(state)
-        assert state.history_id == "222"
+        assert state.history_id == "100"
         assert state.last_error is None
     finally:
         db.close()

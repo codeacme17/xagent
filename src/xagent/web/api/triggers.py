@@ -26,6 +26,7 @@ from ..services.trigger_rate_limit import (
 )
 from ..services.triggers import (
     TriggerNotFoundError,
+    TriggerRunPreparationError,
     TriggerSecretError,
     TriggerServiceError,
     create_agent_trigger,
@@ -200,6 +201,10 @@ def _handle_service_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, TriggerSecretError):
         return HTTPException(status_code=401, detail=str(exc))
+    if isinstance(exc, TriggerRunPreparationError):
+        # The run was recorded but no task was attached; a retry of the same
+        # event repairs it via the idempotency key, so ask the caller to retry.
+        return HTTPException(status_code=500, detail=str(exc))
     if isinstance(exc, TriggerServiceError):
         return HTTPException(status_code=400, detail=str(exc))
     logger.exception("Unhandled trigger API error")

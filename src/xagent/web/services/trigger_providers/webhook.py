@@ -175,5 +175,16 @@ class WebhookProvider:
             )
         ]
 
+    async def finalize_callback(
+        self,
+        *,
+        db: Session,
+        context: CallbackRequestContext,
+        trigger: AgentTrigger | None,
+        events: list[NormalizedEvent],
+        raw_body: bytes,
+    ) -> None:
+        """Webhook delivery has no cursor state to advance."""
+
 
 register_trigger_provider(WebhookProvider(), replace=True)

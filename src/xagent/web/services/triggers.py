@@ -32,6 +32,8 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
 )
+from .trigger_providers.base import TriggerConfigError
+from .trigger_providers.registry import maybe_get_trigger_provider
 from .trigger_providers.schemas import parse_trigger_config
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,21 @@ class TriggerNotFoundError(LookupError):
 
 class TriggerSecretError(PermissionError):
     """Raised when a webhook secret does not match."""
+
+
+class TriggerRunPreparationError(TriggerServiceError):
+    """A trigger run was recorded but its task could not be prepared.
+
+    The run row exists (marked FAILED with no task attached), so a redelivery
+    of the same event resolves to it via the idempotency key and retries the
+    task attachment. Callers that gate acknowledgement or cursor advancement
+    on successful processing must treat this as a failure so the source
+    redelivers instead of silently dropping the event.
+    """
+
+    def __init__(self, message: str, *, run: TriggerRun) -> None:
+        super().__init__(message)
+        self.run = run
 
 
 @dataclass(frozen=True)
@@ -299,13 +316,25 @@ def _validate_config(
 ) -> str | None:
     """Validate config against the typed schema; return the resource identity.
 
-    The stored config keeps the caller-provided JSON shape; validation is
-    performed on the typed model without normalizing persisted fields.
+    Callback-backed trigger types dispatch through their registered
+    ``TriggerProvider.validate_config``; types without a provider (scheduled)
+    validate against the typed schema directly. The stored config keeps the
+    caller-provided JSON shape; validation is performed on the typed model
+    without normalizing persisted fields.
     """
     if not isinstance(config, dict):
         raise TriggerServiceError("config must be an object")
+    provider = maybe_get_trigger_provider(trigger_type)
     try:
-        typed = parse_trigger_config(trigger_type, config)
+        if provider is not None:
+            typed = provider.validate_config(config)
+        else:
+            typed = parse_trigger_config(trigger_type, config)
+    except TriggerConfigError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, ValidationError):
+            raise _typed_config_error(trigger_type, cause) from exc
+        raise TriggerServiceError(str(exc)) from exc
     except ValidationError as exc:
         raise _typed_config_error(trigger_type, exc) from exc
 
@@ -755,7 +784,7 @@ def prepare_trigger_run(
         error_message = f"{type(exc).__name__}: {exc}"
         _mark_run_failed(db, trigger=trigger, run=run, error_message=error_message)
         logger.exception("Trigger run %s failed to prepare task", run.id)
-        return run, True
+        raise TriggerRunPreparationError(error_message, run=run) from exc
 
 
 def _with_session() -> Session:
@@ -1122,15 +1151,20 @@ def scan_due_scheduled_triggers(
             "due_at": due_at.isoformat(),
         }
         source_event_id = f"scheduled:{trigger.id}:{due_at.isoformat()}"
-        run, _created = prepare_trigger_run(
-            db,
-            trigger=trigger,
-            event_payload=payload,
-            source_event_id=source_event_id,
-            background_job_id=None,
-            test=False,
-            event_type="scheduled",
-        )
+        try:
+            run, _created = prepare_trigger_run(
+                db,
+                trigger=trigger,
+                event_payload=payload,
+                source_event_id=source_event_id,
+                background_job_id=None,
+                test=False,
+                event_type="scheduled",
+            )
+        except TriggerRunPreparationError as exc:
+            # Scheduled events have no redelivery; the FAILED run is the
+            # record. Keep advancing next_run_at so the schedule stays live.
+            run = exc.run
 
         config = dict(trigger.config or {})
         next_run_at = _compute_next_run_at(

@@ -128,6 +128,51 @@ def test_webhook_trigger_crud_returns_secret_once() -> None:
     assert patched.json()["webhook_secret"]
 
 
+def test_trigger_config_validation_dispatches_through_provider() -> None:
+    """CRUD config validation must go through TriggerProvider.validate_config
+    for provider-backed types, not the module-level schema parser."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    from xagent.web.services.trigger_providers import get_trigger_provider
+
+    provider = get_trigger_provider("webhook")
+    seen_configs: list[dict] = []
+    original_validate = type(provider).validate_config
+
+    def recording_validate(self, config):
+        seen_configs.append(dict(config))
+        return original_validate(self, config)
+
+    with patch.object(type(provider), "validate_config", recording_validate):
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "webhook",
+                "name": "Provider-validated webhook",
+                "prompt_template": "payload={{payload}}",
+                "config": {"source": "crm"},
+            },
+        )
+    assert created.status_code == 200, created.text
+    assert seen_configs == [{"source": "crm"}]
+
+    # Provider validation errors surface as the same 400 config error.
+    invalid = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Bad webhook config",
+            "prompt_template": "payload={{payload}}",
+            "config": {"event_types": "not-a-list"},
+        },
+    )
+    assert invalid.status_code == 400, invalid.text
+    assert "webhook trigger config invalid" in invalid.json()["detail"]
+
+
 def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
