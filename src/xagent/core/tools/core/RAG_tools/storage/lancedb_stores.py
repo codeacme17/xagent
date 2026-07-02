@@ -2369,6 +2369,23 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         else:
             return f"{step_type_str}_{hash_prefix}"
 
+    @staticmethod
+    def _vis_method_from_parser(parser: Any) -> str:
+        """Recover the real parse method from the ``parser`` column value.
+
+        The ``parses`` table has no top-level ``parse_method`` column; the
+        method is only carried by the ``parser`` column as
+        ``local:{method}@v1.0.0`` (written by ``parse_document`` and
+        ``KBCollectionHandle.write_parse``). This reverse-parse therefore
+        depends on that write-side format — if the ``parser`` string format
+        changes, update this helper. Any non-conforming value yields
+        ``"unknown"``.
+        """
+        if not isinstance(parser, str) or not parser.startswith("local:"):
+            return "unknown"
+        method = parser[len("local:") :].split("@", 1)[0]
+        return method or "unknown"
+
     def _vis_get_parse_candidates(
         self, connection: Any, filters: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
@@ -2378,8 +2395,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return []
         parse_candidates: List[Dict[str, Any]] = []
         for row in result:
-            parse_method = row.get("parse_method", "unknown")
             parser = row.get("parser", "unknown")
+            parse_method = self._vis_method_from_parser(parser)
             merged_params: Dict[str, Any] = {
                 "parse_method": parse_method,
                 "parser": parser,

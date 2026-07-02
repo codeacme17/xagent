@@ -136,6 +136,12 @@ def _get_parse_candidates(
         return []
     parse_candidates: List[Dict[str, Any]] = []
     for row in result:
+        # NOTE: This legacy path shares the same latent bug as #705 (the parses
+        # table has no top-level parse_method column, so this resolves to
+        # "unknown"). It is intentionally left unfixed because it is unreachable:
+        # the only callers are the KBVersionCompatibilityFacade fallbacks
+        # (coordinator is None), and the facade is always constructed with a
+        # coordinator. The live path is LanceDBVectorIndexStore._vis_get_parse_candidates.
         params = {
             "parse_method": row.get("parse_method", "unknown"),
             "parser": row.get("parser", "unknown"),
