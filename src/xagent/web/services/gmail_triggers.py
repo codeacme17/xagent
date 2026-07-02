@@ -7,12 +7,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import quote
 
-from google.auth.exceptions import RefreshError  # type: ignore[import-untyped]
-from google.auth.transport.requests import (  # type: ignore[import-untyped]
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import (
     AuthorizedSession,
     Request,
 )
-from google.oauth2.credentials import Credentials  # type: ignore[import-untyped]
+from google.oauth2.credentials import Credentials
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
@@ -144,6 +144,21 @@ class GmailPubsubProcessResult:
     duplicates: int = 0
     skipped: int = 0
     status_code: int = 200
+
+
+@dataclass(frozen=True)
+class GmailCollectedEvent:
+    trigger_id: int
+    payload: dict[str, Any]
+    source_event_id: str
+    event_type: str
+    resource_id: str
+
+
+@dataclass(frozen=True)
+class GmailPubsubEventCollection:
+    events: list[GmailCollectedEvent]
+    skipped: int = 0
 
 
 def _get_google_oauth_config(db: Session) -> tuple[str | None, str | None]:
@@ -598,6 +613,168 @@ def _get_gmail_message(service: Any, message_id: str) -> dict[str, Any]:
         .execute()
     )
     return response if isinstance(response, dict) else {}
+
+
+async def collect_gmail_pubsub_events(
+    db: Session,
+    notification: GmailPubsubNotification,
+    *,
+    service_factory: GmailServiceFactory = build_gmail_service,
+    advance_cursor: bool = True,
+) -> GmailPubsubEventCollection:
+    """Decode Gmail history into provider-normalized events without firing.
+
+    The unified TriggerProvider pipeline owns authorization, idempotency,
+    audit, and execution. This helper keeps Gmail-specific history traversal
+    and trigger filter matching in the Gmail module.
+    """
+    email_address = notification.email_address.strip().lower()
+    if not email_address or not notification.history_id:
+        return GmailPubsubEventCollection(events=[], skipped=1)
+
+    state = (
+        db.query(GmailWatchState)
+        .filter(func.lower(GmailWatchState.email) == email_address)
+        .first()
+    )
+    if state is None:
+        return GmailPubsubEventCollection(events=[], skipped=1)
+
+    oauth_account = (
+        db.query(UserOAuth).filter(UserOAuth.id == int(state.oauth_account_id)).first()
+    )
+    if oauth_account is None:
+        return GmailPubsubEventCollection(events=[], skipped=1)
+
+    state_id = int(state.id)
+    try:
+        service = service_factory(db, oauth_account)
+    except GmailTriggerError as exc:
+        db.rollback()
+        _record_watch_state_error(
+            db,
+            state_id=state_id,
+            error_message=str(exc),
+        )
+        raise
+
+    start_history_id = str(state.history_id)
+    try:
+        message_ids = _list_added_message_ids(
+            service,
+            start_history_id=start_history_id,
+        )
+    except Exception as exc:
+        if _exception_status_code(exc) not in (400, 404):
+            raise
+        logger.warning(
+            "Gmail startHistoryId %s is too old or expired for %s; "
+            "re-registering watch: %s",
+            start_history_id,
+            email_address,
+            exc,
+        )
+        db.rollback()
+        try:
+            register_gmail_watch_for_account(
+                db,
+                oauth_account,
+                service_factory=service_factory,
+            )
+        except Exception as watch_exc:
+            logger.error(
+                "Failed to re-register Gmail watch for %s: %s",
+                email_address,
+                watch_exc,
+                exc_info=True,
+            )
+            db.rollback()
+            _record_watch_state_error(
+                db,
+                state_id=state_id,
+                error_message="Gmail history expired and re-registration failed",
+            )
+            raise GmailTriggerError(
+                "Gmail history expired and re-registration failed"
+            ) from watch_exc
+        return GmailPubsubEventCollection(events=[], skipped=1)
+
+    triggers = (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.user_id == int(state.user_id),
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+        )
+        .all()
+    )
+
+    events: list[GmailCollectedEvent] = []
+    skipped = 0
+    failed_message_ids: list[str] = []
+    for message_id in message_ids:
+        try:
+            try:
+                message = _get_gmail_message(service, message_id)
+            except Exception as exc:
+                if _is_non_retriable_message_error(exc):
+                    logger.warning(
+                        "Skipping inaccessible Gmail message %s for %s: %s",
+                        message_id,
+                        email_address,
+                        exc,
+                    )
+                    skipped += 1
+                    continue
+                raise
+
+            payload = _message_payload(message, notification=notification)
+            payload["message_id"] = payload["message_id"] or message_id
+            matched = False
+            for trigger in triggers:
+                if not _trigger_matches_message(trigger, payload):
+                    continue
+                matched = True
+                events.append(
+                    GmailCollectedEvent(
+                        trigger_id=int(trigger.id),
+                        payload=dict(payload),
+                        source_event_id=f"gmail:{message_id}",
+                        event_type="gmail.message",
+                        resource_id=email_address,
+                    )
+                )
+            if not matched:
+                skipped += 1
+        except Exception as exc:
+            logger.error(
+                "Failed to collect Gmail message %s for %s: %s",
+                message_id,
+                email_address,
+                exc,
+                exc_info=True,
+            )
+            db.rollback()
+            failed_message_ids.append(message_id)
+            skipped += 1
+
+    if failed_message_ids:
+        error_message = "Failed to process Gmail message(s): " + ", ".join(
+            failed_message_ids
+        )
+        _record_watch_state_error(
+            db,
+            state_id=state_id,
+            error_message=error_message,
+        )
+        raise GmailTriggerError(error_message)
+
+    if advance_cursor:
+        setattr(state, "history_id", str(notification.history_id))
+        setattr(state, "last_error", None)
+        db.add(state)
+        db.commit()
+    return GmailPubsubEventCollection(events=events, skipped=skipped)
 
 
 async def process_gmail_pubsub_notification(

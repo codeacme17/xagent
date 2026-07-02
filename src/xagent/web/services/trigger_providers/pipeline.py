@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -46,14 +47,26 @@ def _allowed_event_types(trigger: AgentTrigger) -> list[str] | None:
     return None
 
 
-def _filter_events(
-    trigger: AgentTrigger, events: list[NormalizedEvent]
-) -> tuple[list[NormalizedEvent], int]:
+def _event_allowed_for_trigger(trigger: AgentTrigger, event: NormalizedEvent) -> bool:
     allow_list = _allowed_event_types(trigger)
-    if allow_list is None:
-        return events, 0
-    allowed = [event for event in events if event.event_type in allow_list]
-    return allowed, len(events) - len(allowed)
+    return allow_list is None or event.event_type in allow_list
+
+
+def _resolve_event_trigger(
+    db: Session, default_trigger: AgentTrigger, event: NormalizedEvent
+) -> AgentTrigger | None:
+    target_trigger_id = event.target_trigger_id
+    if target_trigger_id is None or int(target_trigger_id) == int(default_trigger.id):
+        return default_trigger
+    return (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.id == int(target_trigger_id),
+            AgentTrigger.type == default_trigger.type,
+            AgentTrigger.provider == default_trigger.provider,
+        )
+        .first()
+    )
 
 
 def _attested_resource_matches(
@@ -176,19 +189,14 @@ async def process_trigger_callback(
             detail=str(exc) or "Malformed callback payload",
         )
 
-    events, filtered_count = _filter_events(trigger, events)
-
     runs: list[TriggerRun] = []
     duplicates = 0
     rejected_events = 0
+    filtered_count = 0
     failures: list[str] = []
-    resource_matches = _attested_resource_matches(
-        trigger, verification.attested_resource_id
-    )
     for event in events:
-        if not resource_matches or not provider.authorize_resource(
-            trigger, verification.attested_resource_id, event
-        ):
+        event_trigger = _resolve_event_trigger(db, trigger, event)
+        if event_trigger is None:
             rejected_events += 1
             record_trigger_audit(
                 db,
@@ -197,8 +205,48 @@ async def process_trigger_callback(
                 callback_id=callback_id,
                 trigger_id=int(trigger.id),
                 detail={
+                    "reason": "unknown_event_trigger",
+                    "target_trigger_id": event.target_trigger_id,
                     "attested_resource_id": verification.attested_resource_id,
-                    "trigger_resource_id": trigger.resource_id,
+                    "event_type": event.event_type,
+                },
+                remote_ip=context.remote_ip,
+            )
+            continue
+
+        if not event_trigger.enabled:
+            rejected_events += 1
+            record_trigger_audit(
+                db,
+                outcome=TriggerAuditOutcome.REJECTED_DISABLED,
+                provider=provider_name,
+                callback_id=callback_id,
+                trigger_id=int(event_trigger.id),
+                detail={"event_type": event.event_type},
+                remote_ip=context.remote_ip,
+            )
+            continue
+
+        if not _event_allowed_for_trigger(event_trigger, event):
+            filtered_count += 1
+            continue
+
+        resource_matches = _attested_resource_matches(
+            event_trigger, verification.attested_resource_id
+        )
+        if not resource_matches or not provider.authorize_resource(
+            event_trigger, verification.attested_resource_id, event
+        ):
+            rejected_events += 1
+            record_trigger_audit(
+                db,
+                outcome=TriggerAuditOutcome.REJECTED_RESOURCE,
+                provider=provider_name,
+                callback_id=callback_id,
+                trigger_id=int(event_trigger.id),
+                detail={
+                    "attested_resource_id": verification.attested_resource_id,
+                    "trigger_resource_id": event_trigger.resource_id,
                     "event_type": event.event_type,
                 },
                 remote_ip=context.remote_ip,
@@ -206,16 +254,18 @@ async def process_trigger_callback(
             continue
 
         try:
-            run, created = await _fire_event(db, trigger=trigger, event=event)
+            run, created = await _fire_event(db, trigger=event_trigger, event=event)
         except Exception as exc:
             failures.append(f"{type(exc).__name__}: {exc}")
-            logger.exception("Trigger %s failed to execute callback event", trigger.id)
+            logger.exception(
+                "Trigger %s failed to execute callback event", event_trigger.id
+            )
             record_trigger_audit_best_effort(
                 db,
                 outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
                 provider=provider_name,
                 callback_id=callback_id,
-                trigger_id=int(trigger.id),
+                trigger_id=int(event_trigger.id),
                 detail={"stage": "fire", "error": f"{type(exc).__name__}: {exc}"},
                 remote_ip=context.remote_ip,
             )
@@ -225,6 +275,32 @@ async def process_trigger_callback(
             runs.append(run)
         else:
             duplicates += 1
+
+    if not failures:
+        try:
+            await _finalize_provider_callback(
+                provider,
+                db=db,
+                context=context,
+                trigger=trigger,
+                events=events,
+                raw_body=raw_body,
+            )
+        except Exception as exc:
+            failures.append(f"{type(exc).__name__}: {exc}")
+            logger.exception("Provider %s failed to finalize callback", provider_name)
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+                provider=provider_name,
+                callback_id=callback_id,
+                trigger_id=int(trigger.id),
+                detail={
+                    "stage": "finalize",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                remote_ip=context.remote_ip,
+            )
 
     if runs or duplicates or not (rejected_events or failures):
         record_trigger_audit(
@@ -299,3 +375,26 @@ async def _fire_event(
         resource_id=event.resource_id,
         received_at=event.received_at,
     )
+
+
+async def _finalize_provider_callback(
+    provider: Any,
+    *,
+    db: Session,
+    context: CallbackRequestContext,
+    trigger: AgentTrigger,
+    events: list[NormalizedEvent],
+    raw_body: bytes,
+) -> None:
+    finalize = getattr(provider, "finalize_callback", None)
+    if finalize is None:
+        return
+    result = finalize(
+        db=db,
+        context=context,
+        trigger=trigger,
+        events=events,
+        raw_body=raw_body,
+    )
+    if isawaitable(result):
+        await result

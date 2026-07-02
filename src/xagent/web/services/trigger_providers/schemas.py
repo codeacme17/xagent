@@ -24,6 +24,13 @@ class NormalizedEvent(BaseModel):
 
     event_type: str
     source_event_id: str | None = None
+    target_trigger_id: int | None = None
+    """Optional trigger selected by provider-specific ingestion.
+
+    Most providers address one trigger per callback. Shared-delivery providers
+    such as Gmail can fan one callback out to multiple matching triggers while
+    still letting the shared pipeline own authorization, idempotency, and audit.
+    """
     resource_id: str | None = None
     """Payload-claimed resource identity. Never trusted for authorization."""
     payload: dict[str, Any] = Field(default_factory=dict)

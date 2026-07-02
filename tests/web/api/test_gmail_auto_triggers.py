@@ -19,7 +19,7 @@ from xagent.config import (
 from xagent.web.models.agent import Agent
 from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.oauth_provider import OAuthProvider
-from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerType
+from xagent.web.models.trigger import AgentTrigger, TriggerAudit, TriggerRun, TriggerType
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_triggers import (
@@ -33,6 +33,7 @@ from xagent.web.services.gmail_triggers import (
     register_gmail_watch_for_account,
     scan_due_gmail_watch_renewals,
 )
+from xagent.web.services.trigger_providers import GmailProvider, register_trigger_provider
 
 from .conftest import _direct_db_session, client
 
@@ -228,6 +229,356 @@ def _gmail_message(
             ]
         },
     }
+
+
+def _mark_unified_gmail_trigger(
+    db,
+    trigger: AgentTrigger,
+    *,
+    resource_id: str = "codeacme17@gmail.com",
+    callback_id: str | None = "legacy-trigger-callback",
+) -> AgentTrigger:
+    trigger.provider = TriggerType.GMAIL.value
+    trigger.resource_id = resource_id
+    trigger.callback_id = callback_id
+    db.add(trigger)
+    db.commit()
+    db.refresh(trigger)
+    return trigger
+
+
+def _create_gmail_watch_state(
+    db,
+    user: User,
+    oauth: UserOAuth,
+    *,
+    callback_id: str = "cb-gmail-watch",
+    email: str = "CodeAcme17@Gmail.com",
+) -> GmailWatchState:
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(oauth.id),
+        email=email,
+        history_id="100",
+        topic_name="projects/demo/topics/xagent-gmail",
+        callback_id=callback_id,
+        push_audience=f"https://stored.example.test/api/triggers/callback/gmail/{callback_id}",
+    )
+    db.add(state)
+    db.commit()
+    db.refresh(state)
+    return state
+
+
+def _gmail_pubsub_push_body(
+    *,
+    claimed_email: str,
+    history_id: str = "222",
+    message_id: str = "pubsub-1",
+) -> bytes:
+    data = base64.urlsafe_b64encode(
+        json.dumps(
+            {"emailAddress": claimed_email, "historyId": history_id},
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii")
+    return json.dumps(
+        {"message": {"data": data.rstrip("="), "messageId": message_id}},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def test_gmail_provider_verifies_oidc_with_stored_audience_and_service_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "push-sa@example.iam.gserviceaccount.com",
+    )
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-audience-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-oidc")
+        seen: dict[str, str] = {}
+
+        def fake_verify(token: str, audience: str) -> dict[str, object]:
+            seen["token"] = token
+            seen["audience"] = audience
+            return {
+                "iss": "https://accounts.google.com",
+                "aud": audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": True,
+            }
+
+        provider = GmailProvider(oidc_verifier=fake_verify)
+
+        result = asyncio.run(
+            provider.verify(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "callback_id": "cb-oidc",
+                        "url_path": "/api/triggers/callback/gmail/cb-oidc",
+                        "header": lambda _self, name: "Bearer oidc-token"
+                        if name.lower() == "authorization"
+                        else None,
+                    },
+                )(),
+                db=db,
+                trigger=trigger,
+                raw_body=b"{}",
+            )
+        )
+
+        assert result.verified is True
+        assert result.attested_resource_id == "codeacme17@gmail.com"
+        assert seen == {"token": "oidc-token", "audience": state.push_audience}
+    finally:
+        db.close()
+
+
+def test_gmail_provider_rejects_unverified_push_service_account_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "push-sa@example.iam.gserviceaccount.com",
+    )
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-unverified-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        _create_gmail_watch_state(db, user, oauth, callback_id="cb-unverified")
+
+        provider = GmailProvider(
+            oidc_verifier=lambda _token, audience: {
+                "iss": "https://accounts.google.com",
+                "aud": audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": False,
+            }
+        )
+
+        result = asyncio.run(
+            provider.verify(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "callback_id": "cb-unverified",
+                        "header": lambda _self, name: "Bearer oidc-token"
+                        if name.lower() == "authorization"
+                        else None,
+                    },
+                )(),
+                db=db,
+                trigger=trigger,
+                raw_body=b"{}",
+            )
+        )
+
+        assert result.verified is False
+        assert "email_verified" in str(result.reason)
+    finally:
+        db.close()
+
+
+def test_gmail_unified_callback_ingests_history_filters_and_deduplicates(
+    mock_bg_scheduler,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-unified-user")
+        oauth = _create_gmail_oauth(db, user)
+        matching_trigger = _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(
+                db,
+                user,
+                config={
+                    "watch_label": "INBOX",
+                    "sender_filter": "boss@company.com",
+                    "subject_keyword": "urgent",
+                },
+            ),
+        )
+        filtered_trigger = _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(
+                db,
+                user,
+                config={"watch_label": "INBOX", "sender_filter": "finance@example.com"},
+            ),
+            callback_id="legacy-trigger-callback-2",
+        )
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-unified")
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-unified"}}]}]
+            },
+            messages={"msg-unified": _gmail_message("msg-unified")},
+        )
+        seen_audiences: list[str] = []
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            seen_audiences.append(audience)
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=fake_verify,
+            ),
+            replace=True,
+        )
+        raw_body = _gmail_pubsub_push_body(
+            claimed_email="attacker@example.com",
+            message_id="pubsub-unified",
+        )
+
+        first = client.post(
+            "/api/triggers/callback/gmail/cb-unified",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+        second = client.post(
+            "/api/triggers/callback/gmail/cb-unified",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+
+        assert first.status_code == 200, first.text
+        assert first.json()["outcome"] == "accepted"
+        assert len(first.json()["trigger_run_ids"]) == 1
+        assert second.status_code == 200, second.text
+        assert second.json()["duplicates"] == 1
+        assert seen_audiences == [state.push_audience, state.push_audience]
+        run = (
+            db.query(TriggerRun)
+            .filter(TriggerRun.trigger_id == int(matching_trigger.id))
+            .one()
+        )
+        assert run.source_event_id == "gmail:msg-unified"
+        assert run.payload_snapshot["metadata"]["resource_id"] == "codeacme17@gmail.com"
+        assert "attacker@example.com" not in str(run.payload_snapshot)
+        assert (
+            db.query(TriggerRun)
+            .filter(TriggerRun.trigger_id == int(filtered_trigger.id))
+            .count()
+            == 0
+        )
+        db.refresh(state)
+        assert state.history_id == "222"
+        assert mock_bg_scheduler.call_count == 1
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_unified_callback_holds_history_cursor_when_execution_fails() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-unified-failure-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(db, user, oauth, callback_id="cb-failure")
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-failure"}}]}]
+            },
+            messages={"msg-failure": _gmail_message("msg-failure")},
+        )
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=lambda _token, audience: {
+                    "iss": "https://accounts.google.com",
+                    "aud": audience,
+                },
+            ),
+            replace=True,
+        )
+
+        async def fail_to_start(*_args, **_kwargs):
+            raise RuntimeError("task start failed")
+
+        with patch(
+            "xagent.web.services.triggers.start_prepared_trigger_run",
+            new=fail_to_start,
+        ):
+            response = client.post(
+                "/api/triggers/callback/gmail/cb-failure",
+                headers={"Authorization": "Bearer oidc-token"},
+                content=_gmail_pubsub_push_body(
+                    claimed_email="codeacme17@gmail.com",
+                    message_id="pubsub-failure",
+                ),
+            )
+
+        assert response.status_code == 500, response.text
+        db.refresh(state)
+        assert state.history_id == "100"
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_unified_callback_rejects_resource_mismatch_without_trusting_payload_email(
+    mock_bg_scheduler,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-resource-mismatch-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(db, user),
+            resource_id="other@example.com",
+        )
+        _create_gmail_watch_state(db, user, oauth, callback_id="cb-mismatch")
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-mismatch"}}]}]
+            },
+            messages={"msg-mismatch": _gmail_message("msg-mismatch")},
+        )
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=lambda _token, audience: {
+                    "iss": "https://accounts.google.com",
+                    "aud": audience,
+                },
+            ),
+            replace=True,
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-mismatch",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=_gmail_pubsub_push_body(claimed_email="other@example.com"),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["outcome"] == "rejected_resource"
+        assert db.query(TriggerRun).count() == 0
+        audit = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_resource")
+            .one()
+        )
+        assert audit.trigger_id == trigger.id
+        assert audit.detail["attested_resource_id"] == "codeacme17@gmail.com"
+        assert audit.detail["trigger_resource_id"] == "other@example.com"
+        assert mock_bg_scheduler.call_count == 0
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
 
 
 def test_gmail_watch_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
