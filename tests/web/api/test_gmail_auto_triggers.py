@@ -906,6 +906,7 @@ def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
                     history_id="222",
                     pubsub_message_id="pubsub-1",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -966,6 +967,7 @@ def test_collect_gmail_pubsub_events_skips_label_mismatch() -> None:
                     history_id="222",
                     pubsub_message_id="pubsub-label",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1013,6 +1015,7 @@ def test_collect_gmail_pubsub_events_accepts_case_insensitive_all_label() -> Non
                     history_id="222",
                     pubsub_message_id="pubsub-all",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1060,6 +1063,7 @@ def test_collect_gmail_pubsub_events_accepts_wildcard_star_label() -> None:
                     history_id="222",
                     pubsub_message_id="pubsub-star",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1111,6 +1115,7 @@ def test_collect_gmail_pubsub_events_skips_sender_mismatch() -> None:
                     history_id="222",
                     pubsub_message_id="pubsub-sender",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1161,6 +1166,7 @@ def test_collect_gmail_pubsub_events_skips_subject_mismatch() -> None:
                     history_id="222",
                     pubsub_message_id="pubsub-subject",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1204,6 +1210,7 @@ def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
                     history_id="222",
                     pubsub_message_id="pubsub-expired",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: next(services),
             )
         )
@@ -1258,6 +1265,7 @@ def test_collect_gmail_pubsub_events_records_service_configuration_error() -> No
                         history_id="222",
                         pubsub_message_id="pubsub-refresh-error",
                     ),
+                    state=state,
                     service_factory=service_factory,
                 )
             )
@@ -1321,6 +1329,7 @@ def test_collect_gmail_pubsub_events_skips_deleted_message_and_advances_cursor()
                     history_id="222",
                     pubsub_message_id="pubsub-batch",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1378,6 +1387,7 @@ def test_collect_gmail_pubsub_events_skips_forbidden_message_and_advances_cursor
                     history_id="222",
                     pubsub_message_id="pubsub-forbidden",
                 ),
+                state=state,
                 service_factory=lambda _db, _oauth: fake_service,
             )
         )
@@ -1436,6 +1446,7 @@ def test_collect_gmail_pubsub_events_fails_batch_on_transient_message_error_and_
                         history_id="222",
                         pubsub_message_id="pubsub-transient",
                     ),
+                    state=state,
                     service_factory=lambda _db, _oauth: fake_service,
                 )
             )
@@ -1488,6 +1499,7 @@ def test_collect_gmail_pubsub_events_holds_cursor_on_rate_limited_message() -> N
                         history_id="222",
                         pubsub_message_id="pubsub-rate-limited",
                     ),
+                    state=state,
                     service_factory=lambda _db, _oauth: fake_service,
                 )
             )
@@ -1811,4 +1823,99 @@ def test_gmail_unified_callback_ingestion_failure_is_controlled_and_audited(
         assert mock_bg_scheduler.call_count == 0
     finally:
         register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_malformed_pubsub_message_is_acked_not_redelivered() -> None:
+    """A permanently malformed Pub/Sub message must not loop for the
+    retention window: Gmail maps parse failures to a 200 ack while the
+    execution_failure audit row keeps the outcome visible."""
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-malformed-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        _create_gmail_watch_state(db, user, oauth, callback_id="cb-malformed")
+
+        register_trigger_provider(
+            GmailProvider(
+                oidc_verifier=lambda _token, audience: {
+                    "iss": "https://accounts.google.com",
+                    "aud": audience,
+                },
+            ),
+            replace=True,
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-malformed",
+            headers={"Authorization": "Bearer oidc-token"},
+            json={"message": {"data": "!!!not-base64!!!", "messageId": "m-1"}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["outcome"] == "execution_failure"
+        audit = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "execution_failure")
+            .one()
+        )
+        assert audit.detail["stage"] == "parse"
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_collect_uses_the_callback_watch_state_not_email_lookup() -> None:
+    """Two accounts can watch the same mailbox; ingestion must use the
+    cursor and trigger set of the watch state the callback addressed."""
+    db = _direct_db_session()
+    try:
+        user_a = _create_user(db, "gmail-shared-mailbox-a")
+        oauth_a = _create_gmail_oauth(db, user_a)
+        state_a = _create_gmail_watch_state(db, user_a, oauth_a, callback_id="cb-a")
+        setattr(state_a, "history_id", "100")
+
+        user_b = _create_user(db, "gmail-shared-mailbox-b")
+        oauth_b = UserOAuth(
+            user_id=int(user_b.id),
+            provider="gmail",
+            access_token="access-token-b",
+            provider_user_id="provider-user-b",
+            email="codeacme17@gmail.com",
+        )
+        db.add(oauth_b)
+        db.commit()
+        db.refresh(oauth_b)
+        state_b = _create_gmail_watch_state(db, user_b, oauth_b, callback_id="cb-b")
+        setattr(state_b, "history_id", "500")
+        db.add_all([state_a, state_b])
+        db.commit()
+
+        fake_service = _FakeGmailService(history_response={"history": []})
+        result = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="600",
+                    pubsub_message_id="pubsub-shared",
+                ),
+                state=state_b,
+                service_factory=lambda _db, oauth: fake_service,
+            )
+        )
+
+        assert result.events == []
+        # History listing started from B's cursor, not A's.
+        assert fake_service.history_resource.calls == [
+            {
+                "userId": "me",
+                "startHistoryId": "500",
+                "historyTypes": ["messageAdded"],
+            }
+        ]
+        db.refresh(state_a)
+        assert state_a.history_id == "100"
+    finally:
         db.close()

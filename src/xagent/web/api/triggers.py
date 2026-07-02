@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Literal, cast
@@ -234,7 +235,10 @@ async def create_trigger(
 ) -> TriggerResponse:
     _enforce_crud_rate_limit(int(current_user.id))
     try:
-        trigger, secret = create_agent_trigger(
+        # Runs in a worker thread: Gmail trigger provisioning can block on
+        # cloud calls up to the registration timeout.
+        trigger, secret = await asyncio.to_thread(
+            create_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,
@@ -263,7 +267,8 @@ async def update_trigger(
 ) -> TriggerResponse:
     _enforce_crud_rate_limit(int(current_user.id))
     try:
-        trigger, secret = update_agent_trigger(
+        trigger, secret = await asyncio.to_thread(
+            update_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,
@@ -284,7 +289,8 @@ async def delete_trigger(
 ) -> dict[str, str]:
     _enforce_crud_rate_limit(int(current_user.id))
     try:
-        delete_agent_trigger(
+        await asyncio.to_thread(
+            delete_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,

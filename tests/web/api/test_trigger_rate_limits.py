@@ -289,3 +289,38 @@ class TestLimiterConfiguration:
         assert not [
             record for record in caplog.records if "per process" in record.message
         ]
+
+
+class TestCallbackIpCeiling:
+    def test_rotating_callback_ids_hit_the_ip_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single IP cannot bypass limiting by minting fresh callback ids."""
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", "100/minute")
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", "3/minute")
+        reset_trigger_rate_limiter()
+
+        for index in range(3):
+            response = client.post(
+                f"/api/triggers/callback/webhook/rotating-{index}", content=b"{}"
+            )
+            assert response.status_code != 429
+
+        db = _direct_db_session()
+        try:
+            audits_at_ceiling = db.query(TriggerAudit).count()
+        finally:
+            db.close()
+
+        for index in range(3, 8):
+            limited = client.post(
+                f"/api/triggers/callback/webhook/rotating-{index}", content=b"{}"
+            )
+            assert limited.status_code == 429
+
+        db = _direct_db_session()
+        try:
+            # No audit-write amplification once the IP ceiling kicks in.
+            assert db.query(TriggerAudit).count() == audits_at_ceiling
+        finally:
+            db.close()

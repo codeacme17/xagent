@@ -77,6 +77,9 @@ class AckPolicy(BaseModel):
     rejected_status: int = 401
     rejected_resource_status: int = 403
     disabled_status: int = 409
+    parse_failure_status: int = 400
+    """Malformed payloads are permanent: redelivery-heavy providers map this
+    to 2xx so the same broken message is not redelivered forever."""
     failure_status: int = 500
 
 

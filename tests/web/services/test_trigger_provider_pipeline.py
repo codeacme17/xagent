@@ -561,3 +561,53 @@ class TestProviderRegistration:
         await stub_provider.unregister(db_session, trigger, config)
         assert stub_provider.register_calls == [trigger.id]
         assert stub_provider.unregister_calls == [trigger.id]
+
+
+class TestPartialFailureAcknowledgement:
+    async def test_mixed_success_and_failure_returns_failure_status(
+        self, db_session, stub_provider, monkeypatch
+    ):
+        """A partially failed batch must not be acked as accepted: the
+        provider failure status keeps redelivery semantics, and idempotency
+        keys protect the runs that already succeeded."""
+        from types import SimpleNamespace
+
+        from xagent.web.services.trigger_providers import pipeline as pipeline_module
+
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent)
+
+        fired: list[str] = []
+
+        async def flaky_fire(db, *, trigger, event):
+            fired.append(event.source_event_id)
+            if event.source_event_id == "evt-bad":
+                raise RuntimeError("transient enqueue failure")
+            return SimpleNamespace(id=101), True
+
+        monkeypatch.setattr(pipeline_module, "_fire_event", flaky_fire)
+
+        body = json.dumps(
+            [
+                {"id": "evt-good", "type": "stub.event"},
+                {"id": "evt-bad", "type": "stub.event"},
+            ]
+        ).encode()
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=body,
+        )
+
+        assert fired == ["evt-good", "evt-bad"]
+        assert result.status_code == 500
+        assert result.outcome == TriggerAuditOutcome.EXECUTION_FAILURE
+        assert len(result.runs) == 1
+        failure_audits = [
+            a for a in _audits(db_session) if a.outcome == "execution_failure"
+        ]
+        assert len(failure_audits) == 1
+        assert failure_audits[0].detail["stage"] == "fire"
+        # No accepted audit row: the delivery as a whole was not acknowledged.
+        assert all(a.outcome != "accepted" for a in _audits(db_session))

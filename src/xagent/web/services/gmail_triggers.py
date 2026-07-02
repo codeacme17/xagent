@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from google.auth.transport.requests import (
     Request,
 )
 from google.oauth2.credentials import Credentials
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -471,6 +472,7 @@ async def collect_gmail_pubsub_events(
     db: Session,
     notification: GmailPubsubNotification,
     *,
+    state: GmailWatchState,
     service_factory: GmailServiceFactory = build_gmail_service,
     advance_cursor: bool = True,
 ) -> GmailPubsubEventCollection:
@@ -479,17 +481,14 @@ async def collect_gmail_pubsub_events(
     The unified TriggerProvider pipeline owns authorization, idempotency,
     audit, and execution. This helper keeps Gmail-specific history traversal
     and trigger filter matching in the Gmail module.
+
+    ``state`` must be the watch state the callback was addressed to (resolved
+    by callback id). GmailWatchState.email is not unique — two accounts can
+    watch the same mailbox — so resolving by email here could read another
+    account's cursor and OAuth token while the caller advances this one's.
     """
     email_address = notification.email_address.strip().lower()
     if not email_address or not notification.history_id:
-        return GmailPubsubEventCollection(events=[], skipped=1)
-
-    state = (
-        db.query(GmailWatchState)
-        .filter(func.lower(GmailWatchState.email) == email_address)
-        .first()
-    )
-    if state is None:
         return GmailPubsubEventCollection(events=[], skipped=1)
 
     oauth_account = (
@@ -500,7 +499,7 @@ async def collect_gmail_pubsub_events(
 
     state_id = int(state.id)
     try:
-        service = service_factory(db, oauth_account)
+        service = await asyncio.to_thread(service_factory, db, oauth_account)
     except GmailTriggerError as exc:
         db.rollback()
         _record_watch_state_error(
@@ -512,7 +511,8 @@ async def collect_gmail_pubsub_events(
 
     start_history_id = str(state.history_id)
     try:
-        message_ids = _list_added_message_ids(
+        message_ids = await asyncio.to_thread(
+            _list_added_message_ids,
             service,
             start_history_id=start_history_id,
         )
@@ -528,7 +528,8 @@ async def collect_gmail_pubsub_events(
         )
         db.rollback()
         try:
-            _renew_watch_for_account(
+            await asyncio.to_thread(
+                _renew_watch_for_account,
                 db,
                 oauth_account,
                 service_factory=service_factory,
@@ -567,7 +568,9 @@ async def collect_gmail_pubsub_events(
     for message_id in message_ids:
         try:
             try:
-                message = _get_gmail_message(service, message_id)
+                message = await asyncio.to_thread(
+                    _get_gmail_message, service, message_id
+                )
             except Exception as exc:
                 if _is_non_retriable_message_error(exc):
                     logger.warning(

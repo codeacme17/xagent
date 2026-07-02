@@ -20,6 +20,7 @@ from limits.strategies import MovingWindowRateLimiter
 
 from ...config import (
     get_redis_url,
+    get_trigger_callback_ip_rate_limit,
     get_trigger_callback_rate_limit,
     get_trigger_crud_rate_limit,
     get_trusted_proxy_hops,
@@ -28,6 +29,7 @@ from ...config import (
 logger = logging.getLogger(__name__)
 
 _CALLBACK_NAMESPACE = "trigger-callback"
+_CALLBACK_IP_NAMESPACE = "trigger-callback-ip"
 _CRUD_NAMESPACE = "trigger-crud"
 
 _WORKER_COUNT_ENV_VARS = ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS")
@@ -48,13 +50,27 @@ class TriggerRateLimiter:
         self._callback_limit = _parse_rate(
             get_trigger_callback_rate_limit(), fallback="120/minute"
         )
+        self._callback_ip_limit = _parse_rate(
+            get_trigger_callback_ip_rate_limit(), fallback="600/minute"
+        )
         self._crud_limit = _parse_rate(
             get_trigger_crud_rate_limit(), fallback="60/minute"
         )
 
     def hit_callback(self, callback_id: str, remote_ip: str | None) -> bool:
-        """Count one callback request; False when the limit is exceeded."""
-        key = f"{callback_id}:{remote_ip or 'unknown'}"
+        """Count one callback request; False when the limit is exceeded.
+
+        Two buckets must both admit: per callback id + IP (protects one
+        trigger from one noisy caller) and per IP alone. Without the IP-only
+        bucket, an attacker rotating random callback ids would get a fresh
+        bucket per request and amplify audit writes without bound.
+        """
+        ip_key = remote_ip or "unknown"
+        if not self._limiter.hit(
+            self._callback_ip_limit, _CALLBACK_IP_NAMESPACE, ip_key
+        ):
+            return False
+        key = f"{callback_id}:{ip_key}"
         return self._limiter.hit(self._callback_limit, _CALLBACK_NAMESPACE, key)
 
     def hit_crud(self, user_id: int) -> bool:

@@ -184,7 +184,7 @@ async def process_trigger_callback(
             remote_ip=context.remote_ip,
         )
         return CallbackResult(
-            status_code=400,
+            status_code=ack.parse_failure_status,
             outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
             detail=str(exc) or "Malformed callback payload",
         )
@@ -321,7 +321,23 @@ async def process_trigger_callback(
                 remote_ip=context.remote_ip,
             )
 
-    if runs or duplicates or not (rejected_events or failures):
+    if failures:
+        # Any fire/finalize failure means the callback was not fully
+        # processed: report the provider failure status so redelivery-based
+        # providers retry the whole delivery. Runs already created are
+        # protected by their idempotency keys, and finalize was skipped so
+        # cursors did not advance past the failed event.
+        return CallbackResult(
+            status_code=ack.failure_status,
+            outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
+            detail="; ".join(failures),
+            runs=runs,
+            duplicates=duplicates,
+            rejected_events=rejected_events,
+            filtered_events=filtered_count,
+        )
+
+    if runs or duplicates or not rejected_events:
         record_trigger_audit(
             db,
             outcome=TriggerAuditOutcome.ACCEPTED,
@@ -345,19 +361,11 @@ async def process_trigger_callback(
             filtered_events=filtered_count,
         )
 
-    if rejected_events:
-        return CallbackResult(
-            status_code=ack.rejected_resource_status,
-            outcome=TriggerAuditOutcome.REJECTED_RESOURCE,
-            detail="Event resource does not match this trigger",
-            rejected_events=rejected_events,
-            filtered_events=filtered_count,
-        )
-
     return CallbackResult(
-        status_code=ack.failure_status,
-        outcome=TriggerAuditOutcome.EXECUTION_FAILURE,
-        detail="; ".join(failures) or "Trigger execution failed",
+        status_code=ack.rejected_resource_status,
+        outcome=TriggerAuditOutcome.REJECTED_RESOURCE,
+        detail="Event resource does not match this trigger",
+        rejected_events=rejected_events,
         filtered_events=filtered_count,
     )
 

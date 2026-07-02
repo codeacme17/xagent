@@ -80,6 +80,7 @@ TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
 TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
+TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
 TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -479,6 +480,23 @@ def get_trigger_callback_rate_limit() -> str:
     """
     value = (os.getenv(TRIGGER_CALLBACK_RATE_LIMIT) or "").strip()
     return value or "120/minute"
+
+
+def get_trigger_callback_ip_rate_limit() -> str:
+    """Per-IP ceiling across ALL callback ids on the public callback endpoint.
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT environment variable
+        2. Default "600/minute"
+
+    The per-callback-id bucket alone can be bypassed by rotating random
+    callback ids; this IP-wide bucket caps that traffic before audit writes.
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "600/minute".
+    """
+    value = (os.getenv(TRIGGER_CALLBACK_IP_RATE_LIMIT) or "").strip()
+    return value or "600/minute"
 
 
 def get_trigger_crud_rate_limit() -> str:

@@ -100,9 +100,18 @@ def _history_cursor_advances(current: object, incoming: str) -> bool:
         return True
 
 
+# Shared transport so Google's signing certs benefit from connection reuse
+# instead of a fresh session (and TLS handshake) per callback.
+_GOOGLE_AUTH_REQUEST = GoogleAuthRequest()
+
+
 def verify_google_oidc_token(token: str, audience: str) -> Mapping[str, Any]:
-    """Verify a Google OIDC token signature and audience."""
-    claims = id_token.verify_oauth2_token(token, GoogleAuthRequest(), audience)
+    """Verify a Google OIDC token signature and audience.
+
+    Performs blocking HTTP (Google cert fetch); call via asyncio.to_thread
+    from async code.
+    """
+    claims = id_token.verify_oauth2_token(token, _GOOGLE_AUTH_REQUEST, audience)
     return claims if isinstance(claims, Mapping) else {}
 
 
@@ -158,6 +167,11 @@ class GmailProvider:
         rejected_status=200,
         rejected_resource_status=200,
         disabled_status=200,
+        # A malformed Pub/Sub message fails identically on every redelivery;
+        # ack it so it does not loop for the retention window. Transient
+        # ingestion errors raise GmailTriggerError instead, which maps to
+        # failure_status=500 and keeps redelivery semantics.
+        parse_failure_status=200,
     )
 
     def __init__(
@@ -246,7 +260,7 @@ class GmailProvider:
             return VerificationResult.reject("Missing Gmail OIDC bearer token")
 
         try:
-            claims = self.oidc_verifier(token, audience)
+            claims = await asyncio.to_thread(self.oidc_verifier, token, audience)
         except Exception as exc:
             return VerificationResult.reject(
                 f"Gmail OIDC token verification failed: {type(exc).__name__}"
@@ -317,6 +331,7 @@ class GmailProvider:
         collection = await collect_gmail_pubsub_events(
             db,
             notification,
+            state=state,
             service_factory=self.service_factory or build_gmail_service,
             advance_cursor=False,
         )

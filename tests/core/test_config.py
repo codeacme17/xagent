@@ -1380,3 +1380,19 @@ class TestTrustedProxyHopsConfig:
         assert get_trusted_proxy_hops() == 0
         monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "-1")
         assert get_trusted_proxy_hops() == 0
+
+
+class TestTriggerCallbackIpRateLimitConfig:
+    """Config for the IP-wide callback rate ceiling."""
+
+    def test_default(self, monkeypatch):
+        from xagent.config import get_trigger_callback_ip_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", raising=False)
+        assert get_trigger_callback_ip_rate_limit() == "600/minute"
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_callback_ip_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", "50/second")
+        assert get_trigger_callback_ip_rate_limit() == "50/second"
