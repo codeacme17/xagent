@@ -564,10 +564,16 @@ def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fa
         "xagent.web.services.kb_file_service.ensure_documents_table",
         lambda _conn: None,
     )
-    # Mock cascade_cleaner's connection (used by cascade_delete)
+
+    # Make cascade_delete raise so the reconciler records a cleanup error.
+    # cascade_delete now routes through the store (not cascade_cleaner internals),
+    # so we patch it at the service's import site.
+    def _failing_cascade_delete(**_kw):
+        raise RuntimeError("delete failed")
+
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection",
-        lambda: _DeleteFailingConn(),
+        "xagent.web.services.kb_file_service.cascade_delete",
+        _failing_cascade_delete,
     )
 
     result = reconcile_uploaded_files(

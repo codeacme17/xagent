@@ -7,7 +7,7 @@ import logging
 import os
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
 import lancedb
 import pyarrow as pa  # type: ignore
@@ -23,7 +23,11 @@ from ..core.config import (
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
-from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
+from ..utils.string_utils import (
+    build_lancedb_filter_expression,
+    build_user_id_filter_for_table,
+    escape_lancedb_string,
+)
 from ..utils.user_permissions import UserPermissions
 from .contracts import (
     DocumentRecord,
@@ -822,21 +826,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete all data for a collection from vector-side tables."""
-        conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete
-
-        counts = cascade_delete(
+        return self.cascade_delete(
             target="collection",
             collection=collection_name,
             user_id=user_id,
             is_admin=is_admin,
             preview_only=False,
             confirm=True,
-            conn=conn,
         )
-        # Ensure subsequent reads don't observe stale cached table handles.
-        self.invalidate_table_cache()
-        return counts
 
     def delete_document_data(
         self,
@@ -846,10 +843,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         is_admin: bool,
     ) -> Dict[str, int]:
         """Delete all vector-side data for a document."""
-        conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete
-
-        counts = cascade_delete(
+        return self.cascade_delete(
             target="document",
             collection=collection_name,
             doc_id=doc_id,
@@ -857,11 +851,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             is_admin=is_admin,
             preview_only=False,
             confirm=True,
-            conn=conn,
         )
-        # Ensure subsequent reads don't observe stale cached table handles.
-        self.invalidate_table_cache()
-        return counts
 
     def delete_document_record(
         self,
@@ -878,16 +868,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         the row or the ``documents`` table is absent.
         """
         from ..LanceDB.schema_manager import _safe_close_table
-        from ..version_management.cascade_cleaner import (
-            _build_document_filter,
-            _delete_rows_by_filters,
-        )
 
         if "documents" not in self.list_table_names():
             return 0
 
         conn = self._get_connection()
-        filter_expr = _build_document_filter(
+        filter_expr = _vis_build_document_filter(
             conn=conn,
             table_name="documents",
             collection=collection_name,
@@ -897,7 +883,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         )
         table = conn.open_table("documents")
         try:
-            deleted = _delete_rows_by_filters(table, [filter_expr])
+            deleted = _vis_delete_rows_by_filters(table, [filter_expr])
         finally:
             _safe_close_table(table)
         self.invalidate_table_cache("documents")
@@ -922,16 +908,12 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         from ..LanceDB.schema_manager import _safe_close_table
         from ..utils.string_utils import escape_lancedb_string
-        from ..version_management.cascade_cleaner import (
-            _build_document_filter,
-            _delete_rows_by_filters,
-        )
 
         if table_name not in self.list_table_names():
             return 0
 
         conn = self._get_connection()
-        filter_expr = _build_document_filter(
+        filter_expr = _vis_build_document_filter(
             conn=conn,
             table_name=table_name,
             collection=collection_name,
@@ -946,7 +928,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
         table = conn.open_table(table_name)
         try:
-            deleted = _delete_rows_by_filters(table, [filter_expr])
+            deleted = _vis_delete_rows_by_filters(table, [filter_expr])
         finally:
             _safe_close_table(table)
         self.invalidate_table_cache(table_name)
@@ -1015,7 +997,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             resolve_cleanup_scope,
         )
         from ..LanceDB.schema_manager import _safe_close_table
-        from ..version_management.cascade_cleaner import _delete_rows_by_filters
 
         scope = resolve_cleanup_scope(
             collection=collection_name,
@@ -1038,7 +1019,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             table = None
             try:
                 table = conn.open_table(table_name)
-                deleted += _delete_rows_by_filters(table, filter_exprs)
+                deleted += _vis_delete_rows_by_filters(table, filter_exprs)
             finally:
                 _safe_close_table(table)
             self.invalidate_table_cache(table_name)
@@ -1054,12 +1035,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         warnings_out: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Delete vector-side data for multiple documents in batches."""
-        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if str(doc_id)})
+        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if doc_id})
         if not normalized_doc_ids:
             return {}
 
         conn = self._get_connection()
-        from ..version_management.cascade_cleaner import cascade_delete_documents
 
         batch_size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
         merged: Dict[str, int] = {}
@@ -1068,14 +1048,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             for start in range(0, len(normalized_doc_ids), batch_size):
                 batch = normalized_doc_ids[start : start + batch_size]
                 try:
-                    counts = cascade_delete_documents(
+                    counts = _vis_cascade_delete_documents(
+                        conn,
                         collection=collection_name,
                         doc_ids=batch,
                         user_id=user_id,
                         is_admin=is_admin,
                         preview_only=False,
                         confirm=True,
-                        conn=conn,
                     )
                 except Exception as exc:
                     if warnings_out is not None:
@@ -2583,10 +2563,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
-        # NOTE: The predicate pipeline below (_vis_plan_by_predicates, etc.) is a TEMPORARY
-        # DUPLICATION of cascade_cleaner.py helpers, intentionally accepted until the #494
-        # follow-up migrates the collection-delete path.
-        # Do NOT refactor the two into one yet.
         from ..core.exceptions import CascadeCleanupError
         from ..kb.cleanup_filters import (
             KBCleanupScope,
@@ -2609,9 +2585,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_main_pointers_table(conn)
 
         if scope == "document":
-            from ..version_management.cascade_cleaner import _cascade_delete_impl
-
-            raw = _cascade_delete_impl(
+            raw = self.cascade_delete(
                 target="document",
                 collection=collection,
                 doc_id=doc_id,
@@ -2620,7 +2594,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 model_tag=model_tag,
                 preview_only=preview_only,
                 confirm=confirm,
-                conn=conn,
             )
             embeddings_total = sum(
                 int(v) for k, v in raw.items() if str(k).startswith("embeddings_")
@@ -2776,9 +2749,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 if filter_exprs:
                     predicates.setdefault(table_name, []).extend(filter_exprs)
         elif scope == "pointers":
-            from ..version_management.cascade_cleaner import _build_document_filter
-
-            filt = _build_document_filter(
+            filt = _vis_build_document_filter(
                 conn=conn,
                 table_name="main_pointers",
                 collection=collection,
@@ -2801,14 +2772,113 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return _vis_collapse_embedding_table_counts(result)
         return result
 
+    def cascade_delete(
+        self,
+        *,
+        target: Literal["collection", "document"],
+        collection: str,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        from ..core.exceptions import CascadeCleanupError
+        from ..kb.cleanup_filters import select_embedding_tables
+        from ..LanceDB.schema_manager import (
+            ensure_chunks_table,
+            ensure_documents_table,
+            ensure_ingestion_runs_table,
+            ensure_main_pointers_table,
+            ensure_parses_table,
+        )
+        from ..utils.user_scope import resolve_user_scope
+
+        user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+        user_id = user_scope.user_id
+        is_admin = user_scope.is_admin
+
+        if target == "document" and not doc_id:
+            raise CascadeCleanupError("doc_id is required for document cascade delete")
+
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        ensure_parses_table(conn)
+        ensure_chunks_table(conn)
+        ensure_main_pointers_table(conn)
+        ensure_ingestion_runs_table(conn)
+
+        table_names = _vis_get_table_names(conn)
+        predicates: Dict[str, list] = {}
+
+        core_tables = [
+            "documents",
+            "parses",
+            "chunks",
+            "main_pointers",
+            "ingestion_runs",
+        ]
+        for table_name in core_tables:
+            if table_name not in table_names:
+                continue
+            if target == "collection":
+                filter_expr = _vis_build_collection_filter(
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            else:
+                filter_expr = _vis_build_document_filter(
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    doc_id=str(doc_id),
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            predicates[table_name] = [filter_expr]
+
+        for table_name in select_embedding_tables(conn, model_tag=model_tag):
+            if target == "collection":
+                filter_expr = _vis_build_collection_filter(
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            else:
+                filter_expr = _vis_build_document_filter(
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    doc_id=str(doc_id),
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            predicates[table_name] = [filter_expr]
+
+        result = _vis_execute_or_plan_by_predicates(
+            conn,
+            predicates,
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=None,
+        )
+        if confirm:
+            self.invalidate_table_cache()
+        return result
+
 
 # ============================================================================
 # Phase 1A Part 2: Additional LanceDB Store Implementations
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# _vis_* helpers: temporary duplication of cascade_cleaner.py predicate utils
-# (accepted until #494 follow-up; do NOT merge into one yet)
+# _vis_* helpers: predicate pipeline for collection/document cascade delete
 # ---------------------------------------------------------------------------
 
 
@@ -3053,6 +3123,200 @@ def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, in
             embeddings_total += int(collapsed.pop(table_name, 0))
     collapsed["embeddings"] = embeddings_total
     return collapsed
+
+
+def _vis_build_collection_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for collection-scoped deletion.
+
+    Adds user_id filtering only when the target table contains a user_id column.
+    """
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base: Dict[str, str] = {"collection": collection}
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if not is_admin and user_id is not None:
+            if _table_has_column(table, "user_id"):
+                base_expr = build_lancedb_filter_expression(
+                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
+                )
+                user_expr = build_user_id_filter_for_table(table, int(user_id))
+                return f"{base_expr} AND {user_expr}"
+            # Legacy schemas without user_id must remain compatible.
+            return build_lancedb_filter_expression(base, skip_user_filter=True)
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    except Exception:
+        # If table introspection fails, keep tenant-safe fallback.
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_build_document_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    doc_id: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for document-scoped deletion."""
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if not is_admin and user_id is not None:
+            if _table_has_column(table, "user_id"):
+                base_expr = build_lancedb_filter_expression(
+                    base, user_id=user_id, is_admin=is_admin, skip_user_filter=True
+                )
+                user_expr = build_user_id_filter_for_table(table, int(user_id))
+                return f"{base_expr} AND {user_expr}"
+            # Legacy schemas without user_id must remain compatible.
+            return build_lancedb_filter_expression(base, skip_user_filter=True)
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    except Exception:
+        # If table introspection fails, keep tenant-safe fallback.
+        return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_doc_ids_filter(doc_ids: list) -> str:
+    if len(doc_ids) == 1:
+        return f"doc_id == '{escape_lancedb_string(doc_ids[0])}'"
+    values = ", ".join(f"'{escape_lancedb_string(doc_id)}'" for doc_id in doc_ids)
+    return f"doc_id IN ({values})"
+
+
+def _vis_build_documents_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    doc_ids: list,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for deleting multiple document-scoped rows."""
+    from ..kb.cleanup_filters import table_has_column as _table_has_column
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    base_expr = build_lancedb_filter_expression(
+        {"collection": collection}, skip_user_filter=True
+    )
+    doc_expr = _vis_doc_ids_filter(doc_ids)
+    scoped_expr = f"{base_expr} AND {doc_expr}"
+
+    if is_admin:
+        return scoped_expr
+    if user_id is None:
+        return f"{scoped_expr} AND ({UserPermissions.get_no_access_filter()})"
+
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if _table_has_column(table, "user_id"):
+            return (
+                f"{scoped_expr} AND "
+                f"{build_user_id_filter_for_table(table, int(user_id))}"
+            )
+        # Legacy schemas without user_id stay document-scoped by doc_id.
+        return scoped_expr
+    except Exception:
+        # If introspection fails, fail closed with an explicit user_id predicate.
+        return f"{scoped_expr} AND user_id == {int(user_id)}"
+    finally:
+        _safe_close_table(table)
+
+
+def _vis_cascade_delete_documents(
+    conn: Any,
+    *,
+    collection: str,
+    doc_ids: list,
+    user_id: Optional[int],
+    is_admin: bool,
+    preview_only: bool = True,
+    confirm: bool = False,
+) -> Dict[str, int]:
+    """Cascade delete multiple documents using one predicate set per table."""
+    from ..kb.cleanup_filters import select_embedding_tables
+    from ..LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+        ensure_ingestion_runs_table,
+        ensure_main_pointers_table,
+        ensure_parses_table,
+    )
+    from ..utils.user_scope import resolve_user_scope
+
+    normalized_doc_ids = sorted({str(d) for d in doc_ids if d})
+    if not normalized_doc_ids:
+        return {}
+
+    user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    user_id = user_scope.user_id
+    is_admin = user_scope.is_admin
+    if not is_admin and user_id is None:
+        return {}
+
+    ensure_documents_table(conn)
+    ensure_parses_table(conn)
+    ensure_chunks_table(conn)
+    ensure_main_pointers_table(conn)
+    ensure_ingestion_runs_table(conn)
+
+    table_names = _vis_get_table_names(conn)
+    predicates: Dict[str, list] = {}
+
+    core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
+    for table_name in core_tables:
+        if table_name not in table_names:
+            continue
+        predicates[table_name] = [
+            _vis_build_documents_filter(
+                conn=conn,
+                table_name=table_name,
+                collection=collection,
+                doc_ids=normalized_doc_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
+
+    for table_name in select_embedding_tables(conn):
+        predicates[table_name] = [
+            _vis_build_documents_filter(
+                conn=conn,
+                table_name=table_name,
+                collection=collection,
+                doc_ids=normalized_doc_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
+
+    return _vis_execute_or_plan_by_predicates(
+        conn,
+        predicates,
+        preview_only=preview_only,
+        confirm=confirm,
+        model_tag=None,
+    )
 
 
 class LanceDBIngestionStatusStore(IngestionStatusStore):

@@ -15,6 +15,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Protocol,
     Sequence,
@@ -981,6 +982,26 @@ class VectorIndexStore(ABC):
             preview_only=preview_only,
             confirm=confirm,
         )
+
+    @abstractmethod
+    def cascade_delete(
+        self,
+        *,
+        target: Literal["collection", "document"],
+        collection: str,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> Dict[str, int]:
+        """Cascade-delete a collection or single document across vector-side tables.
+
+        Returns per-table counts (per-``embeddings_*`` keys, NOT collapsed).
+        ``preview_only`` plans without deleting; ``confirm`` executes. The
+        implementation owns its own connection; callers must not pass one.
+        """
 
     @abstractmethod
     def search_vectors(
