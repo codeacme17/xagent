@@ -3121,6 +3121,33 @@ Build when you need.`,
       copy_failed: "Failed to copy to clipboard"
     }
   },
+  appWidget: {
+    builder: {
+      title: "App Widget",
+      description: "Embed this agent as a chat bubble on a website",
+      saveFirst: "Save the agent before configuring the app widget",
+      configure: "Configure app widget",
+      toggle: "Toggle app widget"
+    },
+    dialog: {
+      title: "App Widget",
+      enabledLabel: "Widget enabled",
+      allowedDomains: "Allowed domains",
+      domainPlaceholder: "e.g. example.com",
+      addDomain: "Add",
+      invalidDomain: "Enter a domain like example.com or localhost:3000 (no scheme, path, or wildcard), or * to allow any domain.",
+      removeDomain: "Remove domain",
+      noDomains: "No domains configured. Widget requests are blocked until a domain or * is added.",
+      embedTitle: "Embed snippet",
+      embedDescription: "Copy this script into the page where the chat bubble should appear.",
+      copySnippet: "Copy snippet"
+    },
+    messages: {
+      updated: "Widget configuration updated",
+      updateFailed: "Failed to update widget configuration",
+      copyFailed: "Failed to copy widget snippet"
+    }
+  },
   triggers: {
     title: "Triggers",
     subtitle: "Choose how this agent gets activated",

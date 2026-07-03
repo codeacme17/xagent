@@ -347,6 +347,26 @@ def test_generated_workforce_manager_agents_cannot_authenticate_widget() -> None
     assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
 
 
+def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Case Insensitive Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["Example.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+        headers={"origin": "https://EXAMPLE.com"},
+    )
+
+    assert response.status_code == 200, response.text
+
+
 def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
     _admin_headers()
     owner_id = _user_id("admin")

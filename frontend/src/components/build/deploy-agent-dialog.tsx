@@ -18,6 +18,7 @@ import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
+import { buildWidgetSnippet, isValidAllowedDomain, normalizeAllowedDomain, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
   id: number
@@ -161,55 +162,59 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
     }
   }
 
-  const handleUpdateWidgetConfig = async (updates: { widget_enabled?: boolean, allowed_domains?: string[] }) => {
-    if (!deployAgent) return
+  const handleUpdateWidgetConfig = async (
+    updates: { widget_enabled?: boolean, allowed_domains?: string[] },
+  ): Promise<boolean> => {
+    if (!deployAgent) return false
     try {
       setIsUpdatingWidget(true)
-      const res = await apiRequest(`${getApiUrl()}/api/agents/${deployAgent.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updates)
-      })
-      if (!res.ok) throw new Error("Failed to update widget config")
-      const updatedAgent = await res.json()
-      onUpdate(updatedAgent)
+      const fallbackMessage = t("deploy_agent.messages.update_failed") || "Failed to update widget configuration"
+      const updatedAgent = await updateAgentWidgetConfig(deployAgent.id, updates, fallbackMessage)
+      onUpdate(updatedAgent as unknown as Agent)
       toast.success(t("deploy_agent.messages.update_success") || "Widget configuration updated")
+      return true
     } catch (err) {
       console.error(err)
-      toast.error(t("deploy_agent.messages.update_failed") || "Failed to update widget configuration")
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : t("deploy_agent.messages.update_failed") || "Failed to update widget configuration"
+      )
+      return false
     } finally {
       setIsUpdatingWidget(false)
     }
   }
 
-  const handleAddDomain = () => {
-    if (!newDomain.trim() || !deployAgent) return
-    const domain = newDomain.trim()
+  const handleAddDomain = async () => {
+    if (!deployAgent) return
+    const domain = normalizeAllowedDomain(newDomain)
+    if (!domain) return
+    if (!isValidAllowedDomain(domain)) {
+      toast.error(t("appWidget.dialog.invalidDomain"))
+      return
+    }
     const currentDomains = deployAgent.allowed_domains || []
-    if (currentDomains.includes(domain)) {
+    if (currentDomains.some((item) => item.toLowerCase() === domain)) {
       setNewDomain("")
       return
     }
-    handleUpdateWidgetConfig({ allowed_domains: [...currentDomains, domain] })
-    setNewDomain("")
+    const updated = await handleUpdateWidgetConfig({ allowed_domains: [...currentDomains, domain] })
+    if (updated) {
+      setNewDomain("")
+    }
   }
 
   const handleRemoveDomain = (domain: string) => {
     if (!deployAgent) return
     const currentDomains = deployAgent.allowed_domains || []
-    handleUpdateWidgetConfig({ allowed_domains: currentDomains.filter(d => d !== domain) })
+    void handleUpdateWidgetConfig({ allowed_domains: currentDomains.filter(d => d !== domain) })
   }
 
   const handleCopySnippet = () => {
     if (!deployAgent) return
-    const snippet = `<script
-  src="${appOrigin}/widget.js"
-  data-agent-id="${deployAgent.id}"
-  data-button-size="60px"
-  data-button-color="#000"
-  data-icon-color="#fff"
-  data-panel-bg-color="#fff">
-</script>`
+    const snippet = buildWidgetSnippet(deployAgent.id, appOrigin)
+    if (!snippet) return
     navigator.clipboard.writeText(snippet)
     setCopiedSnippet(true)
     toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
@@ -459,7 +464,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                 </div>
                 <Switch
                   checked={deployAgent?.widget_enabled}
-                  onCheckedChange={(checked) => handleUpdateWidgetConfig({ widget_enabled: checked })}
+                  onCheckedChange={(checked) => void handleUpdateWidgetConfig({ widget_enabled: checked })}
                   disabled={isUpdatingWidget}
                 />
               </div>
@@ -477,11 +482,11 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                       placeholder={t("deploy_agent.access_control.domain_placeholder") || "e.g. example.com"}
                       value={newDomain}
                       onChange={(e) => setNewDomain(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && handleAddDomain()}
+                      onKeyDown={(e) => e.key === "Enter" && void handleAddDomain()}
                       disabled={isUpdatingWidget}
                       className="flex-1"
                     />
-                    <Button onClick={handleAddDomain} disabled={isUpdatingWidget || !newDomain.trim()}>
+                    <Button onClick={() => void handleAddDomain()} disabled={isUpdatingWidget || !newDomain.trim()}>
                       {t("deploy_agent.access_control.add_btn") || "Add"}
                     </Button>
                   </div>
@@ -515,14 +520,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
               </div>
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                  {`<script
-  src="${appOrigin}/widget.js"
-  data-agent-id="${deployAgent?.id}"
-  data-button-size="60px"
-  data-button-color="#000"
-  data-icon-color="#fff"
-  data-panel-bg-color="#fff">
-</script>`}
+                  {buildWidgetSnippet(deployAgent?.id ?? "", appOrigin)}
                 </pre>
                 <Button
                   variant="secondary"
