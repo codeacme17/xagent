@@ -326,7 +326,6 @@ def test_public_version_helpers_remain_sync_and_route_through_facade(
                 "model_tag": None,
                 "preview_only": True,
                 "confirm": False,
-                "conn": None,
             },
         ),
     ]
@@ -708,3 +707,34 @@ def test_failed_promotion_does_not_advance_main_pointer() -> None:
                         )
 
     mock_set_main_pointer.assert_not_called()
+
+
+def test_facade_cascade_delete_routes_to_store(mocker) -> None:
+    """facade.cascade_delete should delegate to get_vector_index_store().cascade_delete."""
+    from xagent.core.tools.core.RAG_tools.kb import KBVersionCompatibilityFacade
+
+    fake_store = mocker.Mock()
+    fake_store.cascade_delete.return_value = {"documents": 3}
+    mocker.patch(
+        "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
+        return_value=fake_store,
+    )
+    facade = KBVersionCompatibilityFacade(
+        storage_shim=_FakeStorageShim(_FakeMainPointerStore())
+    )
+
+    out = facade.cascade_delete(
+        target="collection",
+        collection="c1",
+        user_id=1,
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert out == {"documents": 3}
+    fake_store.cascade_delete.assert_called_once()
+    kw = fake_store.cascade_delete.call_args.kwargs
+    assert kw["target"] == "collection"
+    assert kw["collection"] == "c1"
+    assert "conn" not in kw

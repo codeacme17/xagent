@@ -263,12 +263,12 @@ class TestDeleteDocumentsPartialFailure:
             # First call succeeds – return minimal counts dict.
             return {"documents": 1, "parses": 0, "chunks": 0}
 
-        # cascade_delete_documents is imported locally inside delete_documents_data;
-        # patch it at its definition site in cascade_cleaner so the local import
-        # picks up the patched version.
+        # _vis_cascade_delete_documents is the module-level function called inside
+        # delete_documents_data's batching loop; patch it at its definition site in
+        # lancedb_stores so the batching loop picks up the patched version.
         target = (
-            "xagent.core.tools.core.RAG_tools.version_management"
-            ".cascade_cleaner.cascade_delete_documents"
+            "xagent.core.tools.core.RAG_tools.storage"
+            ".lancedb_stores._vis_cascade_delete_documents"
         )
         with patch(target, side_effect=_fail_on_second):
             # Force batch_size to 1 so each doc is its own batch.

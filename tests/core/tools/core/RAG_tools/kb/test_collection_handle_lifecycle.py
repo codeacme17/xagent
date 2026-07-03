@@ -291,11 +291,11 @@ class TestDeleteDocumentsDataPartialFailurePreservesContract:
         """
         handle = make_handle("test_coll")
 
-        # Patch cascade_delete_documents (used inside the store's batching loop)
+        # Patch _vis_cascade_delete_documents (used inside the store's batching loop)
         # to raise so the store's exception-wrapping logic fires.
         cascade_path = (
-            "xagent.core.tools.core.RAG_tools.version_management"
-            ".cascade_cleaner.cascade_delete_documents"
+            "xagent.core.tools.core.RAG_tools.storage"
+            ".lancedb_stores._vis_cascade_delete_documents"
         )
 
         with patch(cascade_path, side_effect=RuntimeError("simulated cascade failure")):

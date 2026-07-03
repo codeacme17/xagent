@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -127,7 +128,8 @@ class TestListCandidates:
         mock_conn.table_names.return_value = ["parses"]
         mock_table = MagicMock()
 
-        # Mock pandas result
+        # Real `parses` schema has NO top-level parse_method column; the method
+        # is carried only by the `parser` column as local:{method}@v1.0.0.
         now = datetime.now()
         mock_data = pd.DataFrame(
             [
@@ -135,16 +137,16 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash1",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
+                    "params_json": "{}",
                     "created_at": now + timedelta(milliseconds=1),
                 },
                 {
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash2",
-                    "parse_method": "pypdf",
-                    "parser": "local:PyPDFParser@v1",
+                    "parser": "local:pypdf@v1.0.0",
+                    "params_json": "{}",
                     "created_at": now,
                 },
             ]
@@ -164,11 +166,46 @@ class TestListCandidates:
             assert result["returned_count"] == 2
             assert result["step_type"] == "parse"
 
-            # Check first candidate (should be hash1 as it's newer)
+            # hash1 is newer -> first; method recovered from the parser column.
             candidate1 = result["candidates"][0]
             assert candidate1["technical_id"] == "hash1"
             assert candidate1["state"] == "candidate"
-            assert "parse_unstructured" in candidate1["semantic_id"]
+            assert candidate1["semantic_id"] == "parse_unstructured_hash1"
+            assert candidate1["stats"]["parse_method"] == "unstructured"
+
+    def test_parse_candidates_method_from_parser_column(self):
+        """Characterization: with no top-level parse_method column and an empty
+        params_json, the method must still be recovered from the parser column,
+        so semantic_id reflects the real method instead of parse_unknown_*.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["parses"]
+        mock_table = MagicMock()
+
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "abcd1234ef",
+                    "parser": "local:pypdf@v1.0.0",
+                    "params_json": "{}",  # method is NOT in params_json
+                    "created_at": datetime.now(),
+                }
+            ]
+        )
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates("test_collection", "test_doc", StepType.PARSE)
+
+            candidate = result["candidates"][0]
+            assert candidate["semantic_id"] == "parse_pypdf_abcd1234"
+            assert candidate["stats"]["parse_method"] == "pypdf"
 
     def test_chunk_candidates_with_data(self):
         """Test list_candidates returns chunk candidates when data exists."""
@@ -225,6 +262,62 @@ class TestListCandidates:
             candidate1 = result["candidates"][0]
             assert candidate1["technical_id"] == "parse_hash1"
             assert candidate1["stats"]["chunks_count"] == 2
+
+    def test_chunk_candidates_none_text(self):
+        """Regression for #709/#708: a chunk row whose ``text`` value is None
+        must not crash. The pre-#708 ``len(row.get("text", ""))`` raised
+        ``TypeError: object of type 'NoneType' has no len()`` (get() only
+        substitutes the default when the key is *absent*, not when it is None).
+        Also verifies avg_length treats the None row as length 0.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["chunks"]
+
+        mock_table = MagicMock()
+        base = datetime.now()
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash1",
+                    "chunk_id": "chunk1",
+                    "text": "0123456789",  # len 10
+                    "created_at": base + timedelta(milliseconds=2),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash1",
+                    "chunk_id": "chunk2",
+                    "text": None,  # len treated as 0 -> avg (10+0)/2 = 5
+                    "created_at": base + timedelta(milliseconds=1),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "parse_hash": "parse_hash2",
+                    "chunk_id": "chunk3",
+                    "text": "0123456789",  # len 10 -> avg 10
+                    "created_at": base,
+                },
+            ]
+        )
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates("test_collection", "test_doc", StepType.CHUNK)
+
+        assert len(result["candidates"]) == 2  # grouped by parse_hash
+        by_hash = {c["technical_id"]: c for c in result["candidates"]}
+        assert by_hash["parse_hash1"]["stats"]["chunks_count"] == 2
+        assert by_hash["parse_hash1"]["stats"]["avg_length"] == 5
+        assert by_hash["parse_hash2"]["stats"]["chunks_count"] == 1
+        assert by_hash["parse_hash2"]["stats"]["avg_length"] == 10
 
     def test_embed_candidates_with_data(self):
         """Test list_candidates returns embed candidates when data exists."""
@@ -283,6 +376,52 @@ class TestListCandidates:
                 )  # Each parse_hash has 1 row
                 assert candidate["stats"]["vector_dim"] == 3
 
+    def test_embed_candidates_numpy_vector(self):
+        """Regression for #709/#708: a numpy-ndarray ``vector`` column must not
+        crash candidate listing. The pre-#708 ``if vector:`` check raised
+        ``ValueError: truth value of an array ... is ambiguous`` on np.ndarray.
+        """
+        mock_conn = MagicMock(spec=["table_names", "open_table"])
+        mock_conn.table_names.return_value = ["embeddings_bge_large"]
+
+        mock_table = MagicMock()
+        mock_data = pd.DataFrame(
+            [
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "model": "BAAI/bge-large-zh-v1.5",
+                    "parse_hash": "parse_hash1",
+                    "vector": np.array([0.1, 0.2, 0.3]),  # numpy, not list
+                    "created_at": datetime.now(),
+                },
+                {
+                    "collection": "test_collection",
+                    "doc_id": "test_doc",
+                    "model": "BAAI/bge-large-zh-v1.5",
+                    "parse_hash": "parse_hash2",
+                    "vector": np.array([0.4, 0.5, 0.6]),  # numpy, not list
+                    "created_at": datetime.now(),
+                },
+            ]
+        )
+        # Force the to_pandas fallback (where vector columns come back as
+        # np.ndarray); to_arrow/to_list raise as in the sibling tests.
+        mock_where = mock_table.search.return_value.where.return_value
+        mock_where.to_arrow.side_effect = AttributeError("to_arrow not available")
+        mock_where.to_list.side_effect = AttributeError("to_list not available")
+        mock_where.to_pandas.return_value = mock_data
+        mock_conn.open_table.return_value = mock_table
+
+        with self._patch_get_connection_from_env(mock_conn):
+            result = list_candidates(
+                "test_collection", "test_doc", StepType.EMBED, model_tag="bge_large"
+            )
+
+        assert len(result["candidates"]) == 2
+        for candidate in result["candidates"]:
+            assert candidate["stats"]["vector_dim"] == 3
+
     def test_state_filter(self):
         """Test that state filter works correctly."""
         mock_conn = MagicMock(spec=["table_names", "open_table"])
@@ -296,8 +435,7 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": "hash1",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
                     "created_at": datetime.now(),
                 }
             ]
@@ -332,8 +470,7 @@ class TestListCandidates:
                     "collection": "test_collection",
                     "doc_id": "test_doc",
                     "parse_hash": f"hash{i}",
-                    "parse_method": "unstructured",
-                    "parser": "local:UnstructuredParser@v1",
+                    "parser": "local:unstructured@v1.0.0",
                     "created_at": datetime.now(),
                 }
                 for i in range(5)
@@ -518,3 +655,26 @@ class TestListCandidates:
             assert result["total_count"] == 0
             assert result["returned_count"] == 0
             assert result["step_type"] == "parse"
+
+
+@pytest.mark.parametrize(
+    "parser,expected",
+    [
+        ("local:pypdf@v1.0.0", "pypdf"),
+        ("local:unstructured@v1.0.0", "unstructured"),
+        ("local:default@v1.0.0", "default"),
+        ("local:pypdf", "pypdf"),  # missing version segment, still recovers
+        ("local:@v1.0.0", "unknown"),  # empty method
+        ("unknown", "unknown"),  # current row.get("parser", "unknown") default
+        ("remote:something@v1", "unknown"),  # non-local prefix
+        ("", "unknown"),
+        (None, "unknown"),
+        (123, "unknown"),  # non-str
+    ],
+)
+def test_vis_method_from_parser(parser, expected):
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        LanceDBVectorIndexStore,
+    )
+
+    assert LanceDBVectorIndexStore._vis_method_from_parser(parser) == expected

@@ -3121,6 +3121,33 @@ Build when you need.`,
       copy_failed: "复制到剪贴板失败"
     }
   },
+  appWidget: {
+    builder: {
+      title: "App Widget",
+      description: "将此 Agent 作为聊天气泡嵌入网站",
+      saveFirst: "请先保存 Agent，再配置 App Widget",
+      configure: "配置 App Widget",
+      toggle: "切换 App Widget"
+    },
+    dialog: {
+      title: "App Widget",
+      enabledLabel: "开启 Widget",
+      allowedDomains: "允许的域名",
+      domainPlaceholder: "例如 example.com",
+      addDomain: "添加",
+      invalidDomain: "请输入 example.com 或 localhost:3000 这样的域名（不含协议、路径或通配符），或输入 * 允许任意域名。",
+      removeDomain: "移除域名",
+      noDomains: "尚未配置域名。添加域名或 * 前，Widget 请求会被拦截。",
+      embedTitle: "嵌入代码",
+      embedDescription: "将这段 script 复制到需要显示聊天气泡的页面。",
+      copySnippet: "复制代码"
+    },
+    messages: {
+      updated: "Widget 配置已更新",
+      updateFailed: "更新 Widget 配置失败",
+      copyFailed: "复制 Widget 代码失败"
+    }
+  },
   triggers: {
     title: "Triggers",
     subtitle: "选择此 Agent 的触发方式",
