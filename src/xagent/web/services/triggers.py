@@ -9,16 +9,22 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import bcrypt
+from pydantic import ValidationError
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.agent import Agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
+from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
+from .gmail_provisioning import (
+    provision_gmail_trigger,
+    release_gmail_mailbox_if_unused,
+)
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
@@ -26,6 +32,9 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
 )
+from .trigger_providers.base import TriggerConfigError
+from .trigger_providers.registry import maybe_get_trigger_provider
+from .trigger_providers.schemas import parse_trigger_config
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +46,6 @@ _TRIGGER_SCOPE_PAYLOAD_KEYS = (
     "tenant_id",
 )
 
-_PAYLOAD_PREVIEW_LIMIT = 64_000
-_WEBHOOK_SECRET_BCRYPT_COST = 12
 _TRIGGER_NAME_MAX_LENGTH = 200
 
 
@@ -54,14 +61,19 @@ class TriggerSecretError(PermissionError):
     """Raised when a webhook secret does not match."""
 
 
-def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from .gmail_triggers import best_effort_ensure_gmail_watches_for_user
+class TriggerRunPreparationError(TriggerServiceError):
+    """A trigger run was recorded but its task could not be prepared.
 
-    best_effort_ensure_gmail_watches_for_user(
-        db,
-        user_id=user_id,
-        context="after trigger save",
-    )
+    The run row exists (marked FAILED with no task attached), so a redelivery
+    of the same event resolves to it via the idempotency key and retries the
+    task attachment. Callers that gate acknowledgement or cursor advancement
+    on successful processing must treat this as a failure so the source
+    redelivers instead of silently dropping the event.
+    """
+
+    def __init__(self, message: str, *, run: TriggerRun) -> None:
+        super().__init__(message)
+        self.run = run
 
 
 @dataclass(frozen=True)
@@ -91,33 +103,98 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def _payload_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    encoded = _json_dumps(payload)
-    if len(encoded) <= _PAYLOAD_PREVIEW_LIMIT:
-        return payload
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return {
-        "truncated": True,
-        "sha256": digest,
-        "preview": encoded[:_PAYLOAD_PREVIEW_LIMIT],
+def _store_full_payload_enabled(trigger: AgentTrigger) -> bool:
+    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
+    return bool(config.get("store_full_payload"))
+
+
+def _payload_snapshot(
+    trigger: AgentTrigger,
+    payload: dict[str, Any],
+    *,
+    source_event_id: str | None,
+    event_type: str | None,
+    resource_id: str | None,
+    received_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Conservative trigger-run snapshot: stable hash plus allow-listed metadata.
+
+    Event content (e.g. Gmail sender/subject/snippet/body/headers) is never
+    stored by default. Full payload content is stored only when the trigger
+    explicitly opts in via store_full_payload, and then only encrypted.
+    """
+    snapshot: dict[str, Any] = {
+        "payload_sha256": _payload_hash(payload),
+        "metadata": {
+            "source_event_id": source_event_id,
+            "event_type": event_type,
+            "resource_id": resource_id,
+            "received_at": (received_at or _now()).isoformat(),
+        },
     }
+    if _store_full_payload_enabled(trigger):
+        snapshot["encrypted_payload"] = encrypt_value(_json_dumps(payload))
+    return snapshot
+
+
+def decrypt_trigger_run_payload(run: TriggerRun) -> Any:
+    """Return the decrypted original payload of a trigger run.
+
+    Raises TriggerServiceError when the run did not store an encrypted full
+    payload (full payload storage was not enabled at event time).
+    """
+    snapshot = run.payload_snapshot
+    if not isinstance(snapshot, dict) or "encrypted_payload" not in snapshot:
+        raise TriggerServiceError(
+            "Full payload storage was not enabled for this trigger run"
+        )
+    decrypted = decrypt_value(str(snapshot["encrypted_payload"]))
+    try:
+        return json.loads(decrypted)
+    except ValueError as exc:
+        raise TriggerServiceError("Failed to decrypt trigger run payload") from exc
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
 
 
-def _hash_secret(secret: str) -> str:
-    return bcrypt.hashpw(
-        secret.encode("utf-8"),
-        bcrypt.gensalt(rounds=_WEBHOOK_SECRET_BCRYPT_COST),
-    ).decode("utf-8")
+def _new_callback_id() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _new_webhook_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def find_webhook_trigger(db: Session, webhook_token: str) -> AgentTrigger | None:
+    """Resolve a legacy webhook trigger by its pre-pipeline webhook token.
+
+    Deprecated: only serves triggers created before the unified callback
+    pipeline. New triggers carry a callback_id instead of a webhook token.
+    """
+    return (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.webhook_token == webhook_token,
+            AgentTrigger.type == TriggerType.WEBHOOK.value,
+        )
+        .first()
+    )
 
 
 def verify_webhook_secret(trigger: AgentTrigger, provided_secret: str | None) -> None:
+    """Verify the legacy bcrypt-hashed webhook secret.
+
+    Deprecated alongside find_webhook_trigger. Unlike the historical
+    behavior, a trigger without a stored secret hash is rejected instead of
+    accepted, so the legacy route can never run unauthenticated.
+    """
+    import bcrypt
+
     expected = trigger.secret_hash
     if not expected:
-        return
+        raise TriggerSecretError("Webhook trigger has no legacy secret")
     if not provided_secret:
         raise TriggerSecretError("Missing webhook secret")
     try:
@@ -129,14 +206,6 @@ def verify_webhook_secret(trigger: AgentTrigger, provided_secret: str | None) ->
         matched = False
     if not matched:
         raise TriggerSecretError("Invalid webhook secret")
-
-
-def _new_webhook_token() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def _new_webhook_secret() -> str:
-    return secrets.token_urlsafe(32)
 
 
 def _normalize_trigger_type(trigger_type: str) -> str:
@@ -208,23 +277,100 @@ def _compute_next_run_at(
     return candidate
 
 
-def _validate_config(trigger_type: str, config: dict[str, Any]) -> None:
+def _typed_config_error(trigger_type: str, exc: ValidationError) -> TriggerServiceError:
+    parts: list[str] = []
+    for error in exc.errors():
+        location = ".".join(
+            str(item) for item in error.get("loc", []) if item != "config"
+        )
+        message = str(error.get("msg", "invalid value"))
+        message = message.removeprefix("Value error, ")
+        parts.append(f"{location}: {message}" if location else message)
+    detail = "; ".join(parts) or "invalid config"
+    return TriggerServiceError(f"{trigger_type} trigger config invalid: {detail}")
+
+
+def _resolve_gmail_resource(
+    db: Session, *, user_id: int, oauth_account_id: int | None
+) -> str:
+    """Validate the bound Gmail account and return the normalized mailbox."""
+    if oauth_account_id is None:
+        raise TriggerServiceError("gmail trigger requires oauth_account_id")
+    account = db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account_id)).first()
+    if account is None or int(account.user_id) != int(user_id):
+        raise TriggerServiceError("Gmail account not found")
+    if str(account.provider) != "gmail":
+        raise TriggerServiceError("Selected account is not a Gmail account")
+    email = str(account.email or "").strip().lower()
+    if not email:
+        raise TriggerServiceError("Gmail account has no email address")
+    return email
+
+
+def _validate_config(
+    db: Session,
+    *,
+    user_id: int,
+    trigger_type: str,
+    config: dict[str, Any],
+) -> str | None:
+    """Validate config against the typed schema; return the resource identity.
+
+    Callback-backed trigger types dispatch through their registered
+    ``TriggerProvider.validate_config``; types without a provider (scheduled)
+    validate against the typed schema directly. The stored config keeps the
+    caller-provided JSON shape; validation is performed on the typed model
+    without normalizing persisted fields.
+    """
     if not isinstance(config, dict):
         raise TriggerServiceError("config must be an object")
+    provider = maybe_get_trigger_provider(trigger_type)
+    try:
+        if provider is not None:
+            typed = provider.validate_config(config)
+        else:
+            typed = parse_trigger_config(trigger_type, config)
+    except TriggerConfigError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, ValidationError):
+            raise _typed_config_error(trigger_type, cause) from exc
+        raise TriggerServiceError(str(exc)) from exc
+    except ValidationError as exc:
+        raise _typed_config_error(trigger_type, exc) from exc
+
     if trigger_type == TriggerType.SCHEDULED.value:
-        if "interval_seconds" not in config and "next_run_at" not in config:
-            raise TriggerServiceError(
-                "scheduled trigger requires interval_seconds or next_run_at"
-            )
         _compute_next_run_at(config)
     if trigger_type == TriggerType.GMAIL.value:
-        watch_label = config.get("watch_label")
-        if not isinstance(watch_label, str) or not watch_label.strip():
-            raise TriggerServiceError("gmail trigger requires watch_label")
-        for key in ("sender_filter", "subject_keyword"):
-            value = config.get(key)
-            if value is not None and not isinstance(value, str):
-                raise TriggerServiceError(f"gmail trigger {key} must be a string")
+        return _resolve_gmail_resource(
+            db,
+            user_id=user_id,
+            oauth_account_id=getattr(typed, "oauth_account_id", None),
+        )
+    return None
+
+
+def _gmail_oauth_account_id(config: Any) -> int | None:
+    if not isinstance(config, dict):
+        return None
+    value = config.get("oauth_account_id")
+    if value is None:
+        return None
+    return int(value)
+
+
+def _provision_gmail_trigger_if_enabled(db: Session, trigger: AgentTrigger) -> None:
+    if str(trigger.type) != TriggerType.GMAIL.value or not bool(trigger.enabled):
+        return
+    provision_gmail_trigger(db, trigger)
+    db.refresh(trigger)
+
+
+def _release_gmail_mailbox_if_bound(
+    db: Session, trigger_type: str, oauth_account_id: int | None
+) -> None:
+    if trigger_type != TriggerType.GMAIL.value or oauth_account_id is None:
+        return
+    release_gmail_mailbox_if_unused(db, oauth_account_id)
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
@@ -269,15 +415,20 @@ def create_agent_trigger(
 
     resolved_type = _normalize_trigger_type(trigger_type)
     resolved_config = dict(config or {})
-    _validate_config(resolved_type, resolved_config)
+    resource_id = _validate_config(
+        db,
+        user_id=user_id,
+        trigger_type=resolved_type,
+        config=resolved_config,
+    )
 
     plain_secret: str | None = None
-    webhook_token: str | None = None
-    secret_hash: str | None = None
+    callback_id: str | None = None
+    secret_encrypted: str | None = None
     if resolved_type == TriggerType.WEBHOOK.value:
-        webhook_token = _new_webhook_token()
+        callback_id = _new_callback_id()
         plain_secret = secret or _new_webhook_secret()
-        secret_hash = _hash_secret(plain_secret)
+        secret_encrypted = encrypt_value(plain_secret)
 
     next_run_at = None
     if resolved_type == TriggerType.SCHEDULED.value and enabled:
@@ -293,16 +444,16 @@ def create_agent_trigger(
         enabled=enabled,
         config=resolved_config,
         prompt_template=prompt_template,
-        webhook_token=webhook_token,
-        secret_hash=secret_hash,
+        provider=resolved_type,
+        callback_id=callback_id,
+        resource_id=resource_id,
+        secret_encrypted=secret_encrypted,
         next_run_at=next_run_at,
     )
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
-        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
-        db.refresh(trigger)
+    _provision_gmail_trigger_if_enabled(db, trigger)
     return trigger, plain_secret
 
 
@@ -320,6 +471,10 @@ def update_agent_trigger(
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
 
+    old_type = str(trigger.type)
+    old_enabled = bool(trigger.enabled)
+    old_oauth_account_id = _gmail_oauth_account_id(trigger.config)
+
     plain_secret: str | None = None
     if "name" in updates and updates["name"] is not None:
         setattr(trigger, "name", _normalize_trigger_name(str(updates["name"])))
@@ -329,14 +484,24 @@ def update_agent_trigger(
         setattr(trigger, "prompt_template", updates["prompt_template"])
     if "config" in updates and updates["config"] is not None:
         config = dict(updates["config"])
-        _validate_config(str(trigger.type), config)
+        resource_id = _validate_config(
+            db,
+            user_id=user_id,
+            trigger_type=str(trigger.type),
+            config=config,
+        )
         setattr(trigger, "config", config)
+        setattr(trigger, "resource_id", resource_id)
+    if trigger.provider is None:
+        setattr(trigger, "provider", str(trigger.type))
+    if str(trigger.type) == TriggerType.WEBHOOK.value and trigger.callback_id is None:
+        setattr(trigger, "callback_id", _new_callback_id())
     if "secret" in updates and updates["secret"]:
         plain_secret = str(updates["secret"])
-        setattr(trigger, "secret_hash", _hash_secret(plain_secret))
+        setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
     elif updates.get("rotate_secret"):
         plain_secret = _new_webhook_secret()
-        setattr(trigger, "secret_hash", _hash_secret(plain_secret))
+        setattr(trigger, "secret_encrypted", encrypt_value(plain_secret))
 
     if trigger.type == TriggerType.SCHEDULED.value:
         if trigger.enabled:
@@ -351,9 +516,12 @@ def update_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    if trigger.type == TriggerType.GMAIL.value and trigger.enabled:
-        _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
-        db.refresh(trigger)
+    new_oauth_account_id = _gmail_oauth_account_id(trigger.config)
+    if old_enabled and (
+        not bool(trigger.enabled) or old_oauth_account_id != new_oauth_account_id
+    ):
+        _release_gmail_mailbox_if_bound(db, old_type, old_oauth_account_id)
+    _provision_gmail_trigger_if_enabled(db, trigger)
     return trigger, plain_secret
 
 
@@ -369,8 +537,11 @@ def delete_agent_trigger(
     )
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
+    trigger_type = str(trigger.type)
+    oauth_account_id = _gmail_oauth_account_id(trigger.config)
     db.delete(trigger)
     db.commit()
+    _release_gmail_mailbox_if_bound(db, trigger_type, oauth_account_id)
 
 
 def render_trigger_prompt(
@@ -434,6 +605,9 @@ def _get_or_create_trigger_run(
     source_event_id: str | None,
     background_job_id: str | None,
     test: bool,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     idempotency_key = _trigger_run_idempotency_key(
         trigger,
@@ -454,7 +628,16 @@ def _get_or_create_trigger_run(
         background_job_id=background_job_id,
         status=TriggerRunStatus.PENDING.value,
         source_event_id=source_event_id,
-        payload_snapshot=_payload_snapshot(event_payload),
+        payload_snapshot=_payload_snapshot(
+            trigger,
+            event_payload,
+            source_event_id=source_event_id,
+            event_type=event_type,
+            resource_id=resource_id
+            if resource_id is not None
+            else (str(trigger.resource_id) if trigger.resource_id else None),
+            received_at=received_at,
+        ),
         idempotency_key=idempotency_key,
     )
     db.add(run)
@@ -564,6 +747,9 @@ def prepare_trigger_run(
     source_event_id: str | None = None,
     background_job_id: str | None = None,
     test: bool = False,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     """Persist a trigger run and hidden task without starting agent execution."""
     if not test and not trigger.enabled:
@@ -576,6 +762,9 @@ def prepare_trigger_run(
         source_event_id=source_event_id,
         background_job_id=background_job_id,
         test=test,
+        event_type=event_type,
+        resource_id=resource_id,
+        received_at=received_at,
     )
     if not created and run.task_id is not None:
         return run, False
@@ -595,7 +784,7 @@ def prepare_trigger_run(
         error_message = f"{type(exc).__name__}: {exc}"
         _mark_run_failed(db, trigger=trigger, run=run, error_message=error_message)
         logger.exception("Trigger run %s failed to prepare task", run.id)
-        return run, True
+        raise TriggerRunPreparationError(error_message, run=run) from exc
 
 
 def _with_session() -> Session:
@@ -860,6 +1049,9 @@ async def fire_trigger(
     background_job_id: str | None = None,
     test: bool = False,
     wait_for_completion: bool = False,
+    event_type: str | None = None,
+    resource_id: str | None = None,
+    received_at: datetime | None = None,
 ) -> tuple[TriggerRun, bool]:
     """Prepare a trigger event and start it in the current backend process."""
     run, created = prepare_trigger_run(
@@ -869,6 +1061,9 @@ async def fire_trigger(
         source_event_id=source_event_id,
         background_job_id=background_job_id,
         test=test,
+        event_type=event_type,
+        resource_id=resource_id,
+        received_at=received_at,
     )
     if created:
         await start_prepared_trigger_run(
@@ -927,17 +1122,6 @@ async def dispatch_pending_trigger_runs(
     return started_count
 
 
-def find_webhook_trigger(db: Session, webhook_token: str) -> AgentTrigger | None:
-    return (
-        db.query(AgentTrigger)
-        .filter(
-            AgentTrigger.webhook_token == webhook_token,
-            AgentTrigger.type == TriggerType.WEBHOOK.value,
-        )
-        .first()
-    )
-
-
 def scan_due_scheduled_triggers(
     db: Session,
     *,
@@ -967,14 +1151,20 @@ def scan_due_scheduled_triggers(
             "due_at": due_at.isoformat(),
         }
         source_event_id = f"scheduled:{trigger.id}:{due_at.isoformat()}"
-        run, _created = prepare_trigger_run(
-            db,
-            trigger=trigger,
-            event_payload=payload,
-            source_event_id=source_event_id,
-            background_job_id=None,
-            test=False,
-        )
+        try:
+            run, _created = prepare_trigger_run(
+                db,
+                trigger=trigger,
+                event_payload=payload,
+                source_event_id=source_event_id,
+                background_job_id=None,
+                test=False,
+                event_type="scheduled",
+            )
+        except TriggerRunPreparationError as exc:
+            # Scheduled events have no redelivery; the FAILED run is the
+            # record. Keep advancing next_run_at so the schedule stays live.
+            run = exc.run
 
         config = dict(trigger.config or {})
         next_run_at = _compute_next_run_at(

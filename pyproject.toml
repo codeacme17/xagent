@@ -54,6 +54,10 @@ dependencies = [
   "python-jose[cryptography]>=3.3.0",
   "cryptography>=3.0.0",
   "bcrypt>=4.0.0",
+  # Rate limiting for public trigger callback and trigger CRUD endpoints
+  "limits>=3.13.0",
+  # Per-mailbox Gmail Pub/Sub provisioning for Gmail triggers
+  "google-cloud-pubsub>=2.21.0",
   # Utilities
   "docker>=7.1.0",
   "json-repair==0.35.0",

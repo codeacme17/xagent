@@ -29,6 +29,11 @@ from xagent.config import (
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
     FRONTEND_DIST_DIR,
+    GMAIL_PUBSUB_PROJECT_ID,
+    GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
+    GMAIL_PUBSUB_SUBSCRIPTION_PREFIX,
+    GMAIL_PUBSUB_TOPIC_PREFIX,
+    GMAIL_REGISTRATION_TIMEOUT_SECONDS,
     HOT_PATH_CACHE_ENABLED,
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
@@ -40,6 +45,7 @@ from xagent.config import (
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
+    PUBLIC_API_BASE_URL,
     REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -90,6 +96,11 @@ from xagent.config import (
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
     get_frontend_dist_dir,
+    get_gmail_pubsub_project_id,
+    get_gmail_pubsub_push_service_account,
+    get_gmail_pubsub_subscription_prefix,
+    get_gmail_pubsub_topic_prefix,
+    get_gmail_registration_timeout_seconds,
     get_hot_path_cache_enabled,
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
@@ -101,6 +112,7 @@ from xagent.config import (
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
+    get_public_api_base_url,
     get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -1326,3 +1338,134 @@ class TestSandboxConcurrencyConfig:
         assert get_sandbox_max_concurrency() == 3
         monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONCURRENCY", "0")
         assert get_sandbox_max_concurrency() == 3
+
+
+class TestTriggerRateLimitConfig:
+    """Config for trigger callback and CRUD rate limits."""
+
+    def test_callback_rate_limit_default(self, monkeypatch):
+        from xagent.config import get_trigger_callback_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", raising=False)
+        assert get_trigger_callback_rate_limit() == "120/minute"
+
+    def test_callback_rate_limit_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_callback_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", "10/second")
+        assert get_trigger_callback_rate_limit() == "10/second"
+
+    def test_crud_rate_limit_default(self, monkeypatch):
+        from xagent.config import get_trigger_crud_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CRUD_RATE_LIMIT", raising=False)
+        assert get_trigger_crud_rate_limit() == "60/minute"
+
+    def test_crud_rate_limit_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_crud_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CRUD_RATE_LIMIT", "5/minute")
+        assert get_trigger_crud_rate_limit() == "5/minute"
+
+
+class TestGmailPubSubProvisioningConfig:
+    """Config for per-mailbox Gmail Pub/Sub provisioning."""
+
+    def test_constants(self):
+        assert GMAIL_PUBSUB_PROJECT_ID == "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
+        assert GMAIL_PUBSUB_TOPIC_PREFIX == "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
+        assert (
+            GMAIL_PUBSUB_SUBSCRIPTION_PREFIX
+            == "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
+        )
+        assert (
+            GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT
+            == "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
+        )
+        assert (
+            GMAIL_REGISTRATION_TIMEOUT_SECONDS
+            == "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
+        )
+        assert PUBLIC_API_BASE_URL == "XAGENT_PUBLIC_API_BASE_URL"
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", raising=False)
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX", raising=False)
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX", raising=False)
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT", raising=False)
+        monkeypatch.delenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", raising=False)
+        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+
+        assert get_gmail_pubsub_project_id() is None
+        assert get_gmail_pubsub_topic_prefix() == "xagent-gmail"
+        assert get_gmail_pubsub_subscription_prefix() == "xagent-gmail-push"
+        assert get_gmail_pubsub_push_service_account() is None
+        assert get_gmail_registration_timeout_seconds() == 10
+        assert get_public_api_base_url() is None
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", " demo ")
+        monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX", " mail-topic ")
+        monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX", " mail-sub ")
+        monkeypatch.setenv(
+            "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+            " push@demo.iam.gserviceaccount.com ",
+        )
+        monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "3")
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", " https://api.example.com/ ")
+
+        assert get_gmail_pubsub_project_id() == "demo"
+        assert get_gmail_pubsub_topic_prefix() == "mail-topic"
+        assert get_gmail_pubsub_subscription_prefix() == "mail-sub"
+        assert (
+            get_gmail_pubsub_push_service_account()
+            == "push@demo.iam.gserviceaccount.com"
+        )
+        assert get_gmail_registration_timeout_seconds() == 3
+        assert get_public_api_base_url() == "https://api.example.com"
+
+    def test_invalid_timeout_uses_default(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "0")
+        assert get_gmail_registration_timeout_seconds() == 10
+        monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "not-a-number")
+        assert get_gmail_registration_timeout_seconds() == 10
+
+
+class TestTrustedProxyHopsConfig:
+    """Config for proxy-aware remote IP derivation."""
+
+    def test_default_is_zero(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.delenv("XAGENT_TRUSTED_PROXY_HOPS", raising=False)
+        assert get_trusted_proxy_hops() == 0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "2")
+        assert get_trusted_proxy_hops() == 2
+
+    def test_invalid_value_falls_back_to_zero(self, monkeypatch):
+        from xagent.config import get_trusted_proxy_hops
+
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "not-a-number")
+        assert get_trusted_proxy_hops() == 0
+        monkeypatch.setenv("XAGENT_TRUSTED_PROXY_HOPS", "-1")
+        assert get_trusted_proxy_hops() == 0
+
+
+class TestTriggerCallbackIpRateLimitConfig:
+    """Config for the IP-wide callback rate ceiling."""
+
+    def test_default(self, monkeypatch):
+        from xagent.config import get_trigger_callback_ip_rate_limit
+
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", raising=False)
+        assert get_trigger_callback_ip_rate_limit() == "600/minute"
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_trigger_callback_ip_rate_limit
+
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", "50/second")
+        assert get_trigger_callback_ip_rate_limit() == "50/second"

@@ -33,6 +33,29 @@ class TriggerRunStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class TriggerProvisioningStatus(str, enum.Enum):
+    """Provider-side resource provisioning state for a trigger."""
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+
+
+class TriggerAuditOutcome(str, enum.Enum):
+    """Durable outcome recorded for callback and payload-access activity."""
+
+    ACCEPTED = "accepted"
+    REJECTED_SIGNATURE = "rejected_signature"
+    REJECTED_RESOURCE = "rejected_resource"
+    REJECTED_DISABLED = "rejected_disabled"
+    UNKNOWN_PROVIDER = "unknown_provider"
+    UNKNOWN_CALLBACK = "unknown_callback"
+    NOT_FOUND = "not_found"
+    EXECUTION_FAILURE = "execution_failure"
+    PAYLOAD_READ = "payload_read"
+    RATE_LIMITED = "rate_limited"
+
+
 class AgentTrigger(Base):  # type: ignore
     """Reusable automatic entry point for an agent."""
 
@@ -57,6 +80,13 @@ class AgentTrigger(Base):  # type: ignore
     webhook_token = Column(String(128), nullable=True, unique=True, index=True)
     secret_hash = Column(String(64), nullable=True)
 
+    provider = Column(String(64), nullable=True, index=True)
+    callback_id = Column(String(128), nullable=True, unique=True, index=True)
+    resource_id = Column(String(255), nullable=True, index=True)
+    secret_encrypted = Column(Text, nullable=True)
+    provisioning_status = Column(String(32), nullable=True)
+    provisioning_error = Column(Text, nullable=True)
+
     next_run_at = Column(DateTime(timezone=True), nullable=True, index=True)
     last_run_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(Text, nullable=True)
@@ -74,6 +104,10 @@ class AgentTrigger(Base):  # type: ignore
         cascade="all, delete-orphan",
         order_by="TriggerRun.id.desc()",
     )
+    # Default (non-delete) cascade nullifies audit trigger_id on trigger
+    # deletion, preserving audit history even when SQLite runs without
+    # foreign-key enforcement.
+    audits = relationship("TriggerAudit", back_populates="trigger")
 
     def __repr__(self) -> str:
         return (
@@ -129,4 +163,36 @@ class TriggerRun(Base):  # type: ignore
         return (
             f"<TriggerRun(id={self.id}, trigger_id={self.trigger_id}, "
             f"status='{self.status}', task_id={self.task_id})>"
+        )
+
+
+class TriggerAudit(Base):  # type: ignore
+    """Durable audit record for trigger callback and payload access activity.
+
+    Rows outlive the trigger they describe: trigger_id is nullable and set to
+    NULL when the trigger row is deleted.
+    """
+
+    __tablename__ = "trigger_audits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trigger_id = Column(
+        Integer,
+        ForeignKey("agent_triggers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    provider = Column(String(64), nullable=True, index=True)
+    callback_id = Column(String(128), nullable=True, index=True)
+    outcome = Column(String(64), nullable=False, index=True)
+    detail: Any = Column(JSON, nullable=True)
+    remote_ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    trigger = relationship("AgentTrigger", back_populates="audits")
+
+    def __repr__(self) -> str:
+        return (
+            f"<TriggerAudit(id={self.id}, trigger_id={self.trigger_id}, "
+            f"provider='{self.provider}', outcome='{self.outcome}')>"
         )

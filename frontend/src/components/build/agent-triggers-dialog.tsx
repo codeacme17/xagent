@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/sonner"
@@ -35,10 +36,12 @@ import {
   AgentTrigger,
   AgentTriggerRun,
   AgentTriggerType,
+  GmailAccount,
   createAgentTrigger,
   deleteAgentTrigger,
   listAgentTriggerRuns,
   listAgentTriggers,
+  listGmailAccounts,
   testAgentTrigger,
   updateAgentTrigger,
 } from "@/lib/agent-triggers-api"
@@ -72,6 +75,7 @@ interface TriggerFormState {
   watchLabel: string
   senderFilter: string
   subjectKeyword: string
+  oauthAccountId: string
 }
 
 const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
@@ -89,6 +93,7 @@ function emptyForm(type: AgentTriggerType = "webhook"): TriggerFormState {
     watchLabel: "INBOX",
     senderFilter: "",
     subjectKeyword: "",
+    oauthAccountId: "",
   }
 }
 
@@ -123,6 +128,11 @@ function configString(config: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : ""
 }
 
+function configId(config: Record<string, unknown>, key: string): string {
+  const value = config[key]
+  return typeof value === "number" || typeof value === "string" ? String(value) : ""
+}
+
 function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
   return {
     type: trigger.type,
@@ -142,12 +152,14 @@ function formFromTrigger(trigger: AgentTrigger): TriggerFormState {
       trigger.type === "gmail" ? configString(trigger.config, "watch_label") || "INBOX" : "INBOX",
     senderFilter: trigger.type === "gmail" ? configString(trigger.config, "sender_filter") : "",
     subjectKeyword: trigger.type === "gmail" ? configString(trigger.config, "subject_keyword") : "",
+    oauthAccountId:
+      trigger.type === "gmail" ? configId(trigger.config, "oauth_account_id") : "",
   }
 }
 
 function webhookUrl(trigger: AgentTrigger | null): string {
-  if (!trigger?.webhook_token) return ""
-  return `${getApiUrl()}/api/triggers/webhook/${trigger.webhook_token}`
+  if (!trigger?.callback_id) return ""
+  return `${getApiUrl()}/api/triggers/callback/webhook/${trigger.callback_id}`
 }
 
 function runStatusClass(status: string): string {
@@ -191,6 +203,8 @@ export function AgentTriggersDialog({
   const [secretReveal, setSecretReveal] = useState<string | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
+  const [gmailAccounts, setGmailAccounts] = useState<GmailAccount[] | null>(null)
+  const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
   const activeTypeRef = useRef<AgentTriggerType | null>(null)
 
@@ -287,6 +301,39 @@ export function AgentTriggersDialog({
   }, [initialType, loadTriggers, open, setActiveType, setSelectedTriggerId])
 
   useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setGmailAccountsLoading(true)
+    listGmailAccounts()
+      .then((accounts) => {
+        if (!cancelled) setGmailAccounts(accounts)
+      })
+      .catch((err) => {
+        console.error(err)
+        if (!cancelled) setGmailAccounts([])
+      })
+      .finally(() => {
+        if (!cancelled) setGmailAccountsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
+  // With exactly one connected account, bind new Gmail triggers to it. With
+  // several accounts the user must pick explicitly so the wrong mailbox is
+  // never chosen silently.
+  useEffect(() => {
+    if (!open || activeType !== "gmail" || selectedTrigger) return
+    if (gmailAccounts?.length === 1) {
+      const onlyAccountId = String(gmailAccounts[0].id)
+      setForm((current) =>
+        current.oauthAccountId ? current : { ...current, oauthAccountId: onlyAccountId },
+      )
+    }
+  }, [activeType, gmailAccounts, open, selectedTrigger])
+
+  useEffect(() => {
     if (!open || !activeType) return
     if (selectedTrigger) {
       setForm(formFromTrigger(selectedTrigger))
@@ -341,7 +388,14 @@ export function AgentTriggersDialog({
       if (!watchLabel) {
         throw new Error(t("triggers.validation.watchLabel"))
       }
-      const config: Record<string, unknown> = { watch_label: watchLabel }
+      const accountId = Number(form.oauthAccountId)
+      if (!form.oauthAccountId.trim() || !Number.isInteger(accountId)) {
+        throw new Error(t("triggers.validation.gmailAccount"))
+      }
+      const config: Record<string, unknown> = {
+        watch_label: watchLabel,
+        oauth_account_id: accountId,
+      }
       const senderFilter = form.senderFilter.trim()
       const subjectKeyword = form.subjectKeyword.trim()
       if (senderFilter) config.sender_filter = senderFilter
@@ -395,11 +449,15 @@ export function AgentTriggersDialog({
 
   const createDefaultTrigger = async (type: AgentTriggerType, enabled: boolean) => {
     if (!isValidAgentId(agentId)) return null
+    const config = defaultConfigForType(type)
+    if (type === "gmail" && gmailAccounts?.length === 1) {
+      config.oauth_account_id = gmailAccounts[0].id
+    }
     const saved = await createAgentTrigger(agentId, {
       type,
       name: defaultNameForType(type),
       enabled,
-      config: defaultConfigForType(type),
+      config,
       prompt_template: null,
       secret: null,
     })
@@ -415,6 +473,20 @@ export function AgentTriggersDialog({
       typeTriggers.find((trigger) => trigger.enabled) ??
       typeTriggers[0] ??
       null
+    // A quick toggle must never guess which mailbox to bind: without exactly
+    // one connected Gmail account, open the form for an explicit choice.
+    if (checked && type === "gmail" && !triggerGroups.gmail.length) {
+      const accountCount = gmailAccounts?.length ?? 0
+      if (accountCount !== 1) {
+        beginCreateForType("gmail")
+        toast.info(
+          accountCount === 0
+            ? t("triggers.gmail.notConnectedDescription")
+            : t("triggers.validation.gmailAccount"),
+        )
+        return
+      }
+    }
     setBusyType(type)
     try {
       let preferredId: number | null = primary?.id ?? null
@@ -788,6 +860,42 @@ export function AgentTriggersDialog({
               value={form.nextRunAt}
               onChange={(event) => setFormValue("nextRunAt", event.target.value)}
             />
+          </div>
+        )}
+
+        {activeType === "gmail" && (
+          <div className="space-y-2">
+            <Label id="trigger-gmail-account-label">{t("triggers.form.gmailAccount")}</Label>
+            <div aria-labelledby="trigger-gmail-account-label">
+              <Select
+                value={form.oauthAccountId || undefined}
+                onValueChange={(value) => setFormValue("oauthAccountId", value)}
+                options={(gmailAccounts ?? []).map((account) => ({
+                  value: String(account.id),
+                  label: account.email || `#${account.id}`,
+                }))}
+                placeholder={
+                  gmailAccountsLoading
+                    ? t("common.loading")
+                    : gmailAccounts && gmailAccounts.length === 0
+                      ? t("triggers.gmail.noAccounts")
+                      : t("triggers.form.gmailAccountPlaceholder")
+                }
+                disabled={gmailAccountsLoading || (gmailAccounts?.length ?? 0) === 0}
+              />
+            </div>
+            {form.oauthAccountId &&
+              gmailAccounts &&
+              !gmailAccounts.some(
+                (account) => String(account.id) === form.oauthAccountId,
+              ) && (
+                <p className="text-xs text-destructive">
+                  {t("triggers.gmail.accountMissing")}
+                </p>
+              )}
+            <p className="text-xs text-muted-foreground">
+              {t("triggers.form.gmailAccountHelp")}
+            </p>
           </div>
         )}
 

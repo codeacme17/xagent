@@ -55,6 +55,12 @@ repos:
           - python-pptx
           - cloudpickle
           - exa-py
+          - limits
+          # Pin google-auth/google-api-core to versions that ship py.typed;
+          # older releases resolved transitively lack the marker and fail
+          # import-untyped under disallow_any_unimported.
+          - google-auth==2.48.0
+          - google-api-core==2.25.2
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

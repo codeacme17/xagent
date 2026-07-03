@@ -42,6 +42,32 @@ DEEPSEEK_API_KEY="your-deepseek-api-key"
 POSTGRES_PASSWORD="xagent_password"
 ```
 
+Optional Gmail incoming-email trigger provisioning:
+
+```bash
+# Backend public API base URL used for Pub/Sub push endpoints and OIDC audience.
+# Do not use the frontend APP_BASE_URL here.
+XAGENT_PUBLIC_API_BASE_URL="https://api.example.com"
+
+# Google Cloud project and deterministic per-mailbox resource prefixes.
+XAGENT_GMAIL_PUBSUB_PROJECT_ID="your-gcp-project"
+XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX="xagent-gmail"
+XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX="xagent-gmail-push"
+
+# Service account used by Pub/Sub push OIDC tokens.
+XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT="pubsub-push@your-gcp-project.iam.gserviceaccount.com"
+
+# Local/container credential file path when not running on GCP with ADC.
+GOOGLE_APPLICATION_CREDENTIALS="/run/secrets/google-application-credentials.json"
+```
+
+The backend uses Google Application Default Credentials. Grant the backend
+service account permission to create/delete Pub/Sub topics and subscriptions
+in `XAGENT_GMAIL_PUBSUB_PROJECT_ID`, and allow
+`gmail-api-push@system.gserviceaccount.com` to publish to each per-mailbox
+topic. Xagent grants the Gmail publisher IAM binding during provisioning when
+the credentials have permission to update topic IAM policy.
+
 ### 2. Start Services
 
 From the project root directory:

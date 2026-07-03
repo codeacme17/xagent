@@ -28,6 +28,11 @@ class GmailWatchState(Base):  # type: ignore
     watch_expiration = Column(DateTime(timezone=True), nullable=True, index=True)
     topic_name = Column(String(512), nullable=False)
     last_error = Column(Text, nullable=True)
+
+    callback_id = Column(String(128), nullable=True, unique=True, index=True)
+    push_audience = Column(Text, nullable=True)
+    subscription_name = Column(String(512), nullable=True)
+    status = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

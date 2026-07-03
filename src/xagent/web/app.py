@@ -204,6 +204,19 @@ async def _run_trigger_dispatcher(
         finally:
             db.close()
 
+    def _sweep_gmail_provisioning_tick() -> int:
+        from ..config import get_gmail_pubsub_project_id
+        from .services.gmail_provisioning import sweep_gmail_provisioning
+
+        if not get_gmail_pubsub_project_id():
+            return 0
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            return sweep_gmail_provisioning(db)
+        finally:
+            db.close()
+
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
     while True:
@@ -219,6 +232,12 @@ async def _run_trigger_dispatcher(
                             logger.info(
                                 "Trigger dispatcher renewed %s Gmail watch(es)",
                                 renewed,
+                            )
+                        swept = await asyncio.to_thread(_sweep_gmail_provisioning_tick)
+                        if swept:
+                            logger.info(
+                                "Trigger dispatcher retried %s Gmail registration(s)",
+                                swept,
                             )
                 finally:
                     next_gmail_watch_scan_at = (
@@ -575,6 +594,10 @@ async def startup_event() -> None:
     logger.info("Database initialized successfully")
     start_file_storage_startup_sync_task(app)
     start_trigger_dispatcher_task(app)
+
+    from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
+
+    warn_if_rate_limits_are_per_process()
 
     initialize_langfuse()
 

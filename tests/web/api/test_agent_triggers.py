@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerAudit,
+    TriggerProvisioningStatus,
+    TriggerRun,
+    TriggerRunStatus,
+)
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
+from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
     _compute_next_run_at,
     _start_prepared_trigger_run_id,
@@ -47,6 +57,29 @@ def _create_agent(headers: dict[str, str], name: str = "Trigger Agent") -> int:
     return int(resp.json()["id"])
 
 
+def _connect_gmail_account(
+    username: str = "admin",
+    *,
+    email: str = "owner@gmail.example",
+    provider: str = "gmail",
+) -> int:
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == username).one()
+        account = UserOAuth(
+            user_id=int(user.id),
+            provider=provider,
+            access_token="access-token",
+            email=email,
+        )
+        db.add(account)
+        db.commit()
+        db.refresh(account)
+        return int(account.id)
+    finally:
+        db.close()
+
+
 def test_webhook_trigger_crud_returns_secret_once() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -64,14 +97,19 @@ def test_webhook_trigger_crud_returns_secret_once() -> None:
     assert created.status_code == 200, created.text
     body = created.json()
     assert body["type"] == "webhook"
-    assert body["webhook_token"]
+    assert body["callback_id"]
     assert body["webhook_secret"]
 
     db = _direct_db_session()
     try:
         trigger = db.query(AgentTrigger).filter(AgentTrigger.id == body["id"]).one()
-        assert str(trigger.secret_hash).startswith("$2")
-        assert trigger.secret_hash != body["webhook_secret"]
+        # New rows store only the encrypted HMAC secret; no bcrypt hash.
+        assert trigger.secret_hash is None
+        assert trigger.secret_encrypted
+        assert trigger.secret_encrypted != body["webhook_secret"]
+        assert decrypt_value(str(trigger.secret_encrypted)) == body["webhook_secret"]
+        assert trigger.provider == "webhook"
+        assert trigger.callback_id == body["callback_id"]
     finally:
         db.close()
 
@@ -88,6 +126,51 @@ def test_webhook_trigger_crud_returns_secret_once() -> None:
     assert patched.status_code == 200, patched.text
     assert patched.json()["name"] == "Renamed webhook"
     assert patched.json()["webhook_secret"]
+
+
+def test_trigger_config_validation_dispatches_through_provider() -> None:
+    """CRUD config validation must go through TriggerProvider.validate_config
+    for provider-backed types, not the module-level schema parser."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    from xagent.web.services.trigger_providers import get_trigger_provider
+
+    provider = get_trigger_provider("webhook")
+    seen_configs: list[dict] = []
+    original_validate = type(provider).validate_config
+
+    def recording_validate(self, config):
+        seen_configs.append(dict(config))
+        return original_validate(self, config)
+
+    with patch.object(type(provider), "validate_config", recording_validate):
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "webhook",
+                "name": "Provider-validated webhook",
+                "prompt_template": "payload={{payload}}",
+                "config": {"source": "crm"},
+            },
+        )
+    assert created.status_code == 200, created.text
+    assert seen_configs == [{"source": "crm"}]
+
+    # Provider validation errors surface as the same 400 config error.
+    invalid = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Bad webhook config",
+            "prompt_template": "payload={{payload}}",
+            "config": {"event_types": "not-a-list"},
+        },
+    )
+    assert invalid.status_code == 400, invalid.text
+    assert "webhook trigger config invalid" in invalid.json()["detail"]
 
 
 def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
@@ -128,7 +211,22 @@ def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
         db.close()
 
 
-def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> None:
+def _signed_webhook_headers(
+    secret: str, raw_body: bytes, *, event_id: str | None = None
+) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    headers = {
+        "x-xagent-signature": sign_webhook_payload(secret, timestamp, raw_body),
+        "x-xagent-timestamp": timestamp,
+    }
+    if event_id:
+        headers["x-xagent-event-id"] = event_id
+    return headers
+
+
+def test_public_webhook_validates_signature_and_deduplicates(
+    mock_bg_scheduler,
+) -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     created = client.post(
@@ -137,24 +235,42 @@ def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> 
         json={"type": "webhook", "name": "Public webhook"},
     )
     body = created.json()
-    url = f"/api/triggers/webhook/{body['webhook_token']}"
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'{"subject": "hello"}'
 
-    rejected = client.post(url, json={"subject": "hello"})
-    assert rejected.status_code == 401
+    unsigned = client.post(url, content=raw_body)
+    assert unsigned.status_code == 401
 
-    event_headers = {
-        "x-xagent-trigger-secret": body["webhook_secret"],
-        "x-xagent-event-id": "evt-1",
-    }
-    first = client.post(url, headers=event_headers, json={"subject": "hello"})
+    forged_headers = _signed_webhook_headers("wrong-secret", raw_body, event_id="evt-1")
+    forged = client.post(url, headers=forged_headers, content=raw_body)
+    assert forged.status_code == 401
+
+    db = _direct_db_session()
+    try:
+        rejected_audits = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_signature")
+            .all()
+        )
+        assert len(rejected_audits) >= 1
+        assert rejected_audits[-1].trigger_id == body["id"]
+        assert rejected_audits[-1].provider == "webhook"
+    finally:
+        db.close()
+
+    event_headers = _signed_webhook_headers(
+        body["webhook_secret"], raw_body, event_id="evt-1"
+    )
+    first = client.post(url, headers=event_headers, content=raw_body)
     assert first.status_code == 200, first.text
-    assert set(first.json()) == {"trigger_run_id", "status", "duplicate"}
-    assert first.json()["duplicate"] is False
+    assert first.json()["outcome"] == "accepted"
+    assert len(first.json()["trigger_run_ids"]) == 1
+    assert first.json()["duplicates"] == 0
 
-    second = client.post(url, headers=event_headers, json={"subject": "hello"})
+    second = client.post(url, headers=event_headers, content=raw_body)
     assert second.status_code == 200, second.text
-    assert second.json()["duplicate"] is True
-    assert second.json()["trigger_run_id"] == first.json()["trigger_run_id"]
+    assert second.json()["duplicates"] == 1
+    assert second.json()["trigger_run_ids"] == []
     assert mock_bg_scheduler.call_count == 1
 
     db = _direct_db_session()
@@ -165,7 +281,204 @@ def test_public_webhook_validates_secret_and_deduplicates(mock_bg_scheduler) -> 
         db.close()
 
 
-def test_public_webhook_invalid_utf8_body_falls_back_to_text(
+def test_public_webhook_rejects_stale_timestamp(mock_bg_scheduler) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Replay webhook"},
+    )
+    body = created.json()
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'{"subject": "hello"}'
+
+    stale_timestamp = str(int(time.time()) - 3600)
+    stale = client.post(
+        url,
+        headers={
+            "x-xagent-signature": sign_webhook_payload(
+                body["webhook_secret"], stale_timestamp, raw_body
+            ),
+            "x-xagent-timestamp": stale_timestamp,
+        },
+        content=raw_body,
+    )
+    assert stale.status_code == 401
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 0
+    finally:
+        db.close()
+
+
+def test_legacy_webhook_route_verifies_bcrypt_secret(mock_bg_scheduler) -> None:
+    """Pre-pipeline webhooks keep working on the deprecated token route."""
+    import bcrypt
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Legacy webhook"},
+    )
+    trigger_id = created.json()["id"]
+
+    # Rewrite the row into its pre-migration shape: webhook token plus
+    # bcrypt secret hash, none of the unified pipeline identity fields.
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.webhook_token = "legacy-token-1"
+        trigger.secret_hash = bcrypt.hashpw(
+            b"legacy-secret", bcrypt.gensalt(rounds=4)
+        ).decode("utf-8")
+        trigger.callback_id = None
+        trigger.secret_encrypted = None
+        trigger.provider = None
+        db.commit()
+    finally:
+        db.close()
+
+    url = "/api/triggers/webhook/legacy-token-1"
+    payload = {"subject": "hello"}
+
+    unknown = client.post("/api/triggers/webhook/unknown-token", json=payload)
+    assert unknown.status_code == 404
+
+    missing = client.post(url, json=payload)
+    assert missing.status_code == 401
+
+    wrong = client.post(
+        url, json=payload, headers={"x-xagent-trigger-secret": "wrong-secret"}
+    )
+    assert wrong.status_code == 401
+
+    accepted = client.post(
+        url, json=payload, headers={"x-xagent-trigger-secret": "legacy-secret"}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.headers.get("deprecation") == "true"
+    assert accepted.json()["trigger_run_id"] > 0
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 1
+        audits = db.query(TriggerAudit).order_by(TriggerAudit.id.asc()).all()
+        outcomes = [str(a.outcome) for a in audits if a.trigger_id == trigger_id]
+        assert "rejected_signature" in outcomes
+        assert "accepted" in outcomes
+    finally:
+        db.close()
+
+
+def test_public_callback_unknown_provider_and_callback_are_controlled(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Known webhook"},
+    )
+    body = created.json()
+    raw_body = b"{}"
+
+    unknown_provider = client.post(
+        f"/api/triggers/callback/ghost/{body['callback_id']}",
+        content=raw_body,
+    )
+    assert unknown_provider.status_code == 404
+    assert unknown_provider.json()["outcome"] == "unknown_provider"
+
+    unknown_callback = client.post(
+        "/api/triggers/callback/webhook/does-not-exist",
+        content=raw_body,
+    )
+    assert unknown_callback.status_code == 404
+    assert unknown_callback.json()["outcome"] == "unknown_callback"
+
+
+def test_public_callback_disabled_trigger_is_rejected_after_verification(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Disabled webhook", "enabled": False},
+    )
+    body = created.json()
+    raw_body = b'{"subject": "hello"}'
+
+    fired = client.post(
+        f"/api/triggers/callback/webhook/{body['callback_id']}",
+        headers=_signed_webhook_headers(body["webhook_secret"], raw_body),
+        content=raw_body,
+    )
+    assert fired.status_code == 409
+    assert fired.json()["outcome"] == "rejected_disabled"
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 0
+        disabled_audits = (
+            db.query(TriggerAudit)
+            .filter(TriggerAudit.outcome == "rejected_disabled")
+            .all()
+        )
+        assert len(disabled_audits) == 1
+        assert disabled_audits[0].trigger_id == body["id"]
+    finally:
+        db.close()
+
+
+def test_public_callback_filters_events_against_allow_list(
+    mock_bg_scheduler,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "webhook",
+            "name": "Filtered webhook",
+            "config": {"event_types": ["order.created"]},
+        },
+    )
+    body = created.json()
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+
+    ignored_body = b'{"event_type": "order.deleted", "id": "evt-a"}'
+    ignored = client.post(
+        url,
+        headers=_signed_webhook_headers(body["webhook_secret"], ignored_body),
+        content=ignored_body,
+    )
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["trigger_run_ids"] == []
+
+    matched_body = b'{"event_type": "order.created", "id": "evt-b"}'
+    matched = client.post(
+        url,
+        headers=_signed_webhook_headers(body["webhook_secret"], matched_body),
+        content=matched_body,
+    )
+    assert matched.status_code == 200, matched.text
+    assert len(matched.json()["trigger_run_ids"]) == 1
+
+    db = _direct_db_session()
+    try:
+        assert db.query(TriggerRun).count() == 1
+    finally:
+        db.close()
+
+
+def test_public_webhook_invalid_utf8_body_is_a_controlled_parse_failure(
     mock_bg_scheduler,
 ) -> None:
     headers = _admin_headers()
@@ -176,24 +489,23 @@ def test_public_webhook_invalid_utf8_body_falls_back_to_text(
         json={"type": "webhook", "name": "Invalid UTF-8 webhook"},
     )
     body = created.json()
-    url = f"/api/triggers/webhook/{body['webhook_token']}"
+    url = f"/api/triggers/callback/webhook/{body['callback_id']}"
+    raw_body = b'\xff{"subject":"hello"}'
 
     fired = client.post(
         url,
-        headers={"x-xagent-trigger-secret": body["webhook_secret"]},
-        content=b'\xff{"subject":"hello"}',
+        headers=_signed_webhook_headers(body["webhook_secret"], raw_body),
+        content=raw_body,
     )
-    assert fired.status_code == 200, fired.text
+    assert fired.status_code == 400
+    assert fired.json()["outcome"] == "execution_failure"
 
     db = _direct_db_session()
     try:
-        run_id = fired.json()["trigger_run_id"]
-        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
-        assert run.payload_snapshot == {"body": '\ufffd{"subject":"hello"}'}
+        assert db.query(TriggerRun).count() == 0
     finally:
         db.close()
-
-    assert mock_bg_scheduler.call_count == 1
+    assert mock_bg_scheduler.call_count == 0
 
 
 def test_trigger_name_validation_rejects_empty_and_oversized() -> None:
@@ -232,6 +544,7 @@ def test_trigger_name_validation_rejects_empty_and_oversized() -> None:
 def test_gmail_trigger_crud_persists_filters() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account(email="Owner@Gmail.Example")
 
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
@@ -243,6 +556,7 @@ def test_gmail_trigger_crud_persists_filters() -> None:
                 "watch_label": "INBOX",
                 "sender_filter": "boss@company.com",
                 "subject_keyword": "urgent",
+                "oauth_account_id": account_id,
             },
             "prompt_template": "Handle Gmail message {{payload}}",
         },
@@ -256,7 +570,16 @@ def test_gmail_trigger_crud_persists_filters() -> None:
         "watch_label": "INBOX",
         "sender_filter": "boss@company.com",
         "subject_keyword": "urgent",
+        "oauth_account_id": account_id,
     }
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == body["id"]).one()
+        assert trigger.provider == "gmail"
+        assert trigger.resource_id == "owner@gmail.example"
+    finally:
+        db.close()
 
     patched = client.patch(
         f"/api/agents/{agent_id}/triggers/{body['id']}",
@@ -266,6 +589,7 @@ def test_gmail_trigger_crud_persists_filters() -> None:
                 "watch_label": "CATEGORY_PRIMARY",
                 "sender_filter": "",
                 "subject_keyword": "invoice",
+                "oauth_account_id": account_id,
             }
         },
     )
@@ -274,23 +598,11 @@ def test_gmail_trigger_crud_persists_filters() -> None:
         "watch_label": "CATEGORY_PRIMARY",
         "sender_filter": "",
         "subject_keyword": "invoice",
+        "oauth_account_id": account_id,
     }
 
 
-def test_enabled_gmail_trigger_create_best_effort_registers_watch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-
-    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
-        calls.append(user_id)
-        raise RuntimeError("watch registration unavailable")
-
-    monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
-        fake_ensure_gmail_watches_for_user,
-        raising=False,
-    )
+def test_gmail_trigger_requires_oauth_account() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
 
@@ -299,40 +611,121 @@ def test_enabled_gmail_trigger_create_best_effort_registers_watch(
         headers=headers,
         json={
             "type": "gmail",
-            "name": "Support inbox",
+            "name": "No account",
             "config": {"watch_label": "INBOX"},
         },
     )
+    assert created.status_code == 400
+    assert "oauth_account_id" in created.json()["detail"]
 
-    assert created.status_code == 200, created.text
-    assert (
-        created.json()["last_error"]
-        == "Gmail watch registration failed: watch registration unavailable"
+
+def test_gmail_trigger_rejects_foreign_oauth_account() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    from .conftest import _register_second_user
+
+    _register_second_user()
+    foreign_account_id = _connect_gmail_account("bob", email="bob@gmail.example")
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Foreign account",
+            "config": {"watch_label": "INBOX", "oauth_account_id": foreign_account_id},
+        },
     )
-    db = _direct_db_session()
-    try:
-        admin = db.query(User).filter(User.username == "admin").one()
-        assert calls == [int(admin.id)]
-    finally:
-        db.close()
+    assert created.status_code == 400
+    assert "not found" in created.json()["detail"].lower()
 
 
-def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
+def test_gmail_trigger_rejects_non_gmail_oauth_account() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    drive_account_id = _connect_gmail_account(
+        email="owner@gmail.example", provider="google-drive"
+    )
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Wrong provider",
+            "config": {"watch_label": "INBOX", "oauth_account_id": drive_account_id},
+        },
+    )
+    assert created.status_code == 400
+    assert "not a gmail account" in created.json()["detail"].lower()
+
+
+def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
 
-    def fake_ensure_gmail_watches_for_user(_db, *, user_id: int):
-        calls.append(user_id)
-        raise RuntimeError("watch registration unavailable")
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        calls.append((int(trigger.id), int(trigger.config["oauth_account_id"])))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.ensure_gmail_watches_for_user",
-        fake_ensure_gmail_watches_for_user,
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
         raising=False,
     )
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["provisioning_status"] == "active"
+    assert created.json()["provisioning_error"] is None
+    db = _direct_db_session()
+    try:
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == created.json()["id"]).one()
+        )
+        assert calls == [(int(trigger.id), account_id)]
+    finally:
+        db.close()
+
+
+def test_enabling_existing_gmail_trigger_provisions_bound_mailbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        calls.append(int(trigger.id))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
         headers=headers,
@@ -340,7 +733,7 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
             "type": "gmail",
             "enabled": False,
             "name": "Support inbox",
-            "config": {"watch_label": "INBOX"},
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
         },
     )
     assert created.status_code == 200, created.text
@@ -353,16 +746,188 @@ def test_enabling_existing_gmail_trigger_best_effort_registers_watch(
     )
 
     assert patched.status_code == 200, patched.text
-    assert (
-        patched.json()["last_error"]
-        == "Gmail watch registration failed: watch registration unavailable"
+    assert patched.json()["provisioning_status"] == "active"
+    assert calls == [created.json()["id"]]
+
+
+def test_listing_triggers_reflects_background_provisioning_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status reported by the API self-resolves once the watch state converges,
+    without requiring another user-initiated create/update."""
+    from xagent.web.models.gmail_watch import GmailWatchState
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.PENDING.value
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
     )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["provisioning_status"] == "pending"
+
+    # Simulate the background thread converging the mailbox to active.
     db = _direct_db_session()
     try:
-        admin = db.query(User).filter(User.username == "admin").one()
-        assert calls == [int(admin.id)]
+        user = db.query(User).filter(User.username == "admin").one()
+        db.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=account_id,
+                email="owner@gmail.example",
+                history_id="hist-1",
+                topic_name="projects/demo/topics/xagent-gmail-abc",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            )
+        )
+        db.commit()
     finally:
         db.close()
+
+    listed = client.get(f"/api/agents/{agent_id}/triggers", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["provisioning_status"] == "active"
+    assert listed.json()[0]["provisioning_error"] is None
+
+    db = _direct_db_session()
+    try:
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == created.json()["id"]).one()
+        )
+        assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    finally:
+        db.close()
+
+
+def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_account_id = _connect_gmail_account(email="first@gmail.example")
+    second_account_id = _connect_gmail_account(email="second@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": first_account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": second_account_id,
+            }
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert provisioned == [first_account_id, second_account_id]
+    assert released == [first_account_id]
+
+
+def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        assert db.query(AgentTrigger).count() == 0
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+        raising=False,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    deleted = client.delete(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    assert provisioned == [account_id]
+    assert released == [account_id]
 
 
 def test_gmail_trigger_requires_watch_label() -> None:
@@ -385,13 +950,14 @@ def test_gmail_trigger_requires_watch_label() -> None:
 def test_gmail_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
     created = client.post(
         f"/api/agents/{agent_id}/triggers",
         headers=headers,
         json={
             "type": "gmail",
             "name": "Gmail support",
-            "config": {"watch_label": "INBOX"},
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
             "prompt_template": "Triage this email: {{payload}}",
         },
     )

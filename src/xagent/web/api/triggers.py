@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import base64
-import binascii
+import asyncio
 import json
 import logging
-import secrets
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -12,21 +10,30 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ...config import get_gmail_pubsub_push_token
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
-from ..models.trigger import AgentTrigger, TriggerRun
+from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
-from ..services.gmail_triggers import (
-    GmailPubsubNotification,
-    GmailTriggerError,
-    process_gmail_pubsub_notification,
+from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
+from ..services.trigger_providers import (
+    CallbackRequestContext,
+    process_trigger_callback,
+    record_trigger_audit,
+    record_trigger_audit_best_effort,
+)
+from ..services.trigger_rate_limit import (
+    check_callback_rate_limit,
+    check_trigger_crud_rate_limit,
+    remote_ip_from_request,
+    should_audit_rate_limited_callback,
 )
 from ..services.triggers import (
     TriggerNotFoundError,
+    TriggerRunPreparationError,
     TriggerSecretError,
     TriggerServiceError,
     create_agent_trigger,
+    decrypt_trigger_run_payload,
     delete_agent_trigger,
     find_webhook_trigger,
     fire_trigger,
@@ -75,6 +82,9 @@ class TriggerResponse(BaseModel):
     prompt_template: str | None
     webhook_token: str | None
     webhook_secret: str | None = None
+    callback_id: str | None = None
+    provisioning_status: str | None = None
+    provisioning_error: str | None = None
     next_run_at: str | None
     last_run_at: str | None
     last_error: str | None
@@ -90,6 +100,8 @@ class TriggerRunResponse(BaseModel):
     status: str
     source_event_id: str | None
     payload_snapshot: dict[str, Any] | None
+    payload_stored: bool = False
+    payload: Any | None = None
     idempotency_key: str
     error_message: str | None
     started_at: str | None
@@ -101,18 +113,6 @@ class TriggerRunResponse(BaseModel):
 class TriggerFireResponse(BaseModel):
     trigger_run: TriggerRunResponse
     duplicate: bool = False
-
-
-class PublicTriggerFireResponse(BaseModel):
-    trigger_run_id: int
-    status: str
-    duplicate: bool = False
-
-
-class GmailPubsubResponse(BaseModel):
-    processed: int
-    duplicates: int
-    skipped: int
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -133,6 +133,9 @@ def _serialize_trigger(
         prompt_template=trigger.prompt_template,
         webhook_token=trigger.webhook_token,
         webhook_secret=webhook_secret,
+        callback_id=trigger.callback_id,
+        provisioning_status=trigger.provisioning_status,
+        provisioning_error=trigger.provisioning_error,
         next_run_at=_dt(cast(datetime | None, trigger.next_run_at)),
         last_run_at=_dt(cast(datetime | None, trigger.last_run_at)),
         last_error=trigger.last_error,
@@ -141,8 +144,15 @@ def _serialize_trigger(
     )
 
 
-def _serialize_run(run: TriggerRun) -> TriggerRunResponse:
-    payload = run.payload_snapshot if isinstance(run.payload_snapshot, dict) else None
+def _serialize_run(
+    run: TriggerRun, *, payload: Any | None = None
+) -> TriggerRunResponse:
+    snapshot = run.payload_snapshot if isinstance(run.payload_snapshot, dict) else None
+    payload_stored = bool(snapshot and "encrypted_payload" in snapshot)
+    if snapshot and payload_stored:
+        # Never ship ciphertext to clients; decrypted content is only
+        # available through the audited include_payload read.
+        snapshot = {k: v for k, v in snapshot.items() if k != "encrypted_payload"}
     return TriggerRunResponse(
         id=int(run.id),
         trigger_id=int(run.trigger_id),
@@ -150,7 +160,9 @@ def _serialize_run(run: TriggerRun) -> TriggerRunResponse:
         background_job_id=run.background_job_id,
         status=str(run.status),
         source_event_id=run.source_event_id,
-        payload_snapshot=payload,
+        payload_snapshot=snapshot,
+        payload_stored=payload_stored,
+        payload=payload,
         idempotency_key=str(run.idempotency_key),
         error_message=run.error_message,
         started_at=_dt(getattr(run, "started_at", None)),
@@ -180,11 +192,22 @@ def _trigger_or_404(
     return trigger
 
 
+def _enforce_crud_rate_limit(user_id: int) -> None:
+    if not check_trigger_crud_rate_limit(user_id):
+        raise HTTPException(
+            status_code=429, detail="Too many trigger management requests"
+        )
+
+
 def _handle_service_error(exc: Exception) -> HTTPException:
     if isinstance(exc, TriggerNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, TriggerSecretError):
         return HTTPException(status_code=401, detail=str(exc))
+    if isinstance(exc, TriggerRunPreparationError):
+        # The run was recorded but no task was attached; a retry of the same
+        # event repairs it via the idempotency key, so ask the caller to retry.
+        return HTTPException(status_code=500, detail=str(exc))
     if isinstance(exc, TriggerServiceError):
         return HTTPException(status_code=400, detail=str(exc))
     logger.exception("Unhandled trigger API error")
@@ -208,6 +231,9 @@ async def list_triggers(
         .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
         .all()
     )
+    # Gmail provisioning converges in background threads/sweeps that only
+    # write the watch state; fold that convergence into the reported status.
+    await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
     return [_serialize_trigger(row) for row in rows]
 
 
@@ -221,8 +247,12 @@ async def create_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
-        trigger, secret = create_agent_trigger(
+        # Runs in a worker thread: Gmail trigger provisioning can block on
+        # cloud calls up to the registration timeout.
+        trigger, secret = await asyncio.to_thread(
+            create_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,
@@ -249,8 +279,10 @@ async def update_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
-        trigger, secret = update_agent_trigger(
+        trigger, secret = await asyncio.to_thread(
+            update_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,
@@ -269,8 +301,10 @@ async def delete_trigger(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    _enforce_crud_rate_limit(int(current_user.id))
     try:
-        delete_agent_trigger(
+        await asyncio.to_thread(
+            delete_agent_trigger,
             db,
             user_id=int(current_user.id),
             agent_id=agent_id,
@@ -307,6 +341,54 @@ async def list_trigger_runs(
     return [_serialize_run(row) for row in rows]
 
 
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}",
+    response_model=TriggerRunResponse,
+)
+async def get_trigger_run(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    include_payload: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+
+    payload: Any | None = None
+    if include_payload:
+        try:
+            payload = decrypt_trigger_run_payload(run)
+        except Exception as exc:
+            raise _handle_service_error(exc)
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.PAYLOAD_READ,
+            provider=str(trigger.provider) if trigger.provider else None,
+            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+            trigger_id=int(trigger.id),
+            detail={
+                "trigger_run_id": int(run.id),
+                "user_id": int(current_user.id),
+            },
+            remote_ip=request.client.host if request.client else None,
+        )
+    return _serialize_run(run, payload=payload)
+
+
 @router.post(
     "/api/agents/{agent_id}/triggers/{trigger_id}/test",
     response_model=TriggerFireResponse,
@@ -331,6 +413,7 @@ async def test_trigger(
             event_payload=request.payload,
             source_event_id=request.source_event_id,
             test=True,
+            event_type="test",
         )
         return TriggerFireResponse(
             trigger_run=_serialize_run(run), duplicate=not created
@@ -339,7 +422,93 @@ async def test_trigger(
         raise _handle_service_error(exc)
 
 
-async def _read_payload(request: Request) -> dict[str, Any]:
+_SECRET_QUERY_PARAMS = frozenset(
+    {"token", "secret", "signature", "key", "apikey", "api_key", "auth"}
+)
+
+
+class TriggerCallbackResponse(BaseModel):
+    outcome: str | None
+    detail: str | None = None
+    trigger_run_ids: list[int] = Field(default_factory=list)
+    duplicates: int = 0
+
+
+@router.post(
+    "/api/triggers/callback/{provider}/{callback_id}",
+    response_model=TriggerCallbackResponse,
+)
+async def receive_trigger_callback(
+    provider: str,
+    callback_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Response | TriggerCallbackResponse:
+    """Public unified trigger callback endpoint.
+
+    The callback id is only a locator; authentication happens inside the
+    provider pipeline via provider-specific proof (e.g. HMAC signature
+    headers). The raw body is preserved for signature verification.
+    """
+    remote_ip = remote_ip_from_request(request)
+    # Rate limiting runs before any parsing, so hostile or garbage traffic
+    # cannot amplify database writes; throttling is still observable through
+    # one deduplicated rate_limited audit row per source per window.
+    if not check_callback_rate_limit(callback_id, remote_ip):
+        if should_audit_rate_limited_callback(callback_id, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider=provider,
+                callback_id=callback_id,
+                remote_ip=remote_ip,
+                detail={"route": "unified_callback"},
+            )
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    # Secrets are accepted only via headers. A request that smuggles its
+    # proof through the query string is rejected outright.
+    for query_key in request.query_params:
+        if query_key.lower() in _SECRET_QUERY_PARAMS:
+            raise HTTPException(
+                status_code=400,
+                detail="Callback credentials must be sent via headers",
+            )
+
+    raw_body = await request.body()
+    context = CallbackRequestContext(
+        provider=provider,
+        callback_id=callback_id,
+        method=request.method,
+        url_path=request.url.path,
+        headers=dict(request.headers),
+        query_params=dict(request.query_params),
+        remote_ip=remote_ip,
+    )
+    result = await process_trigger_callback(db, context=context, raw_body=raw_body)
+    if result.challenge is not None:
+        return Response(
+            content=result.challenge.body,
+            media_type=result.challenge.media_type,
+            status_code=result.challenge.status_code,
+        )
+    response.status_code = result.status_code
+    return TriggerCallbackResponse(
+        outcome=result.outcome.value if result.outcome else None,
+        detail=result.detail,
+        trigger_run_ids=[int(run.id) for run in result.runs],
+        duplicates=result.duplicates,
+    )
+
+
+class PublicTriggerFireResponse(BaseModel):
+    trigger_run_id: int
+    status: str
+    duplicate: bool = False
+
+
+async def _read_legacy_payload(request: Request) -> dict[str, Any]:
     body = await request.body()
     if not body:
         return {}
@@ -352,46 +521,38 @@ async def _read_payload(request: Request) -> dict[str, Any]:
     return {"value": decoded}
 
 
-def _decode_gmail_pubsub_notification(
-    payload: dict[str, Any],
-) -> GmailPubsubNotification:
-    message = payload.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("Missing Pub/Sub message")
-
-    data = message.get("data")
-    if not isinstance(data, str) or not data:
-        raise ValueError("Missing Pub/Sub message data")
-    try:
-        padded_data = data + "=" * ((4 - len(data) % 4) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(padded_data).decode("utf-8"))
-    except (binascii.Error, UnicodeDecodeError, ValueError, TypeError) as exc:
-        raise ValueError("Invalid Pub/Sub message data") from exc
-    if not isinstance(decoded, dict):
-        raise ValueError("Invalid Pub/Sub message payload")
-
-    email_address = decoded.get("emailAddress")
-    history_id = decoded.get("historyId")
-    if not email_address or not history_id:
-        raise ValueError("Gmail notification requires emailAddress and historyId")
-
-    message_id = message.get("messageId") or message.get("message_id")
-    return GmailPubsubNotification(
-        email_address=str(email_address),
-        history_id=str(history_id),
-        pubsub_message_id=str(message_id) if message_id else None,
-    )
-
-
 @router.post(
     "/api/triggers/webhook/{webhook_token}",
     response_model=PublicTriggerFireResponse,
+    deprecated=True,
 )
-async def receive_webhook_trigger(
+async def receive_legacy_webhook_trigger(
     webhook_token: str,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
 ) -> PublicTriggerFireResponse:
+    """Deprecated pre-pipeline webhook endpoint, kept for migration.
+
+    Serves only triggers created before the unified callback pipeline
+    (bcrypt-hashed shared secret in the x-xagent-trigger-secret header).
+    Re-saving such a trigger assigns a callback id and rotating its secret
+    moves callers to /api/triggers/callback/webhook/{callback_id}.
+    """
+    remote_ip = remote_ip_from_request(request)
+    if not check_callback_rate_limit(webhook_token, remote_ip):
+        if should_audit_rate_limited_callback(webhook_token, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider="webhook",
+                callback_id=webhook_token,
+                remote_ip=remote_ip,
+                detail={"route": "legacy_webhook"},
+            )
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    response.headers["Deprecation"] = "true"
     trigger = find_webhook_trigger(db, webhook_token)
     if trigger is None:
         raise HTTPException(status_code=404, detail="Trigger not found")
@@ -401,7 +562,19 @@ async def receive_webhook_trigger(
     secret = request.headers.get("x-xagent-trigger-secret")
     try:
         verify_webhook_secret(trigger, secret)
-        payload = await _read_payload(request)
+    except TriggerSecretError as exc:
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.REJECTED_SIGNATURE,
+            provider=str(trigger.type),
+            trigger_id=int(trigger.id),
+            detail={"route": "legacy_webhook", "reason": str(exc)},
+            remote_ip=remote_ip,
+        )
+        raise _handle_service_error(exc)
+
+    try:
+        payload = await _read_legacy_payload(request)
         source_event_id = (
             request.headers.get("x-xagent-event-id")
             or request.headers.get("x-event-id")
@@ -413,64 +586,20 @@ async def receive_webhook_trigger(
             event_payload=payload,
             source_event_id=source_event_id,
         )
-        return PublicTriggerFireResponse(
-            trigger_run_id=int(run.id),
-            status=str(run.status),
-            duplicate=not created,
-        )
     except Exception as exc:
-        logger.warning("Webhook trigger %s rejected: %s", trigger.id, exc)
+        logger.warning("Legacy webhook trigger %s rejected: %s", trigger.id, exc)
         raise _handle_service_error(exc)
 
-
-@router.post(
-    "/api/triggers/gmail/pubsub",
-    response_model=GmailPubsubResponse,
-)
-async def receive_gmail_pubsub_trigger(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-) -> GmailPubsubResponse:
-    expected_token = get_gmail_pubsub_push_token()
-    if not expected_token:
-        raise HTTPException(
-            status_code=503,
-            detail="Gmail Pub/Sub push token is not configured",
-        )
-    provided_token = request.headers.get(
-        "x-xagent-gmail-pubsub-token"
-    ) or request.query_params.get("token")
-    if not secrets.compare_digest(provided_token or "", expected_token):
-        raise HTTPException(status_code=401, detail="Invalid Gmail Pub/Sub token")
-
-    try:
-        payload = await _read_payload(request)
-        notification = _decode_gmail_pubsub_notification(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        result = await process_gmail_pubsub_notification(db, notification)
-    except GmailTriggerError as exc:
-        logger.warning("Gmail Pub/Sub notification rejected: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.error(
-            "Unexpected error processing Gmail Pub/Sub notification for %s"
-            " (historyId=%s): %s",
-            notification.email_address,
-            notification.history_id,
-            exc,
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=500, detail="Failed to process Gmail Pub/Sub notification"
-        ) from exc
-
-    response.status_code = result.status_code
-    return GmailPubsubResponse(
-        processed=result.processed,
-        duplicates=result.duplicates,
-        skipped=result.skipped,
+    record_trigger_audit(
+        db,
+        outcome=TriggerAuditOutcome.ACCEPTED,
+        provider=str(trigger.type),
+        trigger_id=int(trigger.id),
+        detail={"route": "legacy_webhook", "run_ids": [int(run.id)]},
+        remote_ip=remote_ip,
+    )
+    return PublicTriggerFireResponse(
+        trigger_run_id=int(run.id),
+        status=str(run.status),
+        duplicate=not created,
     )
