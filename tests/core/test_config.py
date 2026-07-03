@@ -35,6 +35,8 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
+    MCP_OAUTH_PROXY_URL,
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
@@ -94,6 +96,8 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_mcp_oauth_allow_private_hosts,
+    get_mcp_oauth_proxy_url,
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
@@ -177,6 +181,12 @@ class TestEnvironmentVariableConstants:
             OPENROUTER_OFFICIAL_PROVIDERS_ONLY
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
+
+    def test_mcp_oauth_allow_private_hosts_constant(self):
+        assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
+
+    def test_mcp_oauth_proxy_url_constant(self):
+        assert MCP_OAUTH_PROXY_URL == "XAGENT_MCP_OAUTH_PROXY_URL"
 
     def test_file_storage_uri_constant(self):
         assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
@@ -335,6 +345,39 @@ class TestOpenRouterConfig:
     def test_official_providers_only_false_values(self, monkeypatch, value):
         monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
         assert get_openrouter_official_providers_only() is False
+
+
+class TestMCPOAuthConfig:
+    def test_allow_private_hosts_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, raising=False)
+        assert get_mcp_oauth_allow_private_hosts() is False
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", " TRUE "])
+    def test_allow_private_hosts_true_values(self, monkeypatch, value):
+        monkeypatch.setenv(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, value)
+        assert get_mcp_oauth_allow_private_hosts() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "", "unknown"])
+    def test_allow_private_hosts_false_values(self, monkeypatch, value):
+        monkeypatch.setenv(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, value)
+        assert get_mcp_oauth_allow_private_hosts() is False
+
+    def test_proxy_url_returns_none_when_unset_or_blank(self, monkeypatch):
+        monkeypatch.delenv(MCP_OAUTH_PROXY_URL, raising=False)
+        assert get_mcp_oauth_proxy_url() is None
+
+        monkeypatch.setenv(MCP_OAUTH_PROXY_URL, "   ")
+        assert get_mcp_oauth_proxy_url() is None
+
+    def test_proxy_url_accepts_absolute_http_proxy(self, monkeypatch):
+        monkeypatch.setenv(MCP_OAUTH_PROXY_URL, " http://proxy.example.com:8080 ")
+        assert get_mcp_oauth_proxy_url() == "http://proxy.example.com:8080"
+
+    @pytest.mark.parametrize("value", ["proxy.example.com:8080", "socks5://proxy:1080"])
+    def test_proxy_url_rejects_unsupported_values(self, monkeypatch, value):
+        monkeypatch.setenv(MCP_OAUTH_PROXY_URL, value)
+        with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
+            get_mcp_oauth_proxy_url()
 
 
 class TestHotPathCacheConfig:

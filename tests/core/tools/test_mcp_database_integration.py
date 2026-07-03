@@ -2,6 +2,7 @@
 Test MCP database integration for web and agent entry points.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,8 +12,11 @@ from sqlalchemy.orm import sessionmaker
 from xagent.core.agent.service import AgentService
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.core.mcp.manager.db import DatabaseMCPServerManager, MCPServer
+from xagent.core.utils.encryption import encrypt_value
 from xagent.core.workspace import TaskWorkspace
+from xagent.web.models import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.database import Base
+from xagent.web.models.mcp import UserMCPServer
 from xagent.web.models.user import User
 
 
@@ -181,6 +185,37 @@ class TestDatabaseMCPServerManager:
         assert stdio_conn["concurrency_safe"] is True
         assert stdio_conn["concurrent_tools"] == ["list_messages"]
 
+    def test_get_connections_skips_mcp_oauth_without_runtime_resolver(self, test_db):
+        """Direct DB manager must not execute MCP OAuth via static headers."""
+        manager = DatabaseMCPServerManager(test_db)
+        config = manager.create_config(
+            name="test_mcp_oauth_server",
+            transport="streamable_http",
+            managed="external",
+            description="MCP OAuth server",
+            url="https://mcp.example.com/mcp",
+            headers={"Authorization": "Bearer static-token"},
+            auth={
+                "type": "mcp_oauth",
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "client_id": "client-123",
+            },
+        )
+        manager.add_server(config)
+
+        connections = manager.get_connections()
+
+        assert "test_mcp_oauth_server" not in connections
+
+    def test_runtime_oauth_detection_fails_closed_without_auth_decrypter(self):
+        server = SimpleNamespace(
+            transport="streamable_http",
+            auth={"type": "mcp_oauth"},
+        )
+
+        assert DatabaseMCPServerManager._requires_runtime_mcp_oauth(server) is False
+
     def test_get_server(self, test_db, sample_stdio_config):
         """Test getting specific server."""
         manager = DatabaseMCPServerManager(test_db)
@@ -309,6 +344,23 @@ class TestDatabaseMCPServerManager:
 class TestToolFactoryMCPIntegration:
     """Test ToolFactory MCP integration."""
 
+    @staticmethod
+    def _mcp_oauth_config(name: str = "test_mcp_oauth_server"):
+        return {
+            "name": name,
+            "transport": "streamable_http",
+            "managed": "external",
+            "description": "MCP OAuth server",
+            "url": "https://mcp.example.com/mcp",
+            "headers": {"Authorization": "Bearer static-token"},
+            "auth": {
+                "type": "mcp_oauth",
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "client_id": "client-123",
+            },
+        }
+
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_success(
         self, mock_load_mcp, test_db, sample_stdio_config
@@ -334,6 +386,85 @@ class TestToolFactoryMCPIntegration:
         call_args = mock_load_mcp.call_args
         connections_arg = call_args[0][0]  # First positional argument
         assert sample_stdio_config["name"] in connections_arg
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_skips_mcp_oauth_but_loads_other_servers(
+        self, mock_load_mcp, test_db, sample_stdio_config
+    ):
+        mock_tools = [MagicMock()]
+        mock_load_mcp.return_value = mock_tools
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+
+        tools = await ToolFactory.create_mcp_tools(test_db)
+
+        assert tools == mock_tools
+        connections_arg = mock_load_mcp.call_args[0][0]
+        assert sample_stdio_config["name"] in connections_arg
+        assert "test_mcp_oauth_server" not in connections_arg
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_all_mcp_oauth_returns_empty_without_loading(
+        self, mock_load_mcp, test_db
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+
+        tools = await ToolFactory.create_mcp_tools(test_db)
+
+        assert tools == []
+        mock_load_mcp.assert_not_called()
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_routes_mcp_oauth_through_runtime_builder(
+        self, mock_load_mcp, test_db
+    ):
+        mock_tools = [MagicMock()]
+        mock_load_mcp.return_value = mock_tools
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+        server = test_db.query(MCPServer).filter_by(name="test_mcp_oauth_server").one()
+        test_db.add(
+            UserMCPServer(
+                user_id=1,
+                mcpserver_id=server.id,
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        oauth_client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-123",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+        test_db.add(oauth_client)
+        test_db.flush()
+        test_db.add(
+            MCPOAuthGrant(
+                mcp_server_id=server.id,
+                user_id=1,
+                mcp_oauth_client_id=oauth_client.id,
+                resource_owner_key="xagent:user:1",
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="",
+                access_token=encrypt_value("runtime-access-token"),
+            )
+        )
+        test_db.commit()
+
+        tools = await ToolFactory.create_mcp_tools(test_db, user_id=1)
+
+        assert tools == mock_tools
+        connections_arg = mock_load_mcp.call_args[0][0]
+        assert connections_arg["test_mcp_oauth_server"]["headers"] == {
+            "Authorization": "Bearer runtime-access-token"
+        }
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):

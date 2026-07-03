@@ -103,6 +103,8 @@ OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
+MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -306,6 +308,32 @@ def get_smtp_from_name(default: str) -> str:
 def get_openrouter_official_providers_only() -> bool:
     """Return whether OpenRouter requests should pin official provider endpoints."""
     return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
+
+
+def get_mcp_oauth_allow_private_hosts() -> bool:
+    """Return whether MCP OAuth URL policy may target local/private hosts.
+
+    This is intended only for local development with local authorization
+    servers. Production deployments should leave it disabled.
+    """
+    return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_mcp_oauth_proxy_url() -> str | None:
+    """Return an explicit trusted proxy URL for outbound MCP OAuth HTTP calls."""
+    value = os.getenv(MCP_OAUTH_PROXY_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError(
+            f"Invalid {MCP_OAUTH_PROXY_URL} value: {value!r}. "
+            "Expected an absolute HTTP(S) proxy URL."
+        )
+    return value
 
 
 def _redis_url_with_database(url: str, database: int) -> str:

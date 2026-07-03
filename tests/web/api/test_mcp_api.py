@@ -73,6 +73,24 @@ class TestMCPServerModel:
         assert connection_dict["url"] == "ws://localhost:8080/ws"
         assert connection_dict["headers"] == {"Authorization": "Bearer token"}
 
+    def test_mcp_oauth_to_connection_dict_strips_static_authorization(self):
+        """MCP OAuth runtime credentials must not fall back to stored headers."""
+        server = MCPServer(
+            name="test_oauth_server",
+            transport="streamable_http",
+            managed="external",
+            url="https://mcp.example.com/mcp",
+            headers={
+                "Authorization": "Bearer static-token",
+                "X-Request-Source": "xagent",
+            },
+            auth={"type": "mcp_oauth"},
+        )
+
+        connection_dict = server.to_connection_dict()
+
+        assert connection_dict["headers"] == {"X-Request-Source": "xagent"}
+
     def test_to_config_dict_external(self):
         """Test to_config_dict method for external server."""
         server = MCPServer(
@@ -232,6 +250,23 @@ class TestMCPServerModel:
 
         assert server.auth["access_token"] != "plain-access-token"
         assert server.to_config_dict()["auth"]["access_token"] == "plain-access-token"
+
+    def test_from_config_rejects_masked_auth_secret_without_existing_value(self):
+        """Masked placeholders are response values, not creatable secrets."""
+        with pytest.raises(ValueError, match="Masked auth value"):
+            MCPServer.from_config(
+                {
+                    "name": "masked_server",
+                    "managed": "external",
+                    "transport": "streamable_http",
+                    "url": "https://example.com/mcp",
+                    "auth": {
+                        "type": "mcp_oauth",
+                        "client_id": "client-123",
+                        "client_secret": "********",
+                    },
+                }
+            )
 
     def test_transport_display_property(self):
         """Test transport_display property for different transports."""

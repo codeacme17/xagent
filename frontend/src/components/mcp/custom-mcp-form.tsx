@@ -1,39 +1,122 @@
-import React, { useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select-radix"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { ChevronDown, ChevronRight, Info, Plus, Trash2 } from "lucide-react"
+import { CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Info, Loader2, Plus, RefreshCw, Search, ShieldCheck, Trash2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
+import { toast } from "@/components/ui/sonner"
+import { apiRequest } from "@/lib/api-wrapper"
+import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
 
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
   setMcpFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
-  transports: any[]
+  serverId?: number | null
+  onOAuthStatusChange?: () => void
+}
+
+interface McpOAuthGrantStatus {
+  id: number
+  resource_owner_key: string
+  issuer: string
+  resource: string
+  scope: string
+  token_type: string
+  status: string
+  expires_at?: string | null
+}
+
+interface McpOAuthStatus {
+  server_id: number
+  auth_type?: string | null
+  resource?: string | null
+  issuer?: string | null
+  scope?: string | null
+  grants: McpOAuthGrantStatus[]
+}
+
+interface McpOAuthDiscoveryResponse {
+  resource: string
+  issuer: string
+  scopes: string[]
+}
+
+interface McpOAuthConnectResponse {
+  authorization_url: string
+}
+
+const MASKED_SECRET_VALUE = "********"
+const HTTP_MCP_OAUTH_TRANSPORTS = new Set(["streamable_http", "sse", "websocket"])
+
+export function isHttpMcpOAuthTransport(transport: string): boolean {
+  return HTTP_MCP_OAUTH_TRANSPORTS.has(transport)
+}
+
+async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json()
+    if (typeof payload?.detail === "string") return payload.detail
+    if (payload?.detail?.message) return payload.detail.message
+    if (payload?.detail?.code) return payload.detail.code
+  } catch {
+    // Keep the provided fallback.
+  }
+  return fallback
 }
 
 export function CustomMcpForm({
   mcpFormData,
   setMcpFormData,
-  transports
+  serverId,
+  onOAuthStatusChange
 }: CustomMcpFormProps) {
   const { t } = useI18n()
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
+  const [oauthStatus, setOauthStatus] = useState<McpOAuthStatus | null>(null)
+  const [oauthStatusLoading, setOauthStatusLoading] = useState(false)
+  const [oauthAction, setOauthAction] = useState<string | null>(null)
+  const isMountedRef = useRef(false)
+  const pollingTimeoutRef = useRef<number | null>(null)
+  const editedSecretFieldsRef = useRef<Set<string>>(new Set())
+  const previousServerIdRef = useRef<number | null | undefined>(serverId)
 
   // Default to sse if not set
   const transport = mcpFormData.transport || "sse"
+  const authConfig = mcpFormData.config?.auth
+  const authType = authConfig?.type || "none"
+  const isHttpMcpTransport = isHttpMcpOAuthTransport(transport)
+  const isMcpOAuth = authType === "mcp_oauth"
+  const bearerTokenValue = authConfig?.bearer_token
+  const apiKeyValue = authConfig?.api_key_value
+  const clientSecretValue = authConfig?.client_secret
 
-  const updateConfig = (key: string, value: any) => {
+  const clearOAuthPolling = useCallback(() => {
+    if (pollingTimeoutRef.current !== null && typeof window !== "undefined") {
+      window.clearTimeout(pollingTimeoutRef.current)
+      pollingTimeoutRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      clearOAuthPolling()
+    }
+  }, [clearOAuthPolling])
+
+  const updateConfig = (key: string, value: unknown) => {
     setMcpFormData((prev: MCPServerFormData) => ({
       ...prev,
       config: { ...prev.config, [key]: value }
     }))
   }
 
-  const updateAuth = (key: string, value: any) => {
+  const updateAuth = (key: string, value: unknown) => {
     setMcpFormData((prev: MCPServerFormData) => ({
       ...prev,
       config: {
@@ -41,6 +124,231 @@ export function CustomMcpForm({
         auth: { ...(prev.config?.auth || {}), [key]: value }
       }
     }))
+  }
+
+  const updateSecretAuth = (key: string, value: string) => {
+    editedSecretFieldsRef.current.add(key)
+    updateAuth(key, value)
+  }
+
+  const focusSecretAuth = (key: string, value: unknown) => {
+    if (value === MASKED_SECRET_VALUE) {
+      editedSecretFieldsRef.current.delete(key)
+      updateAuth(key, "")
+    }
+  }
+
+  const blurSecretAuth = (
+    key: string,
+    value: unknown,
+    originalMaskedValue: string | undefined,
+  ) => {
+    if (
+      (value == null || value === "") &&
+      originalMaskedValue &&
+      !editedSecretFieldsRef.current.has(key)
+    ) {
+      updateAuth(key, MASKED_SECRET_VALUE)
+    }
+  }
+
+  const updateAuthType = (value: string) => {
+    setMcpFormData((prev: MCPServerFormData) => ({
+      ...prev,
+      config: {
+        ...prev.config,
+        auth: { type: value }
+      }
+    }))
+  }
+
+  const updateAuthFields = (fields: Record<string, unknown>) => {
+    setMcpFormData((prev: MCPServerFormData) => ({
+      ...prev,
+      config: {
+        ...prev.config,
+        auth: { ...(prev.config?.auth || {}), ...fields }
+      }
+    }))
+  }
+
+  const buildOAuthRequestBody = (includeRedirectAfter = false) => {
+    const body: Record<string, string | undefined> = {}
+    if (includeRedirectAfter) {
+      body.redirect_after = typeof window !== "undefined"
+        ? `${window.location.pathname}${window.location.search}`
+        : undefined
+    }
+    return body
+  }
+
+  const loadOAuthStatus = useCallback(async () => {
+    if (!serverId || !isMcpOAuth) {
+      if (isMountedRef.current) setOauthStatus(null)
+      return
+    }
+    if (isMountedRef.current) setOauthStatusLoading(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/status`)
+      if (!isMountedRef.current) return
+      if (response.ok) {
+        const status = await response.json()
+        if (!isMountedRef.current) return
+        setOauthStatus(status)
+      } else {
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthStatusFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
+      }
+    } catch (error) {
+      console.error("Failed to load MCP OAuth status:", error)
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthStatusFailed'))
+    } finally {
+      if (isMountedRef.current) setOauthStatusLoading(false)
+    }
+  }, [serverId, isMcpOAuth, t])
+
+  useEffect(() => {
+    loadOAuthStatus()
+  }, [loadOAuthStatus])
+
+  const handleDiscoverMcpOAuth = async () => {
+    if (!serverId) {
+      toast.error(t('tools.mcp.dialog.oauthSaveBeforeConnect'))
+      return
+    }
+    setOauthAction("discover")
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/discover`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildOAuthRequestBody())
+      })
+      if (!isMountedRef.current) return
+      if (!response.ok) {
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDiscoveryFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
+        return
+      }
+      const discovery = await response.json() as McpOAuthDiscoveryResponse
+      if (!isMountedRef.current) return
+      updateAuthFields({
+        resource: discovery.resource,
+        issuer: discovery.issuer,
+        scope: discovery.scopes?.join(" ") || mcpFormData.config?.auth?.scope || ""
+      })
+      toast.success(t('tools.mcp.dialog.oauthDiscoverySuccess'))
+    } catch (error) {
+      console.error("Failed to discover MCP OAuth metadata:", error)
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDiscoveryFailed'))
+    } finally {
+      if (isMountedRef.current) setOauthAction(null)
+    }
+  }
+
+  const handleConnectMcpOAuth = async () => {
+    if (!serverId) {
+      toast.error(t('tools.mcp.dialog.oauthSaveBeforeConnect'))
+      return
+    }
+    setOauthAction("connect")
+    let popup: Window | null = null
+    try {
+      clearOAuthPolling()
+      if (typeof window !== "undefined") {
+        popup = window.open("about:blank", "_blank")
+        if (!popup) {
+          toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+          return
+        }
+        popup.opener = null
+      }
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/connect`, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(buildOAuthRequestBody(true))
+      })
+      if (!isMountedRef.current) {
+        if (popup) popup.close()
+        return
+      }
+      if (!response.ok) {
+        if (popup) popup.close()
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
+        return
+      }
+      const data = await response.json() as McpOAuthConnectResponse
+      if (!isMountedRef.current) {
+        if (popup) popup.close()
+        return
+      }
+      if (!data.authorization_url) {
+        if (popup) popup.close()
+        toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+        return
+      }
+      if (popup) {
+        popup.location.href = data.authorization_url
+      } else {
+        popup = window.open(data.authorization_url, "_blank", "noopener,noreferrer")
+      }
+      const startedAt = Date.now()
+      const maxWaitMs = 5 * 60 * 1000
+      const poll = async () => {
+        if (!isMountedRef.current) return
+        const expired = Date.now() - startedAt >= maxWaitMs
+        const stillOpen = popup && !popup.closed
+        if (stillOpen && !expired) {
+          await loadOAuthStatus()
+          if (!isMountedRef.current) return
+          pollingTimeoutRef.current = window.setTimeout(poll, 3000)
+          return
+        }
+        clearOAuthPolling()
+        await loadOAuthStatus()
+        if (!isMountedRef.current) return
+        onOAuthStatusChange?.()
+      }
+      pollingTimeoutRef.current = window.setTimeout(poll, 3000)
+    } catch (error) {
+      if (popup) popup.close()
+      console.error("Failed to start MCP OAuth authorization:", error)
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+    } finally {
+      if (isMountedRef.current) setOauthAction(null)
+    }
+  }
+
+  const handleDeleteGrant = async (grantId: number) => {
+    if (!serverId) return
+    setOauthAction(`delete-${grantId}`)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/grants/${grantId}`, {
+        method: "DELETE"
+      })
+      if (!isMountedRef.current) return
+      if (!response.ok) {
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDisconnectFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
+        return
+      }
+      toast.success(t('tools.mcp.dialog.oauthDisconnectSuccess'))
+      await loadOAuthStatus()
+      if (!isMountedRef.current) return
+      onOAuthStatusChange?.()
+    } catch (error) {
+      console.error("Failed to delete MCP OAuth grant:", error)
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDisconnectFailed'))
+    } finally {
+      if (isMountedRef.current) setOauthAction(null)
+    }
   }
 
   // Handle headers state (array of {key, value} for the UI, but config expects an object)
@@ -57,10 +365,42 @@ export function CustomMcpForm({
     api_key_value?: string;
     client_secret?: string;
   }>({
-    bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : undefined,
-    api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
-    client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
+    bearer_token: bearerTokenValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    api_key_value: apiKeyValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    client_secret: clientSecretValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
   })
+
+  useEffect(() => {
+    const serverChanged = previousServerIdRef.current !== serverId
+    if (serverChanged) {
+      editedSecretFieldsRef.current.clear()
+      previousServerIdRef.current = serverId
+    }
+    const nextOriginalAuth = {
+      bearer_token: bearerTokenValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+      api_key_value: apiKeyValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+      client_secret: clientSecretValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    }
+    if (nextOriginalAuth.bearer_token) {
+      editedSecretFieldsRef.current.delete("bearer_token")
+    }
+    if (nextOriginalAuth.api_key_value) {
+      editedSecretFieldsRef.current.delete("api_key_value")
+    }
+    if (nextOriginalAuth.client_secret) {
+      editedSecretFieldsRef.current.delete("client_secret")
+    }
+    setOriginalAuth((prev) => ({
+      bearer_token: serverChanged ? nextOriginalAuth.bearer_token : nextOriginalAuth.bearer_token || prev.bearer_token,
+      api_key_value: serverChanged ? nextOriginalAuth.api_key_value : nextOriginalAuth.api_key_value || prev.api_key_value,
+      client_secret: serverChanged ? nextOriginalAuth.client_secret : nextOriginalAuth.client_secret || prev.client_secret,
+    }))
+  }, [
+    serverId,
+    bearerTokenValue,
+    apiKeyValue,
+    clientSecretValue,
+  ])
 
   const syncHeaders = (newList: { key: string, value: string }[]) => {
     setHeadersList(newList)
@@ -157,8 +497,8 @@ export function CustomMcpForm({
               {t('tools.mcp.dialog.authentication')} <span className="text-slate-400 text-xs">(?)</span>
             </Label>
             <Select
-              value={mcpFormData.config?.auth?.type || "none"}
-              onValueChange={(val) => updateAuth("type", val)}
+              value={authType}
+              onValueChange={(val) => updateAuthType(val)}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -168,6 +508,9 @@ export function CustomMcpForm({
                 <SelectItem value="bearer">{t('tools.mcp.dialog.authTypes.bearer')}</SelectItem>
                 <SelectItem value="api_key">{t('tools.mcp.dialog.authTypes.apiKey')}</SelectItem>
                 <SelectItem value="oauth2">{t('tools.mcp.dialog.authTypes.oauth2')}</SelectItem>
+                {(isHttpMcpTransport || isMcpOAuth) && (
+                  <SelectItem value="mcp_oauth">{t('tools.mcp.dialog.authTypes.mcpOAuth')}</SelectItem>
+                )}
               </SelectContent>
             </Select>
           </div>
@@ -179,16 +522,12 @@ export function CustomMcpForm({
                 id="bearer_token"
                 type="password"
                 value={mcpFormData.config?.auth?.bearer_token || ""}
-                onChange={(e) => updateAuth("bearer_token", e.target.value)}
+                onChange={(e) => updateSecretAuth("bearer_token", e.target.value)}
                 onFocus={() => {
-                  if (mcpFormData.config?.auth?.bearer_token === "********") {
-                    updateAuth("bearer_token", "")
-                  }
+                  focusSecretAuth("bearer_token", mcpFormData.config?.auth?.bearer_token)
                 }}
                 onBlur={() => {
-                  if ((!mcpFormData.config?.auth?.bearer_token || mcpFormData.config.auth.bearer_token === "") && originalAuth.bearer_token) {
-                    updateAuth("bearer_token", "********")
-                  }
+                  blurSecretAuth("bearer_token", mcpFormData.config?.auth?.bearer_token, originalAuth.bearer_token)
                 }}
                 placeholder={t('tools.mcp.dialog.tokenPlaceholder')}
               />
@@ -212,16 +551,12 @@ export function CustomMcpForm({
                   id="api_key_value"
                   type="password"
                   value={mcpFormData.config?.auth?.api_key_value || ""}
-                  onChange={(e) => updateAuth("api_key_value", e.target.value)}
+                  onChange={(e) => updateSecretAuth("api_key_value", e.target.value)}
                   onFocus={() => {
-                    if (mcpFormData.config?.auth?.api_key_value === "********") {
-                      updateAuth("api_key_value", "")
-                    }
+                    focusSecretAuth("api_key_value", mcpFormData.config?.auth?.api_key_value)
                   }}
                   onBlur={() => {
-                    if ((!mcpFormData.config?.auth?.api_key_value || mcpFormData.config.auth.api_key_value === "") && originalAuth.api_key_value) {
-                      updateAuth("api_key_value", "********")
-                    }
+                    blurSecretAuth("api_key_value", mcpFormData.config?.auth?.api_key_value, originalAuth.api_key_value)
                   }}
                   placeholder={t('tools.mcp.dialog.apiKeyPlaceholder')}
                 />
@@ -246,16 +581,12 @@ export function CustomMcpForm({
                   id="client_secret"
                   type="password"
                   value={mcpFormData.config?.auth?.client_secret || ""}
-                  onChange={(e) => updateAuth("client_secret", e.target.value)}
+                  onChange={(e) => updateSecretAuth("client_secret", e.target.value)}
                   onFocus={() => {
-                    if (mcpFormData.config?.auth?.client_secret === "********") {
-                      updateAuth("client_secret", "")
-                    }
+                    focusSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret)
                   }}
                   onBlur={() => {
-                    if ((!mcpFormData.config?.auth?.client_secret || mcpFormData.config.auth.client_secret === "") && originalAuth.client_secret) {
-                      updateAuth("client_secret", "********")
-                    }
+                    blurSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret, originalAuth.client_secret)
                   }}
                   placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
                 />
@@ -268,6 +599,187 @@ export function CustomMcpForm({
                   onChange={(e) => updateAuth("token_url", e.target.value)}
                   placeholder={t('tools.mcp.dialog.tokenUrlPlaceholder')}
                 />
+              </div>
+            </>
+          )}
+
+          {isMcpOAuth && (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_resource">{t('tools.mcp.dialog.oauthResource')}</Label>
+                  <Input
+                    id="mcp_oauth_resource"
+                    value={mcpFormData.config?.auth?.resource || ""}
+                    onChange={(e) => updateAuth("resource", e.target.value)}
+                    placeholder="https://mcp.example.com/mcp"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_issuer">{t('tools.mcp.dialog.oauthIssuer')}</Label>
+                  <Input
+                    id="mcp_oauth_issuer"
+                    value={mcpFormData.config?.auth?.issuer || ""}
+                    onChange={(e) => updateAuth("issuer", e.target.value)}
+                    placeholder="https://auth.example.com"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="mcp_oauth_scope">{t('tools.mcp.dialog.oauthScope')}</Label>
+                <Input
+                  id="mcp_oauth_scope"
+                  value={mcpFormData.config?.auth?.scope || ""}
+                  onChange={(e) => updateAuth("scope", e.target.value)}
+                  placeholder="records.read records.write"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_client_id">{t('tools.mcp.dialog.clientId')}</Label>
+                  <Input
+                    id="mcp_oauth_client_id"
+                    value={mcpFormData.config?.auth?.client_id || ""}
+                    onChange={(e) => updateAuth("client_id", e.target.value)}
+                    placeholder={t('tools.mcp.dialog.clientIdPlaceholder')}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_client_secret">{t('tools.mcp.dialog.clientSecret')}</Label>
+                  <Input
+                    id="mcp_oauth_client_secret"
+                    type="password"
+                    value={mcpFormData.config?.auth?.client_secret || ""}
+                    onChange={(e) => updateSecretAuth("client_secret", e.target.value)}
+                    onFocus={() => {
+                      focusSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret)
+                    }}
+                    onBlur={() => {
+                      blurSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret, originalAuth.client_secret)
+                    }}
+                    placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_resource_metadata">{t('tools.mcp.dialog.oauthResourceMetadataUrl')}</Label>
+                  <Input
+                    id="mcp_oauth_resource_metadata"
+                    value={mcpFormData.config?.auth?.resource_metadata_url || ""}
+                    onChange={(e) => updateAuth("resource_metadata_url", e.target.value)}
+                    placeholder="https://mcp.example.com/.well-known/oauth-protected-resource"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="mcp_oauth_redirect_uri">{t('tools.mcp.dialog.oauthRedirectUri')}</Label>
+                  <Input
+                    id="mcp_oauth_redirect_uri"
+                    value={mcpFormData.config?.auth?.redirect_uri || ""}
+                    onChange={(e) => updateAuth("redirect_uri", e.target.value)}
+                    placeholder="https://xagent.example.com/api/mcp/oauth/callback"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label>{t('tools.mcp.dialog.oauthTokenEndpointAuthMethod')}</Label>
+                <Select
+                  value={mcpFormData.config?.auth?.token_endpoint_auth_method || "none"}
+                  onValueChange={(val) => updateAuth("token_endpoint_auth_method", val)}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">none</SelectItem>
+                    <SelectItem value="client_secret_post">client_secret_post</SelectItem>
+                    <SelectItem value="client_secret_basic">client_secret_basic</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <ShieldCheck className="h-4 w-4 text-slate-600 shrink-0" />
+                    <span className="text-sm font-medium text-slate-800 truncate">
+                      {t('tools.mcp.dialog.oauthStatus')}
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={loadOAuthStatus}
+                    disabled={!serverId || oauthStatusLoading}
+                    title={t('tools.mcp.dialog.oauthRefreshStatus')}
+                  >
+                    <RefreshCw className={`h-4 w-4 ${oauthStatusLoading ? "animate-spin" : ""}`} />
+                  </Button>
+                </div>
+
+                {!serverId ? (
+                  <p className="text-sm text-slate-500">{t('tools.mcp.dialog.oauthSaveBeforeConnect')}</p>
+                ) : oauthStatus?.grants?.length ? (
+                  <div className="space-y-2">
+                    {oauthStatus.grants.map((grant) => (
+                      <div key={grant.id} className="flex items-start justify-between gap-3 rounded-md border border-slate-200 bg-white px-3 py-2">
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                            <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                            <span className="truncate">{grant.resource_owner_key}</span>
+                          </div>
+                          <p className="text-xs text-slate-500 truncate">{grant.scope || t('tools.mcp.dialog.oauthNoScope')}</p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => handleDeleteGrant(grant.id)}
+                          disabled={oauthAction === `delete-${grant.id}`}
+                          title={t('tools.mcp.dialog.oauthDisconnectGrant')}
+                          className="shrink-0 text-red-500 hover:text-red-700"
+                        >
+                          {oauthAction === `delete-${grant.id}` ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-slate-500">{t('tools.mcp.dialog.oauthNoGrants')}</p>
+                )}
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleDiscoverMcpOAuth}
+                    disabled={!serverId || oauthAction === "discover"}
+                    className="flex-1"
+                  >
+                    {oauthAction === "discover" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Search className="h-4 w-4 mr-2" />}
+                    {t('tools.mcp.dialog.oauthDiscover')}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={handleConnectMcpOAuth}
+                    disabled={!serverId || oauthAction === "connect"}
+                    className="flex-1"
+                  >
+                    {oauthAction === "connect" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ExternalLink className="h-4 w-4 mr-2" />}
+                    {oauthStatus?.grants?.length ? t('tools.mcp.dialog.oauthReconnect') : t('tools.mcp.dialog.oauthConnect')}
+                  </Button>
+                </div>
               </div>
             </>
           )}

@@ -178,6 +178,7 @@ class WebToolConfig(BaseToolConfig):
         agent_call_stack: Optional[List[int]] = None,
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
+        mcp_auth_context: Optional[Dict[str, Any]] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -217,7 +218,16 @@ class WebToolConfig(BaseToolConfig):
             workspace_config["base_dir"] = workspace_base_dir
         if self._user_id is not None and "user_id" not in workspace_config:
             workspace_config["user_id"] = self._user_id
+        if mcp_auth_context is None:
+            raw_auth_context = workspace_config.get("mcp_auth_context")
+            mcp_auth_context = (
+                raw_auth_context if isinstance(raw_auth_context, dict) else None
+            )
         self._workspace_config = workspace_config
+        self._mcp_auth_context = (
+            mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
+        )
+        self._mcp_oauth_diagnostics: List[Dict[str, Any]] = []
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
@@ -364,6 +374,10 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_mcp_configs is None:
             self._cached_mcp_configs = await self._load_mcp_server_configs()
         return self._cached_mcp_configs
+
+    def get_mcp_oauth_diagnostics(self) -> List[Dict[str, Any]]:
+        """Return structured MCP OAuth runtime diagnostics from the last load."""
+        return list(self._mcp_oauth_diagnostics)
 
     def get_embedding_model(self) -> Optional[str]:
         """Load default embedding model ID from database."""
@@ -666,6 +680,7 @@ class WebToolConfig(BaseToolConfig):
         """Load MCP server configurations from database with user context."""
         logger = logging.getLogger(__name__)
         configs = []
+        self._mcp_oauth_diagnostics = []
 
         try:
             from ...web.models.mcp import MCPServer, UserMCPServer
@@ -828,20 +843,24 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["cwd"] = server.cwd
 
                 elif server.transport in ["sse", "websocket", "streamable_http"]:
-                    decrypted_auth = server._decrypt_auth_config(
-                        getattr(server, "auth", None)
+                    from ...web.services.mcp_runtime import (
+                        build_mcp_runtime_connection,
+                        connection_to_transport_config,
                     )
-                    if server.url:
-                        transport_config["url"] = server.url
-                    raw_headers = getattr(server, "headers", None)
-                    typed_headers = (
-                        raw_headers if isinstance(raw_headers, dict) else None
+
+                    runtime_build = await build_mcp_runtime_connection(
+                        self.db,
+                        server,
+                        user_id=self._user_id,
+                        mcp_auth_context=self._mcp_auth_context,
                     )
-                    merged_headers = server._merge_auth_headers(
-                        typed_headers, decrypted_auth
+                    if runtime_build.connection is None:
+                        if runtime_build.diagnostic is not None:
+                            self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
+                        continue
+                    transport_config.update(
+                        connection_to_transport_config(runtime_build.connection)
                     )
-                    if merged_headers:
-                        transport_config["headers"] = merged_headers
 
                 transport_config["concurrency_safe"] = bool(
                     getattr(server, "concurrency_safe", False)
