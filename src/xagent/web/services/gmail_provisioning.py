@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -140,12 +141,21 @@ def _get_or_create_watch_state(
     # release_gmail_mailbox_if_unused: without it, unregistering the last
     # trigger can delete the row a concurrent provisioning run is updating,
     # stranding the new trigger at PENDING until the sweep retries.
-    state = (
-        db.query(GmailWatchState)
-        .filter(GmailWatchState.oauth_account_id == int(oauth_account.id))
-        .with_for_update()
-        .first()
-    )
+    def locked_state() -> GmailWatchState | None:
+        return (
+            db.query(GmailWatchState)
+            .filter(GmailWatchState.oauth_account_id == int(oauth_account.id))
+            .with_for_update()
+            .first()
+        )
+
+    def mark_pending(target: GmailWatchState) -> None:
+        if not target.callback_id:
+            setattr(target, "callback_id", _new_callback_id())
+        setattr(target, "email", email)
+        setattr(target, "status", TriggerProvisioningStatus.PENDING.value)
+
+    state = locked_state()
     if state is None:
         state = GmailWatchState(
             user_id=int(oauth_account.user_id),
@@ -155,11 +165,21 @@ def _get_or_create_watch_state(
             topic_name="",
         )
         db.add(state)
-    if not state.callback_id:
-        setattr(state, "callback_id", _new_callback_id())
-    setattr(state, "email", email)
-    setattr(state, "status", TriggerProvisioningStatus.PENDING.value)
-    db.commit()
+    mark_pending(state)
+    try:
+        db.commit()
+    except IntegrityError:
+        # FOR UPDATE takes no lock when the row does not exist yet, so two
+        # concurrent first-time enables for the same account can both reach
+        # the insert path; the loser trips the oauth_account_id unique
+        # constraint and adopts the winner's row instead of erroring out.
+        db.rollback()
+        adopted = locked_state()
+        if adopted is None:  # pragma: no cover - row deleted between retries
+            raise
+        state = adopted
+        mark_pending(state)
+        db.commit()
     db.refresh(state)
     return state
 

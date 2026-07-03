@@ -546,6 +546,7 @@ async def receive_legacy_webhook_trigger(
                 db,
                 outcome=TriggerAuditOutcome.RATE_LIMITED,
                 provider="webhook",
+                callback_id=webhook_token,
                 remote_ip=remote_ip,
                 detail={"route": "legacy_webhook"},
             )

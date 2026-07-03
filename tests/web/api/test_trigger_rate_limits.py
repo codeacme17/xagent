@@ -140,6 +140,34 @@ class TestCallbackRateLimit:
         finally:
             db.close()
 
+    def test_legacy_route_rate_limited_audit_records_callback_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deprecated webhook route's 429 audit row carries the webhook
+        token as callback_id, matching the unified route's forensic detail."""
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_RATE_LIMIT", "1/minute")
+        reset_trigger_rate_limiter()
+
+        url = "/api/triggers/webhook/legacy-token"
+        first = client.post(url, content=b"{}")
+        assert first.status_code != 429
+
+        limited = client.post(url, content=b"{}")
+        assert limited.status_code == 429
+
+        db = _direct_db_session()
+        try:
+            rate_limited = (
+                db.query(TriggerAudit)
+                .filter(TriggerAudit.outcome == "rate_limited")
+                .all()
+            )
+            assert len(rate_limited) == 1
+            assert rate_limited[0].callback_id == "legacy-token"
+            assert rate_limited[0].detail == {"route": "legacy_webhook"}
+        finally:
+            db.close()
+
     def test_rate_limit_key_includes_callback_id(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

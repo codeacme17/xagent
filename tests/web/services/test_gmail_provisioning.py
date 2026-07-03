@@ -791,6 +791,57 @@ def test_release_and_reprovision_contend_on_the_watch_state_lock(
     assert rows[0].status == TriggerProvisioningStatus.ACTIVE.value
 
 
+def test_first_time_creation_race_adopts_winner_row(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FOR UPDATE takes no lock when the watch-state row does not exist yet,
+    so two concurrent first-time enables can both reach the insert path. The
+    loser's IntegrityError must adopt the winner's committed row instead of
+    propagating a spurious error into the background thread."""
+    from sqlalchemy.exc import IntegrityError
+
+    from xagent.web.services.gmail_provisioning import _get_or_create_watch_state
+
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+
+    real_commit = db_session.commit
+    real_rollback = db_session.rollback
+    calls = {"count": 0}
+
+    def racing_commit() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Simulate a concurrent winner committing between this session's
+            # empty FOR UPDATE select and its own insert commit.
+            real_rollback()
+            winner = GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(account.id),
+                email="owner@gmail.example",
+                history_id="hist-winner",
+                topic_name="projects/demo-project/topics/winner",
+                callback_id="winner-callback-id",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            )
+            db_session.add(winner)
+            real_commit()
+            raise IntegrityError(
+                "UNIQUE constraint failed: gmail_watch_states.oauth_account_id",
+                params=None,
+                orig=Exception("simulated concurrent insert"),
+            )
+        real_commit()
+
+    monkeypatch.setattr(db_session, "commit", racing_commit)
+    state = _get_or_create_watch_state(db_session, account, "owner@gmail.example")
+
+    assert state.callback_id == "winner-callback-id"
+    assert state.history_id == "hist-winner"
+    assert state.status == TriggerProvisioningStatus.PENDING.value
+    assert db_session.query(GmailWatchState).count() == 1
+
+
 def test_provisioning_requires_account_email(db_session: Session) -> None:
     from xagent.web.services.gmail_provisioning import GmailProvisioningError
 
