@@ -65,6 +65,8 @@ def init_db(db_url: str | None = None) -> None:
         UserDefaultModel,
         UserIdentity,
         UserModel,
+        UserSkill,
+        UserSkillFile,
         UserTemplateRelation,
         Workforce,
         WorkforceAgent,
