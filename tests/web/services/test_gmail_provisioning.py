@@ -842,6 +842,72 @@ def test_first_time_creation_race_adopts_winner_row(
     assert db_session.query(GmailWatchState).count() == 1
 
 
+def test_concurrent_first_time_creations_race_on_the_unique_constraint(
+    pg_session: Session,
+) -> None:
+    """Two sessions both pass the empty FOR UPDATE select and insert; the
+    loser must recover from the genuine unique-constraint violation by
+    rolling back and adopting the winner's committed row. Unlike the mocked
+    variant above, the loser's session really is in a failed transaction, so
+    this fails if _get_or_create_watch_state drops its rollback."""
+    from xagent.web.models.database import get_session_local
+    from xagent.web.services.gmail_provisioning import _get_or_create_watch_state
+
+    db = pg_session
+    user = _create_user(db)
+    account = _create_oauth(db, user)
+    account_id = int(account.id)
+
+    both_past_the_empty_select = threading.Barrier(2)
+    results: dict[str, str] = {}
+    errors: dict[str, BaseException] = {}
+
+    def do_enable(name: str) -> None:
+        session = get_session_local()()
+        real_commit = session.commit
+        insert_commit_pending = True
+
+        def synchronized_commit() -> None:
+            # Hold the insert commit until both sessions have run the empty
+            # FOR UPDATE select, so both take the insert path; the loser's
+            # adoption retry commit passes straight through.
+            nonlocal insert_commit_pending
+            if insert_commit_pending:
+                insert_commit_pending = False
+                both_past_the_empty_select.wait(timeout=30)
+            real_commit()
+
+        session.commit = synchronized_commit  # type: ignore[method-assign]
+        try:
+            acct = session.query(UserOAuth).filter(UserOAuth.id == account_id).one()
+            state = _get_or_create_watch_state(session, acct, "owner@gmail.example")
+            results[name] = str(state.callback_id)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors[name] = exc
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=do_enable, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert errors == {}
+    # The loser adopted the winner's row, so both report the same identity.
+    assert results["a"] == results["b"]
+    rows = (
+        db.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == account_id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert str(rows[0].callback_id) == results["a"]
+    assert rows[0].status == TriggerProvisioningStatus.PENDING.value
+    assert rows[0].email == "owner@gmail.example"
+
+
 def test_provisioning_requires_account_email(db_session: Session) -> None:
     from xagent.web.services.gmail_provisioning import GmailProvisioningError
 
