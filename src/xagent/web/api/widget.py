@@ -36,6 +36,7 @@ widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
 class WidgetAuthRequest(BaseModel):
     guest_id: str
     agent_id: Optional[int] = None
+    embed_origin: Optional[str] = None
 
 
 WidgetAuthResponse = PublicChatAuthResponse
@@ -69,21 +70,22 @@ async def authenticate_widget(
             # Check allowed domains
             allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
 
-            # Use X-Forwarded-Host if available, then Host, then Origin/Referer
-            # This is important when widget is loaded via iframe
-            origin = req.headers.get("origin") or req.headers.get("referer", "")
+            # The auth fetch runs inside the widget iframe, so the browser's
+            # Origin/Referer headers reflect the xagent host itself, not the
+            # embedding site. widget.js forwards the embedding page's origin
+            # as embed_origin; prefer it, falling back to headers for older
+            # cached embeds and direct page visits.
+            origin = request.embed_origin or (
+                req.headers.get("origin") or req.headers.get("referer", "")
+            )
 
             from urllib.parse import urlparse
 
             origin_domain = ""
 
-            # Try origin/referer
             if origin:
                 parsed = urlparse(origin)
                 origin_domain = (parsed.netloc or parsed.path).lower()
-
-            # If origin_domain is localhost:3000 but host is localhost:8001
-            # Next.js might be rewriting the request. Let's use the origin_domain.
 
             # Check if origin matches any allowed domain. Domains are
             # case-insensitive, so compare both sides lowercased regardless of

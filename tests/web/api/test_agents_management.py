@@ -367,6 +367,77 @@ def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
     assert response.status_code == 200, response.text
 
 
+def test_widget_auth_prefers_embed_origin_over_iframe_origin_header() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Embed Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    # The auth fetch runs inside the widget iframe, so the Origin header is
+    # the xagent host's own origin; embed_origin carries the embedding page.
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_origin": "https://trusted-site.com",
+        },
+        headers={"origin": "https://xagent-host.example"},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_widget_auth_rejects_disallowed_embed_origin_despite_allowed_header() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Embed Origin Rejection Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_origin": "https://evil-attacker.com",
+        },
+        headers={"origin": "https://trusted-site.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
+
+
+def test_widget_auth_falls_back_to_origin_header_without_embed_origin() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Header Fallback Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+
+    assert response.status_code == 200, response.text
+
+
 def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
     _admin_headers()
     owner_id = _user_id("admin")

@@ -117,6 +117,9 @@
   if (agentId) {
     iframeUrl += '&agent_id=' + agentId;
   }
+  // Pass the embedding page's origin: fetches inside the iframe carry the
+  // iframe's own origin, so the backend needs this to check allowed_domains.
+  iframeUrl += '&embed_origin=' + encodeURIComponent(window.location.origin);
   iframe.src = iframeUrl;
   panel.appendChild(iframe);
 
