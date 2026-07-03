@@ -48,9 +48,12 @@ access; no Tool type import required.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_mcp_server_name(name: str) -> str:
@@ -150,11 +153,10 @@ class ToolSelectionSpec(ABC):
     def includes_custom_api(self) -> bool:
         """Whether the Custom API creator should run.
 
-        In BY_CATEGORIES mode this also requires ``"other"`` in
-        :attr:`categories` because Custom API tools surface under
-        the ``other`` category; without it they cannot survive the
-        post-build name filter, so running the creator (and its
-        ``get_custom_api_configs()`` DB lookup) is wasted I/O.
+        In BY_CATEGORIES mode Custom API tools are connector-scoped:
+        only an explicit ``mcp:<server>`` selector should load the matching
+        Custom API wrapper. Plain ``"other"`` must not bulk-enable every
+        Custom API the user has configured.
         """
 
     @abstractmethod
@@ -230,7 +232,8 @@ class ToolSelectionSpec(ABC):
             filters to the worker tool names (or ``_SpecNone`` when there
             is no ``published_agent_ids``). Lets an unconfigured manager
             delegate only to its workers without inheriting the full set.
-          - Otherwise → ``_SpecByCategories``.
+          - Otherwise → ``_SpecByCategories`` after dropping non-assignable
+            entries such as ``"other"``; if nothing assignable remains, NONE.
 
         ``name_allowlist`` is a pure name-level filter (only meaningful in
         BY_CATEGORIES; ALL already includes everything, NONE rejects
@@ -271,7 +274,8 @@ class ToolSelectionSpec(ABC):
             return _SpecAll()
 
         # ``tool_categories`` mixes two orthogonal shapes:
-        #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``)
+        #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``);
+        #     ``"other"`` is an internal fallback, not an assignable category
         #   - ``"mcp:<server>"`` — a specific MCP server (or the
         #     Custom-API tool fronting it)
         #
@@ -291,21 +295,40 @@ class ToolSelectionSpec(ABC):
             if isinstance(entry, str) and entry.startswith("mcp:"):
                 server_name = normalize_mcp_server_name(entry.split(":", 1)[1])
                 derived_mcp_servers.add(server_name)
+            elif entry == "other":
+                # Legacy-only entry, no longer assignable (see module
+                # docstring). No built-in tool carries this category, so
+                # dropping it just prunes stale data -- except a legacy
+                # agent persisted with exactly ["other"] (no mcp_servers),
+                # which loses its only tool access. Warn so this is
+                # visible in logs; from_raw() has no agent id, so
+                # per-agent traceability comes from the backfill
+                # migration's logging instead.
+                logger.warning(
+                    "Dropping non-assignable 'other' tool category from "
+                    "tool_categories=%r; if 'other' was the only entry, "
+                    "this agent now gets zero tools instead of its "
+                    "previous (leaky) Custom API access",
+                    tool_categories,
+                )
+                continue
             else:
                 plain_cats.add(entry)
 
         final_mcp_servers = (
             frozenset(derived_mcp_servers) if derived_mcp_servers else None
         )
+        final_published_agent_ids = (
+            frozenset(published_agent_ids) if published_agent_ids is not None else None
+        )
+
+        if not plain_cats and not final_mcp_servers and not final_published_agent_ids:
+            return _SpecNone()
 
         return _SpecByCategories(
             categories=frozenset(plain_cats),
             mcp_servers=final_mcp_servers,
-            published_agent_ids=(
-                frozenset(published_agent_ids)
-                if published_agent_ids is not None
-                else None
-            ),
+            published_agent_ids=final_published_agent_ids,
             name_allowlist=names,
         )
 
@@ -523,14 +546,14 @@ class _SpecByCategories(ToolSelectionSpec):
         return "mcp" in self.categories or bool(self.mcp_servers)
 
     def includes_custom_api(self) -> bool:
-        # Custom API tools surface under the "other" category. A scoped
-        # mcp:<server> also fronts a Custom-API wrapper
-        # (api_<server>_call), so a server scope runs this creator too.
+        # Custom API tools are exposed through connector scope only. A plain
+        # "other" category used to bulk-load every Custom API for the user,
+        # which let agents call APIs unrelated to the configured connector.
         # Filter happens in the creator via ``config.get_custom_api_configs``
         # and ``compute_allowed_names``'s structured ``source_server`` match
         # -- there is no spec-level custom_api id list (ids can't be mapped to
         # tool names in the spec layer).
-        return "other" in self.categories or bool(self.mcp_servers)
+        return bool(self.mcp_servers)
 
     def includes_published_agent(self) -> bool:
         # Pure dispatch decision: whether the published-agent creator runs
@@ -561,8 +584,8 @@ class _SpecByCategories(ToolSelectionSpec):
         reconstruction):
 
           - a tool whose category ∈ ``categories`` is admitted (plain
-            ``"mcp"`` admits all MCP tools, ``"other"`` all Custom-API
-            tools, etc.);
+            ``"mcp"`` admits all MCP tools, etc.; DB-backed Custom API
+            tools are loaded only for scoped ``mcp:<server>`` connectors);
           - otherwise a tool whose ``metadata.source_server`` matches a
             scoped server in ``mcp_servers`` is admitted. ``source_server``
             is the normalized originating-server identity set once at
