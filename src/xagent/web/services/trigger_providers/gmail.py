@@ -48,9 +48,12 @@ OidcVerifier = Callable[[str, str], Mapping[str, Any]]
 GOOGLE_OIDC_ISSUERS = frozenset({"https://accounts.google.com", "accounts.google.com"})
 
 
-def _gmail_oauth_account_id(trigger: AgentTrigger) -> int | None:
-    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
-    value = config.get("oauth_account_id")
+def _binding_oauth_account_id(config: Any) -> int | None:
+    """Read the bound OAuth account from a binding config (mapping or typed)."""
+    if isinstance(config, Mapping):
+        value = config.get("oauth_account_id")
+    else:
+        value = getattr(config, "oauth_account_id", None)
     return int(value) if value is not None else None
 
 
@@ -330,7 +333,9 @@ class GmailProvider:
         )
 
     async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        oauth_account_id = _gmail_oauth_account_id(trigger)
+        # The binding must come from config: CRUD passes the trigger's
+        # previous config, and on delete the trigger row no longer exists.
+        oauth_account_id = _binding_oauth_account_id(config)
         if oauth_account_id is not None:
             await asyncio.to_thread(
                 release_gmail_mailbox_if_unused, db, oauth_account_id

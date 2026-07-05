@@ -417,7 +417,11 @@ async def test_gmail_provider_register_unregister_offload_sync_sdk_work(
 
     provider = GmailProvider()
     result = await provider.register(db_session, trigger, object())
-    await provider.unregister(db_session, trigger, object())
+    # unregister resolves the binding from config alone; the trigger row may
+    # already be rebound or deleted when CRUD dispatches it.
+    await provider.unregister(
+        db_session, trigger, {"oauth_account_id": int(account.id)}
+    )
 
     assert result.status == TriggerProvisioningStatus.ACTIVE
     assert calls == [
