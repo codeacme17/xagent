@@ -16,7 +16,7 @@ from fastapi import (
     WebSocket,
 )
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -41,9 +41,11 @@ EMBED_TICKET_TTL_SECONDS = 60
 
 
 class WidgetAuthRequest(BaseModel):
-    guest_id: str
+    guest_id: str = Field(max_length=256)
     agent_id: Optional[int] = None
-    embed_ticket: Optional[str] = None
+    # A signed embed ticket is a compact JWT; cap it to reject pathological
+    # payloads, matching the length limits on sibling request models.
+    embed_ticket: Optional[str] = Field(default=None, max_length=4096)
 
 
 class EmbedTicketRequest(BaseModel):

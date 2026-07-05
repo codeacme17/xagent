@@ -587,6 +587,44 @@ def test_widget_auth_falls_back_to_origin_header_without_embed_ticket() -> None:
     assert response.status_code == 200, response.text
 
 
+def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
+    """allowed_domains matches on host[:port] only; the scheme is not part
+    of the comparison, so an http origin matches an entry with no scheme."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Scheme Agnostic Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = _issue_embed_ticket(agent_id, "http://trusted-site.com")
+
+    assert response.status_code == 200, response.text
+
+
+def test_widget_auth_rejects_when_ticket_and_origin_both_absent() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="No Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: "
+
+
 def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
     _admin_headers()
     owner_id = _user_id("admin")
