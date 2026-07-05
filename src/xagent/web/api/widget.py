@@ -118,6 +118,10 @@ async def issue_widget_embed_ticket(
             status_code=403, detail=f"Domain not allowed: {origin_domain}"
         )
 
+    # The ticket has no jti/nonce and is intentionally replayable within its
+    # short TTL: it only re-certifies "this origin is allowed", which /auth
+    # independently re-checks against the live allowlist on every use, and the
+    # guest tokens it mints are low-privilege. Replay-within-TTL is accepted.
     expire = datetime.now(timezone.utc) + timedelta(seconds=EMBED_TICKET_TTL_SECONDS)
     ticket = jwt.encode(
         {
@@ -215,8 +219,6 @@ async def authenticate_widget(
             "guest_id": request.guest_id,
             "auth_mode": "widget",
             "widget_agent_id": int(agent.id) if agent else None,
-            # Validated embedding origin, kept for downstream re-validation.
-            "embed_origin": origin_domain,
         }
     )
 

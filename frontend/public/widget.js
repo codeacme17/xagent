@@ -115,7 +115,7 @@
   iframe.className = 'xagent-widget-iframe';
   var iframeUrl = host + '/widget/chat/' + token + '?guest_id=' + guestId;
   if (agentId) {
-    iframeUrl += '&agent_id=' + agentId;
+    iframeUrl += '&agent_id=' + encodeURIComponent(agentId);
   }
   panel.appendChild(iframe);
 

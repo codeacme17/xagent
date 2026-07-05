@@ -396,6 +396,12 @@ def test_widget_embed_ticket_flow_validates_embedding_origin() -> None:
     assert ticket_response.status_code == 200, ticket_response.text
     ticket = ticket_response.json()["ticket"]
 
+    # The backend signs the validated embedding origin into the ticket, not
+    # a caller-supplied value.
+    ticket_claims = jose_jwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    assert ticket_claims["type"] == EMBED_TICKET_TYPE
+    assert ticket_claims["embed_origin"] == "trusted-site.com"
+
     # The auth fetch runs inside the iframe: its Origin is the xagent host,
     # which is NOT in allowed_domains — the ticket alone must carry trust.
     auth_response = client.post(
@@ -404,13 +410,6 @@ def test_widget_embed_ticket_flow_validates_embedding_origin() -> None:
         headers={"origin": "https://xagent-host.example"},
     )
     assert auth_response.status_code == 200, auth_response.text
-
-    claims = jose_jwt.decode(
-        auth_response.json()["access_token"],
-        JWT_SECRET_KEY,
-        algorithms=[JWT_ALGORITHM],
-    )
-    assert claims["embed_origin"] == "trusted-site.com"
 
 
 def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
