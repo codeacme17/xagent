@@ -22,10 +22,14 @@ def record_trigger_audit(
     detail: dict[str, Any] | None = None,
     remote_ip: str | None = None,
 ) -> TriggerAudit:
-    """Persist one audit row immediately.
+    """Persist one audit row immediately, isolated from the caller's session.
 
-    Audit rows are committed as they are written so that a later failure in
-    the same request cannot roll the security trail back out.
+    Audit rows are the forensic record of callback handling — including the
+    very failures that roll the surrounding transaction back — so each row is
+    committed on a short-lived session with its own connection to the
+    caller's engine. A later rollback of the caller's transaction cannot
+    discard the row, committing it cannot commit the caller's pending state,
+    and a caller session already in a failed state cannot block it.
     """
     audit = TriggerAudit(
         outcome=outcome.value,
@@ -35,9 +39,11 @@ def record_trigger_audit(
         detail=detail,
         remote_ip=remote_ip,
     )
-    db.add(audit)
-    db.commit()
-    db.refresh(audit)
+    with Session(bind=db.get_bind().engine) as audit_db:
+        audit_db.add(audit)
+        audit_db.commit()
+        audit_db.refresh(audit)
+        audit_db.expunge(audit)
     return audit
 
 
@@ -54,7 +60,8 @@ def record_trigger_audit_best_effort(
     """Like record_trigger_audit, but never raises.
 
     Used on failure paths where the original error must win over any audit
-    storage problem.
+    storage problem. The audit write runs on its own session, so the caller's
+    session needs no cleanup here.
     """
     try:
         return record_trigger_audit(
@@ -68,5 +75,4 @@ def record_trigger_audit_best_effort(
         )
     except Exception:
         logger.exception("Failed to write trigger audit row (outcome=%s)", outcome)
-        db.rollback()
         return None
