@@ -117,11 +117,31 @@
   if (agentId) {
     iframeUrl += '&agent_id=' + agentId;
   }
-  // Pass the embedding page's origin: fetches inside the iframe carry the
-  // iframe's own origin, so the backend needs this to check allowed_domains.
-  iframeUrl += '&embed_origin=' + encodeURIComponent(window.location.origin);
-  iframe.src = iframeUrl;
   panel.appendChild(iframe);
+
+  function loadIframe(ticket) {
+    iframe.src = ticket
+      ? iframeUrl + '&embed_ticket=' + encodeURIComponent(ticket)
+      : iframeUrl;
+  }
+
+  // Request a short-lived embed ticket from the top-level page. This fetch
+  // carries the embedding page's real, browser-enforced Origin header, which
+  // the backend validates against allowed_domains before signing the ticket.
+  // Fetches inside the iframe carry the iframe's own origin instead, so the
+  // ticket is how the validated embedding origin reaches the auth call.
+  if (agentId) {
+    fetch(host + '/api/widget/embed-ticket', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: parseInt(agentId, 10) })
+    })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) { loadIframe(data && data.ticket); })
+      .catch(function () { loadIframe(null); });
+  } else {
+    loadIframe(null);
+  }
 
   // FAB
   var fab = document.createElement('button');
