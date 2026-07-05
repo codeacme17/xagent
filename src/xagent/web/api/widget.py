@@ -1,6 +1,6 @@
 """Web Widget API route handlers."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -24,6 +24,7 @@ from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
     PublicChatAuthResponse,
@@ -81,6 +82,14 @@ def _domain_allowed(origin_domain: str, allowed_domains: list[str]) -> bool:
     return False
 
 
+def _require_domain_allowed(origin_domain: str, allowed_domains: list[str]) -> None:
+    """Raise 403 unless the domain passes the agent allowlist."""
+    if not _domain_allowed(origin_domain, allowed_domains):
+        raise HTTPException(
+            status_code=403, detail=f"Domain not allowed: {origin_domain}"
+        )
+
+
 def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
     """Load a widget-enabled agent or raise the matching HTTP error."""
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
@@ -112,26 +121,19 @@ async def issue_widget_embed_ticket(
     allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
     origin = req.headers.get("origin") or req.headers.get("referer", "")
     origin_domain = _origin_to_domain(origin)
-
-    if not _domain_allowed(origin_domain, allowed_domains):
-        raise HTTPException(
-            status_code=403, detail=f"Domain not allowed: {origin_domain}"
-        )
+    _require_domain_allowed(origin_domain, allowed_domains)
 
     # The ticket has no jti/nonce and is intentionally replayable within its
     # short TTL: it only re-certifies "this origin is allowed", which /auth
     # independently re-checks against the live allowlist on every use, and the
     # guest tokens it mints are low-privilege. Replay-within-TTL is accepted.
-    expire = datetime.now(timezone.utc) + timedelta(seconds=EMBED_TICKET_TTL_SECONDS)
-    ticket = jwt.encode(
+    ticket = create_access_token(
         {
             "type": EMBED_TICKET_TYPE,
             "agent_id": int(agent.id),
             "embed_origin": origin_domain,
-            "exp": expire,
         },
-        JWT_SECRET_KEY,
-        algorithm=JWT_ALGORITHM,
+        expires_delta=timedelta(seconds=EMBED_TICKET_TTL_SECONDS),
     )
     return EmbedTicketResponse(ticket=ticket)
 
@@ -181,19 +183,13 @@ async def authenticate_widget(
                 )
             origin_domain = str(claims.get("embed_origin") or "")
             # Re-check so tickets die immediately if the allowlist shrinks.
-            if not _domain_allowed(origin_domain, allowed_domains):
-                raise HTTPException(
-                    status_code=403, detail=f"Domain not allowed: {origin_domain}"
-                )
+            _require_domain_allowed(origin_domain, allowed_domains)
         else:
             # No ticket: direct page visits (not embedded via widget.js).
             # Fall back to the request's own Origin/Referer headers.
             origin = req.headers.get("origin") or req.headers.get("referer", "")
             origin_domain = _origin_to_domain(origin)
-            if not _domain_allowed(origin_domain, allowed_domains):
-                raise HTTPException(
-                    status_code=403, detail=f"Domain not allowed: {origin_domain}"
-                )
+            _require_domain_allowed(origin_domain, allowed_domains)
 
         user = db.query(User).filter(User.id == agent.user_id).first()
 

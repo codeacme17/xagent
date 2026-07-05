@@ -130,15 +130,28 @@
   // the backend validates against allowed_domains before signing the ticket.
   // Fetches inside the iframe carry the iframe's own origin instead, so the
   // ticket is how the validated embedding origin reaches the auth call.
-  if (agentId) {
+  var numericAgentId = parseInt(agentId, 10);
+  if (agentId && isNaN(numericAgentId)) {
+    console.error('Xagent Widget: data-agent-id must be numeric, got "' + agentId + '".');
+    loadIframe(null);
+  } else if (agentId) {
     fetch(host + '/api/widget/embed-ticket', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: parseInt(agentId, 10) })
+      body: JSON.stringify({ agent_id: numericAgentId })
     })
-      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (res) {
+        if (!res.ok) {
+          console.warn('Xagent Widget: embed ticket request failed (HTTP ' + res.status + '); loading widget without a ticket. If this page is not in the agent\'s allowed domains, authentication will fail.');
+          return null;
+        }
+        return res.json();
+      })
       .then(function (data) { loadIframe(data && data.ticket); })
-      .catch(function () { loadIframe(null); });
+      .catch(function (err) {
+        console.warn('Xagent Widget: embed ticket request failed (' + err + '); loading widget without a ticket.');
+        loadIframe(null);
+      });
   } else {
     loadIframe(null);
   }
