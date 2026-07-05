@@ -81,11 +81,12 @@ def warn_if_gmail_oidc_verification_degraded() -> None:
 
 
 def _binding_oauth_account_id(config: Any) -> int | None:
-    """Read the bound OAuth account from a binding config (mapping or typed)."""
-    if isinstance(config, Mapping):
-        value = config.get("oauth_account_id")
-    else:
-        value = getattr(config, "oauth_account_id", None)
+    """Read the bound OAuth account from a binding config.
+
+    CRUD dispatch always passes the previous config as a plain dict
+    (AgentTrigger.config is a JSON column).
+    """
+    value = (config or {}).get("oauth_account_id")
     return int(value) if value is not None else None
 
 

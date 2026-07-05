@@ -39,6 +39,10 @@ def record_trigger_audit(
         detail=detail,
         remote_ip=remote_ip,
     )
+    # .engine deliberately resolves to the real Engine even when the caller's
+    # session is bound to a Connection (e.g. a SAVEPOINT-based test fixture):
+    # that is what lets audit rows survive the caller's rollback — and it also
+    # means they would escape any future Connection+SAVEPOINT test isolation.
     with Session(bind=db.get_bind().engine) as audit_db:
         audit_db.add(audit)
         audit_db.commit()

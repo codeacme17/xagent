@@ -557,8 +557,21 @@ def test_reconcile_copies_watch_state_status_onto_triggers(
     assert reconcile_gmail_trigger_provisioning(db_session) == 0
 
 
+@pytest.mark.parametrize(
+    ("candidate_count", "expected_page_queries"),
+    [
+        # Short final page (5 = 2+2+1): the len(page) < page_size branch
+        # terminates without an extra query.
+        (5, 3),
+        # Exact multiple of the page size (4 = 2+2): termination needs one
+        # extra empty-page query, taking the `if not page` branch.
+        (4, 3),
+    ],
+)
 def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
     db_session: Session,
+    candidate_count: int,
+    expected_page_queries: int,
 ) -> None:
     """The sweep-path reconcile (triggers=None) walks candidates in keyset
     pages: every diverged trigger still reconciles, and every candidate
@@ -570,7 +583,7 @@ def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
     user = _create_user(db_session)
     agent = _create_agent(db_session, user)
     triggers = []
-    for index in range(5):
+    for index in range(candidate_count):
         account = _create_oauth(db_session, user, email=f"owner{index}@gmail.example")
         trigger = _create_gmail_trigger(db_session, user, agent, account)
         setattr(trigger, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
@@ -600,7 +613,7 @@ def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
     finally:
         sa_event.remove(engine, "before_cursor_execute", _track)
 
-    assert updated == 5
+    assert updated == candidate_count
     for trigger in triggers:
         db_session.refresh(trigger)
         assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
@@ -610,8 +623,7 @@ def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
     ]
     assert candidate_queries, "expected candidate page queries"
     assert all("LIMIT" in s for s in candidate_queries)
-    # 5 candidates in pages of 2 -> exactly three keyset page queries.
-    assert len(candidate_queries) == 3
+    assert len(candidate_queries) == expected_page_queries
 
 
 class ResyncFakeSubscriber(FakeSubscriber):
