@@ -78,6 +78,8 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  user_env?: Record<string, string>
+  can_edit_global?: boolean
 }
 
 interface ConfigurableToolField {
