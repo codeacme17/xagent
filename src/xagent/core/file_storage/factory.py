@@ -20,6 +20,11 @@ _DEFAULT_S3_CONFIG_KWARGS = {
 }
 
 
+def get_file_storage_backend() -> str:
+    """Backend scheme of the configured durable storage ("s3", "file", ...)."""
+    return get_unscoped_file_storage().backend
+
+
 def get_user_file_storage(user_id: int) -> ScopedFileStorage:
     """Get a storage view scoped to a user's key prefix.
 
@@ -60,10 +65,6 @@ def get_unscoped_file_storage() -> FsspecFileStorage:
         base_uri=uri,
         materialize_dir=get_file_materialize_dir(),
     )
-
-
-# Transitional alias until every call site is migrated to scoped handles.
-get_file_storage = get_unscoped_file_storage
 
 
 def _with_default_s3_config_kwargs(options: dict) -> dict:

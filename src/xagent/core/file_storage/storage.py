@@ -70,6 +70,10 @@ class FsspecFileStorage:
         self._base_uri = base_uri.rstrip("/")
         self._materialize_dir = materialize_dir
 
+    @property
+    def backend(self) -> str:
+        return self._backend
+
     def put_file(
         self, source: Path, key: str, content_type: str | None = None
     ) -> StoredObject:

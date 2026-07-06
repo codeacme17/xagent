@@ -10,7 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
-from ...core.file_storage import FsspecFileStorage, StoredObject, get_file_storage
+from ...core.file_storage import (
+    FsspecFileStorage,
+    ScopedFileStorage,
+    StoredObject,
+    get_user_file_storage,
+)
 from ...core.file_storage.keys import (
     build_task_output_storage_key as build_task_output_storage_key,
 )
@@ -42,6 +47,9 @@ class DurableObjectIntegrityError(DurableStorageOperationError):
 
 class UploadedFileLocalPathRecord(Protocol):
     """Fields needed to restore or locate an uploaded file without an ORM session."""
+
+    @property
+    def user_id(self) -> Any: ...
 
     @property
     def file_id(self) -> Any: ...
@@ -121,7 +129,11 @@ class ManagedFileRef:
     """Registered file handle with local-first durable fallback semantics."""
 
     record: UploadedFileLocalPathRecord
-    storage: FsspecFileStorage = field(default_factory=get_file_storage)
+    storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.storage is None:
+            self.storage = get_user_file_storage(int(self.record.user_id))
 
     @property
     def local_path(self) -> Path:
@@ -242,8 +254,8 @@ class ManagedFileRef:
             storage_key
             or self.storage_key
             or build_upload_storage_key(
-                int(getattr(self.record, "user_id")),
-                str(getattr(self.record, "file_id")),
+                int(self.record.user_id),
+                str(self.record.file_id),
                 self.filename or path.name,
             )
         )

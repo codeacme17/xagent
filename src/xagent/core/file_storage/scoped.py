@@ -33,6 +33,10 @@ class ScopedFileStorage:
     def prefix(self) -> str:
         return self._prefix
 
+    @property
+    def backend(self) -> str:
+        return self._storage.backend
+
     def _scoped(self, key: str, *, strict: bool = True) -> str:
         normalized = normalize_storage_key(key, strict=strict)
         if normalized != self._prefix and not normalized.startswith(self._prefix + "/"):

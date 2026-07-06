@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import xagent.core.file_storage.factory as file_storage_factory
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage, normalize_storage_key
 
 
@@ -76,9 +76,9 @@ def test_normalize_storage_key_forbidden_characters_strict_only(key):
 
 def test_write_paths_reject_legacy_characters(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     source = tmp_path / "source.txt"
     source.write_text("data", encoding="utf-8")
 
@@ -93,9 +93,9 @@ def test_write_paths_reject_legacy_characters(monkeypatch, tmp_path):
 def test_read_and_delete_paths_tolerate_legacy_db_keys(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     legacy_key = "users/1/uploads/id/back\\slash.txt"
     legacy_object = tmp_path / "objects" / "users/1/uploads/id" / "back\\slash.txt"
     legacy_object.parent.mkdir(parents=True)
@@ -124,9 +124,9 @@ def test_local_file_storage_round_trips_file(monkeypatch, tmp_path):
 
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", storage_root.as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_file(
         source, "users/1/uploads/file-id/source.txt", "text/plain"
     )
@@ -166,9 +166,9 @@ def test_s3_file_storage_uses_bounded_client_timeouts(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path))
     monkeypatch.delenv("XAGENT_FILE_STORAGE_OPTIONS", raising=False)
     monkeypatch.setattr(file_storage_factory.fsspec.core, "url_to_fs", fake_url_to_fs)
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
 
     assert storage._backend == "s3"
     assert captured["options"] == {
@@ -206,9 +206,9 @@ def test_s3_file_storage_keeps_explicit_client_timeout_overrides(monkeypatch, tm
         ),
     )
     monkeypatch.setattr(file_storage_factory.fsspec.core, "url_to_fs", fake_url_to_fs)
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    get_file_storage()
+    get_unscoped_file_storage()
 
     assert captured["options"] == {
         "endpoint_url": "http://minio:9000",
@@ -222,9 +222,9 @@ def test_s3_file_storage_keeps_explicit_client_timeout_overrides(monkeypatch, tm
 
 def test_put_file_hashes_while_copying(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     source = tmp_path / "single-pass.txt"
     source.write_bytes(b"hash while copying")
 
@@ -241,9 +241,9 @@ def test_put_file_hashes_while_copying(monkeypatch, tmp_path):
 
 def test_local_file_storage_put_bytes(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"abc", "bytes/data.bin")
 
     assert stored.size == 3
@@ -252,9 +252,9 @@ def test_local_file_storage_put_bytes(monkeypatch, tmp_path):
 
 def test_object_uri_quotes_key_without_backend_branch(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"abc", "uploads/file with spaces.txt")
 
     assert stored.uri.endswith("/uploads/file%20with%20spaces.txt")
@@ -262,9 +262,9 @@ def test_object_uri_quotes_key_without_backend_branch(monkeypatch, tmp_path):
 
 def test_local_file_storage_does_not_return_signed_url(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
 
     assert storage.signed_url("uploads/data.txt", expires=300) is None
 
@@ -514,9 +514,9 @@ def test_s3_content_hash_reads_native_sha256_checksum(tmp_path):
 
 def test_local_file_storage_copies_object_to_path(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"restore me", "copies/data.txt")
     target = tmp_path / "restored" / "data.txt"
 
@@ -530,9 +530,9 @@ def test_copy_to_path_does_not_publish_partial_file_on_read_failure(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     target = tmp_path / "restored" / "data.txt"
 
     class FailingRead:
@@ -562,9 +562,9 @@ def test_copy_to_path_does_not_publish_partial_file_on_read_failure(
 
 def test_copy_to_path_uses_unique_temp_file_per_attempt(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"restore me", "copies/data.txt")
     target = tmp_path / "restored" / "data.txt"
     wait_at_open = threading.Barrier(2)
@@ -627,9 +627,9 @@ def test_materialize_isolates_objects_with_same_filename(monkeypatch, tmp_path):
     materialize_dir = tmp_path / "materialized"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     first = storage.put_bytes(b"first content", "users/1/tasks/1/output/report.txt")
     second = storage.put_bytes(b"second content", "users/2/tasks/2/output/report.txt")
 
@@ -649,9 +649,9 @@ def test_materialize_reuses_existing_cached_file(monkeypatch, tmp_path):
     materialize_dir = tmp_path / "materialized"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"cached content", "users/1/uploads/file.txt")
     first_path = storage.materialize(stored.key, "file.txt")
 
@@ -670,9 +670,9 @@ def test_materialize_uses_content_hash_in_cache_path(monkeypatch, tmp_path):
     materialize_dir = tmp_path / "materialized"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     content = b"cache identity"
     stored = storage.put_bytes(content, "users/1/uploads/file.txt")
     content_hash = hashlib.sha256(content).hexdigest()
@@ -692,9 +692,9 @@ def test_materialize_refreshes_cached_file_when_object_changes(monkeypatch, tmp_
     materialize_dir = tmp_path / "materialized"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialize_dir))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"old-data", "users/1/uploads/file.txt")
     first_path = storage.materialize(stored.key, "file.txt")
 
