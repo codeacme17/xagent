@@ -84,14 +84,6 @@ chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 _TERMINAL_CACHE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
 
 
-@dataclass
-class _SandboxLifecycleLock:
-    """Per-sandbox lifecycle lock with waiter/holder tracking."""
-
-    lock: asyncio.Lock
-    ref_count: int = 0
-
-
 def _build_task_agent_config(
     request_agent_config: Optional[Dict[str, Any]],
     selected_file_ids: list[str],
@@ -593,54 +585,14 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
-        self._sandboxes: Dict[str, Any] = {}  # lifecycle scope -> Sandbox instance
-        self._sandbox_active_tasks: Dict[str, int] = {}
-        self._sandbox_active_tasks_lock = asyncio.Lock()
-        self._sandbox_lifecycle_locks: Dict[str, _SandboxLifecycleLock] = {}
         self._default_llm = create_default_llm()
         self.request = request
 
-    async def _acquire_sandbox_lifecycle_lock(
-        self, sandbox_key: str
-    ) -> _SandboxLifecycleLock:
-        async with self._sandbox_active_tasks_lock:
-            lifecycle_lock = self._sandbox_lifecycle_locks.get(sandbox_key)
-            if lifecycle_lock is None:
-                lifecycle_lock = _SandboxLifecycleLock(lock=asyncio.Lock())
-                self._sandbox_lifecycle_locks[sandbox_key] = lifecycle_lock
-            lifecycle_lock.ref_count += 1
-
-        try:
-            await lifecycle_lock.lock.acquire()
-        except BaseException:
-            async with self._sandbox_active_tasks_lock:
-                lifecycle_lock.ref_count -= 1
-                self._drop_sandbox_lifecycle_lock_if_unused_locked(
-                    sandbox_key, lifecycle_lock
-                )
-            raise
-
-        return lifecycle_lock
-
-    async def _release_sandbox_lifecycle_lock(
-        self, sandbox_key: str, lifecycle_lock: _SandboxLifecycleLock
-    ) -> None:
-        lifecycle_lock.lock.release()
-        async with self._sandbox_active_tasks_lock:
-            lifecycle_lock.ref_count -= 1
-            self._drop_sandbox_lifecycle_lock_if_unused_locked(
-                sandbox_key, lifecycle_lock
-            )
-
-    def _drop_sandbox_lifecycle_lock_if_unused_locked(
-        self, sandbox_key: str, lifecycle_lock: _SandboxLifecycleLock
-    ) -> None:
-        if lifecycle_lock.ref_count > 0:
-            return
-        if sandbox_key in self._sandboxes or sandbox_key in self._sandbox_active_tasks:
-            return
-        if self._sandbox_lifecycle_locks.get(sandbox_key) is lifecycle_lock:
-            self._sandbox_lifecycle_locks.pop(sandbox_key, None)
+    @staticmethod
+    def _parse_sandbox_key(sandbox_key: str) -> tuple[str, str]:
+        """Split a web sandbox key (``user:<owner_id>``) into lifecycle parts."""
+        lifecycle_type, _, lifecycle_id = sandbox_key.partition(":")
+        return lifecycle_type, lifecycle_id
 
     def _sandbox_key_for_task(self, task_id: Optional[str]) -> Optional[str]:
         if task_id is None:
@@ -652,27 +604,27 @@ class AgentServiceManager:
 
         sandbox_key = self._agent_sandbox_keys.get(task_key)
         if sandbox_key is not None:
-            if sandbox_key not in self._sandboxes:
-                return None
             return sandbox_key
 
         owner_id = self._agent_owner_ids.get(task_key)
         if owner_id is None:
             return None
-
-        sandbox_key = f"user:{owner_id}"
-        if sandbox_key not in self._sandboxes:
-            return None
-        return sandbox_key
+        return f"user:{owner_id}"
 
     async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
-        async with self._sandbox_active_tasks_lock:
-            sandbox_key = self._sandbox_key_for_task(task_id)
-            if sandbox_key is None:
-                return None
-            self._sandbox_active_tasks[sandbox_key] = (
-                self._sandbox_active_tasks.get(sandbox_key, 0) + 1
-            )
+        sandbox_key = self._sandbox_key_for_task(task_id)
+        if sandbox_key is None:
+            return None
+
+        from ..sandbox_manager import get_sandbox_manager
+
+        sandbox_mgr = get_sandbox_manager()
+        if sandbox_mgr is None:
+            return None
+
+        lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
+        if not await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
+            return None
         return sandbox_key
 
     def _evict_agents_for_sandbox(self, sandbox_key: str) -> None:
@@ -713,81 +665,55 @@ class AgentServiceManager:
         workspace_owner_id: int,
         workspace_config: Mapping[str, Any],
     ) -> Any | None:
-        sandbox_key = f"user:{workspace_owner_id}"
+        from ..sandbox_manager import get_sandbox_manager
 
-        lifecycle_lock = await self._acquire_sandbox_lifecycle_lock(sandbox_key)
+        sandbox_mgr = get_sandbox_manager()
+        if not sandbox_mgr:
+            self._agent_sandbox_keys.pop(task_id, None)
+            return None
+
         try:
-            async with self._sandbox_active_tasks_lock:
-                sandbox = self._sandboxes.get(sandbox_key)
-                if sandbox is not None:
-                    self._agent_sandbox_keys[task_id] = sandbox_key
-                    return sandbox
+            sandbox = await sandbox_mgr.get_or_create_lease_provider(
+                "user",
+                str(workspace_owner_id),
+                workspace_config=workspace_config,
+            )
+        except Exception as e:
+            self._agent_sandbox_keys.pop(task_id, None)
+            logger.warning(
+                "Sandbox creation failed for workspace owner %s, "
+                "falling back to local execution: %s",
+                workspace_owner_id,
+                e,
+            )
+            return None
 
-            from ..sandbox_manager import get_sandbox_manager
-
-            sandbox_mgr = get_sandbox_manager()
-            if not sandbox_mgr:
-                async with self._sandbox_active_tasks_lock:
-                    self._agent_sandbox_keys.pop(task_id, None)
-                return None
-
-            try:
-                sandbox = await sandbox_mgr.create_lease_provider(
-                    "user",
-                    str(workspace_owner_id),
-                    workspace_config=workspace_config,
-                )
-            except Exception as e:
-                async with self._sandbox_active_tasks_lock:
-                    self._agent_sandbox_keys.pop(task_id, None)
-                logger.warning(
-                    "Sandbox creation failed for workspace owner %s, "
-                    "falling back to local execution: %s",
-                    workspace_owner_id,
-                    e,
-                )
-                return None
-
-            async with self._sandbox_active_tasks_lock:
-                self._sandboxes[sandbox_key] = sandbox
-                self._agent_sandbox_keys[task_id] = sandbox_key
-            return sandbox
-        finally:
-            await self._release_sandbox_lifecycle_lock(sandbox_key, lifecycle_lock)
+        self._agent_sandbox_keys[task_id] = f"user:{workspace_owner_id}"
+        return sandbox
 
     async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
         if sandbox_key is None:
             return
 
-        lifecycle_lock = await self._acquire_sandbox_lifecycle_lock(sandbox_key)
+        from ..sandbox_manager import get_sandbox_manager
+
+        sandbox_mgr = get_sandbox_manager()
+        if sandbox_mgr is None:
+            return
+
+        lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
         try:
-            async with self._sandbox_active_tasks_lock:
-                active_count = self._sandbox_active_tasks.get(sandbox_key, 0)
-                if active_count > 1:
-                    self._sandbox_active_tasks[sandbox_key] = active_count - 1
-                    return
-
-                self._sandbox_active_tasks.pop(sandbox_key, None)
-                provider = self._sandboxes.pop(sandbox_key, None)
-                self._evict_agents_for_sandbox(sandbox_key)
-
-            # Keep the per-sandbox lifecycle lock through cleanup so a new
-            # provider cannot create same-named worker sandboxes while the old
-            # provider deletes them. Other sandbox keys can proceed.
-            cleanup_workers = getattr(provider, "cleanup_worker_sandboxes", None)
-            if cleanup_workers is None:
-                return
-
-            try:
-                await cleanup_workers()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to cleanup sandbox workers for %s: %s",
-                    sandbox_key,
-                    exc,
-                )
-        finally:
-            await self._release_sandbox_lifecycle_lock(sandbox_key, lifecycle_lock)
+            await sandbox_mgr.release(
+                lifecycle_type,
+                lifecycle_id,
+                on_last_release=lambda: self._evict_agents_for_sandbox(sandbox_key),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to release sandbox %s: %s",
+                sandbox_key,
+                exc,
+            )
 
     def _get_task_llm_ids(self, task: Task, db: Session) -> List[Optional[str]]:
         """Return internal model_id identifiers for a task (never provider model_name)."""

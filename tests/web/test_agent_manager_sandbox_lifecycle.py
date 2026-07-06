@@ -1,4 +1,10 @@
-"""Tests for task-scoped sandbox worker cleanup in AgentServiceManager."""
+"""Tests for task-scoped sandbox lifecycle handling in AgentServiceManager.
+
+The active-task ref-count and per-key lifecycle locks live in
+``SandboxManager`` (attach/release); these tests cover the web layer's
+integration with that API: exactly-once worker cleanup and AgentService
+eviction when the last task releases a sandbox.
+"""
 
 import asyncio
 from unittest.mock import AsyncMock
@@ -6,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
+from xagent.web.sandbox_manager import SandboxManager
 
 
 class _FakeAgentService:
@@ -28,22 +35,46 @@ class _FakeAgentService:
         return self.result
 
 
+def _make_sandbox_manager() -> SandboxManager:
+    service = AsyncMock()
+    service.list_sandboxes = AsyncMock(return_value=[])
+    service.delete = AsyncMock()
+    return SandboxManager(service)
+
+
+async def _seed_attached_provider(
+    sandbox_mgr: SandboxManager, owner_id: int, provider: object
+) -> None:
+    """Cache a lease provider and attach one active task for an owner."""
+    sandbox_mgr._lease_providers[f"user::{owner_id}"] = provider
+    assert await sandbox_mgr.attach("user", str(owner_id))
+
+
+@pytest.fixture
+def sandbox_mgr(monkeypatch) -> SandboxManager:
+    manager = _make_sandbox_manager()
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: manager,
+    )
+    return manager
+
+
 @pytest.mark.asyncio
-async def test_worker_cleanup_does_not_block_other_users() -> None:
+async def test_worker_cleanup_does_not_block_other_users(sandbox_mgr) -> None:
     """Slow worker cleanup for one user must not serialize other users."""
     manager = AgentServiceManager()
-    provider = AsyncMock()
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
 
-    async def slow_cleanup() -> None:
+    async def slow_list_sandboxes() -> list:
         cleanup_started.set()
         await cleanup_release.wait()
+        return []
 
-    provider.cleanup_worker_sandboxes.side_effect = slow_cleanup
-    manager._sandboxes["user:7"] = provider
-    manager._sandbox_active_tasks["user:7"] = 1
-    manager._sandboxes["user:8"] = AsyncMock()
+    sandbox_mgr._service.list_sandboxes.side_effect = slow_list_sandboxes
+    await _seed_attached_provider(sandbox_mgr, 7, AsyncMock())
+    sandbox_mgr._lease_providers["user::8"] = AsyncMock()
     manager._agent_owner_ids[2] = 8
     manager._agent_sandbox_keys[2] = "user:8"
 
@@ -60,50 +91,44 @@ async def test_worker_cleanup_does_not_block_other_users() -> None:
         await release_task
 
     assert sandbox_key == "user:8"
-    assert manager._sandbox_active_tasks["user:8"] == 1
+    assert sandbox_mgr.ref_count("user", "8") == 1
 
 
 @pytest.mark.asyncio
-async def test_worker_cleanup_removes_sandbox_lifecycle_lock_entry() -> None:
+async def test_worker_cleanup_removes_sandbox_lifecycle_lock_entry(
+    sandbox_mgr,
+) -> None:
     """Lifecycle lock entries should not leak after a provider is removed."""
     manager = AgentServiceManager()
-    provider = AsyncMock()
-    manager._sandboxes["user:7"] = provider
-    manager._sandbox_active_tasks["user:7"] = 1
+    await _seed_attached_provider(sandbox_mgr, 7, AsyncMock())
 
     await manager._release_sandbox_task("user:7")
 
-    assert "user:7" not in manager._sandbox_lifecycle_locks
+    assert sandbox_mgr._lifecycle_locks == {}
+    assert "user::7" not in sandbox_mgr._lease_providers
 
 
 @pytest.mark.asyncio
-async def test_worker_cleanup_blocks_same_user_provider_recreate(monkeypatch) -> None:
+async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) -> None:
     """The same user must not recreate same-named workers during cleanup."""
     manager = AgentServiceManager()
-    old_provider = AsyncMock()
     new_provider = AsyncMock()
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
     create_called = asyncio.Event()
 
-    async def slow_cleanup() -> None:
+    async def slow_list_sandboxes() -> list:
         cleanup_started.set()
         await cleanup_release.wait()
+        return []
 
     async def create_provider(*_args, **_kwargs):
         create_called.set()
         return new_provider
 
-    sandbox_mgr = AsyncMock()
-    sandbox_mgr.create_lease_provider.side_effect = create_provider
-    monkeypatch.setattr(
-        "xagent.web.sandbox_manager.get_sandbox_manager",
-        lambda: sandbox_mgr,
-    )
-
-    old_provider.cleanup_worker_sandboxes.side_effect = slow_cleanup
-    manager._sandboxes["user:7"] = old_provider
-    manager._sandbox_active_tasks["user:7"] = 1
+    sandbox_mgr._service.list_sandboxes.side_effect = slow_list_sandboxes
+    sandbox_mgr.create_lease_provider = AsyncMock(side_effect=create_provider)
+    await _seed_attached_provider(sandbox_mgr, 7, AsyncMock())
 
     release_task = asyncio.create_task(manager._release_sandbox_task("user:7"))
     await cleanup_started.wait()
@@ -132,12 +157,12 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_execute_task_releases_sandbox_workers_after_task() -> None:
+async def test_execute_task_releases_sandbox_workers_after_task(sandbox_mgr) -> None:
     """Terminal task execution should release cached worker sandboxes."""
     manager = AgentServiceManager()
-    provider = AsyncMock()
     agent_service = _FakeAgentService()
-    manager._sandboxes["user:7"] = provider
+    sandbox_mgr._lease_providers["user::7"] = AsyncMock()
+    sandbox_mgr.delete_worker_sandboxes = AsyncMock()
     manager._agents[1] = agent_service
     manager._agent_owner_ids[1] = 7
     manager._agent_sandbox_keys[1] = "user:7"
@@ -149,18 +174,19 @@ async def test_execute_task_releases_sandbox_workers_after_task() -> None:
     )
 
     assert result == {"success": True}
-    assert "user:7" not in manager._sandboxes
-    provider.cleanup_worker_sandboxes.assert_awaited_once()
+    assert "user::7" not in sandbox_mgr._lease_providers
+    sandbox_mgr.delete_worker_sandboxes.assert_awaited_once_with("user", "7")
 
 
 @pytest.mark.asyncio
-async def test_execute_task_evicts_agents_for_released_sandbox_provider() -> None:
+async def test_execute_task_evicts_agents_for_released_sandbox_provider(
+    sandbox_mgr,
+) -> None:
     """Cached agents must not retain a provider after its sandbox is released."""
     manager = AgentServiceManager()
-    provider = AsyncMock()
     agent_service = _FakeAgentService()
     other_agent_service = _FakeAgentService()
-    manager._sandboxes["user:7"] = provider
+    sandbox_mgr._lease_providers["user::7"] = AsyncMock()
     manager._agents[1] = agent_service
     manager._agents[2] = other_agent_service
     manager._agent_owner_ids[1] = 7
@@ -174,7 +200,7 @@ async def test_execute_task_evicts_agents_for_released_sandbox_provider() -> Non
         task_id="1",
     )
 
-    assert "user:7" not in manager._sandboxes
+    assert "user::7" not in sandbox_mgr._lease_providers
     assert 1 not in manager._agents
     assert 2 not in manager._agents
     assert 1 not in manager._agent_owner_ids
@@ -184,13 +210,15 @@ async def test_execute_task_evicts_agents_for_released_sandbox_provider() -> Non
 
 
 @pytest.mark.asyncio
-async def test_execute_task_keeps_workers_until_last_same_user_task_finishes() -> None:
+async def test_execute_task_keeps_workers_until_last_same_user_task_finishes(
+    sandbox_mgr,
+) -> None:
     """One task finishing must not delete workers still shared by another task."""
     manager = AgentServiceManager()
-    provider = AsyncMock()
     first_agent_service = _FakeAgentService()
     second_agent_service = _FakeAgentService()
-    manager._sandboxes["user:7"] = provider
+    sandbox_mgr._lease_providers["user::7"] = AsyncMock()
+    sandbox_mgr.delete_worker_sandboxes = AsyncMock()
     manager._agents[1] = first_agent_service
     manager._agents[2] = second_agent_service
     manager._agent_owner_ids[1] = 7
@@ -227,14 +255,27 @@ async def test_execute_task_keeps_workers_until_last_same_user_task_finishes() -
 
     first_release.set()
     await first_task
-    assert "user:7" in manager._sandboxes
+    assert "user::7" in sandbox_mgr._lease_providers
     assert 1 in manager._agents
     assert 2 in manager._agents
-    provider.cleanup_worker_sandboxes.assert_not_awaited()
+    sandbox_mgr.delete_worker_sandboxes.assert_not_awaited()
 
     second_release.set()
     await second_task
-    assert "user:7" not in manager._sandboxes
+    assert "user::7" not in sandbox_mgr._lease_providers
     assert 1 not in manager._agents
     assert 2 not in manager._agents
-    provider.cleanup_worker_sandboxes.assert_awaited_once()
+    sandbox_mgr.delete_worker_sandboxes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_acquire_sandbox_task_without_provider_returns_none(
+    sandbox_mgr,
+) -> None:
+    """A task whose provider was already released must not attach."""
+    manager = AgentServiceManager()
+    manager._agent_owner_ids[1] = 7
+    manager._agent_sandbox_keys[1] = "user:7"
+
+    assert await manager._acquire_sandbox_task("1") is None
+    assert sandbox_mgr.ref_count("user", "7") == 0

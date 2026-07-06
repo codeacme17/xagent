@@ -6,7 +6,10 @@ import asyncio
 import logging
 import os
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,6 +34,22 @@ from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 logger = logging.getLogger(__name__)
 
 _WORKER_LIFECYCLE_MARKER = "::worker::"
+
+
+@dataclass
+class _SandboxActivity:
+    """Per-lifecycle activity state used for reclamation decisions."""
+
+    ref_count: int = 0
+    last_activity: float = 0.0
+
+
+@dataclass
+class _LifecycleLockEntry:
+    """Per-lifecycle lock with holder/waiter tracking for safe eviction."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    waiters: int = 0
 
 
 class SandboxLease:
@@ -224,6 +243,14 @@ class SandboxManager:
         self._config_cache: dict[str, SandboxConfig] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        # Activity tracking: lease providers, active-task ref-counts, and
+        # last-activity timestamps keyed by the primary sandbox name. This is
+        # the single source of truth reclamation decisions are made from.
+        self._lease_providers: dict[str, SandboxLeaseProvider] = {}
+        self._activity: dict[str, _SandboxActivity] = {}
+        self._activity_guard = asyncio.Lock()
+        self._lifecycle_locks: dict[str, _LifecycleLockEntry] = {}
+        self._startup_monotonic = time.monotonic()
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -253,6 +280,128 @@ class SandboxManager:
             cls.make_sandbox_name(lifecycle_type, lifecycle_id)
             + _WORKER_LIFECYCLE_MARKER
         )
+
+    @classmethod
+    def _base_sandbox_name(cls, lifecycle_type: str, lifecycle_id: str) -> str:
+        """Primary sandbox name owning activity state for a lifecycle key."""
+        return cls.make_sandbox_name(
+            lifecycle_type, cls._base_lifecycle_id(lifecycle_id)
+        )
+
+    @asynccontextmanager
+    async def _lifecycle_locked(self, base_name: str) -> AsyncIterator[None]:
+        """Serialize provider creation and release-to-zero cleanup per key.
+
+        Entries are dropped once no holder or waiter remains, so the dict
+        does not grow with every lifecycle key ever seen.
+        """
+        async with self._activity_guard:
+            entry = self._lifecycle_locks.get(base_name)
+            if entry is None:
+                entry = _LifecycleLockEntry()
+                self._lifecycle_locks[base_name] = entry
+            entry.waiters += 1
+
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            async with self._activity_guard:
+                entry.waiters -= 1
+                self._drop_lifecycle_lock_if_unused(base_name, entry)
+            raise
+
+        try:
+            yield
+        finally:
+            entry.lock.release()
+            async with self._activity_guard:
+                entry.waiters -= 1
+                self._drop_lifecycle_lock_if_unused(base_name, entry)
+
+    def _drop_lifecycle_lock_if_unused(
+        self, base_name: str, entry: _LifecycleLockEntry
+    ) -> None:
+        if entry.waiters > 0:
+            return
+        if self._lifecycle_locks.get(base_name) is entry:
+            self._lifecycle_locks.pop(base_name, None)
+
+    def _touch_locked(self, base_name: str) -> _SandboxActivity:
+        """Bump last-activity for a key; caller must hold ``_activity_guard``."""
+        activity = self._activity.get(base_name)
+        if activity is None:
+            activity = _SandboxActivity()
+            self._activity[base_name] = activity
+        activity.last_activity = time.monotonic()
+        return activity
+
+    async def attach(self, lifecycle_type: str, lifecycle_id: str) -> bool:
+        """Mark one task as actively using the lifecycle's lease provider.
+
+        Returns False when no lease provider is cached for the key — nothing
+        is attached and the caller must not release. A sandbox with a
+        non-zero ref-count is never reclaimed.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._activity_guard:
+            if base_name not in self._lease_providers:
+                return False
+            self._touch_locked(base_name).ref_count += 1
+        return True
+
+    async def release(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        on_last_release: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Release one active task for a lifecycle key.
+
+        When the last task releases, the cached lease provider is dropped,
+        ``on_last_release`` is invoked (still under the per-key lifecycle
+        lock, before worker deletion, so callers can evict their own caches
+        exactly once), and the lifecycle's worker sandboxes are deleted.
+
+        Returns True when this call released the last active task.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            async with self._activity_guard:
+                activity = self._touch_locked(base_name)
+                if activity.ref_count > 1:
+                    activity.ref_count -= 1
+                    return False
+                activity.ref_count = 0
+                self._lease_providers.pop(base_name, None)
+
+            if on_last_release is not None:
+                on_last_release()
+
+            await self.delete_worker_sandboxes(
+                lifecycle_type, self._base_lifecycle_id(lifecycle_id)
+            )
+        return True
+
+    def ref_count(self, lifecycle_type: str, lifecycle_id: str) -> int:
+        """Number of active tasks attached to a lifecycle key."""
+        activity = self._activity.get(
+            self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        )
+        return activity.ref_count if activity is not None else 0
+
+    def last_activity_at(self, lifecycle_type: str, lifecycle_id: str) -> float:
+        """Monotonic timestamp of the last recorded activity for a key.
+
+        Keys with no recorded activity (e.g. containers discovered after a
+        backend restart) report idle since manager startup.
+        """
+        activity = self._activity.get(
+            self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        )
+        if activity is None:
+            return self._startup_monotonic
+        return activity.last_activity
 
     def _get_sandbox_image_and_config(self) -> tuple[str, SandboxConfig]:
         """Get sandbox image and configuration from centralized config module."""
@@ -422,6 +571,9 @@ class SandboxManager:
             Sandbox instance
         """
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._activity_guard:
+            self._touch_locked(self._base_sandbox_name(lifecycle_type, lifecycle_id))
+
         image, desired_config = self._build_sandbox_config(
             lifecycle_type,
             lifecycle_id,
@@ -500,6 +652,38 @@ class SandboxManager:
             max_concurrency=get_sandbox_max_concurrency(),
         )
 
+    async def get_or_create_lease_provider(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        workspace_config: Mapping[str, Any] | None = None,
+    ) -> SandboxLeaseProvider:
+        """Get the cached lease provider for a lifecycle key or create one.
+
+        Creation is serialized per key with release-to-zero cleanup, so a new
+        provider can never create worker sandboxes while an old provider's
+        workers are still being deleted.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            async with self._activity_guard:
+                provider = self._lease_providers.get(base_name)
+                if provider is not None:
+                    self._touch_locked(base_name)
+                    return provider
+
+            provider = await self.create_lease_provider(
+                lifecycle_type,
+                lifecycle_id,
+                workspace_config=workspace_config,
+            )
+
+            async with self._activity_guard:
+                self._lease_providers[base_name] = provider
+                self._touch_locked(base_name)
+            return provider
+
     async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
         """
         Delete sandbox.
@@ -575,6 +759,9 @@ class SandboxManager:
                 self._cache.pop(name, None)
                 self._config_cache.pop(name, None)
                 self._locks.pop(name, None)
+                # Only primary names appear in these maps; worker names no-op.
+                self._lease_providers.pop(name, None)
+                self._activity.pop(name, None)
 
     async def warmup(self) -> None:
         """
@@ -713,6 +900,8 @@ class SandboxManager:
             self._cache.clear()
             self._config_cache.clear()
             self._locks.clear()
+            self._lease_providers.clear()
+            self._activity.clear()
             logger.info("Sandbox cleanup completed")
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")
