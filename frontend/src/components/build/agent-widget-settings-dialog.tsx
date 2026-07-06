@@ -250,6 +250,9 @@ export function AgentWidgetSettingsDialog({
                 <p className="text-xs text-muted-foreground">
                   {t("deploy_agent.access_control.allowed_domains_desc")}
                 </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("appWidget.dialog.allowedDomainsSecurityNote")}
+                </p>
               </div>
               <div className="flex gap-2">
                 <Input
