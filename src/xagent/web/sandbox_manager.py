@@ -909,8 +909,9 @@ class SandboxManager:
                 self._config_cache.pop(name, None)
                 self._locks.pop(name, None)
                 # Only primary names appear in these maps; worker names no-op.
-                self._lease_providers.pop(name, None)
-                self._activity.pop(name, None)
+                async with self._activity_guard:
+                    self._lease_providers.pop(name, None)
+                    self._activity.pop(name, None)
 
     async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
         """Delete sandboxes with no attached tasks that are idle past the TTL.
@@ -921,8 +922,9 @@ class SandboxManager:
         startup and get one TTL grace period.
 
         Each deletion re-checks ref-count and idle time under the per-key
-        lifecycle lock, so a sweep can never delete a sandbox a task is
-        concurrently attaching or recreating. Workspace data lives on bind
+        lifecycle lock, and the eviction decision plus provider removal are
+        atomic under the activity guard, so a sweep can never delete a
+        sandbox a task is concurrently attaching or recreating. Workspace data lives on bind
         mounts and survives; the next use recreates the sandbox.
 
         Args:
@@ -956,15 +958,18 @@ class SandboxManager:
                 continue
 
             async with self._lifecycle_locked(base_name):
-                if self.ref_count(lifecycle_type, lifecycle_id) > 0:
-                    continue
-                idle_for = time.monotonic() - self.last_activity_at(
-                    lifecycle_type, lifecycle_id
-                )
-                if idle_for <= idle_ttl:
-                    continue
-
+                # Decision and provider eviction are one atomic step under
+                # the activity guard: an attach can never land between the
+                # ref-count check and the pop that makes attaches fail.
                 async with self._activity_guard:
+                    if self.ref_count(lifecycle_type, lifecycle_id) > 0:
+                        continue
+                    idle_for = time.monotonic() - self.last_activity_at(
+                        lifecycle_type, lifecycle_id
+                    )
+                    if idle_for <= idle_ttl:
+                        continue
+
                     self._lease_providers.pop(base_name, None)
 
                 logger.info(
