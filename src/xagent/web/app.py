@@ -383,14 +383,17 @@ async def health_check() -> dict[str, Any]:
     """Health check endpoint for container probes.
 
     Active degraded-mode signals ride along for monitoring to alert on;
-    the status stays "ok" so probes keep passing while degraded.
+    the status stays "ok" so probes keep passing while degraded. Only
+    signal names are exposed — /health is unauthenticated, and the detail
+    strings describe security-relevant misconfiguration; those stay in the
+    logs and the in-process registry.
     """
     from .services.ops_signals import active_degradations
 
     payload: dict[str, Any] = {"status": "ok"}
     degradations = active_degradations()
     if degradations:
-        payload["degradations"] = degradations
+        payload["degradations"] = sorted(degradations)
     return payload
 
 

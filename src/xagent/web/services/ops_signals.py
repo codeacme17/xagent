@@ -6,6 +6,10 @@ otherwise only exist as log lines. This registry gives them a
 machine-readable surface — the ``/health`` endpoint reports active
 degradations — that uptime monitors and dashboards can alert on.
 
+``/health`` is unauthenticated, so it exposes only the signal *names*;
+the detail strings describe security-relevant misconfiguration and are
+reserved for logs and authenticated diagnostics.
+
 Signals are per-process and idempotent: registering the same name twice
 updates its detail, and clearing a name that is not active is a no-op.
 """
