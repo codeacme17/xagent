@@ -10,6 +10,7 @@ from ...config import (
     get_file_storage_options,
     get_file_storage_uri,
 )
+from .scoped import ScopedFileStorage
 from .storage import FsspecFileStorage
 
 _DEFAULT_S3_CONFIG_KWARGS = {
@@ -19,9 +20,23 @@ _DEFAULT_S3_CONFIG_KWARGS = {
 }
 
 
+def get_user_file_storage(user_id: int) -> ScopedFileStorage:
+    """Get a storage view scoped to a user's key prefix.
+
+    This is the primary storage factory: every operation through the returned
+    handle is confined to ``users/{user_id}``. Reach for
+    ``get_unscoped_file_storage`` only in infrastructure code inside this
+    package.
+    """
+    return ScopedFileStorage(
+        storage=get_unscoped_file_storage(),
+        prefix=f"users/{int(user_id)}",
+    )
+
+
 @lru_cache
-def get_file_storage() -> FsspecFileStorage:
-    """Build the configured durable file storage backend."""
+def get_unscoped_file_storage() -> FsspecFileStorage:
+    """Build the configured durable file storage backend (no prefix scope)."""
     uri = get_file_storage_uri()
     options = get_file_storage_options()
     parsed = urlparse(uri)
@@ -45,6 +60,10 @@ def get_file_storage() -> FsspecFileStorage:
         base_uri=uri,
         materialize_dir=get_file_materialize_dir(),
     )
+
+
+# Transitional alias until every call site is migrated to scoped handles.
+get_file_storage = get_unscoped_file_storage
 
 
 def _with_default_s3_config_kwargs(options: dict) -> dict:
