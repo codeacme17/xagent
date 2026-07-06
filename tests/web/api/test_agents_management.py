@@ -9,7 +9,11 @@ import pytest
 from jose import jwt as jose_jwt
 
 from xagent.config import get_uploads_dir
-from xagent.web.api.widget import EMBED_TICKET_TYPE
+from xagent.web.api.widget import (
+    EMBED_TICKET_TYPE,
+    WIDGET_CREDENTIAL_REQUIRED_DETAIL,
+    WIDGET_KEY_REQUIRED_DETAIL,
+)
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
@@ -475,7 +479,8 @@ def test_embed_ticket_requires_valid_widget_key_despite_spoofed_origin() -> None
 
 
 def test_embed_ticket_rejects_numeric_agent_id_without_key() -> None:
-    """The enumerable numeric agent_id can no longer obtain a ticket."""
+    """The enumerable numeric agent_id can no longer obtain a ticket, and a
+    key-less (legacy) request gets an actionable 403 rather than a bare 422."""
     _admin_headers()
     owner_id = _user_id("admin")
     agent_id = _create_agent_row(
@@ -491,7 +496,8 @@ def test_embed_ticket_rejects_numeric_agent_id_without_key() -> None:
         json={"agent_id": agent_id},
         headers={"origin": "https://trusted-site.com"},
     )
-    assert response.status_code == 422
+    assert response.status_code == 403
+    assert response.json()["detail"] == WIDGET_KEY_REQUIRED_DETAIL
 
 
 def test_embed_ticket_rejects_stale_key_after_rotation() -> None:
@@ -570,10 +576,7 @@ def test_widget_auth_rejects_spoofed_origin_without_credential() -> None:
     )
 
     assert response.status_code == 403
-    assert (
-        response.json()["detail"]
-        == "Widget authentication requires an embed ticket or widget key"
-    )
+    assert response.json()["detail"] == WIDGET_CREDENTIAL_REQUIRED_DETAIL
 
 
 def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
@@ -600,10 +603,7 @@ def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
     )
 
     assert response.status_code == 403
-    assert (
-        response.json()["detail"]
-        == "Widget authentication requires an embed ticket or widget key"
-    )
+    assert response.json()["detail"] == WIDGET_CREDENTIAL_REQUIRED_DETAIL
 
 
 def test_widget_auth_with_no_origin_and_no_credential_is_rejected() -> None:

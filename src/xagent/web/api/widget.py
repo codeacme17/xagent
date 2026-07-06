@@ -40,6 +40,17 @@ widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
 EMBED_TICKET_TYPE = "widget_embed_ticket"
 EMBED_TICKET_TTL_SECONDS = 60
 
+# Actionable errors for the removed legacy (agent_id / bare-header) auth paths,
+# so operators who miss the migration note can diagnose quickly.
+WIDGET_KEY_REQUIRED_DETAIL = (
+    "A widget key is required. Re-copy the embed snippet from the agent's "
+    "App Widget settings."
+)
+WIDGET_CREDENTIAL_REQUIRED_DETAIL = (
+    "Widget authentication requires a valid embed ticket or widget key. "
+    "Re-copy the embed snippet from the agent's App Widget settings."
+)
+
 
 class WidgetAuthRequest(BaseModel):
     guest_id: str = Field(max_length=256)
@@ -57,7 +68,9 @@ class WidgetAuthRequest(BaseModel):
 class EmbedTicketRequest(BaseModel):
     # The widget key is the unguessable per-agent credential distributed in the
     # embed snippet; capped like sibling request fields to reject junk payloads.
-    widget_key: str = Field(min_length=1, max_length=512)
+    # Optional so a legacy (key-less) request yields an actionable 403 rather
+    # than a generic 422 validation error.
+    widget_key: Optional[str] = Field(default=None, max_length=512)
 
 
 class EmbedTicketResponse(BaseModel):
@@ -119,6 +132,10 @@ def _get_widget_agent_by_key(db: Session, widget_key: str) -> Agent:
     collapse into a single 403 so callers cannot enumerate agents or probe
     which keys exist.
     """
+    # Short-circuit blank/whitespace keys before hitting the database; a real
+    # key is a URL-safe token and never matches these anyway.
+    if not widget_key or not widget_key.strip():
+        raise HTTPException(status_code=403, detail="Invalid widget key")
     agent = db.query(Agent).filter(Agent.widget_key == widget_key).first()
     if (
         agent is None
@@ -151,6 +168,10 @@ async def issue_widget_embed_ticket(
     genuine browser traffic it still blocks embedding from non-allowlisted
     sites, but it is no longer the boundary a non-browser client must defeat.
     """
+    if not request.widget_key or not request.widget_key.strip():
+        # Legacy key-less request (e.g. an old data-agent-id snippet): fail
+        # with an actionable error rather than a generic 422.
+        raise HTTPException(status_code=403, detail=WIDGET_KEY_REQUIRED_DETAIL)
     agent = _get_widget_agent_by_key(db, request.widget_key)
 
     allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
@@ -214,10 +235,7 @@ def _resolve_widget_auth_agent(db: Session, request: WidgetAuthRequest) -> Agent
         # the gate. No origin allowlist applies — the allowlist governs
         # embedding sites, and a direct visit is not embedded.
         return _get_widget_agent_by_key(db, request.widget_key)
-    raise HTTPException(
-        status_code=403,
-        detail="Widget authentication requires an embed ticket or widget key",
-    )
+    raise HTTPException(status_code=403, detail=WIDGET_CREDENTIAL_REQUIRED_DETAIL)
 
 
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
