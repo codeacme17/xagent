@@ -82,6 +82,7 @@ app = FastAPI(
 _migration_task: asyncio.Task[None] | None = None
 _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
+_sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
@@ -1000,6 +1001,15 @@ async def startup_event() -> None:
         await sandbox_mgr.cleanup()
         await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
+
+        from ..config import get_sandbox_idle_ttl
+
+        if get_sandbox_idle_ttl() is not None:
+            global _sandbox_idle_sweep_task
+            _sandbox_idle_sweep_task = asyncio.create_task(
+                sandbox_mgr.run_idle_sweep_loop()
+            )
+            logger.info("Started sandbox idle sweep task")
     else:
         logger.info("Sandbox manager not available (disabled or init failed)")
 
@@ -1025,9 +1035,20 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _file_storage_startup_sync_task, _migration_task, _trigger_dispatcher_task
+    global \
+        _file_storage_startup_sync_task, \
+        _migration_task, \
+        _trigger_dispatcher_task, \
+        _sandbox_idle_sweep_task
 
     flush_langfuse()
+
+    if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
+        logger.info("Cancelling sandbox idle sweep task...")
+        _sandbox_idle_sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_idle_sweep_task
+    _sandbox_idle_sweep_task = None
 
     if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
         logger.info("Cancelling background startup file storage sync task...")

@@ -18,9 +18,11 @@ from ..config import (
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_storage_root,
+    get_sandbox_idle_ttl,
     get_sandbox_image,
     get_sandbox_max_concurrency,
     get_sandbox_memory,
+    get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_storage_root,
     get_uploads_dir,
@@ -762,6 +764,105 @@ class SandboxManager:
                 # Only primary names appear in these maps; worker names no-op.
                 self._lease_providers.pop(name, None)
                 self._activity.pop(name, None)
+
+    async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
+        """Delete sandboxes with no attached tasks that are idle past the TTL.
+
+        Candidates come from both the in-memory activity map and the sandbox
+        service listing, so containers surviving a backend restart are also
+        reclaimed: with no recorded activity they report idle since manager
+        startup and get one TTL grace period.
+
+        Each deletion re-checks ref-count and idle time under the per-key
+        lifecycle lock, so a sweep can never delete a sandbox a task is
+        concurrently attaching or recreating. Workspace data lives on bind
+        mounts and survives; the next use recreates the sandbox.
+
+        Args:
+            idle_ttl: Idle threshold in seconds (> 0).
+
+        Returns:
+            Primary sandbox names that were reclaimed.
+        """
+        try:
+            listed_sandboxes = await self._service.list_sandboxes()
+        except Exception as exc:
+            logger.warning("Failed to list sandboxes for idle sweep: %s", exc)
+            listed_sandboxes = []
+
+        # Only keys with an existing container (or cached instance) are
+        # candidates; activity entries alone have nothing left to reclaim.
+        candidates: set[str] = set()
+        listed_names = [sb.name for sb in listed_sandboxes or []]
+        for name in [*listed_names, *self._cache]:
+            try:
+                lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+            except ValueError:
+                continue
+            candidates.add(self._base_sandbox_name(lifecycle_type, lifecycle_id))
+
+        reclaimed: list[str] = []
+        for base_name in sorted(candidates):
+            try:
+                lifecycle_type, lifecycle_id = self.parse_sandbox_name(base_name)
+            except ValueError:
+                continue
+
+            async with self._lifecycle_locked(base_name):
+                if self.ref_count(lifecycle_type, lifecycle_id) > 0:
+                    continue
+                idle_for = time.monotonic() - self.last_activity_at(
+                    lifecycle_type, lifecycle_id
+                )
+                if idle_for <= idle_ttl:
+                    continue
+
+                async with self._activity_guard:
+                    self._lease_providers.pop(base_name, None)
+
+                logger.info(
+                    "Reclaiming idle sandbox %s (idle for %.0fs, TTL %.0fs)",
+                    base_name,
+                    idle_for,
+                    idle_ttl,
+                )
+                await self.delete_sandbox(lifecycle_type, lifecycle_id)
+                reclaimed.append(base_name)
+
+        return reclaimed
+
+    async def run_idle_sweep_loop(self) -> None:
+        """Periodically reclaim idle sandboxes until cancelled.
+
+        Reads XAGENT_SANDBOX_IDLE_TTL / XAGENT_SANDBOX_SWEEP_INTERVAL; when
+        no TTL is configured the loop exits immediately and behavior is
+        identical to deployments without idle reclamation.
+        """
+        idle_ttl = get_sandbox_idle_ttl()
+        if idle_ttl is None:
+            logger.debug("Sandbox idle reclamation disabled (no TTL configured)")
+            return
+
+        sweep_interval = get_sandbox_sweep_interval()
+        logger.info(
+            "Sandbox idle reclamation enabled: TTL %.0fs, sweep interval %.0fs",
+            idle_ttl,
+            sweep_interval,
+        )
+        while True:
+            await asyncio.sleep(sweep_interval)
+            try:
+                reclaimed = await self.sweep_idle_sandboxes(idle_ttl)
+                if reclaimed:
+                    logger.info(
+                        "Idle sweep reclaimed %d sandbox(es): %s",
+                        len(reclaimed),
+                        ", ".join(reclaimed),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Idle sandbox sweep failed: %s", exc)
 
     async def warmup(self) -> None:
         """

@@ -51,8 +51,10 @@ from xagent.config import (
     SANDBOX_ENV,
     SANDBOX_HOST_PROJECT_ROOT,
     SANDBOX_HOST_STORAGE_ROOT,
+    SANDBOX_IDLE_TTL,
     SANDBOX_IMAGE,
     SANDBOX_MEMORY,
+    SANDBOX_SWEEP_INTERVAL,
     SANDBOX_VOLUMES,
     SMTP_FROM_EMAIL,
     SMTP_FROM_NAME,
@@ -118,8 +120,10 @@ from xagent.config import (
     get_sandbox_env,
     get_sandbox_host_project_root,
     get_sandbox_host_storage_root,
+    get_sandbox_idle_ttl,
     get_sandbox_image,
     get_sandbox_memory,
+    get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_smtp_from_email,
     get_smtp_from_name,
@@ -1469,3 +1473,53 @@ class TestTriggerCallbackIpRateLimitConfig:
 
         monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", "50/second")
         assert get_trigger_callback_ip_rate_limit() == "50/second"
+
+
+class TestGetSandboxIdleTtl:
+    """Test get_sandbox_idle_ttl() function."""
+
+    def test_no_env_var_disables_reclamation(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_IDLE_TTL, raising=False)
+        assert get_sandbox_idle_ttl() is None
+
+    def test_blank_env_var_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "   ")
+        assert get_sandbox_idle_ttl() is None
+
+    def test_valid_ttl_seconds(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "86400")
+        assert get_sandbox_idle_ttl() == 86400.0
+
+    def test_fractional_ttl_seconds(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "0.5")
+        assert get_sandbox_idle_ttl() == 0.5
+
+    def test_invalid_ttl_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "invalid")
+        assert get_sandbox_idle_ttl() is None
+
+    def test_non_positive_ttl_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "0")
+        assert get_sandbox_idle_ttl() is None
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "-60")
+        assert get_sandbox_idle_ttl() is None
+
+
+class TestGetSandboxSweepInterval:
+    """Test get_sandbox_sweep_interval() function."""
+
+    def test_no_env_var_returns_default(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_SWEEP_INTERVAL, raising=False)
+        assert get_sandbox_sweep_interval() == 60.0
+
+    def test_valid_interval(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "5")
+        assert get_sandbox_sweep_interval() == 5.0
+
+    def test_invalid_interval_returns_default(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "invalid")
+        assert get_sandbox_sweep_interval() == 60.0
+
+    def test_non_positive_interval_returns_default(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "0")
+        assert get_sandbox_sweep_interval() == 60.0

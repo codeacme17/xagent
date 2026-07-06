@@ -59,6 +59,8 @@ SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
+SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
+SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -1112,6 +1114,58 @@ def get_sandbox_max_concurrency() -> int:
         The per-lifecycle sandbox worker cap (>= 1).
     """
     return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
+
+
+def _get_positive_float_env(env_var: str, default: float | None) -> float | None:
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    return parsed
+
+
+def get_sandbox_idle_ttl() -> float | None:
+    """Idle TTL in seconds after which unreferenced sandboxes are reclaimed.
+
+    Priority:
+        1. XAGENT_SANDBOX_IDLE_TTL environment variable (seconds)
+        2. Default ``None`` — idle reclamation disabled
+
+    Invalid or non-positive values keep reclamation disabled.
+
+    Reclamation deletes the container: anything written outside the
+    bind-mounted workspace/uploads paths (e.g. lazily installed pip
+    packages, files under ``/tmp`` or ``$HOME``) is lost. Workspace data on
+    bind mounts survives, and the sandbox is transparently recreated on
+    next use.
+
+    Returns:
+        TTL in seconds, or None when idle reclamation is disabled.
+    """
+    return _get_positive_float_env(SANDBOX_IDLE_TTL, None)
+
+
+def get_sandbox_sweep_interval() -> float:
+    """Interval in seconds between idle sandbox sweep runs.
+
+    Priority:
+        1. XAGENT_SANDBOX_SWEEP_INTERVAL environment variable (seconds)
+        2. Default ``60``
+
+    Only meaningful when XAGENT_SANDBOX_IDLE_TTL is set. Invalid or
+    non-positive values fall back to the default.
+
+    Returns:
+        Sweep interval in seconds (> 0).
+    """
+    return _get_positive_float_env(SANDBOX_SWEEP_INTERVAL, 60.0) or 60.0
 
 
 def get_lancedb_path() -> Path:
