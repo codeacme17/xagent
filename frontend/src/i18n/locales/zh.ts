@@ -3193,12 +3193,20 @@ Build when you need.`,
       noDomains: "尚未配置域名。添加域名或 * 前，Widget 请求会被拦截。",
       embedTitle: "嵌入代码",
       embedDescription: "将这段 script 复制到需要显示聊天气泡的页面。",
-      copySnippet: "复制代码"
+      copySnippet: "复制代码",
+      widgetKeyTitle: "Widget 密钥",
+      widgetKeyDescription: "授权此 Widget 的凭证，会包含在嵌入代码中；持有它的人即可访问该智能体，若泄露请重新生成。",
+      copyWidgetKey: "复制 Widget 密钥",
+      rotateWidgetKey: "重新生成",
+      rotateWidgetKeyConfirm: "重新生成 Widget 密钥？所有已部署的嵌入代码都会失效，需替换为新代码。"
     },
     messages: {
       updated: "Widget 配置已更新",
       updateFailed: "更新 Widget 配置失败",
-      copyFailed: "复制 Widget 代码失败"
+      copyFailed: "复制 Widget 代码失败",
+      widgetKeyLoadFailed: "加载 Widget 密钥失败",
+      widgetKeyRotated: "Widget 密钥已重新生成，请更新已部署的嵌入代码。",
+      widgetKeyRotateFailed: "重新生成 Widget 密钥失败"
     }
   },
   triggers: {

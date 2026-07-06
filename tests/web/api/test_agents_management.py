@@ -847,6 +847,100 @@ def test_share_link_can_be_enabled_rotated_and_disabled() -> None:
     assert disabled_agent["share_token"] is None
 
 
+def test_created_agents_get_a_widget_key() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Widget Key Agent")
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
+
+
+def test_generic_agent_responses_do_not_expose_widget_key() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Hidden Widget Key Agent")
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert "widget_key" not in detail_response.json()
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    list_item = next(item for item in list_response.json() if item["id"] == agent_id)
+    assert "widget_key" not in list_item
+
+
+def test_widget_key_endpoint_is_owner_only_and_heals_missing_keys() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    # Row created directly, predating the widget_key column (no key).
+    agent_id = _create_agent_row(user_id=owner_id, name="Legacy Widget Agent")
+
+    response = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["agent_id"] == agent_id
+    assert isinstance(payload["widget_key"], str) and len(payload["widget_key"]) >= 32
+
+    # Stable across reads once generated.
+    second = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert second.json()["widget_key"] == payload["widget_key"]
+
+    other_headers = _register_second_user()
+    for method, url in (
+        ("get", f"/api/agents/{agent_id}/widget-key"),
+        ("post", f"/api/agents/{agent_id}/widget-key/rotate"),
+    ):
+        other_response = getattr(client, method)(url, headers=other_headers)
+        assert other_response.status_code == 404
+
+
+def test_widget_key_can_be_rotated() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Rotating Widget Agent")
+
+    first = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert first.status_code == 200, first.text
+    first_key = first.json()["widget_key"]
+
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+    rotated_key = rotate.json()["widget_key"]
+    assert isinstance(rotated_key, str) and rotated_key != first_key
+
+    after = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert after.json()["widget_key"] == rotated_key
+
+
+def test_enabling_widget_generates_missing_key() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Disabled Widget Agent",
+        widget_enabled=False,
+    )
+
+    response = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": True},
+    )
+    assert response.status_code == 200, response.text
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
+
+
 def test_share_link_authenticates_public_chat_for_published_agent() -> None:
     _admin_headers()
     owner_id = _user_id("admin")

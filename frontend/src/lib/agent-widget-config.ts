@@ -63,3 +63,34 @@ export async function updateAgentWidgetConfig(
   }
   return response.json()
 }
+
+export interface AgentWidgetKeyState {
+  agent_id: number
+  widget_enabled: boolean
+  widget_key: string
+}
+
+export async function fetchAgentWidgetKey(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetKeyState> {
+  const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/widget-key`)
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}
+
+export async function rotateAgentWidgetKey(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetKeyState> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/agents/${agentId}/widget-key/rotate`,
+    { method: "POST" },
+  )
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}

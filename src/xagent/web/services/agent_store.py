@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +34,7 @@ _AGENT_UPDATE_FIELDS = {
     "status",
     "widget_enabled",
     "allowed_domains",
+    "widget_key",
     "share_enabled",
     "share_token",
     "share_updated_at",
@@ -41,6 +43,11 @@ _AGENT_UPDATE_FIELDS = {
 
 def clean_tool_categories(categories: Any) -> list[str]:
     return [c for c in (ensure_list(categories) or []) if c != "other"]
+
+
+def new_widget_key() -> str:
+    """Generate an unguessable widget embed credential for an agent."""
+    return secrets.token_urlsafe(32)
 
 
 class AgentStore:
@@ -221,6 +228,9 @@ class AgentStore:
     ) -> Agent:
         if status == AgentStatus.PUBLISHED and published_at is None:
             published_at = datetime.now(timezone.utc)
+        # Widget-enabled agents always carry an embed credential; agents
+        # created disabled get one when the widget is first enabled.
+        widget_key = new_widget_key() if widget_enabled else None
         agent = Agent(
             user_id=user_id,
             name=name,
@@ -237,6 +247,7 @@ class AgentStore:
             published_at=published_at,
             widget_enabled=widget_enabled,
             allowed_domains=allowed_domains or [],
+            widget_key=widget_key,
             share_enabled=share_enabled,
             share_token=share_token,
             share_updated_at=share_updated_at,
