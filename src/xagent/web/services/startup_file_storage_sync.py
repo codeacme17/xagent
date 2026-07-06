@@ -134,7 +134,7 @@ def _sync_registered_files(
         if user_id != current_user_id or user_storage is None:
             current_user_id = user_id
             user_storage = _user_scoped_storage(storage, user_id)
-            remote_objects = _list_remote_objects_for_user(user_storage, user_id)
+            remote_objects = _list_remote_objects_for_user(user_storage)
 
         expected_key = _expected_storage_key(record)
         remote_object = remote_objects.get(expected_key)
@@ -240,10 +240,8 @@ def _has_complete_durable_metadata(record: UploadedFile) -> bool:
     )
 
 
-def _list_remote_objects_for_user(
-    storage: ScopedFileStorage, user_id: int
-) -> dict[str, Any]:
-    return {stored.key: stored for stored in storage.list(f"users/{user_id}")}
+def _list_remote_objects_for_user(storage: ScopedFileStorage) -> dict[str, Any]:
+    return {stored.key: stored for stored in storage.list(storage.prefix)}
 
 
 def _get_lock_file_path() -> str:
