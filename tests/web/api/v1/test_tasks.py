@@ -158,6 +158,91 @@ def test_create_task_happy_path(mock_start_task):
     assert kwargs["payload"].transcript_message == "first user message"
 
 
+def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
+    """Creating a task bumps usage; polling its status afterward does not.
+
+    Usage is recorded explicitly by the mutating endpoints (create /
+    append), not by the shared auth dependency -- so SDK clients polling
+    ``GET /v1/chat/tasks/{id}`` for status don't inflate "calls this
+    month" or add a DB write per poll.
+    """
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row is not None
+        assert row.last_used_at is not None
+        assert row.usage_month == datetime.now(UTC).strftime("%Y-%m")
+        assert row.usage_month_calls == 1
+    finally:
+        db.close()
+
+    # Poll status/steps repeatedly -- neither should touch the tally.
+    for _ in range(3):
+        assert (
+            client.get(
+                f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key)
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            ).status_code
+            == 200
+        )
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row.usage_month_calls == 1
+    finally:
+        db.close()
+
+    # Force the task terminal so appending a message is accepted rather
+    # than 409ing on RUNNING, then confirm the append endpoint -- a real
+    # invocation, not a poll -- does bump the tally.
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.COMPLETED}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+        },
+    )
+    assert appended.status_code == 202, appended.text
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row.usage_month_calls == 2
+    finally:
+        db.close()
+
+
 def test_create_task_missing_authorization_returns_401(mock_start_task):
     """No Authorization header -> 401 invalid_api_key envelope."""
     agent_id, _key = _create_agent_with_key()
