@@ -133,7 +133,13 @@ class ManagedFileRef:
 
     def __post_init__(self) -> None:
         if self.storage is None:
-            self.storage = get_user_file_storage(int(self.record.user_id))
+            user_id = self.record.user_id
+            if user_id is None:
+                raise ValueError(
+                    "Record user_id is required to bind user-scoped storage; "
+                    "pass an explicit storage handle for records without an owner"
+                )
+            self.storage = get_user_file_storage(int(user_id))
 
     @property
     def local_path(self) -> Path:

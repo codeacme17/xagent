@@ -23,11 +23,15 @@ def normalize_storage_key(key: str, *, strict: bool = True) -> str:
     request-derived key) components containing backslashes or control
     characters are rejected as well. Tolerant mode (``strict=False``) admits
     those characters and exists only for keys already persisted in the
-    database, which may embed legacy POSIX filenames.
+    database, which may embed legacy POSIX filenames. Null bytes are rejected
+    in both modes: they cannot appear in any POSIX filename (so no persisted
+    key can contain one) and can truncate paths in native layers.
 
     Raises:
         ValueError: If the key is structurally invalid.
     """
+    if "\x00" in key:
+        raise ValueError(f"Invalid storage key: {key!r} (null byte)")
     normalized = key.strip().strip("/")
     if not normalized:
         raise ValueError(f"Invalid storage key: {key!r}")

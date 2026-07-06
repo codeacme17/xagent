@@ -48,6 +48,8 @@ def test_normalize_storage_key_strips_surrounding_noise(key, expected):
         "users/1/..",
         "users/./file.txt",
         "users//file.txt",
+        "users/1/uploads/id/null\x00byte.txt",
+        "\x00",
     ],
 )
 def test_normalize_storage_key_rejects_structural_violations_in_both_modes(key):
@@ -61,7 +63,6 @@ def test_normalize_storage_key_rejects_structural_violations_in_both_modes(key):
     "key",
     [
         "users/1/uploads/id/back\\slash.txt",
-        "users/1/uploads/id/control\x00char.txt",
         "users/1/uploads/id/esc\x1b.txt",
         "users/1/uploads/id/del\x7f.txt",
         "users/1/up\\loads/id/file.txt",

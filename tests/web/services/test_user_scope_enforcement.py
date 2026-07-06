@@ -148,3 +148,10 @@ def test_separator_aware_scope_for_record_owner(storage_env, tmp_path):
 
     with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record).delete_durable()
+
+
+def test_record_without_owner_cannot_bind_default_scope(storage_env, tmp_path):
+    record = _record(tmp_path / "uploads" / "missing.txt", user_id=None)
+
+    with pytest.raises(ValueError, match="user_id is required"):
+        ManagedFileRef(record)
