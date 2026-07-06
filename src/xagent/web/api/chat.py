@@ -665,7 +665,19 @@ class AgentServiceManager:
         workspace_owner_id: int,
         workspace_config: Mapping[str, Any],
     ) -> Any | None:
-        from ..sandbox_manager import get_sandbox_manager
+        """Get the task's sandbox lease provider, or None for local execution.
+
+        Capacity exhaustion and sandbox-service unavailability are distinct
+        failure classes: a ``SandboxCapacityError`` rejects the task by
+        default (opt-in local fallback via
+        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), while any other
+        sandbox failure keeps the local-execution fallback.
+
+        Raises:
+            SandboxCapacityError: The container cap is reached, nothing is
+                evictable, and local fallback on capacity is not enabled.
+        """
+        from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 
         sandbox_mgr = get_sandbox_manager()
         if not sandbox_mgr:
@@ -678,6 +690,27 @@ class AgentServiceManager:
                 str(workspace_owner_id),
                 workspace_config=workspace_config,
             )
+        except SandboxCapacityError as e:
+            self._agent_sandbox_keys.pop(task_id, None)
+            from ...config import get_sandbox_allow_local_fallback_on_capacity
+
+            if get_sandbox_allow_local_fallback_on_capacity():
+                logger.warning(
+                    "Sandbox capacity reached for workspace owner %s; "
+                    "falling back to local execution "
+                    "(XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY): %s",
+                    workspace_owner_id,
+                    e,
+                )
+                return None
+            logger.warning(
+                "Sandbox capacity reached for workspace owner %s; "
+                "rejecting task %s: %s",
+                workspace_owner_id,
+                task_id,
+                e,
+            )
+            raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
             logger.warning(

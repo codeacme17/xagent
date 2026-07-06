@@ -49,10 +49,12 @@ from xagent.config import (
     REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
+    SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_HOST_PROJECT_ROOT,
     SANDBOX_HOST_STORAGE_ROOT,
     SANDBOX_IDLE_TTL,
     SANDBOX_IMAGE,
+    SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_VOLUMES,
@@ -118,10 +120,12 @@ from xagent.config import (
     get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
+    get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_host_project_root,
     get_sandbox_host_storage_root,
     get_sandbox_idle_ttl,
     get_sandbox_image,
+    get_sandbox_max_containers,
     get_sandbox_memory,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
@@ -1523,3 +1527,43 @@ class TestGetSandboxSweepInterval:
     def test_non_positive_interval_returns_default(self, monkeypatch):
         monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "0")
         assert get_sandbox_sweep_interval() == 60.0
+
+
+class TestGetSandboxMaxContainers:
+    """Test get_sandbox_max_containers() function."""
+
+    def test_no_env_var_disables_cap(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_MAX_CONTAINERS, raising=False)
+        assert get_sandbox_max_containers() is None
+
+    def test_valid_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "20")
+        assert get_sandbox_max_containers() == 20
+
+    def test_invalid_cap_disables_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "invalid")
+        assert get_sandbox_max_containers() is None
+
+    def test_non_positive_cap_disables_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "0")
+        assert get_sandbox_max_containers() is None
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "-5")
+        assert get_sandbox_max_containers() is None
+
+
+class TestGetSandboxAllowLocalFallbackOnCapacity:
+    """Test get_sandbox_allow_local_fallback_on_capacity() function."""
+
+    def test_defaults_to_false(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, raising=False)
+        assert get_sandbox_allow_local_fallback_on_capacity() is False
+
+    def test_enabled_values(self, monkeypatch):
+        for value in ("1", "true", "True", "yes", "on"):
+            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
+            assert get_sandbox_allow_local_fallback_on_capacity() is True
+
+    def test_disabled_values(self, monkeypatch):
+        for value in ("0", "false", "off", "junk"):
+            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
+            assert get_sandbox_allow_local_fallback_on_capacity() is False

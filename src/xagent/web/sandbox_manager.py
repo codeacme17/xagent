@@ -21,6 +21,7 @@ from ..config import (
     get_sandbox_idle_ttl,
     get_sandbox_image,
     get_sandbox_max_concurrency,
+    get_sandbox_max_containers,
     get_sandbox_memory,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
@@ -36,6 +37,24 @@ from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 logger = logging.getLogger(__name__)
 
 _WORKER_LIFECYCLE_MARKER = "::worker::"
+
+
+class SandboxCapacityError(RuntimeError):
+    """The sandbox container cap is reached and no idle sandbox is evictable.
+
+    Distinct from sandbox-service unavailability: by default the web layer
+    rejects the task with this error instead of falling back to local
+    execution (see XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY).
+    """
+
+    def __init__(self, *, cap: int, in_use: int) -> None:
+        super().__init__(
+            f"Sandbox capacity limit reached ({in_use} containers, cap {cap}) "
+            "and all sandboxes are busy. Please retry when a running task "
+            "finishes, or raise XAGENT_SANDBOX_MAX_CONTAINERS."
+        )
+        self.cap = cap
+        self.in_use = in_use
 
 
 @dataclass
@@ -253,6 +272,10 @@ class SandboxManager:
         self._activity_guard = asyncio.Lock()
         self._lifecycle_locks: dict[str, _LifecycleLockEntry] = {}
         self._startup_monotonic = time.monotonic()
+        # Global gate serializing the capacity check with container creation:
+        # per-name locks cannot stop two concurrent creations for different
+        # names from both passing the count check.
+        self._capacity_gate = asyncio.Lock()
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -622,11 +645,21 @@ class SandboxManager:
             template = SandboxTemplate(type="image", image=image)
 
             logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
-            sandbox = await self._service.get_or_create(
-                sandbox_name,
-                template=template,
-                config=config,
-            )
+            cap = get_sandbox_max_containers()
+            if cap is None:
+                sandbox = await self._service.get_or_create(
+                    sandbox_name,
+                    template=template,
+                    config=config,
+                )
+            else:
+                async with self._capacity_gate:
+                    await self._ensure_capacity_for(sandbox_name, cap)
+                    sandbox = await self._service.get_or_create(
+                        sandbox_name,
+                        template=template,
+                        config=config,
+                    )
 
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = config
@@ -653,6 +686,120 @@ class SandboxManager:
             workspace_config=workspace_config,
             max_concurrency=get_sandbox_max_concurrency(),
         )
+
+    async def _list_managed_sandbox_names(self) -> set[str]:
+        """Names of existing managed containers (warmup/unparsable excluded)."""
+        names: set[str] = set()
+        listed_sandboxes = await self._service.list_sandboxes()
+        for sb in listed_sandboxes or []:
+            try:
+                self.parse_sandbox_name(sb.name)
+            except ValueError:
+                continue
+            names.add(sb.name)
+        return names
+
+    async def _pick_and_claim_eviction_victim(
+        self, existing: set[str], protected_base: str, skip: set[str]
+    ) -> Optional[str]:
+        """Pick the LRU idle primary from ``existing`` and claim it.
+
+        Claiming drops the victim's cached lease provider under the activity
+        guard, so no new task can attach between selection and deletion.
+        Skips primaries with active tasks, the protected key, and keys whose
+        lifecycle lock is currently held or awaited (in-flight creation or
+        release-to-zero cleanup).
+        """
+        async with self._activity_guard:
+            candidates: list[tuple[float, str]] = []
+            for name in existing:
+                try:
+                    lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+                except ValueError:
+                    continue
+                base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+                if name != base_name:
+                    # Workers are deleted with their primary.
+                    continue
+                if base_name == protected_base or base_name in skip:
+                    continue
+                lock_entry = self._lifecycle_locks.get(base_name)
+                if lock_entry is not None and (
+                    lock_entry.lock.locked() or lock_entry.waiters > 0
+                ):
+                    continue
+                activity = self._activity.get(base_name)
+                if activity is not None and activity.ref_count > 0:
+                    continue
+                last_activity = (
+                    activity.last_activity
+                    if activity is not None
+                    else self._startup_monotonic
+                )
+                candidates.append((last_activity, base_name))
+
+            if not candidates:
+                return None
+            victim = min(candidates)[1]
+            self._lease_providers.pop(victim, None)
+            return victim
+
+    async def _ensure_capacity_for(self, sandbox_name: str, cap: int) -> None:
+        """Make room under the container cap for one new sandbox.
+
+        Caller must hold ``_capacity_gate``. Evicts LRU idle primaries (with
+        their workers) until the new container fits; raises
+        ``SandboxCapacityError`` when nothing is evictable. If listing the
+        service fails, enforcement is skipped for this creation (fail-open:
+        the daemon being unreachable will fail the creation itself anyway).
+        """
+        try:
+            existing = await self._list_managed_sandbox_names()
+        except Exception as exc:
+            logger.warning(
+                "Failed to list sandboxes for capacity check; "
+                "skipping enforcement for %s: %s",
+                sandbox_name,
+                exc,
+            )
+            return
+
+        if sandbox_name in existing:
+            return
+
+        lifecycle_type, lifecycle_id = self.parse_sandbox_name(sandbox_name)
+        protected_base = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+
+        # Victims whose deletion was already attempted this pass: a failed
+        # delete leaves the container listed and would otherwise be re-picked
+        # forever.
+        tried_victims: set[str] = set()
+        while len(existing) >= cap:
+            victim = await self._pick_and_claim_eviction_victim(
+                existing, protected_base, tried_victims
+            )
+            if victim is None:
+                raise SandboxCapacityError(cap=cap, in_use=len(existing))
+            tried_victims.add(victim)
+
+            logger.info(
+                "Evicting LRU idle sandbox %s to stay under container cap %d",
+                victim,
+                cap,
+            )
+            victim_type, victim_id = self.parse_sandbox_name(victim)
+            await self.delete_sandbox(victim_type, victim_id)
+
+            try:
+                existing = await self._list_managed_sandbox_names()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to re-list sandboxes after eviction; "
+                    "skipping further enforcement for %s: %s",
+                    sandbox_name,
+                    exc,
+                )
+                return
 
     async def get_or_create_lease_provider(
         self,

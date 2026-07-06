@@ -61,6 +61,10 @@ SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
 SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
 SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
+SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
+SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
+    "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
+)
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -1166,6 +1170,55 @@ def get_sandbox_sweep_interval() -> float:
         Sweep interval in seconds (> 0).
     """
     return _get_positive_float_env(SANDBOX_SWEEP_INTERVAL, 60.0) or 60.0
+
+
+def get_sandbox_max_containers() -> int | None:
+    """Maximum number of concurrently existing sandbox containers.
+
+    Priority:
+        1. XAGENT_SANDBOX_MAX_CONTAINERS environment variable
+        2. Default ``None`` — no cap (previous behavior)
+
+    The cap counts all managed containers including per-lifecycle workers;
+    the transient warmup container is excluded. When the cap is reached,
+    the least-recently-used idle sandbox is evicted to make room; if
+    nothing is evictable the request fails with ``SandboxCapacityError``.
+    Invalid or non-positive values keep the cap disabled.
+
+    Returns:
+        The container cap, or None when no cap is enforced.
+    """
+    value = os.getenv(SANDBOX_MAX_CONTAINERS)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; cap disabled", SANDBOX_MAX_CONTAINERS, value)
+        return None
+    if parsed < 1:
+        logger.warning("Invalid %s=%r; cap disabled", SANDBOX_MAX_CONTAINERS, value)
+        return None
+    return parsed
+
+
+def get_sandbox_allow_local_fallback_on_capacity() -> bool:
+    """Whether tasks may fall back to local (host) execution at capacity.
+
+    Priority:
+        1. XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY environment variable
+        2. Default ``False`` — capacity exhaustion rejects the task
+
+    By default a task that cannot get a sandbox because the container cap
+    is reached is rejected with a clear error. Deployments that prefer
+    availability over strict sandboxing can enable this to run such tasks
+    on the host instead (with a warning log). Sandbox-service
+    unavailability keeps its local fallback regardless of this setting.
+
+    Returns:
+        True when local fallback on capacity exhaustion is allowed.
+    """
+    return _get_bool_env(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, False)
 
 
 def get_lancedb_path() -> Path:

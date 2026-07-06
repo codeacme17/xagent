@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
-from xagent.web.sandbox_manager import SandboxManager
+from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
 
 class _FakeAgentService:
@@ -279,3 +279,64 @@ async def test_acquire_sandbox_task_without_provider_returns_none(
 
     assert await manager._acquire_sandbox_task("1") is None
     assert sandbox_mgr.ref_count("user", "7") == 0
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_rejects_task_by_default(sandbox_mgr, monkeypatch) -> None:
+    """Capacity exhaustion must reject the task, not silently run locally."""
+    monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=SandboxCapacityError(cap=2, in_use=2)
+    )
+
+    with pytest.raises(SandboxCapacityError):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            workspace_config={},
+        )
+
+    assert 1 not in manager._agent_sandbox_keys
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_falls_back_locally_when_enabled(
+    sandbox_mgr, monkeypatch
+) -> None:
+    """The explicit opt-in restores local fallback under capacity pressure."""
+    monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=SandboxCapacityError(cap=2, in_use=2)
+    )
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        workspace_config={},
+    )
+
+    assert sandbox is None
+    assert 1 not in manager._agent_sandbox_keys
+
+
+@pytest.mark.asyncio
+async def test_sandbox_unavailability_keeps_local_fallback(
+    sandbox_mgr, monkeypatch
+) -> None:
+    """Non-capacity sandbox failures keep today's local-execution fallback."""
+    monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=RuntimeError("docker daemon unreachable")
+    )
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        workspace_config={},
+    )
+
+    assert sandbox is None
+    assert 1 not in manager._agent_sandbox_keys
