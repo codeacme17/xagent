@@ -8,7 +8,112 @@ import pytest
 
 import xagent.core.file_storage.factory as file_storage_factory
 from xagent.core.file_storage.factory import get_file_storage
-from xagent.core.file_storage.storage import FsspecFileStorage
+from xagent.core.file_storage.storage import FsspecFileStorage, normalize_storage_key
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "users/1/uploads/file-id/report.txt",
+        "users/1/tasks/2/outputs/id/nested/dir/report.txt",
+        "a",
+    ],
+)
+def test_normalize_storage_key_accepts_well_formed_keys(key):
+    assert normalize_storage_key(key) == key
+    assert normalize_storage_key(key, strict=False) == key
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("/users/1/file.txt", "users/1/file.txt"),
+        ("users/1/file.txt/", "users/1/file.txt"),
+        ("  users/1/file.txt  ", "users/1/file.txt"),
+    ],
+)
+def test_normalize_storage_key_strips_surrounding_noise(key, expected):
+    assert normalize_storage_key(key) == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "",
+        "   ",
+        "/",
+        "..",
+        "../etc/passwd",
+        "users/1/../2/file.txt",
+        "users/1/..",
+        "users/./file.txt",
+        "users//file.txt",
+    ],
+)
+def test_normalize_storage_key_rejects_structural_violations_in_both_modes(key):
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        normalize_storage_key(key)
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        normalize_storage_key(key, strict=False)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "users/1/uploads/id/back\\slash.txt",
+        "users/1/uploads/id/control\x00char.txt",
+        "users/1/uploads/id/esc\x1b.txt",
+        "users/1/uploads/id/del\x7f.txt",
+        "users/1/up\\loads/id/file.txt",
+    ],
+)
+def test_normalize_storage_key_forbidden_characters_strict_only(key):
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        normalize_storage_key(key)
+
+    assert normalize_storage_key(key, strict=False) == key
+
+
+def test_write_paths_reject_legacy_characters(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_file_storage.cache_clear()
+
+    storage = get_file_storage()
+    source = tmp_path / "source.txt"
+    source.write_text("data", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        storage.put_file(source, "users/1/uploads/id/back\\slash.txt")
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        storage.put_bytes(b"data", "users/1/uploads/id/back\\slash.txt")
+    with pytest.raises(ValueError, match="Invalid storage key"):
+        storage.list("users\\1")
+
+
+def test_read_and_delete_paths_tolerate_legacy_db_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
+    get_file_storage.cache_clear()
+
+    storage = get_file_storage()
+    legacy_key = "users/1/uploads/id/back\\slash.txt"
+    legacy_object = tmp_path / "objects" / "users/1/uploads/id" / "back\\slash.txt"
+    legacy_object.parent.mkdir(parents=True)
+    legacy_object.write_bytes(b"legacy data")
+
+    assert storage.exists(legacy_key)
+    assert storage.stat(legacy_key).size == len(b"legacy data")
+    with storage.open_read(legacy_key) as handle:
+        assert handle.read() == b"legacy data"
+
+    restored = storage.copy_to_path(legacy_key, tmp_path / "restored" / "file.txt")
+    assert restored.read_bytes() == b"legacy data"
+
+    materialized = storage.materialize(legacy_key, "file.txt")
+    assert materialized.read_bytes() == b"legacy data"
+
+    storage.delete(legacy_key)
+    assert not storage.exists(legacy_key)
 
 
 def test_local_file_storage_round_trips_file(monkeypatch, tmp_path):
