@@ -262,3 +262,30 @@ async def test_concurrent_recreate_during_eviction_gets_fresh_container(
     assert provider.primary_sandbox is not old_sandbox
     assert "task::victim" in service.deleted
     assert service.containers == {"task::victim"}
+
+
+@pytest.mark.asyncio
+async def test_worker_lease_at_cap_degrades_to_primary(
+    _env, clock, monkeypatch
+) -> None:
+    """A concurrency-safe lease whose worker cannot fit under the cap must
+    degrade to the primary sandbox (same sharing semantics as unsafe
+    leases) instead of failing the tool mid-task, and must not cache the
+    degraded result so worker creation is retried later."""
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "1")
+    manager, service = _make_manager()
+
+    provider = await manager.get_or_create_lease_provider("task", "1")
+    assert service.containers == {"task::1"}
+
+    async with provider.lease(concurrency_safe=True) as sandbox:
+        assert sandbox is provider.primary_sandbox
+
+    assert provider._workers == {}
+    assert service.containers == {"task::1"}
+
+    # With the cap lifted, the same lease creates a real worker again.
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "5")
+    async with provider.lease(concurrency_safe=True) as sandbox:
+        assert sandbox is not provider.primary_sandbox
+        assert sandbox.name.startswith("task::1::worker::")

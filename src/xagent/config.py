@@ -1199,18 +1199,8 @@ def get_sandbox_max_containers() -> int | None:
     Returns:
         The container cap, or None when no cap is enforced.
     """
-    value = os.getenv(SANDBOX_MAX_CONTAINERS)
-    if value is None or not value.strip():
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        logger.warning("Invalid %s=%r; cap disabled", SANDBOX_MAX_CONTAINERS, value)
-        return None
-    if parsed < 1:
-        logger.warning("Invalid %s=%r; cap disabled", SANDBOX_MAX_CONTAINERS, value)
-        return None
-    return parsed
+    # Sentinel default 0 (< minimum) maps every unset/invalid case to None.
+    return _get_positive_int_env(SANDBOX_MAX_CONTAINERS, 0, minimum=1) or None
 
 
 def get_sandbox_allow_local_fallback_on_capacity() -> bool:

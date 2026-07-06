@@ -150,7 +150,15 @@ class SandboxLeaseProvider:
         self._available_slots.put_nowait(slot)
 
     async def get_worker_sandbox(self, slot: int) -> Sandbox:
-        """Get or lazily create a worker sandbox for a slot."""
+        """Get or lazily create a worker sandbox for a slot.
+
+        When the container cap leaves no room for a worker, the lease
+        degrades to the primary sandbox instead of failing the tool
+        mid-task — the same sharing semantics non-concurrency-safe leases
+        already have, trading isolation for availability. The degraded
+        result is not cached, so a later lease retries worker creation
+        once capacity frees up.
+        """
         if slot in self._workers:
             return self._workers[slot]
 
@@ -160,11 +168,22 @@ class SandboxLeaseProvider:
         async with self._worker_locks[slot]:
             if slot in self._workers:
                 return self._workers[slot]
-            worker = await self._manager.get_or_create_sandbox(
-                self._lifecycle_type,
-                f"{self._lifecycle_id}::worker::{slot}",
-                workspace_config=self._workspace_config,
-            )
+            try:
+                worker = await self._manager.get_or_create_sandbox(
+                    self._lifecycle_type,
+                    f"{self._lifecycle_id}::worker::{slot}",
+                    workspace_config=self._workspace_config,
+                )
+            except SandboxCapacityError as exc:
+                logger.warning(
+                    "No capacity for worker sandbox %s::%s::worker::%d; "
+                    "degrading to the primary sandbox: %s",
+                    self._lifecycle_type,
+                    self._lifecycle_id,
+                    slot,
+                    exc,
+                )
+                return self.primary_sandbox
             self._workers[slot] = worker
             return worker
 
@@ -248,8 +267,47 @@ class SandboxPathMapper:
 
 
 class SandboxManager:
-    """
-    Manages sandbox instances.
+    """Manages sandbox instances, their activity state, and reclamation.
+
+    Concurrency model — the invariants every change must preserve:
+
+    Synchronization primitives, from innermost to outermost:
+
+    - ``_activity_guard`` (one asyncio.Lock): makes compound check-then-act
+      decisions on activity state atomic — attach's provider-existence
+      check + ref-count increment, release's decrement + provider pop, and
+      the eviction claim (ref-count re-check + provider pop + instance
+      cache purge). Critical sections must stay fully synchronous: never
+      ``await`` while holding it, and never acquire it inside a ``finally``
+      (a cancellation delivered at that await point would skip the cleanup).
+      Independent single dict operations do NOT need it.
+    - ``_lifecycle_locks`` (per lifecycle key, waiter-counted): serialize
+      lease provider creation with release-to-zero worker cleanup and with
+      the idle sweep, per key. Entries are garbage-collected when the last
+      holder/waiter leaves.
+    - ``_locks`` + ``_locks_guard`` (per sandbox name): serialize container
+      creation per name inside ``get_or_create_sandbox``.
+    - ``_capacity_gate`` (global): serializes the cap check + eviction +
+      container creation so concurrent creations for different names cannot
+      all pass the count check.
+
+    Ordering rules:
+
+    - lifecycle lock -> per-name lock -> capacity gate is the only nesting
+      direction; never acquire a lifecycle lock while holding the gate
+      (a same-key creator holds its lifecycle lock while waiting for the
+      gate, so gate -> lifecycle closes a deadlock cycle). Capacity
+      eviction therefore does NOT lock the victim's lifecycle: it relies on
+      the gate plus the atomic claim purging the instance cache, which
+      forces any concurrent same-key re-creation to cache-miss and queue
+      behind the gate until the deletion finished.
+
+    Safety contract:
+
+    - A lifecycle with a non-zero ref-count is never deleted, stopped, or
+      evicted — by the sweep, by capacity eviction, or by any race between
+      them. Both reclamation paths go through ``_evict_idle_sandbox``,
+      whose claim re-validates the ref-count under ``_activity_guard``.
     """
 
     def __init__(self, service: SandboxService):
