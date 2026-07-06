@@ -525,7 +525,9 @@ class TestWebIngestionUploadedFilePersistence:
 
         assert atomic_replace.called
         assert existing_path.read_text(encoding="utf-8") == "old content"
-        with get_unscoped_file_storage().open_read(str(existing_record.storage_key)) as handle:
+        with get_unscoped_file_storage().open_read(
+            str(existing_record.storage_key)
+        ) as handle:
             assert handle.read() == b"old content"
         mock_snapshot_runs.assert_called_once_with(str(existing_record.file_id))
         mock_restore_runs.assert_called_once_with(ingestion_runs_snapshot)
@@ -808,7 +810,9 @@ class TestWebIngestionUploadedFilePersistence:
         assert result is not None
         assert existing_path.read_text(encoding="utf-8") == "new content"
         assert processed_urls == {"hash": str(existing_record.file_id)}
-        with get_unscoped_file_storage().open_read(str(existing_record.storage_key)) as handle:
+        with get_unscoped_file_storage().open_read(
+            str(existing_record.storage_key)
+        ) as handle:
             assert handle.read() == b"new content"
 
     def test_recreate_missing_existing_file_removes_local_when_upsert_fails(

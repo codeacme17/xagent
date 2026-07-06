@@ -45,6 +45,7 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
     get_supported_parsers,
@@ -146,7 +147,6 @@ from ..services.kb_ingest_targets import (
     tombstone_kb_ingest_target,
     tombstone_kb_ingest_targets_for_collection,
 )
-from ...core.file_storage.keys import build_upload_storage_key
 from ..services.managed_file_ref import (
     DurableObjectMissingError,
     ManagedFileRef,
@@ -3923,21 +3923,23 @@ async def ingest(
         api_result = _get_api_compatibility_facade().with_result(api_result, result)
 
         if result.status in {"error", "partial"}:
-            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                api_result,
-                lambda: _rollback_failed_ingestion(
-                    db=db,
-                    user=_user,
-                    collection_name=collection,
-                    result=result,
-                    file_path=file_path,
-                    file_record=file_record,
-                    collection_existed_before=effective_collection_existed_before,
-                    uploaded_file_existed_before=uploaded_file_existed_before,
-                    file_backup_path=file_backup_path,
-                    had_existing_file=had_existing_file,
-                    embedding_model_id=embedding_model_id,
-                ),
+            rollback_execution = (
+                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                    api_result,
+                    lambda: _rollback_failed_ingestion(
+                        db=db,
+                        user=_user,
+                        collection_name=collection,
+                        result=result,
+                        file_path=file_path,
+                        file_record=file_record,
+                        collection_existed_before=effective_collection_existed_before,
+                        uploaded_file_existed_before=uploaded_file_existed_before,
+                        file_backup_path=file_backup_path,
+                        had_existing_file=had_existing_file,
+                        embedding_model_id=embedding_model_id,
+                    ),
+                )
             )
             api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
@@ -3992,21 +3994,23 @@ async def ingest(
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
-            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                rollback_api_result,
-                lambda: _rollback_failed_ingestion(
-                    db=db,
-                    user=_user,
-                    collection_name=collection,
-                    result=rollback_result,
-                    file_path=file_path,
-                    file_record=file_record,
-                    collection_existed_before=effective_collection_existed_before,
-                    uploaded_file_existed_before=uploaded_file_existed_before,
-                    file_backup_path=file_backup_path,
-                    had_existing_file=had_existing_file,
-                    embedding_model_id=embedding_model_id,
-                ),
+            rollback_execution = (
+                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                    rollback_api_result,
+                    lambda: _rollback_failed_ingestion(
+                        db=db,
+                        user=_user,
+                        collection_name=collection,
+                        result=rollback_result,
+                        file_path=file_path,
+                        file_record=file_record,
+                        collection_existed_before=effective_collection_existed_before,
+                        uploaded_file_existed_before=uploaded_file_existed_before,
+                        file_backup_path=file_backup_path,
+                        had_existing_file=had_existing_file,
+                        embedding_model_id=embedding_model_id,
+                    ),
+                )
             )
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:

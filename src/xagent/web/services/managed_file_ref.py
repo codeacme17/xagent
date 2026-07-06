@@ -22,9 +22,7 @@ from ...core.file_storage.keys import (
 from ...core.file_storage.keys import (
     build_upload_storage_key as build_upload_storage_key,
 )
-from ...core.file_storage.keys import (
-    safe_storage_filename as safe_storage_filename,
-)
+from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)

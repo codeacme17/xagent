@@ -322,8 +322,8 @@ class TaskWorkspace:
 
             # Import lazily: module-level file_storage imports would pull
             # fsspec into sandboxed executions that ship minimal deps.
-            from .file_storage.keys import build_task_output_storage_key
             from ..web.services.uploaded_file_store import UploadedFileStore
+            from .file_storage.keys import build_task_output_storage_key
 
             UploadedFileStore(db).create_from_local_path(
                 local_path=file_path,
