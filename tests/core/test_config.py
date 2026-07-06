@@ -1508,6 +1508,11 @@ class TestGetSandboxIdleTtl:
         monkeypatch.setenv(SANDBOX_IDLE_TTL, "-60")
         assert get_sandbox_idle_ttl() is None
 
+    def test_non_finite_ttl_disables_reclamation(self, monkeypatch):
+        for value in ("nan", "NaN", "inf", "-inf"):
+            monkeypatch.setenv(SANDBOX_IDLE_TTL, value)
+            assert get_sandbox_idle_ttl() is None
+
 
 class TestGetSandboxSweepInterval:
     """Test get_sandbox_sweep_interval() function."""
@@ -1527,6 +1532,11 @@ class TestGetSandboxSweepInterval:
     def test_non_positive_interval_returns_default(self, monkeypatch):
         monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "0")
         assert get_sandbox_sweep_interval() == 60.0
+
+    def test_non_finite_interval_returns_default(self, monkeypatch):
+        for value in ("nan", "inf"):
+            monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, value)
+            assert get_sandbox_sweep_interval() == 60.0
 
 
 class TestGetSandboxMaxContainers:

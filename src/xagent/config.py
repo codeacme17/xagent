@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -1129,7 +1130,9 @@ def _get_positive_float_env(env_var: str, default: float | None) -> float | None
     except ValueError:
         logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
         return default
-    if parsed <= 0:
+    # float() also parses "nan"/"inf"; nan comparisons are always False and
+    # inf would make asyncio.sleep hang, so require a finite positive value.
+    if not math.isfinite(parsed) or parsed <= 0:
         logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
         return default
     return parsed

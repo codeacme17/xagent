@@ -319,29 +319,32 @@ class SandboxManager:
 
         Entries are dropped once no holder or waiter remains, so the dict
         does not grow with every lifecycle key ever seen.
+
+        The waiter bookkeeping is deliberately not guarded by
+        ``_activity_guard``: each step is a single synchronous operation
+        with no compound invariant, and awaiting a lock inside ``finally``
+        could leak the waiter count if the task were cancelled at that
+        await point.
         """
-        async with self._activity_guard:
-            entry = self._lifecycle_locks.get(base_name)
-            if entry is None:
-                entry = _LifecycleLockEntry()
-                self._lifecycle_locks[base_name] = entry
-            entry.waiters += 1
+        entry = self._lifecycle_locks.get(base_name)
+        if entry is None:
+            entry = _LifecycleLockEntry()
+            self._lifecycle_locks[base_name] = entry
+        entry.waiters += 1
 
         try:
             await entry.lock.acquire()
         except BaseException:
-            async with self._activity_guard:
-                entry.waiters -= 1
-                self._drop_lifecycle_lock_if_unused(base_name, entry)
+            entry.waiters -= 1
+            self._drop_lifecycle_lock_if_unused(base_name, entry)
             raise
 
         try:
             yield
         finally:
             entry.lock.release()
-            async with self._activity_guard:
-                entry.waiters -= 1
-                self._drop_lifecycle_lock_if_unused(base_name, entry)
+            entry.waiters -= 1
+            self._drop_lifecycle_lock_if_unused(base_name, entry)
 
     def _drop_lifecycle_lock_if_unused(
         self, base_name: str, entry: _LifecycleLockEntry
@@ -702,6 +705,8 @@ class SandboxManager:
         names: set[str] = set()
         listed_sandboxes = await self._service.list_sandboxes()
         for sb in listed_sandboxes or []:
+            if not isinstance(sb.name, str):
+                continue
             try:
                 self.parse_sandbox_name(sb.name)
             except ValueError:
@@ -919,9 +924,13 @@ class SandboxManager:
                 self._config_cache.pop(name, None)
                 self._locks.pop(name, None)
                 # Only primary names appear in these maps; worker names no-op.
-                async with self._activity_guard:
-                    self._lease_providers.pop(name, None)
-                    self._activity.pop(name, None)
+                # Plain pops on purpose: each is a single synchronous
+                # operation with no compound invariant, and awaiting
+                # ``_activity_guard`` inside ``finally`` would risk skipping
+                # the eviction entirely if the task were cancelled at that
+                # await point.
+                self._lease_providers.pop(name, None)
+                self._activity.pop(name, None)
 
     async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
         """Delete sandboxes with no attached tasks that are idle past the TTL.
@@ -952,7 +961,9 @@ class SandboxManager:
         # Only keys with an existing container (or cached instance) are
         # candidates; activity entries alone have nothing left to reclaim.
         candidates: set[str] = set()
-        listed_names = [sb.name for sb in listed_sandboxes or []]
+        listed_names = [
+            sb.name for sb in listed_sandboxes or [] if isinstance(sb.name, str)
+        ]
         for name in [*listed_names, *self._cache]:
             try:
                 lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
