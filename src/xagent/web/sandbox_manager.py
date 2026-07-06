@@ -714,13 +714,11 @@ class SandboxManager:
             names.add(sb.name)
         return names
 
-    async def _pick_and_claim_eviction_victim(
+    async def _pick_eviction_victim(
         self, existing: set[str], protected_base: str, skip: set[str]
     ) -> Optional[str]:
-        """Pick the LRU idle primary from ``existing`` and claim it.
+        """Pick the LRU idle primary from ``existing`` (no claim).
 
-        Claiming drops the victim's cached lease provider under the activity
-        guard, so no new task can attach between selection and deletion.
         Skips primaries with active tasks, the protected key, and keys whose
         lifecycle lock is currently held or awaited (in-flight creation or
         release-to-zero cleanup).
@@ -755,9 +753,54 @@ class SandboxManager:
 
             if not candidates:
                 return None
-            victim = min(candidates)[1]
-            self._lease_providers.pop(victim, None)
-            return victim
+            return min(candidates)[1]
+
+    async def _claim_idle_sandbox(self, base_name: str) -> bool:
+        """Atomically claim an idle lifecycle for deletion.
+
+        Under the activity guard: re-validates that no task is attached,
+        then drops the lease provider (new attaches fail) and the cached
+        sandbox/config instances for the primary and its workers. Purging
+        the instance cache is what makes eviction safe against a concurrent
+        same-key re-creation: with the cache empty, ``get_or_create_sandbox``
+        cannot short-circuit and hand out the doomed container — it falls
+        through to the capacity gate and recreates only after the deletion
+        has finished.
+
+        Returns False when the lifecycle became active since selection.
+        """
+        worker_prefix = base_name + _WORKER_LIFECYCLE_MARKER
+        async with self._activity_guard:
+            activity = self._activity.get(base_name)
+            if activity is not None and activity.ref_count > 0:
+                return False
+            self._lease_providers.pop(base_name, None)
+            for name in [
+                n for n in self._cache if n == base_name or n.startswith(worker_prefix)
+            ]:
+                self._cache.pop(name, None)
+                self._config_cache.pop(name, None)
+            return True
+
+    async def _evict_idle_sandbox(self, base_name: str, *, reason: str) -> bool:
+        """Claim and delete one idle primary together with its workers.
+
+        Shared primitive for the idle sweep and capacity eviction. The
+        caller must hold the context that excludes a concurrent same-key
+        re-creation from completing against the old container: the sweep
+        holds the victim's per-key lifecycle lock; capacity eviction holds
+        the global capacity gate (which every post-claim re-creation must
+        pass through, because the claim purged the instance cache).
+
+        Returns False when the lifecycle became active and must be spared.
+        """
+        if not await self._claim_idle_sandbox(base_name):
+            return False
+
+        logger.info("Reclaiming idle sandbox %s (%s)", base_name, reason)
+        lifecycle_type, lifecycle_id = self.parse_sandbox_name(base_name)
+        await self.delete_sandbox(lifecycle_type, lifecycle_id)
+        return True
 
     async def _ensure_capacity_for(self, sandbox_name: str, cap: int) -> None:
         """Make room under the container cap for one new sandbox.
@@ -790,20 +833,19 @@ class SandboxManager:
         # forever.
         tried_victims: set[str] = set()
         while len(existing) >= cap:
-            victim = await self._pick_and_claim_eviction_victim(
+            victim = await self._pick_eviction_victim(
                 existing, protected_base, tried_victims
             )
             if victim is None:
                 raise SandboxCapacityError(cap=cap, in_use=len(existing))
-            tried_victims.add(victim)
 
-            logger.info(
-                "Evicting LRU idle sandbox %s to stay under container cap %d",
-                victim,
-                cap,
-            )
-            victim_type, victim_id = self.parse_sandbox_name(victim)
-            await self.delete_sandbox(victim_type, victim_id)
+            if not await self._evict_idle_sandbox(
+                victim, reason=f"LRU eviction under container cap {cap}"
+            ):
+                # Became active between selection and claim; the picker's
+                # ref-count check will exclude it on the next round.
+                continue
+            tried_victims.add(victim)
 
             try:
                 existing = await self._list_managed_sandbox_names()
@@ -979,28 +1021,21 @@ class SandboxManager:
                 continue
 
             async with self._lifecycle_locked(base_name):
-                # Decision and provider eviction are one atomic step under
-                # the activity guard: an attach can never land between the
-                # ref-count check and the pop that makes attaches fail.
-                async with self._activity_guard:
-                    if self.ref_count(lifecycle_type, lifecycle_id) > 0:
-                        continue
-                    idle_for = time.monotonic() - self.last_activity_at(
-                        lifecycle_type, lifecycle_id
-                    )
-                    if idle_for <= idle_ttl:
-                        continue
-
-                    self._lease_providers.pop(base_name, None)
-
-                logger.info(
-                    "Reclaiming idle sandbox %s (idle for %.0fs, TTL %.0fs)",
-                    base_name,
-                    idle_for,
-                    idle_ttl,
+                idle_for = time.monotonic() - self.last_activity_at(
+                    lifecycle_type, lifecycle_id
                 )
-                await self.delete_sandbox(lifecycle_type, lifecycle_id)
-                reclaimed.append(base_name)
+                if idle_for <= idle_ttl:
+                    continue
+
+                # _evict_idle_sandbox re-validates the ref-count and drops
+                # the provider in one atomic step under the activity guard:
+                # an attach can never land between the check and the pop
+                # that makes attaches fail.
+                if await self._evict_idle_sandbox(
+                    base_name,
+                    reason=f"idle for {idle_for:.0f}s, TTL {idle_ttl:.0f}s",
+                ):
+                    reclaimed.append(base_name)
 
         return reclaimed
 

@@ -1914,8 +1914,12 @@ class AgentServiceManager:
                 )
                 tracker = None
 
-        sandbox_task_key = await self._acquire_sandbox_task(tracker_task_id)
         try:
+            # Inside the try so a reclaimed-sandbox raise still runs the
+            # finally (heartbeat stop, lease release, tracker completion);
+            # _release_sandbox_task(None) is a no-op when nothing attached.
+            sandbox_task_key = await self._acquire_sandbox_task(tracker_task_id)
+
             logger.info(
                 f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
             )

@@ -217,3 +217,48 @@ async def test_in_flight_lifecycle_keys_are_not_eviction_victims(
             await manager.get_or_create_sandbox("task", "other")
 
     assert "task::busykey" in service.containers
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recreate_during_eviction_gets_fresh_container(
+    _env, clock, monkeypatch
+) -> None:
+    """A same-key get_or_create_lease_provider racing an in-flight capacity
+    eviction must not be handed a provider around the cached (doomed)
+    sandbox: the eviction claim purges the instance cache, so the recreate
+    cache-misses, queues behind the capacity gate, and builds a fresh
+    container after the deletion finished."""
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "1")
+    manager, service = _make_manager(("task::victim",))
+    old_sandbox = MagicMock()
+    manager._cache["task::victim"] = old_sandbox
+    manager._config_cache["task::victim"] = MagicMock()
+
+    delete_started = asyncio.Event()
+    delete_release = asyncio.Event()
+    original_delete = service.delete
+
+    async def slow_delete(name: str) -> None:
+        delete_started.set()
+        await delete_release.wait()
+        await original_delete(name)
+
+    service.delete = slow_delete  # type: ignore[method-assign]
+
+    evictor = asyncio.create_task(manager.get_or_create_sandbox("task", "new"))
+    await delete_started.wait()
+
+    racer = asyncio.create_task(manager.get_or_create_lease_provider("task", "victim"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # With the old code the racer would cache-hit the doomed sandbox and
+    # complete here; now it must be queued behind the capacity gate.
+    assert not racer.done()
+
+    delete_release.set()
+    await evictor
+    provider = await racer
+
+    assert provider.primary_sandbox is not old_sandbox
+    assert "task::victim" in service.deleted
+    assert service.containers == {"task::victim"}

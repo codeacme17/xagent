@@ -25,7 +25,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -1121,6 +1121,14 @@ def get_sandbox_max_concurrency() -> int:
     return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
 
 
+@overload
+def _get_positive_float_env(env_var: str, default: float) -> float: ...
+
+
+@overload
+def _get_positive_float_env(env_var: str, default: None) -> float | None: ...
+
+
 def _get_positive_float_env(env_var: str, default: float | None) -> float | None:
     value = os.getenv(env_var)
     if value is None or not value.strip():
@@ -1172,7 +1180,7 @@ def get_sandbox_sweep_interval() -> float:
     Returns:
         Sweep interval in seconds (> 0).
     """
-    return _get_positive_float_env(SANDBOX_SWEEP_INTERVAL, 60.0) or 60.0
+    return _get_positive_float_env(SANDBOX_SWEEP_INTERVAL, 60.0)
 
 
 def get_sandbox_max_containers() -> int | None:
