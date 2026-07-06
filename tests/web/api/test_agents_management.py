@@ -128,10 +128,13 @@ def _authenticate_widget_guest(
     guest_id: str = "guest-1",
     origin: str = "https://example.com",
 ) -> dict[str, str]:
+    # Authenticate via the direct-visit widget-key flow, which needs no
+    # embedding origin. The origin arg is accepted for call-site compatibility
+    # but no longer gates auth.
+    del origin
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": guest_id},
-        headers={"origin": origin},
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": guest_id},
     )
     assert response.status_code == 200, response.text
     access_token = response.json()["access_token"]
@@ -359,15 +362,17 @@ def test_generated_workforce_manager_agents_cannot_authenticate_widget() -> None
 
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": generated_manager_id, "guest_id": "guest-1"},
-        headers={"origin": "https://example.com"},
+        json={
+            "widget_key": _widget_key_for(generated_manager_id),
+            "guest_id": "guest-1",
+        },
     )
 
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid widget key"
 
 
-def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
+def test_embed_ticket_origin_matches_allowed_domains_case_insensitively() -> None:
     _admin_headers()
     owner_id = _user_id("admin")
     agent_id = _create_agent_row(
@@ -378,11 +383,7 @@ def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
         allowed_domains=["Example.com"],
     )
 
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-        headers={"origin": "https://EXAMPLE.com"},
-    )
+    response = _issue_embed_ticket(agent_id, "https://EXAMPLE.com")
 
     assert response.status_code == 200, response.text
 
@@ -548,9 +549,36 @@ def test_embed_ticket_rejects_disabled_widget_like_an_unknown_key() -> None:
     assert response.json()["detail"] == "Invalid widget key"
 
 
+def test_widget_auth_rejects_spoofed_origin_without_credential() -> None:
+    """#742 reproduction: a spoofed allowlisted Origin header plus an
+    enumerable agent_id, with no ticket and no widget key, authenticates
+    nothing now that the bare-header fallback is removed."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Spoofed Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+
+    assert response.status_code == 403
+    assert (
+        response.json()["detail"]
+        == "Widget authentication requires an embed ticket or widget key"
+    )
+
+
 def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
-    """A browser-JS attacker must not pass by self-reporting an allowed
-    origin in the request body (the pre-ticket design's flaw)."""
+    """A client self-reporting an allowed origin in the body (the pre-ticket
+    design's flaw) still gets nothing without a verifiable credential."""
     _admin_headers()
     owner_id = _user_id("admin")
     agent_id = _create_agent_row(
@@ -572,7 +600,59 @@ def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
     )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
+    assert (
+        response.json()["detail"]
+        == "Widget authentication requires an embed ticket or widget key"
+    )
+
+
+def test_widget_auth_with_no_origin_and_no_credential_is_rejected() -> None:
+    """The absent-Origin row from #742's table: still 403 with no credential."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="No Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_widget_auth_direct_visit_with_widget_key_succeeds() -> None:
+    """Direct (non-embedded) visits authenticate with the widget key alone;
+    no origin allowlist applies because a direct visit is not embedded."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Direct Visit Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    widget_key = _widget_key_for(agent_id)
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": widget_key, "guest_id": "guest-1"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_id"] == agent_id
+
+    stale = client.post(
+        "/api/widget/auth",
+        json={"widget_key": "wk-not-a-real-key", "guest_id": "guest-1"},
+    )
+    assert stale.status_code == 403
+    assert stale.json()["detail"] == "Invalid widget key"
 
 
 def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
@@ -605,7 +685,8 @@ def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
     assert response.status_code == 403
     assert response.json()["detail"] == "Invalid or expired embed ticket"
 
-    # Valid ticket, but issued for a different agent.
+    # A ticket authenticates only as the agent it was issued for; a spoofed
+    # agent_id in the body cannot redirect it to another agent.
     other_ticket = _issue_embed_ticket(
         other_agent_id, "https://trusted-site.com"
     ).json()["ticket"]
@@ -617,8 +698,8 @@ def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
             "embed_ticket": other_ticket,
         },
     )
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Invalid or expired embed ticket"
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_id"] == other_agent_id
 
 
 def test_widget_auth_rejects_expired_embed_ticket() -> None:
@@ -722,26 +803,6 @@ def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
     assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
 
 
-def test_widget_auth_falls_back_to_origin_header_without_embed_ticket() -> None:
-    _admin_headers()
-    owner_id = _user_id("admin")
-    agent_id = _create_agent_row(
-        user_id=owner_id,
-        name="Header Fallback Widget Agent",
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=True,
-        allowed_domains=["trusted-site.com"],
-    )
-
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-        headers={"origin": "https://trusted-site.com"},
-    )
-
-    assert response.status_code == 200, response.text
-
-
 def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
     """allowed_domains matches on host[:port] only; the scheme is not part
     of the comparison, so an http origin matches an entry with no scheme."""
@@ -758,26 +819,6 @@ def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
     response = _issue_embed_ticket(agent_id, "http://trusted-site.com")
 
     assert response.status_code == 200, response.text
-
-
-def test_widget_auth_rejects_when_ticket_and_origin_both_absent() -> None:
-    _admin_headers()
-    owner_id = _user_id("admin")
-    agent_id = _create_agent_row(
-        user_id=owner_id,
-        name="No Origin Widget Agent",
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=True,
-        allowed_domains=["trusted-site.com"],
-    )
-
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Domain not allowed: "
 
 
 def test_widget_embed_ticket_wildcard_allows_any_origin() -> None:
