@@ -13,8 +13,9 @@ from filelock import FileLock, Timeout
 from sqlalchemy.orm import Session
 
 from ...core.file_storage import FsspecFileStorage, get_file_storage
+from ...core.file_storage.keys import build_upload_storage_key
 from ..models.uploaded_file import UploadedFile
-from .managed_file_ref import ManagedFileRef, build_upload_storage_key
+from .managed_file_ref import ManagedFileRef
 
 logger = logging.getLogger(__name__)
 

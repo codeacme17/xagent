@@ -49,9 +49,9 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ...core.file_storage.keys import build_task_output_storage_key
 from ..services.managed_file_ref import (
     DurableStorageOperationError,
-    build_task_output_storage_key,
     ensure_uploaded_file_local_path,
 )
 from ..services.task_lease_service import (
