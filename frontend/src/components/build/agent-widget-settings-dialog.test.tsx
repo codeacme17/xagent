@@ -320,8 +320,11 @@ describe("AgentWidgetSettingsDialog", () => {
     }
   })
 
-  it("copies the embed snippet for the selected agent", async () => {
+  it("copies the embed snippet with the widget key for the selected agent", async () => {
     renderDialog()
+    await waitFor(() => {
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    })
 
     fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.copySnippet" }))
 
@@ -330,7 +333,8 @@ describe("AgentWidgetSettingsDialog", () => {
     })
     expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('src="http://app.local/widget.js"'))
     expect(copyToClipboardMock).not.toHaveBeenCalledWith(expect.stringContaining("http://api.local/widget.js"))
-    expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('data-agent-id="42"'))
+    expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('data-widget-key="wk-test-key"'))
+    expect(copyToClipboardMock).not.toHaveBeenCalledWith(expect.stringContaining("data-agent-id"))
     expect(toastSuccessMock).toHaveBeenCalledWith("common.copied")
   })
 })

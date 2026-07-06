@@ -6,11 +6,11 @@ export interface AgentWidgetConfigUpdates {
   allowed_domains?: string[]
 }
 
-export function buildWidgetSnippet(agentId: number | string, appOrigin: string): string {
-  if (!agentId || !appOrigin) return ""
+export function buildWidgetSnippet(widgetKey: string, appOrigin: string): string {
+  if (!widgetKey || !appOrigin) return ""
   return `<script
   src="${appOrigin}/widget.js"
-  data-agent-id="${agentId}"
+  data-widget-key="${widgetKey}"
   data-button-size="60px"
   data-button-color="#000"
   data-icon-color="#fff"

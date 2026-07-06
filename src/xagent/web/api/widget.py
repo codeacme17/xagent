@@ -50,11 +50,16 @@ class WidgetAuthRequest(BaseModel):
 
 
 class EmbedTicketRequest(BaseModel):
-    agent_id: int
+    # The widget key is the unguessable per-agent credential distributed in the
+    # embed snippet; capped like sibling request fields to reject junk payloads.
+    widget_key: str = Field(min_length=1, max_length=512)
 
 
 class EmbedTicketResponse(BaseModel):
     ticket: str
+    # The agent id is not secret; returning it lets widget.js address the chat
+    # iframe without embedding the widget key inside the iframe URL.
+    agent_id: int
 
 
 WidgetAuthResponse = PublicChatAuthResponse
@@ -102,6 +107,24 @@ def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
     return agent
 
 
+def _get_widget_agent_by_key(db: Session, widget_key: str) -> Agent:
+    """Resolve a widget-enabled agent from its embed key.
+
+    All failure modes (unknown key, disabled widget, workforce-manager agent)
+    collapse into a single 403 so callers cannot enumerate agents or probe
+    which keys exist.
+    """
+    agent = db.query(Agent).filter(Agent.widget_key == widget_key).first()
+    if (
+        agent is None
+        or not agent.widget_key
+        or is_workforce_generated_manager_agent(agent)
+        or not agent.widget_enabled
+    ):
+        raise HTTPException(status_code=403, detail="Invalid widget key")
+    return agent
+
+
 @widget_router.post("/embed-ticket", response_model=EmbedTicketResponse)
 async def issue_widget_embed_ticket(
     request: EmbedTicketRequest,
@@ -110,13 +133,20 @@ async def issue_widget_embed_ticket(
 ) -> Any:
     """Issue a short-lived signed embed ticket to the embedding page.
 
-    This endpoint is called by widget.js from the top-level embedding page,
-    so the browser-enforced Origin header carries the real embedding site —
-    unlike fetches from inside the widget iframe, whose Origin is the xagent
-    host itself. The signed ticket is the only way that validated origin is
-    trusted downstream; the widget never self-reports its parent's origin.
+    The agent is identified by its unguessable widget key, not an enumerable
+    agent id: a forged Origin header alone is worthless without the key, which
+    can only be obtained from a real deployment. This endpoint is called by
+    widget.js from the top-level embedding page, so the browser-enforced Origin
+    header carries the real embedding site — unlike fetches from inside the
+    widget iframe, whose Origin is the xagent host itself. The signed ticket is
+    the only way that validated origin is trusted downstream; the widget never
+    self-reports its parent's origin.
+
+    The Origin/allowed_domains check is retained as defense-in-depth: for
+    genuine browser traffic it still blocks embedding from non-allowlisted
+    sites, but it is no longer the boundary a non-browser client must defeat.
     """
-    agent = _get_widget_enabled_agent(db, request.agent_id)
+    agent = _get_widget_agent_by_key(db, request.widget_key)
 
     allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
     origin = req.headers.get("origin") or req.headers.get("referer", "")
@@ -135,7 +165,7 @@ async def issue_widget_embed_ticket(
         },
         expires_delta=timedelta(seconds=EMBED_TICKET_TTL_SECONDS),
     )
-    return EmbedTicketResponse(ticket=ticket)
+    return EmbedTicketResponse(ticket=ticket, agent_id=int(agent.id))
 
 
 @widget_router.post("/auth", response_model=WidgetAuthResponse)

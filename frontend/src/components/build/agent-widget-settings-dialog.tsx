@@ -102,8 +102,8 @@ export function AgentWidgetSettingsDialog({
     : []
 
   const widgetSnippet = useMemo(
-    () => buildWidgetSnippet(agentId ?? "", appOrigin),
-    [agentId, appOrigin],
+    () => buildWidgetSnippet(widgetKey ?? "", appOrigin),
+    [widgetKey, appOrigin],
   )
 
   const handleWidgetConfigUpdate = async (updates: Partial<AgentWidgetConfig>): Promise<boolean> => {
