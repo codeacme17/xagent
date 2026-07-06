@@ -388,12 +388,22 @@ class SandboxManager:
         lock, before worker deletion, so callers can evict their own caches
         exactly once), and the lifecycle's worker sandboxes are deleted.
 
+        A release without a matching attach (ref-count already zero) is
+        ignored with a warning: running the cleanup path anyway could tear
+        down a freshly created, not-yet-attached provider.
+
         Returns True when this call released the last active task.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 activity = self._touch_locked(base_name)
+                if activity.ref_count == 0:
+                    logger.warning(
+                        "Ignoring sandbox release without matching attach for %s",
+                        base_name,
+                    )
+                    return False
                 if activity.ref_count > 1:
                     activity.ref_count -= 1
                     return False

@@ -269,13 +269,34 @@ async def test_execute_task_keeps_workers_until_last_same_user_task_finishes(
 
 
 @pytest.mark.asyncio
-async def test_acquire_sandbox_task_without_provider_returns_none(
+async def test_acquire_with_reclaimed_provider_raises_and_evicts_agent(
     sandbox_mgr,
 ) -> None:
-    """A task whose provider was already released must not attach."""
+    """An agent built with a provider that was since reclaimed must fail
+    clearly (and drop its stale cache) instead of running against deleted
+    containers."""
     manager = AgentServiceManager()
+    manager._agents[1] = AsyncMock()
     manager._agent_owner_ids[1] = 7
     manager._agent_sandbox_keys[1] = "user:7"
+
+    with pytest.raises(RuntimeError, match="reclaimed before"):
+        await manager._acquire_sandbox_task("1")
+
+    assert 1 not in manager._agents
+    assert 1 not in manager._agent_owner_ids
+    assert 1 not in manager._agent_sandbox_keys
+    assert sandbox_mgr.ref_count("user", "7") == 0
+
+
+@pytest.mark.asyncio
+async def test_acquire_fallback_key_without_provider_returns_none(
+    sandbox_mgr,
+) -> None:
+    """The owner-id fallback (no explicitly recorded sandbox key, e.g. a
+    local-execution task) must keep returning None, never raise."""
+    manager = AgentServiceManager()
+    manager._agent_owner_ids[1] = 7
 
     assert await manager._acquire_sandbox_task("1") is None
     assert sandbox_mgr.ref_count("user", "7") == 0

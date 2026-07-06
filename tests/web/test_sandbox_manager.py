@@ -841,6 +841,24 @@ class TestSandboxActivityTracking:
         assert "user::7" not in manager._lease_providers
 
     @pytest.mark.asyncio
+    async def test_release_without_attach_is_ignored(self):
+        """A mismatched release must not tear down a fresh, not-yet-attached
+        provider or re-run the worker cleanup."""
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+        manager.delete_worker_sandboxes = AsyncMock()
+        evictions: list[str] = []
+
+        released = await manager.release(
+            "user", "7", on_last_release=lambda: evictions.append("user::7")
+        )
+
+        assert released is False
+        assert "user::7" in manager._lease_providers
+        assert evictions == []
+        manager.delete_worker_sandboxes.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_release_to_zero_runs_cleanup_exactly_once(self):
         manager = self._make_manager()
         manager._lease_providers["user::7"] = MagicMock()

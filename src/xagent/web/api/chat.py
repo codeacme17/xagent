@@ -594,7 +594,21 @@ class AgentServiceManager:
         lifecycle_type, _, lifecycle_id = sandbox_key.partition(":")
         return lifecycle_type, lifecycle_id
 
-    def _sandbox_key_for_task(self, task_id: Optional[str]) -> Optional[str]:
+    async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
+        """Attach the task to its sandbox lifecycle for the execution.
+
+        Returns the sandbox key on success, or None when the task runs
+        without sandbox tracking (sandbox disabled, local-execution
+        fallback, or no recorded sandbox for the task).
+
+        Raises:
+            RuntimeError: The task's agent was built with a sandbox lease
+                provider (explicitly recorded key) that has since been
+                reclaimed by the idle sweep or capacity eviction. Running
+                anyway would hit deleted containers with cryptic tool
+                errors; failing clearly lets a retry rebuild the agent and
+                transparently recreate the sandbox.
+        """
         if task_id is None:
             return None
         try:
@@ -602,19 +616,13 @@ class AgentServiceManager:
         except (TypeError, ValueError):
             return None
 
-        sandbox_key = self._agent_sandbox_keys.get(task_key)
-        if sandbox_key is not None:
-            return sandbox_key
-
-        owner_id = self._agent_owner_ids.get(task_key)
-        if owner_id is None:
-            return None
-        return f"user:{owner_id}"
-
-    async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
-        sandbox_key = self._sandbox_key_for_task(task_id)
+        explicit_key = self._agent_sandbox_keys.get(task_key)
+        sandbox_key = explicit_key
         if sandbox_key is None:
-            return None
+            owner_id = self._agent_owner_ids.get(task_key)
+            if owner_id is None:
+                return None
+            sandbox_key = f"user:{owner_id}"
 
         from ..sandbox_manager import get_sandbox_manager
 
@@ -623,9 +631,22 @@ class AgentServiceManager:
             return None
 
         lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
-        if not await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
-            return None
-        return sandbox_key
+        if await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
+            return sandbox_key
+
+        if explicit_key is not None:
+            # Evict the stale cached agent so a retry rebuilds its tools
+            # against a freshly created sandbox.
+            self._agents.pop(task_key, None)
+            self._agent_owner_ids.pop(task_key, None)
+            self._agent_sandbox_keys.pop(task_key, None)
+            raise RuntimeError(
+                f"The sandbox for task {task_key} was reclaimed before "
+                "execution started (idle reclamation or capacity "
+                "eviction). Please retry the task; the sandbox will be "
+                "recreated automatically."
+            )
+        return None
 
     def _evict_agents_for_sandbox(self, sandbox_key: str) -> None:
         """Drop cached AgentService objects that were built with this sandbox."""
