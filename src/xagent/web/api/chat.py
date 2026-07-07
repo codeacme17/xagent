@@ -30,6 +30,7 @@ from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
+from ...core.workspace import scoped_user_root
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -386,7 +387,10 @@ def _build_tool_selection_spec_for_task(
 
 
 def _build_allowed_external_dirs(
-    user_id: Optional[int], *, only_existing: bool = False
+    user_id: Optional[int],
+    *,
+    only_existing: bool = False,
+    scope: Optional[ExecutionScope] = None,
 ) -> list[str]:
     """Build the allowed_external_dirs list for AgentService / tool
     workspace_config.
@@ -403,7 +407,19 @@ def _build_allowed_external_dirs(
     """
     dirs: list[str] = []
     if user_id is not None:
-        user_upload_dir = get_uploads_dir() / f"user_{user_id}"
+        # Default: the shared user-level upload dir, so already-uploaded
+        # KB files stay reachable from every scope. With
+        # ``isolate_external_dirs`` the entry becomes the scoped subtree,
+        # keeping upload writes and the mount/enforcement allowlist
+        # consistent per scope. Deployment-level external dirs
+        # (XAGENT_EXTERNAL_UPLOAD_DIRS) are not user-root derived and stay
+        # shared either way.
+        segments = (
+            scope.workspace_segments
+            if scope is not None and scope.isolate_external_dirs
+            else ()
+        )
+        user_upload_dir = scoped_user_root(get_uploads_dir(), user_id, segments)
         if not only_existing or user_upload_dir.exists():
             dirs.append(str(user_upload_dir))
     dirs.extend([str(d) for d in get_external_upload_dirs()])
@@ -452,6 +468,7 @@ async def create_default_tools(
     parent_task_id: Optional[str] = None,
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
+    scope: Optional[ExecutionScope] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -475,7 +492,8 @@ async def create_default_tools(
 
     # Build allowed external directories so file tools can reach the task owner's
     # uploads (see _build_allowed_external_dirs docstring).
-    allowed_external_dirs = _build_allowed_external_dirs(owner_id)
+    allowed_external_dirs = _build_allowed_external_dirs(owner_id, scope=scope)
+    scope_segments = scope.workspace_segments if scope is not None else ()
 
     tool_config = WebToolConfig(
         db=db,
@@ -485,10 +503,13 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(get_uploads_dir() / f"user_{owner_id}"),
+            "base_dir": str(
+                scoped_user_root(get_uploads_dir(), owner_id, scope_segments)
+            ),
             "task_id": task_id,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
+            "scope_segments": scope_segments,
         },
         # Only load MCP servers (a DB query + per-server session init)
         # when the caller actually picked MCP. Spec=None / _SpecAll
@@ -1196,11 +1217,17 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
+        scope_segments = scope.workspace_segments if scope is not None else ()
         sandbox_workspace_config = {
-            "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+            "base_dir": str(
+                scoped_user_root(get_uploads_dir(), workspace_owner_id, scope_segments)
+            ),
             "task_id": f"web_task_{task_id}",
             "user_id": workspace_owner_id,
-            "allowed_external_dirs": _build_allowed_external_dirs(workspace_owner_id),
+            "allowed_external_dirs": _build_allowed_external_dirs(
+                workspace_owner_id, scope=scope
+            ),
+            "scope_segments": scope_segments,
         }
 
         sandbox = await self._get_or_create_task_sandbox(
@@ -1216,6 +1243,7 @@ class AgentServiceManager:
             user=user,
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
+            scope=scope,
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -1699,13 +1727,19 @@ class AgentServiceManager:
                     if task and task.user_id is not None
                     else int(runtime_user.id)
                 )
+                scope_segments = scope.workspace_segments if scope is not None else ()
                 sandbox_workspace_config = {
-                    "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+                    "base_dir": str(
+                        scoped_user_root(
+                            get_uploads_dir(), workspace_owner_id, scope_segments
+                        )
+                    ),
                     "task_id": f"web_task_{task_id}",
                     "user_id": workspace_owner_id,
                     "allowed_external_dirs": _build_allowed_external_dirs(
-                        workspace_owner_id
+                        workspace_owner_id, scope=scope
                     ),
+                    "scope_segments": scope_segments,
                 }
 
                 sandbox = await self._get_or_create_task_sandbox(
@@ -1729,6 +1763,7 @@ class AgentServiceManager:
                     user=runtime_user,
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
+                    scope=scope,
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -1791,6 +1826,7 @@ class AgentServiceManager:
                     # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
                         workspace_owner_id,
+                        scope=scope,
                     )
 
                     # Create AgentService first (this creates the workspace)
@@ -1808,9 +1844,12 @@ class AgentServiceManager:
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
                         workspace_base_dir=str(
-                            get_uploads_dir() / f"user_{workspace_owner_id}"
-                        ),  # Use user-isolated base directory
+                            scoped_user_root(
+                                get_uploads_dir(), workspace_owner_id, scope_segments
+                            )
+                        ),  # Use user- (and scope-) isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
+                        scope_segments=scope_segments,
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
@@ -2064,11 +2103,25 @@ class AgentServiceManager:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
-        # Try user-isolated workspace first, then fallback
+        # Try the scoped workspace first (when a resolver maps this task to
+        # a scope), then the user-isolated workspace, then the legacy
+        # uploads-root fallback.
         workspace_ids = []
         if user_id:
+            scope = resolve_execution_scope(task_id)
+            segments = scope.workspace_segments if scope is not None else ()
+            if segments:
+                workspace_ids.append(
+                    (
+                        f"web_task_{task_id}",
+                        str(scoped_user_root(get_uploads_dir(), user_id, segments)),
+                    )
+                )
             workspace_ids.append(
-                (f"web_task_{task_id}", str(get_uploads_dir() / f"user_{user_id}"))
+                (
+                    f"web_task_{task_id}",
+                    str(scoped_user_root(get_uploads_dir(), user_id)),
+                )
             )
         workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
 
@@ -2263,8 +2316,10 @@ class AgentServiceManager:
 
                 # Build allowed external directories
                 allowed_external_dirs = _build_allowed_external_dirs(
-                    int(user_id) if user_id is not None else None
+                    int(user_id) if user_id is not None else None,
+                    scope=scope,
                 )
+                scope_segments = scope.workspace_segments if scope is not None else ()
 
                 # Create agent with basic configuration
                 if user_id is not None:
@@ -2313,9 +2368,12 @@ class AgentServiceManager:
                             system_prompt=system_prompt,
                             enable_workspace=True,
                             workspace_base_dir=str(
-                                get_uploads_dir() / f"user_{user_id}"
-                            ),  # Use user-isolated base directory
+                                scoped_user_root(
+                                    get_uploads_dir(), int(user_id), scope_segments
+                                )
+                            ),  # Use user- (and scope-) isolated base directory
                             allowed_external_dirs=allowed_external_dirs,
+                            scope_segments=scope_segments,
                             task_id=str(task_id),
                             memory_similarity_threshold=memory_similarity_threshold,
                             memory_enabled=memory_policy.memory_enabled,

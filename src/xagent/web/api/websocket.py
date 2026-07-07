@@ -32,7 +32,7 @@ from ...config import (
 )
 from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
-from ...core.execution_scope import turn_execution_scope
+from ...core.execution_scope import resolve_execution_scope, turn_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db, get_session_local
@@ -941,19 +941,28 @@ def _uploaded_file_record_in_task_scope(
         return False
 
 
+def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
+    """workspace_segments of the task's resolved ExecutionScope ((),
+    when unscoped) — for storage-key composition outside the turn context."""
+    scope = resolve_execution_scope(task_id)
+    return scope.workspace_segments if scope is not None else ()
+
+
 def _output_path_in_current_task_scope(
     relative_path: str, task_id: int, task_user_id: int
 ) -> bool:
     parts = Path(relative_path.lstrip("/")).parts
     task_dirs = {f"web_task_{task_id}", f"task_{task_id}"}
 
-    if (
-        len(parts) >= 4
-        and parts[0] == f"user_{task_user_id}"
-        and parts[1] in task_dirs
-        and parts[2] == "output"
-    ):
-        return True
+    if len(parts) >= 4 and parts[0] == f"user_{task_user_id}":
+        # Scoped workspaces insert ExecutionScope.workspace_segments between
+        # the user root and the task dir
+        # (user_{id}/{segment}.../web_task_{id}/output/...); accept the task
+        # dir at any depth after the user root so scoped outputs are not
+        # misclassified as foreign.
+        for index in range(1, len(parts) - 2):
+            if parts[index] in task_dirs:
+                return parts[index + 1] == "output"
 
     return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
 
@@ -1162,6 +1171,7 @@ def _normalize_file_outputs(
                         task_id,
                         expected_file_id,
                         workspace_relative_path,
+                        scope_segments=_scope_segments_for_task(task_id),
                     ),
                     workspace_relative_path=workspace_relative_path,
                     workspace_category=workspace_category,
@@ -1185,6 +1195,7 @@ def _normalize_file_outputs(
                         task_id,
                         str(file_record.file_id),
                         workspace_relative_path,
+                        scope_segments=_scope_segments_for_task(task_id),
                     ),
                     task_id=task_id,
                     workspace_relative_path=workspace_relative_path,
@@ -2153,6 +2164,7 @@ async def redirect_legacy_preview(
                 cast(int, task_id),
                 generated_file_id,
                 relative_path,
+                scope_segments=_scope_segments_for_task(task_id),
             ),
         )
         db.commit()
@@ -4636,7 +4648,9 @@ clarification questions as plain assistant text.
             # Build allowed external directories
             allowed_external_dirs = []
             if user and user.id:
-                user_upload_dir = get_uploads_dir() / f"user_{user.id}"
+                from ...core.workspace import scoped_user_root
+
+                user_upload_dir = scoped_user_root(get_uploads_dir(), int(user.id))
                 allowed_external_dirs.append(str(user_upload_dir))
             allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
 

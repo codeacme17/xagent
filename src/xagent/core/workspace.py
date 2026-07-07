@@ -15,15 +15,53 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 from uuid import uuid4
 
 from ..config import get_uploads_dir
+from .execution_scope import validate_scope_component
 
 logger = logging.getLogger(__name__)
 
 # Context variable for auto-registration mode
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
+
+
+def scoped_user_root(
+    base_dir: Union[str, Path, None],
+    user_id: int,
+    scope_segments: Sequence[str] = (),
+) -> Path:
+    """Single owner of the ``user root + scope segments`` path composition.
+
+    Every user-root path — workspace base dirs, upload dirs, sandbox mounts,
+    read paths — must be composed through this entry point instead of
+    hand-building ``.../user_{id}`` literals, so an active
+    :class:`ExecutionScope`'s ``workspace_segments`` cannot be applied to one
+    path and missed on another (the "partially applied scope" bug class).
+
+    Args:
+        base_dir: Root the user directory lives under; None means the
+            configured uploads dir.
+        user_id: Platform user id (owns the root regardless of scope).
+        scope_segments: ExecutionScope.workspace_segments, inserted after the
+            user root. Empty (the default) composes today's unscoped path
+            byte-for-byte.
+
+    Returns:
+        ``{base_dir}/user_{user_id}[/{segment}...]``
+
+    Raises:
+        InvalidScopeComponentError: a segment fails validation. Rejecting is
+            deliberate — falling back to the unscoped path would silently
+            merge namespaces.
+    """
+    root = Path(base_dir).expanduser() if base_dir is not None else get_uploads_dir()
+    root = root / f"user_{int(user_id)}"
+    for segment in scope_segments:
+        validate_scope_component(segment, field_name="workspace_segments entry")
+        root = root / segment
+    return root
 
 
 @dataclass
@@ -53,9 +91,18 @@ class TaskWorkspace:
         base_dir: Optional[str] = None,
         allowed_external_dirs: Optional[List[str]] = None,
         db_task_id: Optional[int] = None,
+        scope_segments: Sequence[str] = (),
     ):
         self.id = id
         self.db_task_id = db_task_id
+        # ExecutionScope.workspace_segments this workspace was built under.
+        # base_dir already ends with these segments for scoped workspaces;
+        # they are carried separately so storage keys and canonical task
+        # roots insert them after the user root instead of re-deriving them
+        # from the path.
+        self.scope_segments: tuple[str, ...] = tuple(scope_segments)
+        for segment in self.scope_segments:
+            validate_scope_component(segment, field_name="workspace_segments entry")
         if base_dir is None:
             base_dir = str(get_uploads_dir())
         self.base_dir = (
@@ -161,10 +208,15 @@ class TaskWorkspace:
         return parsed_task_id != int(task_id)
 
     def _user_workspace_base_dir(self, user_id: int) -> Path:
-        user_segment = f"user_{user_id}"
-        if self.base_dir.name == user_segment:
+        # base_dir may already be the (scoped) user base
+        # (``.../user_{id}[/{segments}]``) or a raw uploads root; in the
+        # latter case the user root + scope segments are appended.
+        expected_tail = scoped_user_root(Path("/"), user_id, self.scope_segments).parts[
+            1:
+        ]
+        if self.base_dir.parts[-len(expected_tail) :] == expected_tail:
             return self.base_dir
-        return self.base_dir / user_segment
+        return scoped_user_root(self.base_dir, user_id, self.scope_segments)
 
     @staticmethod
     def _storage_path_record(
@@ -332,7 +384,11 @@ class TaskWorkspace:
                 task_id=task_id,
                 filename=file_path.name,
                 storage_key=build_task_output_storage_key(
-                    int(task.user_id), task_id, file_id, relative_path
+                    int(task.user_id),
+                    task_id,
+                    file_id,
+                    relative_path,
+                    scope_segments=self.scope_segments,
                 ),
                 workspace_relative_path=relative_path,
                 workspace_category=category,
@@ -434,6 +490,7 @@ class TaskWorkspace:
                 int(task_id) if task_id is not None else 0,
                 file_id,
                 relative_path,
+                scope_segments=self.scope_segments,
             )
             if task_id is None:
                 storage_key = getattr(record, "storage_key", None) or storage_key
@@ -1212,6 +1269,7 @@ def create_workspace(
     base_dir: Optional[str] = None,
     allowed_external_dirs: Optional[List[str]] = None,
     db_task_id: Optional[int] = None,
+    scope_segments: Sequence[str] = (),
 ) -> TaskWorkspace:
     """
     Create a new workspace for the given id.
@@ -1220,13 +1278,21 @@ def create_workspace(
         id: Workspace identifier
         base_dir: Base directory for workspaces (uses default if None)
         allowed_external_dirs: List of allowed external directories
+        scope_segments: ExecutionScope.workspace_segments the workspace
+            runs under (base_dir is expected to already include them)
 
     Returns:
         TaskWorkspace instance
     """
     if base_dir is None:
         base_dir = str(get_uploads_dir())
-    return TaskWorkspace(id, base_dir, allowed_external_dirs, db_task_id=db_task_id)
+    return TaskWorkspace(
+        id,
+        base_dir,
+        allowed_external_dirs,
+        db_task_id=db_task_id,
+        scope_segments=scope_segments,
+    )
 
 
 def get_workspace_output_files(
@@ -1265,6 +1331,7 @@ class WorkspaceManager:
         task_id: str,
         allowed_external_dirs: Optional[List[str]] = None,
         db_task_id: Optional[int] = None,
+        scope_segments: Sequence[str] = (),
     ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
@@ -1273,6 +1340,9 @@ class WorkspaceManager:
             base_dir: Base directory for workspaces
             task_id: Task/workspace identifier
             allowed_external_dirs: List of allowed external directories
+            scope_segments: ExecutionScope.workspace_segments the workspace
+                runs under (base_dir already includes them, so the cache key
+                distinguishes scopes)
 
         Returns:
             TaskWorkspace instance
@@ -1285,6 +1355,7 @@ class WorkspaceManager:
                 base_dir,
                 allowed_external_dirs,
                 db_task_id=db_task_id,
+                scope_segments=scope_segments,
             )
             self._workspaces[cache_key] = workspace
         elif db_task_id is not None and self._workspaces[cache_key].db_task_id is None:

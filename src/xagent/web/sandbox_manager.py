@@ -34,6 +34,7 @@ from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
 from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
+from ..core.workspace import scoped_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -561,10 +562,12 @@ class SandboxManager:
             # verbatim-path behavior.
             try:
                 owner_id, _suffix = parse_user_lifecycle_id(owner_lifecycle_id)
-                owner_segment = str(owner_id)
+                mount_root = scoped_user_root(get_uploads_dir(), owner_id)
             except ValueError:
-                owner_segment = owner_lifecycle_id
-            paths.append((get_uploads_dir() / f"user_{owner_segment}", True))
+                # Legacy/non-standard lifecycle id: keep the historical
+                # verbatim-path behavior.
+                mount_root = get_uploads_dir() / f"user_{owner_lifecycle_id}"
+            paths.append((mount_root, True))
 
         return paths
 

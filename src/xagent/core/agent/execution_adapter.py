@@ -25,6 +25,7 @@ class AgentExecutionConfig:
     system_prompt: str | None = None
     workspace_base_dir: str = "workspace"
     allowed_external_dirs: list[str] | None = None
+    scope_segments: tuple[str, ...] = ()
     current_task_id: str | None = None
     service_id: str | None = None
     registry: ExecutionRegistry | None = None
@@ -234,6 +235,7 @@ class AgentExecutionAdapter:
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
+                scope_segments=self.config.scope_segments,
                 outbound_message_handler=self.config.outbound_message_handler,
             ),
             execution_type,

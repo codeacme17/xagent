@@ -268,6 +268,71 @@ async def test_resolver_scope_reaches_sandbox_key_on_build() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolver_scope_reaches_workspace_paths_on_build() -> None:
+    """Slice 3: the resolved scope's workspace_segments reach the agent
+    build — the AgentService is constructed with a scoped
+    workspace_base_dir and carries the segments, and two scopes produce
+    disjoint base dirs. Driven through the resolver path."""
+    from xagent.config import get_uploads_dir
+    from xagent.core.workspace import scoped_user_root
+
+    scope = ExecutionScope(workspace_segments=("tenant-a",))
+    set_execution_scope_resolver(lambda task_id: scope)
+    manager = AgentServiceManager()
+
+    with ExitStack() as stack:
+        # _common_patches's last entry patches AgentService anonymously;
+        # patch it here instead to keep a handle on the mock's call kwargs.
+        for p in _common_patches(manager)[:-1]:
+            stack.enter_context(p)
+        agent_service_mock = stack.enter_context(
+            patch("xagent.web.api.chat.AgentService")
+        )
+        await _call(
+            manager,
+            db=_build_db_mock(_make_task_row()),
+            user=_make_user(),
+            task_setup_snapshot=_build_snapshot(),
+        )
+
+    kwargs = agent_service_mock.call_args.kwargs
+    expected_base = str(scoped_user_root(get_uploads_dir(), 1, ("tenant-a",)))
+    assert kwargs["workspace_base_dir"] == expected_base
+    assert kwargs["scope_segments"] == ("tenant-a",)
+    # Default sharing: the user-level upload dir stays in the allowlist.
+    assert (
+        str(scoped_user_root(get_uploads_dir(), 1)) in kwargs["allowed_external_dirs"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_unscoped_build_uses_legacy_workspace_base_dir() -> None:
+    """No resolver -> AgentService gets the byte-identical legacy base dir
+    and empty scope segments."""
+    from xagent.config import get_uploads_dir
+    from xagent.core.workspace import scoped_user_root
+
+    manager = AgentServiceManager()
+    manager._default_llm = MagicMock()
+    with ExitStack() as stack:
+        for p in _common_patches(manager)[:-1]:
+            stack.enter_context(p)
+        agent_service_mock = stack.enter_context(
+            patch("xagent.web.api.chat.AgentService")
+        )
+        await _call(
+            manager,
+            db=_build_db_mock(_make_task_row()),
+            user=_make_user(),
+            task_setup_snapshot=_build_snapshot(),
+        )
+
+    kwargs = agent_service_mock.call_args.kwargs
+    assert kwargs["workspace_base_dir"] == str(scoped_user_root(get_uploads_dir(), 1))
+    assert kwargs["scope_segments"] == ()
+
+
+@pytest.mark.asyncio
 async def test_unscoped_build_records_legacy_key() -> None:
     """No resolver -> the build records the byte-identical legacy key."""
     manager = AgentServiceManager()

@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
+from ...core.workspace import scoped_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ def resolve_legacy_file_path(file_path: str, user_id: int) -> Optional[Path]:
     Returns:
         Resolved absolute Path if found, None otherwise
     """
-    user_root = get_uploads_dir() / f"user_{user_id}"
+    user_root = scoped_user_root(get_uploads_dir(), user_id)
     if not user_root.exists():
         return None
 

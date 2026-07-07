@@ -25,6 +25,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.file_storage import get_user_file_storage
+from ...core.workspace import scoped_user_root
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ..auth_dependencies import get_current_user, is_admin_user
@@ -391,7 +392,7 @@ def _ensure_under_uploads(path: Path, user_id: int) -> None:
     resolved_path = path.resolve()
     uploads_dir = get_uploads_dir()
     uploads_root = uploads_dir.resolve()
-    user_root = (uploads_dir / f"user_{user_id}").resolve()
+    user_root = scoped_user_root(uploads_dir, user_id).resolve()
     try:
         resolved_path.relative_to(uploads_root)
         resolved_path.relative_to(user_root)
@@ -504,7 +505,7 @@ def _to_unix_timestamp(path: Path, fallback: Any) -> int:
 
 
 def _extract_relative_path(storage_path: Path, user_id: int) -> str:
-    user_root = get_uploads_dir() / f"user_{user_id}"
+    user_root = scoped_user_root(get_uploads_dir(), user_id)
     try:
         return str(storage_path.relative_to(user_root))
     except ValueError:
@@ -534,7 +535,7 @@ def _infer_backfill_task_id(
 ) -> Optional[int]:
     from ..models.task import Task
 
-    user_root = get_uploads_dir() / f"user_{user_id}"
+    user_root = scoped_user_root(get_uploads_dir(), user_id)
     try:
         rel_parts = file_path.relative_to(user_root).parts
     except ValueError:
@@ -578,7 +579,7 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
 
     created = 0
     for target_user_id in target_user_ids:
-        user_root = get_uploads_dir() / f"user_{target_user_id}"
+        user_root = scoped_user_root(get_uploads_dir(), target_user_id)
         if not user_root.exists() or not user_root.is_dir():
             continue
 

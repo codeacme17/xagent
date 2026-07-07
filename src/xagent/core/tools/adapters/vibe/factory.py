@@ -482,6 +482,7 @@ class ToolFactory:
                 task_id or "default",
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
                 db_task_id=workspace_config.get("db_task_id"),
+                scope_segments=tuple(workspace_config.get("scope_segments") or ()),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):

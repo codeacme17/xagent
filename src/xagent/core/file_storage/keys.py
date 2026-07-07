@@ -5,11 +5,22 @@ This module is the single source of truth for the object-storage key layout
 Builders sanitize their inputs so the produced keys always pass strict
 normalization (see ``normalize_storage_key``); keys already persisted in the
 database are read back verbatim and never re-derived through these builders.
+
+When an :class:`ExecutionScope` carries ``workspace_segments``, they are
+inserted immediately after the user root
+(``users/{user_id}/{segment}.../...``). The scoped prefix is an extension of
+the user-bound prefix, so per-user prefix-scope enforcement
+(``ScopedFileStorage``) admits scoped keys unchanged. Scope segments are
+validated, never sanitized — silently rewriting one could merge two scopes'
+namespaces.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
+
+from ..execution_scope import validate_scope_component
 
 
 def safe_storage_filename(filename: str) -> str:
@@ -19,15 +30,37 @@ def safe_storage_filename(filename: str) -> str:
     return _sanitize_component(safe_name) or "file"
 
 
-def build_upload_storage_key(user_id: int, file_id: str, filename: str) -> str:
-    return f"users/{user_id}/uploads/{file_id}/{safe_storage_filename(filename)}"
+def _user_key_prefix(user_id: int, scope_segments: Sequence[str]) -> str:
+    prefix = f"users/{user_id}"
+    for segment in scope_segments:
+        validate_scope_component(segment, field_name="workspace_segments entry")
+        prefix += f"/{segment}"
+    return prefix
+
+
+def build_upload_storage_key(
+    user_id: int,
+    file_id: str,
+    filename: str,
+    *,
+    scope_segments: Sequence[str] = (),
+) -> str:
+    return (
+        f"{_user_key_prefix(user_id, scope_segments)}/uploads/"
+        f"{file_id}/{safe_storage_filename(filename)}"
+    )
 
 
 def build_task_output_storage_key(
-    user_id: int, task_id: int, file_id: str, relative_path: str
+    user_id: int,
+    task_id: int,
+    file_id: str,
+    relative_path: str,
+    *,
+    scope_segments: Sequence[str] = (),
 ) -> str:
     return (
-        f"users/{user_id}/tasks/{task_id}/outputs/"
+        f"{_user_key_prefix(user_id, scope_segments)}/tasks/{task_id}/outputs/"
         f"{file_id}/{_safe_relative_output_path(relative_path)}"
     )
 
