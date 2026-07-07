@@ -121,6 +121,14 @@ class TestExecutionScope:
         with pytest.raises(InvalidScopeComponentError):
             ExecutionScope(memory_dimensions={"k": value})
 
+    def test_none_containers_raise_descriptive_value_error(self):
+        """None for the collection fields raises a descriptive ValueError
+        instead of an opaque TypeError from tuple()/dict() conversion."""
+        with pytest.raises(ValueError, match="workspace_segments cannot be None"):
+            ExecutionScope(workspace_segments=None)
+        with pytest.raises(ValueError, match="memory_dimensions cannot be None"):
+            ExecutionScope(memory_dimensions=None)
+
     def test_boolean_flags_independent_of_other_fields(self):
         """Flags are consumable with an otherwise-empty scope (independent fields)."""
         scope = ExecutionScope(strict_memory_isolation=True)
@@ -197,6 +205,15 @@ class TestResolverHook:
         set_execution_scope_resolver(resolver)
         with pytest.raises(RuntimeError, match="resolver down"):
             resolve_execution_scope("42")
+
+    def test_none_task_id_raises_instead_of_resolving_the_string_none(self):
+        """str(None) would silently query the resolver for "None"; a caller
+        with no task identity must treat the execution as unscoped itself."""
+        seen = []
+        set_execution_scope_resolver(lambda task_id: seen.append(task_id))
+        with pytest.raises(ValueError, match="task_id cannot be None"):
+            resolve_execution_scope(None)
+        assert seen == []
 
     def test_resolver_can_be_cleared(self):
         set_execution_scope_resolver(lambda task_id: ExecutionScope())

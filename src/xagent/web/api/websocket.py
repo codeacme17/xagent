@@ -943,7 +943,14 @@ def _uploaded_file_record_in_task_scope(
 
 def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
     """workspace_segments of the task's resolved ExecutionScope ((),
-    when unscoped) — for storage-key composition outside the turn context."""
+    when unscoped) — for storage-key composition outside the turn context.
+
+    A None ``task_id`` (e.g. the legacy-preview backfill, whose owner
+    inference may find a user but no task) means there is no task identity
+    to resolve a scope from — unscoped, never the string ``"None"``.
+    """
+    if task_id is None:
+        return ()
     scope = resolve_execution_scope(task_id)
     return scope.workspace_segments if scope is not None else ()
 
@@ -959,10 +966,13 @@ def _output_path_in_current_task_scope(
         # the user root and the task dir
         # (user_{id}/{segment}.../web_task_{id}/output/...); accept the task
         # dir at any depth after the user root so scoped outputs are not
-        # misclassified as foreign.
+        # misclassified as foreign. Keep scanning past a component that
+        # merely LOOKS like the task dir — a scope segment may legitimately
+        # be named like one (the segment charset allows it), and an early
+        # verdict on it would reject the real task dir further down.
         for index in range(1, len(parts) - 2):
-            if parts[index] in task_dirs:
-                return parts[index + 1] == "output"
+            if parts[index] in task_dirs and parts[index + 1] == "output":
+                return True
 
     return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
 

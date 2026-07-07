@@ -6,7 +6,6 @@ output-path task-scope check tolerating scope segments between the user
 root and the task dir.
 """
 
-
 import pytest
 
 from xagent.core.execution_scope import (
@@ -14,7 +13,10 @@ from xagent.core.execution_scope import (
     set_execution_scope_resolver,
 )
 from xagent.web.api.chat import _build_allowed_external_dirs
-from xagent.web.api.websocket import _output_path_in_current_task_scope
+from xagent.web.api.websocket import (
+    _output_path_in_current_task_scope,
+    _scope_segments_for_task,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +62,23 @@ class TestAllowedExternalDirs:
         assert str(tmp_path / "user_7") in dirs
 
 
+class TestScopeSegmentsForTask:
+    def test_none_task_id_is_unscoped(self):
+        """The legacy-preview backfill can infer an owner but no task id;
+        no task identity means unscoped — never a resolver query for the
+        literal string "None"."""
+        seen = []
+        set_execution_scope_resolver(lambda task_id: seen.append(task_id))
+        assert _scope_segments_for_task(None) == ()
+        assert seen == []
+
+    def test_scoped_task_yields_its_segments(self):
+        set_execution_scope_resolver(
+            lambda task_id: ExecutionScope(workspace_segments=("tenant-a",))
+        )
+        assert _scope_segments_for_task(42) == ("tenant-a",)
+
+
 class TestOutputPathTaskScopeCheck:
     def test_unscoped_layouts_unchanged(self):
         assert _output_path_in_current_task_scope(
@@ -87,4 +106,16 @@ class TestOutputPathTaskScopeCheck:
         )
         assert not _output_path_in_current_task_scope(
             "user_1/tenant-a/web_task_5/input/a.txt", 5, 1
+        )
+
+    def test_segment_named_like_the_task_dir_does_not_shadow_it(self):
+        """The segment charset allows a scope segment literally named like
+        the task dir; the scan must not stop at it and reject the real task
+        dir further down (Gemini round-2 finding on #789)."""
+        assert _output_path_in_current_task_scope(
+            "user_1/web_task_5/web_task_5/output/a.txt", 5, 1
+        )
+        # ...but a lookalike segment alone still is not an output path.
+        assert not _output_path_in_current_task_scope(
+            "user_1/web_task_5/other-segment/input/a.txt", 5, 1
         )

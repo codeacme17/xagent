@@ -140,6 +140,17 @@ class ExecutionScope:
                 self.sandbox_key_suffix, field_name="sandbox_key_suffix"
             )
 
+        if self.workspace_segments is None:
+            raise ValueError(
+                "workspace_segments cannot be None; pass () for a scope "
+                "without workspace segments"
+            )
+        if self.memory_dimensions is None:
+            raise ValueError(
+                "memory_dimensions cannot be None; pass {} for a scope "
+                "without memory dimensions"
+            )
+
         segments = tuple(self.workspace_segments)
         for segment in segments:
             validate_scope_component(segment, field_name="workspace_segments entry")
@@ -332,7 +343,18 @@ def resolve_execution_scope(task_id: str | int) -> Optional[ExecutionScope]:
     is preferred over the resolver; with neither registered, or both
     returning None, the task runs unscoped. Loader/resolver exceptions
     propagate to the caller.
+
+    Raises:
+        ValueError: ``task_id`` is None — ``str(None)`` would silently
+            query the loader/resolver for the literal string ``"None"``.
+            Callers that legitimately have no task identity must treat
+            that as unscoped themselves instead of passing None.
     """
+    if task_id is None:
+        raise ValueError(
+            "task_id cannot be None; a caller without a task identity "
+            "must treat the execution as unscoped instead"
+        )
     if _execution_scope_snapshot_loader is not None:
         snapshot = _execution_scope_snapshot_loader(str(task_id))
         if snapshot is not None:
