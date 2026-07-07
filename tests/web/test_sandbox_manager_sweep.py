@@ -235,3 +235,43 @@ async def test_sweep_loop_runs_periodically_and_survives_errors(monkeypatch) -> 
 
     assert calls[0] == 100.0
     assert len(calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
+    clock,
+) -> None:
+    """A same-key get_or_create_lease_provider racing an in-flight sweep
+    deletion must block on the per-key lifecycle lock (the sweep's
+    exclusion mechanism, unlike capacity eviction's gate) and build a
+    fresh provider only after the reclamation finished."""
+    manager = _make_manager(["user::7"])
+    delete_started = asyncio.Event()
+    delete_release = asyncio.Event()
+
+    async def slow_delete(name: str) -> None:
+        delete_started.set()
+        await delete_release.wait()
+
+    manager._service.delete.side_effect = slow_delete
+    providers = [MagicMock(), MagicMock()]
+    manager.create_lease_provider = AsyncMock(side_effect=providers)
+
+    clock.advance(TTL + 1)
+    sweep_task = asyncio.create_task(manager.sweep_idle_sandboxes(TTL))
+    await delete_started.wait()
+
+    racer = asyncio.create_task(manager.get_or_create_lease_provider("user", "7"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # Blocked on the lifecycle lock held by the sweep across pop-and-delete.
+    assert not racer.done()
+
+    delete_release.set()
+    reclaimed = await sweep_task
+    provider = await racer
+
+    assert reclaimed == ["user::7"]
+    assert provider is providers[0]
+    manager.create_lease_provider.assert_awaited_once()
+    assert manager._lease_providers["user::7"] is provider

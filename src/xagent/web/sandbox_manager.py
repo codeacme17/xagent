@@ -1003,6 +1003,8 @@ class SandboxManager:
 
         for sb in listed_sandboxes or []:
             name = sb.name
+            if not isinstance(name, str):
+                continue
             if include_primary and name == sandbox_name:
                 sandbox_names.add(name)
             elif include_workers and name.startswith(worker_prefix):

@@ -289,3 +289,37 @@ async def test_worker_lease_at_cap_degrades_to_primary(
     async with provider.lease(concurrency_safe=True) as sandbox:
         assert sandbox is not provider.primary_sandbox
         assert sandbox.name.startswith("task::1::worker::")
+
+
+@pytest.mark.asyncio
+async def test_victim_turning_active_between_pick_and_claim_is_spared(
+    _env, clock, monkeypatch
+) -> None:
+    """When the picked victim becomes active between selection and claim,
+    the claim returns False and the eviction loop retries with the next
+    victim instead of deleting the now-active sandbox."""
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "2")
+    manager, service = _make_manager(("task::a", "task::b"))
+    # task::a is LRU-oldest (no recorded activity); task::b is fresher.
+    clock.advance(50)
+    async with manager._activity_guard:
+        manager._touch_locked("task::b")
+
+    original_claim = manager._claim_idle_sandbox
+    raced: list[str] = []
+
+    async def claim_with_race(base_name: str) -> bool:
+        if base_name == "task::a" and not raced:
+            raced.append(base_name)
+            manager._lease_providers["task::a"] = MagicMock()
+            assert await manager.attach("task", "a")
+        return await original_claim(base_name)
+
+    manager._claim_idle_sandbox = claim_with_race  # type: ignore[method-assign]
+
+    await manager.get_or_create_sandbox("task", "c")
+
+    assert raced == ["task::a"]
+    assert "task::a" in service.containers  # spared: became active
+    assert "task::b" in service.deleted  # next victim evicted instead
+    assert "task::c" in service.containers

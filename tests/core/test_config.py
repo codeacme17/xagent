@@ -1534,7 +1534,7 @@ class TestGetSandboxSweepInterval:
         assert get_sandbox_sweep_interval() == 60.0
 
     def test_non_finite_interval_returns_default(self, monkeypatch):
-        for value in ("nan", "inf"):
+        for value in ("nan", "inf", "-inf"):
             monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, value)
             assert get_sandbox_sweep_interval() == 60.0
 
