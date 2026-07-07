@@ -32,6 +32,7 @@ from ...config import (
 )
 from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
+from ...core.execution_scope import turn_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db, get_session_local
@@ -1356,7 +1357,9 @@ async def execute_task_background(
             else None
         )
 
-        with UserContext(effective_user_id):
+        # The execution scope resolves per turn alongside the acting user, so
+        # a resumed/restarted task re-derives the same scope from the resolver.
+        with UserContext(effective_user_id), turn_execution_scope(task_id):
             # Get agent service. ``effective_user_id`` is the task owner
             # (authoritative above); pass it as the runtime identity so the
             # agent's models / tools resolve as the owner, not any acting admin.
@@ -1802,7 +1805,7 @@ async def execute_resume_background(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
 
-        with UserContext(task_owner_user_id):
+        with UserContext(task_owner_user_id), turn_execution_scope(task_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
         if result is None:
@@ -3358,7 +3361,7 @@ async def handle_execute_task(
             # acting principal -- an admin executing another user's task must
             # run with the owner's identity. ``task`` is already loaded and
             # authorized above.
-            with UserContext(int(task.user_id)):
+            with UserContext(int(task.user_id)), turn_execution_scope(task_id):
                 # Build context with vibe mode information if available
                 task_context = {}
                 if hasattr(task, "execution_mode") and task.execution_mode:
