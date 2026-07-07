@@ -17,6 +17,12 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
+from ...core.execution_scope import (
+    ExecutionScope,
+    ScopeFingerprint,
+    resolve_execution_scope,
+    scope_fingerprint,
+)
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
@@ -50,6 +56,12 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
+from ..sandbox_keys import (
+    USER_LIFECYCLE_TYPE,
+    make_user_lifecycle_id,
+    make_user_sandbox_key,
+    parse_user_sandbox_key,
+)
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
@@ -585,29 +597,50 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
+        # ExecutionScope fingerprint each cached AgentService was built
+        # under (None sentinel = unscoped). Sandbox keys and workspace
+        # paths are baked in at build time, so a task reassigned to a
+        # different scope between turns must evict and rebuild instead of
+        # silently executing in the old scope's namespace.
+        self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
+        # Fingerprint evicted by the most recent scope-mismatch rebuild per
+        # task; an A -> B -> A flap points at a non-idempotent resolver that
+        # would otherwise silently rebuild every turn and defeat the cache.
+        self._agent_evicted_scope_fingerprints: Dict[
+            int, Optional[ScopeFingerprint]
+        ] = {}
         self._default_llm = create_default_llm()
         self.request = request
 
     @staticmethod
     def _parse_sandbox_key(sandbox_key: str) -> tuple[str, str]:
-        """Split a web sandbox key (``user:<owner_id>``) into lifecycle parts."""
-        lifecycle_type, _, lifecycle_id = sandbox_key.partition(":")
-        return lifecycle_type, lifecycle_id
+        """Split a recorded sandbox key into sandbox-manager lifecycle parts.
+
+        Round-trips through the shared key helpers so the format lives in
+        exactly one place; scoped keys (``user:{owner}:{suffix}``) map to
+        the composite lifecycle id ``{owner}:{suffix}``.
+        """
+        owner_id, suffix = parse_user_sandbox_key(sandbox_key)
+        return USER_LIFECYCLE_TYPE, make_user_lifecycle_id(owner_id, suffix)
 
     async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
         """Attach the task to its sandbox lifecycle for the execution.
 
         Returns the sandbox key on success, or None when the task runs
         without sandbox tracking (sandbox disabled, local-execution
-        fallback, or no recorded sandbox for the task).
+        fallback, or no recorded sandbox for the task). The key is only
+        ever read from the per-task map recorded at sandbox build time —
+        never re-derived from the owner id, because a reconstructed
+        owner-only key would silently miss a scope-suffixed sandbox and
+        skip the ref-count attach.
 
         Raises:
             RuntimeError: The task's agent was built with a sandbox lease
-                provider (explicitly recorded key) that has since been
-                reclaimed by the idle sweep or capacity eviction. Running
-                anyway would hit deleted containers with cryptic tool
-                errors; failing clearly lets a retry rebuild the agent and
-                transparently recreate the sandbox.
+                provider (recorded key) that has since been reclaimed by
+                the idle sweep or capacity eviction. Running anyway would
+                hit deleted containers with cryptic tool errors; failing
+                clearly lets a retry rebuild the agent and transparently
+                recreate the sandbox.
         """
         if task_id is None:
             return None
@@ -616,13 +649,9 @@ class AgentServiceManager:
         except (TypeError, ValueError):
             return None
 
-        explicit_key = self._agent_sandbox_keys.get(task_key)
-        sandbox_key = explicit_key
+        sandbox_key = self._agent_sandbox_keys.get(task_key)
         if sandbox_key is None:
-            owner_id = self._agent_owner_ids.get(task_key)
-            if owner_id is None:
-                return None
-            sandbox_key = f"user:{owner_id}"
+            return None
 
         from ..sandbox_manager import get_sandbox_manager
 
@@ -634,45 +663,41 @@ class AgentServiceManager:
         if await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
             return sandbox_key
 
-        if explicit_key is not None:
-            # Evict the stale cached agent so a retry rebuilds its tools
-            # against a freshly created sandbox.
-            self._agents.pop(task_key, None)
-            self._agent_owner_ids.pop(task_key, None)
-            self._agent_sandbox_keys.pop(task_key, None)
-            raise RuntimeError(
-                f"The sandbox for task {task_key} was reclaimed before "
-                "execution started (idle reclamation or capacity "
-                "eviction). Please retry the task; the sandbox will be "
-                "recreated automatically."
-            )
-        return None
+        # Evict the stale cached agent so a retry rebuilds its tools
+        # against a freshly created sandbox.
+        self._agents.pop(task_key, None)
+        self._agent_owner_ids.pop(task_key, None)
+        self._agent_sandbox_keys.pop(task_key, None)
+        self._agent_scope_fingerprints.pop(task_key, None)
+        raise RuntimeError(
+            f"The sandbox for task {task_key} was reclaimed before "
+            "execution started (idle reclamation or capacity "
+            "eviction). Please retry the task; the sandbox will be "
+            "recreated automatically."
+        )
 
     def _evict_agents_for_sandbox(self, sandbox_key: str) -> None:
-        """Drop cached AgentService objects that were built with this sandbox."""
+        """Drop cached AgentService objects that were built with this sandbox.
+
+        Only agents whose recorded key matches are evicted. The key is
+        recorded at build time and never re-derived, so a cached agent
+        without a recorded key was built for local execution and holds no
+        reference to the released sandbox (the former owner-id supplement
+        existed only for the removed owner-key attach fallback). Scoped and
+        unscoped keys under the same owner are distinct sandboxes, so
+        releasing one never evicts the other's agents.
+        """
         task_ids = {
             task_key
             for task_key, agent_sandbox_key in self._agent_sandbox_keys.items()
             if agent_sandbox_key == sandbox_key
         }
 
-        if sandbox_key.startswith("user:"):
-            try:
-                owner_id = int(sandbox_key.split(":", 1)[1])
-            except ValueError:
-                owner_id = None
-            if owner_id is not None:
-                for task_key, agent_owner_id in self._agent_owner_ids.items():
-                    if agent_owner_id != owner_id:
-                        continue
-                    agent_sandbox_key = self._agent_sandbox_keys.get(task_key)
-                    if agent_sandbox_key is None or agent_sandbox_key == sandbox_key:
-                        task_ids.add(task_key)
-
         for task_key in task_ids:
             self._agents.pop(task_key, None)
             self._agent_owner_ids.pop(task_key, None)
             self._agent_sandbox_keys.pop(task_key, None)
+            self._agent_scope_fingerprints.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
                 task_key,
@@ -685,8 +710,14 @@ class AgentServiceManager:
         task_id: int,
         workspace_owner_id: int,
         workspace_config: Mapping[str, Any],
+        scope: Optional[ExecutionScope] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
+
+        When ``scope`` carries a ``sandbox_key_suffix``, the lifecycle key
+        becomes ``user:{owner}:{suffix}`` — a separate container family per
+        scope under the same platform user. Unscoped execution keeps
+        producing ``user:{owner}`` and reuses today's containers untouched.
 
         Capacity exhaustion and sandbox-service unavailability are distinct
         failure classes: a ``SandboxCapacityError`` rejects the task by
@@ -705,10 +736,11 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
+        suffix = scope.sandbox_key_suffix if scope is not None else None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
-                "user",
-                str(workspace_owner_id),
+                USER_LIFECYCLE_TYPE,
+                make_user_lifecycle_id(workspace_owner_id, suffix),
                 workspace_config=workspace_config,
             )
         except SandboxCapacityError as e:
@@ -742,7 +774,9 @@ class AgentServiceManager:
             )
             return None
 
-        self._agent_sandbox_keys[task_id] = f"user:{workspace_owner_id}"
+        self._agent_sandbox_keys[task_id] = make_user_sandbox_key(
+            workspace_owner_id, suffix
+        )
         return sandbox
 
     async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
@@ -1127,6 +1161,7 @@ class AgentServiceManager:
         task_llm: Optional[BaseLLM],
         task_vision_llm: Optional[BaseLLM],
         parent_tracer: Optional[Any] = None,
+        scope: Optional[ExecutionScope] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
         workforce_runtime = resolve_workforce_task_runtime(db, task)
@@ -1172,6 +1207,7 @@ class AgentServiceManager:
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
             workspace_config=sandbox_workspace_config,
+            scope=scope,
         )
 
         return await create_default_tools(
@@ -1263,6 +1299,15 @@ class AgentServiceManager:
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
 
+        # The execution scope is resolved per call, at the same place the
+        # owner is resolved, so every path that builds or fetches the
+        # per-task agent (orchestrated turns, pause/resume handlers,
+        # channels) derives it from the same persistent mapping. The
+        # resolver is idempotent per task, so re-resolving inside an
+        # already-activated turn yields the turn's scope.
+        scope = resolve_execution_scope(task_id)
+        fingerprint = scope_fingerprint(scope)
+
         # Owner invariant: evict a cached AgentService built for a different
         # owner so we rebuild it under the correct runtime identity instead of
         # silently reusing the wrong one.
@@ -1295,6 +1340,44 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+
+        # Scope invariant: the cached instance baked its sandbox key (and,
+        # later, workspace paths and memory dimensions) in at build time.
+        # If the embedder reassigned the task to a different scope between
+        # turns, reusing the instance would silently execute in the old
+        # scope's namespace — evict and rebuild instead. The workspace is
+        # NOT cleaned up here: same owner, and the old scope's data must
+        # survive a scope reassignment.
+        if (
+            task_id in self._agents
+            and self._agent_scope_fingerprints.get(task_id) != fingerprint
+        ):
+            evicted_fingerprint = self._agent_scope_fingerprints.get(task_id)
+            if fingerprint == self._agent_evicted_scope_fingerprints.get(task_id):
+                logger.warning(
+                    "Execution scope for task %s flapped back to a previously "
+                    "evicted fingerprint (%s -> %s -> %s): probable resolver "
+                    "bug — a non-idempotent resolver rebuilds the agent every "
+                    "turn and defeats the per-task cache.",
+                    task_id,
+                    fingerprint,
+                    evicted_fingerprint,
+                    fingerprint,
+                )
+            else:
+                logger.warning(
+                    "Evicting cached AgentService for task %s: built under "
+                    "scope fingerprint %s, resolved %s",
+                    task_id,
+                    evicted_fingerprint,
+                    fingerprint,
+                )
+            self._agent_evicted_scope_fingerprints[task_id] = evicted_fingerprint
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
 
         if task_id not in self._agents:
             # Check if task exists in database
@@ -1368,10 +1451,13 @@ class AgentServiceManager:
                 # Task exists in database, try to reconstruct from history only for active executions
                 if db is not None and should_reconstruct:
                     try:
-                        await self._reconstruct_agent_from_history(task_id, db)
+                        await self._reconstruct_agent_from_history(
+                            task_id, db, scope=scope
+                        )
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
                         self._agent_owner_ids[task_id] = runtime_user_id
+                        self._agent_scope_fingerprints[task_id] = fingerprint
                         return self._agents[task_id]
                     except HTTPException:
                         raise
@@ -1387,6 +1473,7 @@ class AgentServiceManager:
                             del self._agents[task_id]
                             self._agent_owner_ids.pop(task_id, None)
                             self._agent_sandbox_keys.pop(task_id, None)
+                            self._agent_scope_fingerprints.pop(task_id, None)
                         # Continue with normal agent creation
 
             # Create tracer with all necessary handlers
@@ -1625,6 +1712,7 @@ class AgentServiceManager:
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
                     workspace_config=sandbox_workspace_config,
+                    scope=scope,
                 )
 
                 tool_selection_spec = _build_tool_selection_spec_for_task(
@@ -1799,6 +1887,7 @@ class AgentServiceManager:
                 raise
 
         self._agent_owner_ids[task_id] = runtime_user_id
+        self._agent_scope_fingerprints[task_id] = fingerprint
         return self._agents[task_id]
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
@@ -1822,6 +1911,8 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_evicted_scope_fingerprints.pop(task_id, None)
             logger.info(f"Removed AgentService for task {task_id}")
         else:
             # If agent is not in memory, clean up workspace directory directly
@@ -2053,7 +2144,12 @@ class AgentServiceManager:
         )
         return has_plan
 
-    async def _reconstruct_agent_from_history(self, task_id: int, db: Session) -> None:
+    async def _reconstruct_agent_from_history(
+        self,
+        task_id: int,
+        db: Session,
+        scope: Optional[ExecutionScope] = None,
+    ) -> None:
         """Reconstruct agent from historical data"""
         try:
             # Get task user information from database
@@ -2151,6 +2247,7 @@ class AgentServiceManager:
                             task_llm=task_llm,
                             task_vision_llm=task_vision_llm,
                             parent_tracer=tracer,
+                            scope=scope,
                         )
                     else:
                         raise ValueError(

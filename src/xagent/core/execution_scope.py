@@ -136,6 +136,28 @@ class ExecutionScope:
         object.__setattr__(self, "memory_dimensions", MappingProxyType(dimensions))
 
 
+# Hashable identity of a scope's namespace-affecting fields:
+# (sandbox_key_suffix, workspace_segments, sorted memory_dimensions items).
+ScopeFingerprint = tuple[Optional[str], tuple[str, ...], tuple[tuple[str, str], ...]]
+
+
+def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerprint]:
+    """Hashable fingerprint of the namespaces a scope selects.
+
+    Per-task caches that bake scope-derived state in at build time (sandbox
+    keys, workspace paths, memory dimensions) key their eviction checks on
+    this. ``None`` is the sentinel for unscoped, distinct from an empty
+    scope's fingerprint.
+    """
+    if scope is None:
+        return None
+    return (
+        scope.sandbox_key_suffix,
+        scope.workspace_segments,
+        tuple(sorted(scope.memory_dimensions.items())),
+    )
+
+
 current_execution_scope: contextvars.ContextVar[Optional[ExecutionScope]] = (
     contextvars.ContextVar("current_execution_scope", default=None)
 )
