@@ -220,12 +220,25 @@ async def get_available_tools(
     sandbox = None
     sandbox_attached = False
     sandbox_user_id = str(int(current_user.id))
-    if sandbox_manager:
+    if sandbox_manager is not None:
         try:
             sandbox = await sandbox_manager.get_or_create_lease_provider(
                 "tools", sandbox_user_id
             )
             sandbox_attached = await sandbox_manager.attach("tools", sandbox_user_id)
+            if not sandbox_attached:
+                # The provider was reclaimed by a concurrent sweep/eviction
+                # between creation and attach. Drop the stale reference and
+                # list tools without a sandbox (same output as the
+                # sandbox-disabled path) rather than failing a metadata-only
+                # request. Call sites that execute inside the sandbox must
+                # treat attach() == False as an error instead (see chat.py).
+                logger.warning(
+                    "Sandbox for user %s was reclaimed before attach; "
+                    "listing tools without a sandbox",
+                    sandbox_user_id,
+                )
+                sandbox = None
         except Exception as e:
             sandbox = None
             logger.error(f"Failed to create sandbox for user {sandbox_user_id}: {e}")
