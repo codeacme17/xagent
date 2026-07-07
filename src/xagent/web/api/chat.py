@@ -511,6 +511,7 @@ async def create_default_tools(
             "allowed_external_dirs": allowed_external_dirs,
             "scope_segments": scope_segments,
         },
+        execution_scope=scope,
         # Only load MCP servers (a DB query + per-server session init)
         # when the caller actually picked MCP. Spec=None / _SpecAll
         # default agents shouldn't pay that cost; only explicit

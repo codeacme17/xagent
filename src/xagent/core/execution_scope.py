@@ -108,6 +108,32 @@ class ExecutionScope:
     strict_memory_isolation: bool = False
     isolate_external_dirs: bool = False
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serializable snapshot (see :func:`ExecutionScope.from_dict`).
+
+        Used to persist a scope into a task's ``agent_config`` so internally
+        created tasks (workforce runs) stay scoped across process restarts
+        without the embedder's resolver knowing their task ids.
+        """
+        return {
+            "sandbox_key_suffix": self.sandbox_key_suffix,
+            "workspace_segments": list(self.workspace_segments),
+            "memory_dimensions": dict(self.memory_dimensions),
+            "strict_memory_isolation": self.strict_memory_isolation,
+            "isolate_external_dirs": self.isolate_external_dirs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionScope":
+        """Rebuild a scope from :meth:`to_dict` output (re-validated)."""
+        return cls(
+            sandbox_key_suffix=data.get("sandbox_key_suffix"),
+            workspace_segments=tuple(data.get("workspace_segments") or ()),
+            memory_dimensions=dict(data.get("memory_dimensions") or {}),
+            strict_memory_isolation=bool(data.get("strict_memory_isolation", False)),
+            isolate_external_dirs=bool(data.get("isolate_external_dirs", False)),
+        )
+
     def __post_init__(self) -> None:
         if self.sandbox_key_suffix is not None:
             validate_scope_component(
@@ -134,6 +160,42 @@ class ExecutionScope:
                     f"{key!r}: must be a non-empty string"
                 )
         object.__setattr__(self, "memory_dimensions", MappingProxyType(dimensions))
+
+
+# Reserved key under which a task's ``agent_config`` JSON carries a
+# persisted scope snapshot (ExecutionScope.to_dict()). Internally created
+# tasks (workforce runs) have task ids the embedder's resolver cannot map;
+# the snapshot is written at task creation and preferred over the resolver.
+EXECUTION_SCOPE_AGENT_CONFIG_KEY = "execution_scope"
+
+# Metadata-key prefix under which ExecutionScope.memory_dimensions are
+# stamped onto memory notes (flat, string-valued entries — the memory
+# backends apply plain string-equality filters). The prefix keeps dimension
+# keys from colliding with system metadata such as ``user_id``.
+MEMORY_DIMENSION_METADATA_PREFIX = "execution_scope_"
+
+
+def memory_dimension_metadata(scope: Optional[ExecutionScope]) -> dict[str, str]:
+    """Prefixed metadata entries for a scope's memory dimensions.
+
+    Empty when unscoped or when the scope carries no dimensions — fields
+    are consumed independently.
+    """
+    if scope is None:
+        return {}
+    return {
+        f"{MEMORY_DIMENSION_METADATA_PREFIX}{key}": value
+        for key, value in scope.memory_dimensions.items()
+    }
+
+
+def metadata_carries_scope_dimensions(metadata: Mapping[str, Any]) -> bool:
+    """True when a note's metadata was stamped with any scope dimension.
+
+    Used by ``strict_memory_isolation`` post-filters to exclude scoped
+    notes from unscoped searches.
+    """
+    return any(key.startswith(MEMORY_DIMENSION_METADATA_PREFIX) for key in metadata)
 
 
 # Hashable identity of a scope's namespace-affecting fields:
@@ -239,12 +301,42 @@ def set_execution_scope_resolver(resolver: Optional[ExecutionScopeResolver]) -> 
     _execution_scope_resolver = resolver
 
 
-def resolve_execution_scope(task_id: str | int) -> Optional[ExecutionScope]:
-    """Resolve the scope for ``task_id`` via the registered resolver.
+# Loader for persisted scope snapshots (EXECUTION_SCOPE_AGENT_CONFIG_KEY in
+# a task's agent_config). The web layer registers an implementation backed
+# by the Task table; None means no snapshot support.
+ExecutionScopeSnapshotLoader = Callable[[str], Optional[ExecutionScope]]
 
-    Returns None (unscoped) when no resolver is registered or the resolver
-    returns None. A resolver exception propagates to the caller.
+_execution_scope_snapshot_loader: Optional[ExecutionScopeSnapshotLoader] = None
+
+
+def set_execution_scope_snapshot_loader(
+    loader: Optional[ExecutionScopeSnapshotLoader],
+) -> None:
+    """Register the loader for persisted per-task scope snapshots.
+
+    The loader returns the snapshot persisted at task creation, or None for
+    tasks without one. A persisted snapshot is preferred over the resolver:
+    internally created tasks (workforce runs) have ids the embedder's
+    resolver cannot map, and the snapshot is what keeps them scoped across
+    process restarts. Loader exceptions fail the turn — falling back to the
+    resolver (or unscoped) on error could silently switch namespaces.
     """
+    global _execution_scope_snapshot_loader
+    _execution_scope_snapshot_loader = loader
+
+
+def resolve_execution_scope(task_id: str | int) -> Optional[ExecutionScope]:
+    """Resolve the scope for ``task_id``.
+
+    A persisted snapshot (see :func:`set_execution_scope_snapshot_loader`)
+    is preferred over the resolver; with neither registered, or both
+    returning None, the task runs unscoped. Loader/resolver exceptions
+    propagate to the caller.
+    """
+    if _execution_scope_snapshot_loader is not None:
+        snapshot = _execution_scope_snapshot_loader(str(task_id))
+        if snapshot is not None:
+            return snapshot
     if _execution_scope_resolver is None:
         return None
     return _execution_scope_resolver(str(task_id))

@@ -3,6 +3,10 @@ from typing import Any, Literal, cast, overload
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    get_execution_scope,
+)
 from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
@@ -251,4 +255,12 @@ def build_workforce_task_config(
         config["workforce_run_id"] = workforce_run_id
     if selected_file_ids:
         config["selected_file_ids"] = selected_file_ids
+    # Workforce runs create fresh Task rows whose ids the embedder's scope
+    # resolver cannot map. Persist the creating context's ExecutionScope
+    # snapshot into agent_config (no schema migration); per-turn activation
+    # prefers this snapshot over the resolver, so the run executes fully
+    # scoped even after a process restart.
+    scope = get_execution_scope()
+    if scope is not None:
+        config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()
     return config
