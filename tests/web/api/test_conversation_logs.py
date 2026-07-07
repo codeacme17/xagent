@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -78,11 +79,22 @@ def _create_agent_row(
             allowed_domains=allowed_domains or ["example.com"],
             share_enabled=share_enabled,
             share_token=share_token,
+            widget_key=f"wk-{secrets.token_urlsafe(24)}" if widget_enabled else None,
         )
         db.add(agent)
         db.commit()
         db.refresh(agent)
         return int(agent.id)
+    finally:
+        db.close()
+
+
+def _widget_key_for(agent_id: int) -> str:
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None and agent.widget_key
+        return str(agent.widget_key)
     finally:
         db.close()
 
@@ -203,10 +215,10 @@ def _authenticate_widget_guest(
     guest_id: str = "guest-1",
     origin: str = "https://example.com",
 ) -> dict[str, str]:
+    del origin
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": guest_id},
-        headers={"origin": origin},
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": guest_id},
     )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

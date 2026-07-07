@@ -36,7 +36,7 @@ from ..services.agent_management import (
     DuplicateAgentNameError,
     TemplateNotFoundError,
 )
-from ..services.agent_store import AgentStore
+from ..services.agent_store import AgentStore, new_widget_key
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
@@ -151,6 +151,14 @@ class AgentShareLinkResponse(BaseModel):
     share_enabled: bool
     share_token: Optional[str]
     share_updated_at: Optional[str]
+
+
+class AgentWidgetKeyResponse(BaseModel):
+    """Owner-only widget embed credential state, including the raw key."""
+
+    agent_id: int
+    widget_enabled: bool
+    widget_key: str
 
 
 class PublishResponse(BaseModel):
@@ -628,6 +636,10 @@ async def update_agent(
             updates["suggested_prompts"] = agent_data.suggested_prompts
         if agent_data.widget_enabled is not None:
             updates["widget_enabled"] = agent_data.widget_enabled
+            # Widget-enabled agents always carry an embed credential; heal
+            # rows that predate the widget_key column.
+            if agent_data.widget_enabled and not agent.widget_key:
+                updates["widget_key"] = new_widget_key()
         if agent_data.allowed_domains is not None:
             updates["allowed_domains"] = agent_data.allowed_domains
 
@@ -869,6 +881,68 @@ async def disable_agent_share_link(
         raise
     except Exception as e:
         logger.error(f"Failed to disable share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}/widget-key", response_model=AgentWidgetKeyResponse)
+async def get_agent_widget_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetKeyResponse:
+    """Return the owner-only widget embed key, generating one if missing."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if not agent.widget_key:
+            agent = store.update_agent_fields(
+                user_id, agent_id, {"widget_key": new_widget_key()}
+            )
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetKeyResponse(
+            agent_id=int(agent.id),
+            widget_enabled=bool(agent.widget_enabled),
+            widget_key=str(agent.widget_key),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get widget key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/widget-key/rotate", response_model=AgentWidgetKeyResponse)
+async def rotate_agent_widget_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetKeyResponse:
+    """Rotate the widget embed key, invalidating already-deployed snippets."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        if store.get_owned_agent(user_id, agent_id) is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent = store.update_agent_fields(
+            user_id, agent_id, {"widget_key": new_widget_key()}
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetKeyResponse(
+            agent_id=int(agent.id),
+            widget_enabled=bool(agent.widget_enabled),
+            widget_key=str(agent.widget_key),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to rotate widget key for agent {agent_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
