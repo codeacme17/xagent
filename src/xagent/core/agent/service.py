@@ -40,6 +40,7 @@ class AgentService:
         workspace_base_dir: str | None = None,
         enable_workspace: bool = True,
         allowed_external_dirs: list[str] | None = None,
+        scope_segments: tuple[str, ...] | None = None,
         task_id: str | None = None,
         fast_llm: BaseLLM | None = None,
         vision_llm: BaseLLM | None = None,
@@ -126,6 +127,10 @@ class AgentService:
         self.workspace_base_dir = workspace_base_dir or str(get_uploads_dir())
         self.enable_workspace = enable_workspace
         self.allowed_external_dirs = allowed_external_dirs
+        # ExecutionScope.workspace_segments this service was built under;
+        # workspace_base_dir already includes them, but the workspace also
+        # carries them explicitly for storage-key composition.
+        self.scope_segments: tuple[str, ...] = tuple(scope_segments or ())
         self.workspace = workspace
 
         if (
@@ -143,6 +148,9 @@ class AgentService:
                 ws_config.get("task_id", self.id),
                 self.allowed_external_dirs,
                 db_task_id=ws_config.get("db_task_id"),
+                scope_segments=tuple(
+                    ws_config.get("scope_segments") or self.scope_segments
+                ),
             )
         elif self.enable_workspace:
             self._setup_workspace()
@@ -373,7 +381,10 @@ class AgentService:
     def _setup_workspace(self) -> None:
         if not self.workspace:
             self.workspace = create_workspace(
-                self.id, self.workspace_base_dir, self.allowed_external_dirs
+                self.id,
+                self.workspace_base_dir,
+                self.allowed_external_dirs,
+                scope_segments=self.scope_segments,
             )
         logger.info(
             "AgentService '%s' using workspace: %s",
@@ -456,6 +467,7 @@ class AgentService:
                 system_prompt=self.system_prompt,
                 workspace_base_dir=self.workspace_base_dir,
                 allowed_external_dirs=self.allowed_external_dirs,
+                scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
                 service_id=self.id,
                 outbound_message_handler=self._outbound_message_handler,

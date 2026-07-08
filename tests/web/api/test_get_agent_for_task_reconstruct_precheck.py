@@ -231,7 +231,7 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
             except Exception:
                 pass
 
-    reconstruct.assert_awaited_once_with(42, db)
+    reconstruct.assert_awaited_once_with(42, db, scope=None)
 
 
 @pytest.mark.asyncio
@@ -259,7 +259,7 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
             except Exception:
                 pass
 
-    reconstruct.assert_awaited_once_with(42, db)
+    reconstruct.assert_awaited_once_with(42, db, scope=None)
 
 
 @pytest.mark.asyncio
@@ -290,7 +290,7 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
             except Exception:
                 pass
 
-    reconstruct.assert_awaited_once_with(42, db)
+    reconstruct.assert_awaited_once_with(42, db, scope=None)
 
 
 @pytest.mark.asyncio
@@ -317,7 +317,7 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
             except Exception:
                 pass
 
-    reconstruct.assert_awaited_once_with(42, db)
+    reconstruct.assert_awaited_once_with(42, db, scope=None)
 
 
 @pytest.mark.asyncio
@@ -348,7 +348,7 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
 
     reconstructed_agent = _Agent()
 
-    async def reconstruct(task_id: int, _db: Any) -> None:
+    async def reconstruct(task_id: int, _db: Any, scope: Any = None) -> None:
         manager._agents[task_id] = reconstructed_agent
 
     with (

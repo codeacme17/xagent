@@ -32,6 +32,7 @@ from ...config import (
 )
 from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
+from ...core.execution_scope import resolve_execution_scope, turn_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db, get_session_local
@@ -958,19 +959,38 @@ def _uploaded_file_record_in_task_scope(
         return False
 
 
+def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
+    """workspace_segments of the task's resolved ExecutionScope ((),
+    when unscoped) — for storage-key composition outside the turn context.
+
+    A None ``task_id`` (e.g. the legacy-preview backfill, whose owner
+    inference may find a user but no task) means there is no task identity
+    to resolve a scope from — unscoped, never the string ``"None"``.
+    """
+    if task_id is None:
+        return ()
+    scope = resolve_execution_scope(task_id)
+    return scope.workspace_segments if scope is not None else ()
+
+
 def _output_path_in_current_task_scope(
     relative_path: str, task_id: int, task_user_id: int
 ) -> bool:
     parts = Path(relative_path.lstrip("/")).parts
     task_dirs = {f"web_task_{task_id}", f"task_{task_id}"}
 
-    if (
-        len(parts) >= 4
-        and parts[0] == f"user_{task_user_id}"
-        and parts[1] in task_dirs
-        and parts[2] == "output"
-    ):
-        return True
+    if len(parts) >= 4 and parts[0] == f"user_{task_user_id}":
+        # Scoped workspaces insert ExecutionScope.workspace_segments between
+        # the user root and the task dir
+        # (user_{id}/{segment}.../web_task_{id}/output/...); accept the task
+        # dir at any depth after the user root so scoped outputs are not
+        # misclassified as foreign. Keep scanning past a component that
+        # merely LOOKS like the task dir — a scope segment may legitimately
+        # be named like one (the segment charset allows it), and an early
+        # verdict on it would reject the real task dir further down.
+        for index in range(1, len(parts) - 2):
+            if parts[index] in task_dirs and parts[index + 1] == "output":
+                return True
 
     return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
 
@@ -1013,6 +1033,10 @@ def _normalize_file_outputs(
     normalized_outputs: list[Dict[str, Any]] = []
     path_to_file_id: Dict[str, str] = {}
     changed = False
+    # Resolved once per normalization pass: per-storage-key resolution would
+    # re-query the snapshot loader / resolver once per output file (N+1 with
+    # the output-file count — workforce runs can emit dozens).
+    scope_segments = _scope_segments_for_task(task_id)
 
     def add_normalized_output(
         file_record: UploadedFile,
@@ -1181,6 +1205,7 @@ def _normalize_file_outputs(
                         task_id,
                         expected_file_id,
                         workspace_relative_path,
+                        scope_segments=scope_segments,
                     ),
                     workspace_relative_path=workspace_relative_path,
                     workspace_category=workspace_category,
@@ -1204,6 +1229,7 @@ def _normalize_file_outputs(
                         task_id,
                         str(file_record.file_id),
                         workspace_relative_path,
+                        scope_segments=scope_segments,
                     ),
                     task_id=task_id,
                     workspace_relative_path=workspace_relative_path,
@@ -1376,7 +1402,9 @@ async def execute_task_background(
             else None
         )
 
-        with UserContext(effective_user_id):
+        # The execution scope resolves per turn alongside the acting user, so
+        # a resumed/restarted task re-derives the same scope from the resolver.
+        with UserContext(effective_user_id), turn_execution_scope(task_id):
             # Get agent service. ``effective_user_id`` is the task owner
             # (authoritative above); pass it as the runtime identity so the
             # agent's models / tools resolve as the owner, not any acting admin.
@@ -1825,7 +1853,7 @@ async def execute_resume_background(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
 
-        with UserContext(task_owner_user_id):
+        with UserContext(task_owner_user_id), turn_execution_scope(task_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
         if result is None:
@@ -2173,6 +2201,7 @@ async def redirect_legacy_preview(
                 cast(int, task_id),
                 generated_file_id,
                 relative_path,
+                scope_segments=_scope_segments_for_task(task_id),
             ),
         )
         db.commit()
@@ -3382,7 +3411,7 @@ async def handle_execute_task(
             # acting principal -- an admin executing another user's task must
             # run with the owner's identity. ``task`` is already loaded and
             # authorized above.
-            with UserContext(int(task.user_id)):
+            with UserContext(int(task.user_id)), turn_execution_scope(task_id):
                 # Build context with vibe mode information if available
                 task_context = {}
                 if hasattr(task, "execution_mode") and task.execution_mode:
@@ -4657,7 +4686,9 @@ clarification questions as plain assistant text.
             # Build allowed external directories
             allowed_external_dirs = []
             if user and user.id:
-                user_upload_dir = get_uploads_dir() / f"user_{user.id}"
+                from ...core.workspace import scoped_user_root
+
+                user_upload_dir = scoped_user_root(get_uploads_dir(), int(user.id))
                 allowed_external_dirs.append(str(user_upload_dir))
             allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
 

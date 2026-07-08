@@ -613,6 +613,14 @@ async def startup_event() -> None:
     start_file_storage_startup_sync_task(app)
     start_trigger_dispatcher_task(app)
 
+    # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
+    # over the embedder's resolver during per-task scope resolution.
+    from .services.execution_scope_snapshot import (
+        register_execution_scope_snapshot_loader,
+    )
+
+    register_execution_scope_snapshot_loader()
+
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
 
     warn_if_rate_limits_are_per_process()

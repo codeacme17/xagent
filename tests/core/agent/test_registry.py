@@ -46,6 +46,7 @@ class FakeWorkspaceManager:
         base_dir: str,
         task_id: str,
         allowed_external_dirs: list[str] | None = None,
+        scope_segments: tuple[str, ...] = (),
     ) -> FakeWorkspace:
         del base_dir
         workspace_dir = self.tmp_path / task_id

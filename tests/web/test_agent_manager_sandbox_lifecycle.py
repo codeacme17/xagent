@@ -290,11 +290,13 @@ async def test_acquire_with_reclaimed_provider_raises_and_evicts_agent(
 
 
 @pytest.mark.asyncio
-async def test_acquire_fallback_key_without_provider_returns_none(
+async def test_acquire_without_recorded_key_returns_none(
     sandbox_mgr,
 ) -> None:
-    """The owner-id fallback (no explicitly recorded sandbox key, e.g. a
-    local-execution task) must keep returning None, never raise."""
+    """A task with no recorded sandbox key (e.g. local execution) returns
+    None, never raises. The key is never re-derived from the owner id —
+    the owner-only reconstruction fallback was removed with #757 scoping,
+    since it would silently miss a scope-suffixed sandbox."""
     manager = AgentServiceManager()
     manager._agent_owner_ids[1] = 7
 

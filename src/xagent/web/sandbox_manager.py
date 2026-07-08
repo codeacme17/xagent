@@ -31,8 +31,10 @@ from ..config import (
 from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
 )
+from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
+from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
 
 logger = logging.getLogger(__name__)
 
@@ -551,9 +553,21 @@ class SandboxManager:
 
             for raw_dir in workspace_config.get("allowed_external_dirs") or []:
                 paths.append((Path(str(raw_dir)), False))
-        elif lifecycle_type == "user":
+        elif lifecycle_type == USER_LIFECYCLE_TYPE:
             owner_lifecycle_id = SandboxManager._base_lifecycle_id(lifecycle_id)
-            paths.append((get_uploads_dir() / f"user_{owner_lifecycle_id}", True))
+            # A scope-suffixed lifecycle id ("7:tenant-a") still mounts the
+            # user-level upload dir: the scope suffix namespaces the
+            # container, not this default mount (scope-local dirs come from
+            # workspace_config). Unparsable ids keep the historical
+            # verbatim-path behavior.
+            try:
+                owner_id, _suffix = parse_user_lifecycle_id(owner_lifecycle_id)
+                mount_root = scoped_user_root(get_uploads_dir(), owner_id)
+            except ValueError:
+                # Legacy/non-standard lifecycle id: keep the historical
+                # verbatim-path behavior.
+                mount_root = get_uploads_dir() / f"user_{owner_lifecycle_id}"
+            paths.append((mount_root, True))
 
         return paths
 

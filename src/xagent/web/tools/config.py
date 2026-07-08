@@ -190,6 +190,7 @@ class WebToolConfig(BaseToolConfig):
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
+        execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
@@ -236,6 +237,11 @@ class WebToolConfig(BaseToolConfig):
                 raw_auth_context if isinstance(raw_auth_context, dict) else None
             )
         self._workspace_config = workspace_config
+        # ExecutionScope (typed as Any to avoid importing core into every
+        # config consumer) the tool set is built under. Nested agent tools
+        # snapshot it at construction so delegated executions re-activate
+        # the parent turn's scope instead of re-resolving.
+        self._execution_scope = execution_scope
         self._mcp_auth_context = (
             mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
         )
@@ -351,6 +357,10 @@ class WebToolConfig(BaseToolConfig):
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         """Get workspace configuration."""
         return self._workspace_config
+
+    def get_execution_scope(self) -> Optional[Any]:
+        """ExecutionScope the tool set was built under (None = unscoped)."""
+        return self._execution_scope
 
     def get_file_tools_enabled(self) -> bool:
         """Whether to include file tools."""

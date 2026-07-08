@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, cast
@@ -17,6 +18,13 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
+from ...core.execution_scope import (
+    ExecutionScope,
+    ScopeFingerprint,
+    get_execution_scope,
+    resolve_execution_scope,
+    scope_fingerprint,
+)
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
@@ -25,6 +33,7 @@ from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
+from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
@@ -33,6 +42,12 @@ from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
+from ..sandbox_keys import (
+    USER_LIFECYCLE_TYPE,
+    make_user_lifecycle_id,
+    make_user_sandbox_key,
+    parse_user_sandbox_key,
+)
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
 from ..services.chat_history_service import (
@@ -81,6 +96,10 @@ from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
+
+# Depth of the per-task recently-evicted scope-fingerprint memory used for
+# resolver-flap detection; catches scope cycles up to this period.
+_EVICTED_FINGERPRINT_MEMORY = 4
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -378,7 +397,10 @@ def _build_tool_selection_spec_for_task(
 
 
 def _build_allowed_external_dirs(
-    user_id: Optional[int], *, only_existing: bool = False
+    user_id: Optional[int],
+    *,
+    only_existing: bool = False,
+    scope: Optional[ExecutionScope] = None,
 ) -> list[str]:
     """Build the allowed_external_dirs list for AgentService / tool
     workspace_config.
@@ -395,7 +417,19 @@ def _build_allowed_external_dirs(
     """
     dirs: list[str] = []
     if user_id is not None:
-        user_upload_dir = get_uploads_dir() / f"user_{user_id}"
+        # Default: the shared user-level upload dir, so already-uploaded
+        # KB files stay reachable from every scope. With
+        # ``isolate_external_dirs`` the entry becomes the scoped subtree,
+        # keeping upload writes and the mount/enforcement allowlist
+        # consistent per scope. Deployment-level external dirs
+        # (XAGENT_EXTERNAL_UPLOAD_DIRS) are not user-root derived and stay
+        # shared either way.
+        segments = (
+            scope.workspace_segments
+            if scope is not None and scope.isolate_external_dirs
+            else ()
+        )
+        user_upload_dir = scoped_user_root(get_uploads_dir(), user_id, segments)
         if not only_existing or user_upload_dir.exists():
             dirs.append(str(user_upload_dir))
     dirs.extend([str(d) for d in get_external_upload_dirs()])
@@ -444,6 +478,7 @@ async def create_default_tools(
     parent_task_id: Optional[str] = None,
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
+    scope: Optional[ExecutionScope] = None,
     connector_runtime_turn_id: Optional[str] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
@@ -468,7 +503,8 @@ async def create_default_tools(
 
     # Build allowed external directories so file tools can reach the task owner's
     # uploads (see _build_allowed_external_dirs docstring).
-    allowed_external_dirs = _build_allowed_external_dirs(owner_id)
+    allowed_external_dirs = _build_allowed_external_dirs(owner_id, scope=scope)
+    scope_segments = scope.workspace_segments if scope is not None else ()
 
     tool_config = WebToolConfig(
         db=db,
@@ -478,11 +514,15 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(get_uploads_dir() / f"user_{owner_id}"),
+            "base_dir": str(
+                scoped_user_root(get_uploads_dir(), owner_id, scope_segments)
+            ),
             "task_id": task_id,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
+            "scope_segments": scope_segments,
         },
+        execution_scope=scope,
         # Only load MCP servers (a DB query + per-server session init)
         # when the caller actually picked MCP. Spec=None / _SpecAll
         # default agents shouldn't pay that cost; only explicit
@@ -591,29 +631,52 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
+        # ExecutionScope fingerprint each cached AgentService was built
+        # under (None sentinel = unscoped). Sandbox keys and workspace
+        # paths are baked in at build time, so a task reassigned to a
+        # different scope between turns must evict and rebuild instead of
+        # silently executing in the old scope's namespace.
+        self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
+        # Recently evicted fingerprints per task (bounded): resolving back
+        # to any of them points at a resolver cycling between scopes, which
+        # silently rebuilds the agent every turn and defeats the cache. The
+        # bounded memory catches cycles up to its depth (A->B->A and longer
+        # A->B->C->A style periods), not just the immediate flap.
+        self._agent_evicted_scope_fingerprints: Dict[
+            int, deque[Optional[ScopeFingerprint]]
+        ] = {}
         self._default_llm = create_default_llm()
         self.request = request
 
     @staticmethod
     def _parse_sandbox_key(sandbox_key: str) -> tuple[str, str]:
-        """Split a web sandbox key (``user:<owner_id>``) into lifecycle parts."""
-        lifecycle_type, _, lifecycle_id = sandbox_key.partition(":")
-        return lifecycle_type, lifecycle_id
+        """Split a recorded sandbox key into sandbox-manager lifecycle parts.
+
+        Round-trips through the shared key helpers so the format lives in
+        exactly one place; scoped keys (``user:{owner}:{suffix}``) map to
+        the composite lifecycle id ``{owner}:{suffix}``.
+        """
+        owner_id, suffix = parse_user_sandbox_key(sandbox_key)
+        return USER_LIFECYCLE_TYPE, make_user_lifecycle_id(owner_id, suffix)
 
     async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
         """Attach the task to its sandbox lifecycle for the execution.
 
         Returns the sandbox key on success, or None when the task runs
         without sandbox tracking (sandbox disabled, local-execution
-        fallback, or no recorded sandbox for the task).
+        fallback, or no recorded sandbox for the task). The key is only
+        ever read from the per-task map recorded at sandbox build time —
+        never re-derived from the owner id, because a reconstructed
+        owner-only key would silently miss a scope-suffixed sandbox and
+        skip the ref-count attach.
 
         Raises:
             RuntimeError: The task's agent was built with a sandbox lease
-                provider (explicitly recorded key) that has since been
-                reclaimed by the idle sweep or capacity eviction. Running
-                anyway would hit deleted containers with cryptic tool
-                errors; failing clearly lets a retry rebuild the agent and
-                transparently recreate the sandbox.
+                provider (recorded key) that has since been reclaimed by
+                the idle sweep or capacity eviction. Running anyway would
+                hit deleted containers with cryptic tool errors; failing
+                clearly lets a retry rebuild the agent and transparently
+                recreate the sandbox.
         """
         if task_id is None:
             return None
@@ -622,13 +685,9 @@ class AgentServiceManager:
         except (TypeError, ValueError):
             return None
 
-        explicit_key = self._agent_sandbox_keys.get(task_key)
-        sandbox_key = explicit_key
+        sandbox_key = self._agent_sandbox_keys.get(task_key)
         if sandbox_key is None:
-            owner_id = self._agent_owner_ids.get(task_key)
-            if owner_id is None:
-                return None
-            sandbox_key = f"user:{owner_id}"
+            return None
 
         from ..sandbox_manager import get_sandbox_manager
 
@@ -640,45 +699,41 @@ class AgentServiceManager:
         if await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
             return sandbox_key
 
-        if explicit_key is not None:
-            # Evict the stale cached agent so a retry rebuilds its tools
-            # against a freshly created sandbox.
-            self._agents.pop(task_key, None)
-            self._agent_owner_ids.pop(task_key, None)
-            self._agent_sandbox_keys.pop(task_key, None)
-            raise RuntimeError(
-                f"The sandbox for task {task_key} was reclaimed before "
-                "execution started (idle reclamation or capacity "
-                "eviction). Please retry the task; the sandbox will be "
-                "recreated automatically."
-            )
-        return None
+        # Evict the stale cached agent so a retry rebuilds its tools
+        # against a freshly created sandbox.
+        self._agents.pop(task_key, None)
+        self._agent_owner_ids.pop(task_key, None)
+        self._agent_sandbox_keys.pop(task_key, None)
+        self._agent_scope_fingerprints.pop(task_key, None)
+        raise RuntimeError(
+            f"The sandbox for task {task_key} was reclaimed before "
+            "execution started (idle reclamation or capacity "
+            "eviction). Please retry the task; the sandbox will be "
+            "recreated automatically."
+        )
 
     def _evict_agents_for_sandbox(self, sandbox_key: str) -> None:
-        """Drop cached AgentService objects that were built with this sandbox."""
+        """Drop cached AgentService objects that were built with this sandbox.
+
+        Only agents whose recorded key matches are evicted. The key is
+        recorded at build time and never re-derived, so a cached agent
+        without a recorded key was built for local execution and holds no
+        reference to the released sandbox (the former owner-id supplement
+        existed only for the removed owner-key attach fallback). Scoped and
+        unscoped keys under the same owner are distinct sandboxes, so
+        releasing one never evicts the other's agents.
+        """
         task_ids = {
             task_key
             for task_key, agent_sandbox_key in self._agent_sandbox_keys.items()
             if agent_sandbox_key == sandbox_key
         }
 
-        if sandbox_key.startswith("user:"):
-            try:
-                owner_id = int(sandbox_key.split(":", 1)[1])
-            except ValueError:
-                owner_id = None
-            if owner_id is not None:
-                for task_key, agent_owner_id in self._agent_owner_ids.items():
-                    if agent_owner_id != owner_id:
-                        continue
-                    agent_sandbox_key = self._agent_sandbox_keys.get(task_key)
-                    if agent_sandbox_key is None or agent_sandbox_key == sandbox_key:
-                        task_ids.add(task_key)
-
         for task_key in task_ids:
             self._agents.pop(task_key, None)
             self._agent_owner_ids.pop(task_key, None)
             self._agent_sandbox_keys.pop(task_key, None)
+            self._agent_scope_fingerprints.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
                 task_key,
@@ -691,8 +746,14 @@ class AgentServiceManager:
         task_id: int,
         workspace_owner_id: int,
         workspace_config: Mapping[str, Any],
+        scope: Optional[ExecutionScope] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
+
+        When ``scope`` carries a ``sandbox_key_suffix``, the lifecycle key
+        becomes ``user:{owner}:{suffix}`` — a separate container family per
+        scope under the same platform user. Unscoped execution keeps
+        producing ``user:{owner}`` and reuses today's containers untouched.
 
         Capacity exhaustion and sandbox-service unavailability are distinct
         failure classes: a ``SandboxCapacityError`` rejects the task by
@@ -711,10 +772,11 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
+        suffix = scope.sandbox_key_suffix if scope is not None else None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
-                "user",
-                str(workspace_owner_id),
+                USER_LIFECYCLE_TYPE,
+                make_user_lifecycle_id(workspace_owner_id, suffix),
                 workspace_config=workspace_config,
             )
         except SandboxCapacityError as e:
@@ -748,7 +810,9 @@ class AgentServiceManager:
             )
             return None
 
-        self._agent_sandbox_keys[task_id] = f"user:{workspace_owner_id}"
+        self._agent_sandbox_keys[task_id] = make_user_sandbox_key(
+            workspace_owner_id, suffix
+        )
         return sandbox
 
     async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
@@ -1133,6 +1197,7 @@ class AgentServiceManager:
         task_llm: Optional[BaseLLM],
         task_vision_llm: Optional[BaseLLM],
         parent_tracer: Optional[Any] = None,
+        scope: Optional[ExecutionScope] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
         workforce_runtime = resolve_workforce_task_runtime(db, task)
@@ -1167,17 +1232,24 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
+        scope_segments = scope.workspace_segments if scope is not None else ()
         sandbox_workspace_config = {
-            "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+            "base_dir": str(
+                scoped_user_root(get_uploads_dir(), workspace_owner_id, scope_segments)
+            ),
             "task_id": f"web_task_{task_id}",
             "user_id": workspace_owner_id,
-            "allowed_external_dirs": _build_allowed_external_dirs(workspace_owner_id),
+            "allowed_external_dirs": _build_allowed_external_dirs(
+                workspace_owner_id, scope=scope
+            ),
+            "scope_segments": scope_segments,
         }
 
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
             workspace_config=sandbox_workspace_config,
+            scope=scope,
         )
 
         return await create_default_tools(
@@ -1186,6 +1258,7 @@ class AgentServiceManager:
             user=user,
             task_id=f"web_task_{task_id}",
             workspace_owner_id=int(task.user_id),
+            scope=scope,
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -1271,6 +1344,21 @@ class AgentServiceManager:
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
 
+        # One turn resolves once: an activated turn (the orchestrated
+        # execute/resume paths) already resolved this task's scope and
+        # carries it in the contextvar, so prefer that over a fresh
+        # loader/resolver round-trip. A None contextvar is ambiguous —
+        # "explicitly unscoped turn" and "not inside an activated turn"
+        # (pause/resume handlers, channels) look the same — so None falls
+        # back to resolving per call, at the same place the owner is
+        # resolved. Correctness is identical either way: the resolver is
+        # idempotent per task and every activation site wraps operations
+        # on the task it activated for.
+        scope = get_execution_scope()
+        if scope is None:
+            scope = resolve_execution_scope(task_id)
+        fingerprint = scope_fingerprint(scope)
+
         # Owner invariant: evict a cached AgentService built for a different
         # owner so we rebuild it under the correct runtime identity instead of
         # silently reusing the wrong one.
@@ -1303,6 +1391,47 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+
+        # Scope invariant: the cached instance baked its sandbox key (and,
+        # later, workspace paths and memory dimensions) in at build time.
+        # If the embedder reassigned the task to a different scope between
+        # turns, reusing the instance would silently execute in the old
+        # scope's namespace — evict and rebuild instead. The workspace is
+        # NOT cleaned up here: same owner, and the old scope's data must
+        # survive a scope reassignment.
+        if (
+            task_id in self._agents
+            and self._agent_scope_fingerprints.get(task_id) != fingerprint
+        ):
+            evicted_fingerprint = self._agent_scope_fingerprints.get(task_id)
+            recently_evicted = self._agent_evicted_scope_fingerprints.setdefault(
+                task_id, deque(maxlen=_EVICTED_FINGERPRINT_MEMORY)
+            )
+            if fingerprint in recently_evicted:
+                logger.warning(
+                    "Execution scope for task %s cycled back to recently "
+                    "evicted fingerprint %s (now evicting %s): probable "
+                    "resolver bug — a resolver cycling between scopes "
+                    "rebuilds the agent every turn and defeats the per-task "
+                    "cache.",
+                    task_id,
+                    fingerprint,
+                    evicted_fingerprint,
+                )
+            else:
+                logger.warning(
+                    "Evicting cached AgentService for task %s: built under "
+                    "scope fingerprint %s, resolved %s",
+                    task_id,
+                    evicted_fingerprint,
+                    fingerprint,
+                )
+            recently_evicted.append(evicted_fingerprint)
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
 
         if task_id not in self._agents:
             # Check if task exists in database
@@ -1377,10 +1506,13 @@ class AgentServiceManager:
                 # Task exists in database, try to reconstruct from history only for active executions
                 if db is not None and should_reconstruct:
                     try:
-                        await self._reconstruct_agent_from_history(task_id, db)
+                        await self._reconstruct_agent_from_history(
+                            task_id, db, scope=scope
+                        )
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
                         self._agent_owner_ids[task_id] = runtime_user_id
+                        self._agent_scope_fingerprints[task_id] = fingerprint
                         self._sync_connector_runtime_turn(
                             task_id, connector_runtime_turn_id
                         )
@@ -1399,6 +1531,7 @@ class AgentServiceManager:
                             del self._agents[task_id]
                             self._agent_owner_ids.pop(task_id, None)
                             self._agent_sandbox_keys.pop(task_id, None)
+                            self._agent_scope_fingerprints.pop(task_id, None)
                         # Continue with normal agent creation
 
             # Create tracer with all necessary handlers
@@ -1624,19 +1757,26 @@ class AgentServiceManager:
                     if task and task.user_id is not None
                     else int(runtime_user.id)
                 )
+                scope_segments = scope.workspace_segments if scope is not None else ()
                 sandbox_workspace_config = {
-                    "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+                    "base_dir": str(
+                        scoped_user_root(
+                            get_uploads_dir(), workspace_owner_id, scope_segments
+                        )
+                    ),
                     "task_id": f"web_task_{task_id}",
                     "user_id": workspace_owner_id,
                     "allowed_external_dirs": _build_allowed_external_dirs(
-                        workspace_owner_id
+                        workspace_owner_id, scope=scope
                     ),
+                    "scope_segments": scope_segments,
                 }
 
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
                     workspace_config=sandbox_workspace_config,
+                    scope=scope,
                 )
 
                 tool_selection_spec = _build_tool_selection_spec_for_task(
@@ -1653,6 +1793,7 @@ class AgentServiceManager:
                     user=runtime_user,
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
+                    scope=scope,
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -1716,6 +1857,7 @@ class AgentServiceManager:
                     # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
                         workspace_owner_id,
+                        scope=scope,
                     )
 
                     # Create AgentService first (this creates the workspace)
@@ -1733,9 +1875,12 @@ class AgentServiceManager:
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
                         workspace_base_dir=str(
-                            get_uploads_dir() / f"user_{workspace_owner_id}"
-                        ),  # Use user-isolated base directory
+                            scoped_user_root(
+                                get_uploads_dir(), workspace_owner_id, scope_segments
+                            )
+                        ),  # Use user- (and scope-) isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
+                        scope_segments=scope_segments,
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
@@ -1812,6 +1957,7 @@ class AgentServiceManager:
                 raise
 
         self._agent_owner_ids[task_id] = runtime_user_id
+        self._agent_scope_fingerprints[task_id] = fingerprint
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         return self._agents[task_id]
 
@@ -1880,6 +2026,8 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_evicted_scope_fingerprints.pop(task_id, None)
             logger.info(f"Removed AgentService for task {task_id}")
         else:
             # If agent is not in memory, clean up workspace directory directly
@@ -2031,11 +2179,29 @@ class AgentServiceManager:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
-        # Try user-isolated workspace first, then fallback
+        # Try the scoped workspace first (when a resolver maps this task to
+        # a scope), then the user-isolated workspace, then the legacy
+        # uploads-root fallback.
         workspace_ids = []
         if user_id:
+            # Contextvar-first for the same reason as get_agent_for_task:
+            # cleanup inside an activated turn reuses the turn's resolution.
+            scope = get_execution_scope()
+            if scope is None:
+                scope = resolve_execution_scope(task_id)
+            segments = scope.workspace_segments if scope is not None else ()
+            if segments:
+                workspace_ids.append(
+                    (
+                        f"web_task_{task_id}",
+                        str(scoped_user_root(get_uploads_dir(), user_id, segments)),
+                    )
+                )
             workspace_ids.append(
-                (f"web_task_{task_id}", str(get_uploads_dir() / f"user_{user_id}"))
+                (
+                    f"web_task_{task_id}",
+                    str(scoped_user_root(get_uploads_dir(), user_id)),
+                )
             )
         workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
 
@@ -2111,7 +2277,12 @@ class AgentServiceManager:
         )
         return has_plan
 
-    async def _reconstruct_agent_from_history(self, task_id: int, db: Session) -> None:
+    async def _reconstruct_agent_from_history(
+        self,
+        task_id: int,
+        db: Session,
+        scope: Optional[ExecutionScope] = None,
+    ) -> None:
         """Reconstruct agent from historical data"""
         try:
             # Get task user information from database
@@ -2209,6 +2380,7 @@ class AgentServiceManager:
                             task_llm=task_llm,
                             task_vision_llm=task_vision_llm,
                             parent_tracer=tracer,
+                            scope=scope,
                         )
                     else:
                         raise ValueError(
@@ -2224,8 +2396,10 @@ class AgentServiceManager:
 
                 # Build allowed external directories
                 allowed_external_dirs = _build_allowed_external_dirs(
-                    int(user_id) if user_id is not None else None
+                    int(user_id) if user_id is not None else None,
+                    scope=scope,
                 )
+                scope_segments = scope.workspace_segments if scope is not None else ()
 
                 # Create agent with basic configuration
                 if user_id is not None:
@@ -2274,9 +2448,12 @@ class AgentServiceManager:
                             system_prompt=system_prompt,
                             enable_workspace=True,
                             workspace_base_dir=str(
-                                get_uploads_dir() / f"user_{user_id}"
-                            ),  # Use user-isolated base directory
+                                scoped_user_root(
+                                    get_uploads_dir(), int(user_id), scope_segments
+                                )
+                            ),  # Use user- (and scope-) isolated base directory
                             allowed_external_dirs=allowed_external_dirs,
+                            scope_segments=scope_segments,
                             task_id=str(task_id),
                             memory_similarity_threshold=memory_similarity_threshold,
                             memory_enabled=memory_policy.memory_enabled,

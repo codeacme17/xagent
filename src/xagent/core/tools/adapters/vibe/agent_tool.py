@@ -1329,6 +1329,7 @@ class AgentTool(AbstractBaseTool):
         target_allowed_agent_ids: Optional[list[int]] = None,
         target_allow_cross_user_agent_ids: bool = False,
         runtime_metadata: Optional[dict[str, Any]] = None,
+        execution_scope: Optional[Any] = None,
     ):
         """
         Initialize an agent tool.
@@ -1389,6 +1390,16 @@ class AgentTool(AbstractBaseTool):
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
         self._workspace_base_dir = workspace_base_dir
+        # Snapshot the parent turn's ExecutionScope at construction (the
+        # resolver already ran for the parent turn; a nested call has no
+        # Task row to re-resolve from). An explicitly passed scope wins over
+        # the ambient contextvar so builds outside an activated turn
+        # (pause/resume paths) still capture the parent's scope.
+        from .....core.execution_scope import get_execution_scope
+
+        self._execution_scope = (
+            execution_scope if execution_scope is not None else get_execution_scope()
+        )
         self._visibility = ToolVisibility.PUBLIC
 
     @property
@@ -1659,6 +1670,9 @@ class AgentTool(AbstractBaseTool):
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the agent with the given task."""
+        from contextlib import nullcontext
+
+        from .....core.execution_scope import ExecutionScopeContext
         from .....web.models.agent import Agent
         from .....web.user_isolated_memory import UserContext
         from .db_session import tool_session_scope
@@ -1767,6 +1781,11 @@ class AgentTool(AbstractBaseTool):
             )
 
             parent_db_task_id = _coerce_db_task_id(self._parent_task_id)
+            _scope_segments = (
+                self._execution_scope.workspace_segments
+                if self._execution_scope is not None
+                else ()
+            )
             tool_config = WebToolConfig(
                 db=None,
                 db_factory=self._session_factory,
@@ -1793,7 +1812,9 @@ class AgentTool(AbstractBaseTool):
                     "base_dir": self._workspace_base_dir,
                     "task_id": execution_task_id,
                     "db_task_id": parent_db_task_id,
+                    "scope_segments": _scope_segments,
                 },
+                execution_scope=self._execution_scope,
             )
 
             try:
@@ -1817,6 +1838,7 @@ class AgentTool(AbstractBaseTool):
                     id=execution_task_id,
                     enable_workspace=True,
                     workspace_base_dir=self._workspace_base_dir,
+                    scope_segments=_scope_segments,
                     task_id=execution_task_id,
                     tracer=tracer,
                 )
@@ -1831,8 +1853,17 @@ class AgentTool(AbstractBaseTool):
                 if system_prompts:
                     execution_context["system_prompt"] = "\n\n".join(system_prompts)
 
-                # Execute task
-                with UserContext(self._user_id):
+                # Execute task. Re-activate the parent turn's scope snapshot
+                # around the nested run (no re-resolution — the nested call
+                # has no Task row), so the sub-agent's memory/workspace
+                # operations land in the parent's scope. A None snapshot
+                # leaves the ambient turn context untouched.
+                scope_context = (
+                    ExecutionScopeContext(self._execution_scope)
+                    if self._execution_scope is not None
+                    else nullcontext()
+                )
+                with UserContext(self._user_id), scope_context:
                     result = await agent_service.execute_task(
                         task=args["task"],
                         context=execution_context if execution_context else None,
@@ -1891,6 +1922,7 @@ def get_published_agents_tools(
     parent_task_id: Optional[str] = None,
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[list[int]] = None,
+    execution_scope: Optional[Any] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2087,6 +2119,7 @@ def get_published_agents_tools(
                     target_allowed_agent_ids=normalized_injected_agent_ids,
                     target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
                     runtime_metadata=runtime_metadata,
+                    execution_scope=execution_scope,
                 )
                 tools.append(tool)
                 logger.debug(f"Created agent tool: {tool.name}")
@@ -2149,6 +2182,9 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             parent_task_id=config.get_parent_task_id(),
             parent_tracer=config.get_parent_tracer(),
             agent_call_stack=config.get_agent_call_stack(),
+            execution_scope=config.get_execution_scope()
+            if hasattr(config, "get_execution_scope")
+            else None,
         )
     except Exception as e:
         logger.warning(f"Failed to create agent tools: {e}")

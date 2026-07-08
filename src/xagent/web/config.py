@@ -12,6 +12,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from ..config import format_file_size, get_max_upload_size_bytes, get_uploads_dir
+from ..core.workspace import scoped_user_root
 
 # File storage paths for AI tools (computed dynamically when needed)
 FILE_STORAGE_URL_BASE = "/uploads"
@@ -274,7 +275,7 @@ def get_upload_path(
 
     if user_id:
         # Create user-specific directory structure
-        user_dir = uploads_dir / f"user_{user_id}"
+        user_dir = scoped_user_root(uploads_dir, int(user_id))
 
         if collection:
             # SECURITY: Sanitize collection name to prevent path traversal attacks

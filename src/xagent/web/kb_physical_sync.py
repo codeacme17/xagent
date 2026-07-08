@@ -17,6 +17,8 @@ from typing import Generator
 
 from filelock import FileLock, Timeout
 
+from ..core.workspace import scoped_user_root
+
 logger = logging.getLogger(__name__)
 
 # Default lock timeout (seconds) when acquiring collection dir lock
@@ -97,7 +99,7 @@ def get_trash_path(
     Same volume as uploads so that rename is atomic. Name includes timestamp
     and short uuid to avoid collisions.
     """
-    trash_base = uploads_dir / TRASH_SUBDIR / f"user_{user_id}"
+    trash_base = scoped_user_root(uploads_dir / TRASH_SUBDIR, user_id)
     trash_base.mkdir(parents=True, exist_ok=True)
     ts = int(time.time() * 1000)
     uid = uuid.uuid4().hex[:8]

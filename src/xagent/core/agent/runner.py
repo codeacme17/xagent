@@ -37,6 +37,7 @@ class AgentRunner:
         callbacks: list[Any] | None = None,
         context_manager: ContextManager | None = None,
         workspace_base_dir: str = "workspace",
+        scope_segments: tuple[str, ...] = (),
         outbound_message_handler: Any | None = None,
     ) -> None:
         self.agent = agent
@@ -46,6 +47,7 @@ class AgentRunner:
         self.callbacks = callbacks or []
         self.context_manager = context_manager or ContextManager()
         self.workspace_base_dir = workspace_base_dir
+        self.scope_segments = scope_segments
         self.outbound_message_handler = outbound_message_handler
         self._active_controls: dict[str, ExecutionControl] = {}
 
@@ -516,6 +518,7 @@ class AgentRunner:
             base_dir=base_dir or self.workspace_base_dir,
             task_id=workspace_id or execution_id,
             allowed_external_dirs=allowed_external_dirs,
+            scope_segments=self.scope_segments,
         )
         if inspect.isawaitable(workspace):
             workspace = await workspace
