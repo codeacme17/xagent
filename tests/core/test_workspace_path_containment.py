@@ -14,7 +14,6 @@ import pytest
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import TaskWorkspace
 
-
 # --------------------------------------------------------------------------
 # SITE 1 — TaskWorkspace.resolve_path / resolve_path_with_search
 # --------------------------------------------------------------------------
@@ -56,6 +55,20 @@ def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(tmp_pat
 
     with pytest.raises(ValueError):
         workspace.resolve_path_with_search("../../other/secret.txt")
+
+
+def test_resolve_path_with_search_rejects_nonexistent_traversal_without_oracle(
+    tmp_path,
+):
+    # Containment is checked before existence, so a traversal to a path that
+    # does NOT exist raises ValueError (the same as an existing target) rather
+    # than FileNotFoundError. Otherwise the exception type would leak whether a
+    # file exists outside the workspace.
+    workspace = TaskWorkspace("task7", str(tmp_path))
+    workspace.input_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError):
+        workspace.resolve_path_with_search("../../other/does_not_exist.txt")
 
 
 def test_resolve_path_with_search_finds_legitimate_file(tmp_path):
