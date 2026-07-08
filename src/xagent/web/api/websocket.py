@@ -1015,6 +1015,10 @@ def _normalize_file_outputs(
     normalized_outputs: list[Dict[str, Any]] = []
     path_to_file_id: Dict[str, str] = {}
     changed = False
+    # Resolved once per normalization pass: per-storage-key resolution would
+    # re-query the snapshot loader / resolver once per output file (N+1 with
+    # the output-file count — workforce runs can emit dozens).
+    scope_segments = _scope_segments_for_task(task_id)
 
     def add_normalized_output(
         file_record: UploadedFile,
@@ -1181,7 +1185,7 @@ def _normalize_file_outputs(
                         task_id,
                         expected_file_id,
                         workspace_relative_path,
-                        scope_segments=_scope_segments_for_task(task_id),
+                        scope_segments=scope_segments,
                     ),
                     workspace_relative_path=workspace_relative_path,
                     workspace_category=workspace_category,
@@ -1205,7 +1209,7 @@ def _normalize_file_outputs(
                         task_id,
                         str(file_record.file_id),
                         workspace_relative_path,
-                        scope_segments=_scope_segments_for_task(task_id),
+                        scope_segments=scope_segments,
                     ),
                     task_id=task_id,
                     workspace_relative_path=workspace_relative_path,

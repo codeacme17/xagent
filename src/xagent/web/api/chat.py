@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, cast
@@ -20,6 +21,7 @@ from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     ExecutionScope,
     ScopeFingerprint,
+    get_execution_scope,
     resolve_execution_scope,
     scope_fingerprint,
 )
@@ -90,6 +92,10 @@ from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
+
+# Depth of the per-task recently-evicted scope-fingerprint memory used for
+# resolver-flap detection; catches scope cycles up to this period.
+_EVICTED_FINGERPRINT_MEMORY = 4
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -625,11 +631,13 @@ class AgentServiceManager:
         # different scope between turns must evict and rebuild instead of
         # silently executing in the old scope's namespace.
         self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
-        # Fingerprint evicted by the most recent scope-mismatch rebuild per
-        # task; an A -> B -> A flap points at a non-idempotent resolver that
-        # would otherwise silently rebuild every turn and defeat the cache.
+        # Recently evicted fingerprints per task (bounded): resolving back
+        # to any of them points at a resolver cycling between scopes, which
+        # silently rebuilds the agent every turn and defeats the cache. The
+        # bounded memory catches cycles up to its depth (A->B->A and longer
+        # A->B->C->A style periods), not just the immediate flap.
         self._agent_evicted_scope_fingerprints: Dict[
-            int, Optional[ScopeFingerprint]
+            int, deque[Optional[ScopeFingerprint]]
         ] = {}
         self._default_llm = create_default_llm()
         self.request = request
@@ -1328,13 +1336,19 @@ class AgentServiceManager:
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
 
-        # The execution scope is resolved per call, at the same place the
-        # owner is resolved, so every path that builds or fetches the
-        # per-task agent (orchestrated turns, pause/resume handlers,
-        # channels) derives it from the same persistent mapping. The
-        # resolver is idempotent per task, so re-resolving inside an
-        # already-activated turn yields the turn's scope.
-        scope = resolve_execution_scope(task_id)
+        # One turn resolves once: an activated turn (the orchestrated
+        # execute/resume paths) already resolved this task's scope and
+        # carries it in the contextvar, so prefer that over a fresh
+        # loader/resolver round-trip. A None contextvar is ambiguous —
+        # "explicitly unscoped turn" and "not inside an activated turn"
+        # (pause/resume handlers, channels) look the same — so None falls
+        # back to resolving per call, at the same place the owner is
+        # resolved. Correctness is identical either way: the resolver is
+        # idempotent per task and every activation site wraps operations
+        # on the task it activated for.
+        scope = get_execution_scope()
+        if scope is None:
+            scope = resolve_execution_scope(task_id)
         fingerprint = scope_fingerprint(scope)
 
         # Owner invariant: evict a cached AgentService built for a different
@@ -1383,16 +1397,19 @@ class AgentServiceManager:
             and self._agent_scope_fingerprints.get(task_id) != fingerprint
         ):
             evicted_fingerprint = self._agent_scope_fingerprints.get(task_id)
-            if fingerprint == self._agent_evicted_scope_fingerprints.get(task_id):
+            recently_evicted = self._agent_evicted_scope_fingerprints.setdefault(
+                task_id, deque(maxlen=_EVICTED_FINGERPRINT_MEMORY)
+            )
+            if fingerprint in recently_evicted:
                 logger.warning(
-                    "Execution scope for task %s flapped back to a previously "
-                    "evicted fingerprint (%s -> %s -> %s): probable resolver "
-                    "bug — a non-idempotent resolver rebuilds the agent every "
-                    "turn and defeats the per-task cache.",
+                    "Execution scope for task %s cycled back to recently "
+                    "evicted fingerprint %s (now evicting %s): probable "
+                    "resolver bug — a resolver cycling between scopes "
+                    "rebuilds the agent every turn and defeats the per-task "
+                    "cache.",
                     task_id,
                     fingerprint,
                     evicted_fingerprint,
-                    fingerprint,
                 )
             else:
                 logger.warning(
@@ -1402,7 +1419,7 @@ class AgentServiceManager:
                     evicted_fingerprint,
                     fingerprint,
                 )
-            self._agent_evicted_scope_fingerprints[task_id] = evicted_fingerprint
+            recently_evicted.append(evicted_fingerprint)
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
@@ -2109,7 +2126,11 @@ class AgentServiceManager:
         # uploads-root fallback.
         workspace_ids = []
         if user_id:
-            scope = resolve_execution_scope(task_id)
+            # Contextvar-first for the same reason as get_agent_for_task:
+            # cleanup inside an activated turn reuses the turn's resolution.
+            scope = get_execution_scope()
+            if scope is None:
+                scope = resolve_execution_scope(task_id)
             segments = scope.workspace_segments if scope is not None else ()
             if segments:
                 workspace_ids.append(

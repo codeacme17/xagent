@@ -16,6 +16,7 @@ through the resolver path and pin:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import ExitStack
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,7 @@ import pytest
 
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeContext,
     scope_fingerprint,
     set_execution_scope_resolver,
 )
@@ -176,7 +178,9 @@ async def test_scope_flap_is_logged_as_probable_resolver_bug(caplog) -> None:
     manager._agent_owner_ids[42] = 1
     manager._agent_scope_fingerprints[42] = scope_fingerprint(SCOPE_B)
     # A previous scope-mismatch rebuild evicted fingerprint A.
-    manager._agent_evicted_scope_fingerprints[42] = scope_fingerprint(SCOPE_A)
+    manager._agent_evicted_scope_fingerprints[42] = deque(
+        [scope_fingerprint(SCOPE_A)], maxlen=4
+    )
 
     with ExitStack() as stack:
         for p in _common_patches(manager):
@@ -190,6 +194,66 @@ async def test_scope_flap_is_logged_as_probable_resolver_bug(caplog) -> None:
             )
 
     assert any("probable resolver bug" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_multi_scope_cycle_is_also_flagged_as_resolver_bug(caplog) -> None:
+    """A resolver cycling through 3+ scopes (A -> B -> C -> A -> ...)
+    defeats the cache every turn just like a period-2 flap; the bounded
+    recently-evicted memory must flag it too (Roger's approval-round
+    finding on #789)."""
+    cycle = [SCOPE_A, SCOPE_B, ExecutionScope(sandbox_key_suffix="tenant-c")]
+    turn = {"n": 0}
+
+    def cycling_resolver(task_id):
+        return cycle[turn["n"] % len(cycle)]
+
+    set_execution_scope_resolver(cycling_resolver)
+    manager = AgentServiceManager()
+
+    with ExitStack() as stack:
+        for p in _common_patches(manager):
+            stack.enter_context(p)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(4):  # A, B, C, then back to A
+                await _call(
+                    manager,
+                    db=_build_db_mock(_make_task_row()),
+                    user=_make_user(),
+                    task_setup_snapshot=_build_snapshot(),
+                )
+                turn["n"] += 1
+
+    assert any("probable resolver bug" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_activated_turn_scope_is_reused_without_re_resolving() -> None:
+    """One turn resolves once: inside an activated turn context,
+    get_agent_for_task consumes the contextvar scope instead of a fresh
+    loader/resolver round-trip (Roger's approval-round finding on #789)."""
+    resolver_calls: list[str] = []
+
+    def resolver(task_id):
+        resolver_calls.append(task_id)
+        return SCOPE_A
+
+    set_execution_scope_resolver(resolver)
+    manager = AgentServiceManager()
+
+    with ExitStack() as stack:
+        for p in _common_patches(manager):
+            stack.enter_context(p)
+        with ExecutionScopeContext(SCOPE_A):  # the turn's activation
+            await _call(
+                manager,
+                db=_build_db_mock(_make_task_row()),
+                user=_make_user(),
+                task_setup_snapshot=_build_snapshot(),
+            )
+
+    assert resolver_calls == []
+    assert manager._agent_scope_fingerprints.get(42) == scope_fingerprint(SCOPE_A)
 
 
 @pytest.mark.asyncio
