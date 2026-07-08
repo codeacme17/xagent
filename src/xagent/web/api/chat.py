@@ -756,14 +756,25 @@ class AgentServiceManager:
         producing ``user:{owner}`` and reuses today's containers untouched.
 
         Capacity exhaustion and sandbox-service unavailability are distinct
-        failure classes: a ``SandboxCapacityError`` rejects the task by
-        default (opt-in local fallback via
-        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), while any other
-        sandbox failure keeps the local-execution fallback.
+        failure classes. For **unscoped** execution the historical behavior is
+        kept: a ``SandboxCapacityError`` rejects the task by default (opt-in
+        local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
+        and any other sandbox failure falls back to local execution.
+
+        A **scoped** execution (``scope is not None``) isolates an untrusted /
+        third-party workload in a per-scope container; running it outside that
+        container would defeat the isolation the scope exists to provide. So
+        for any active scope both fallbacks are disabled and the task fails
+        closed regardless of configuration — neither capacity pressure (even
+        with the opt-in flag on) nor a sandbox-service failure may downgrade a
+        scoped task to local execution.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
-                evictable, and local fallback on capacity is not enabled.
+                evictable, and (unscoped) local fallback on capacity is not
+                enabled, or the execution is scoped.
+            Exception: A scoped execution hit a non-capacity sandbox failure;
+                re-raised instead of falling back to local execution.
         """
         from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 
@@ -772,6 +783,8 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
+        # A scoped execution must never silently run outside its sandbox.
+        scoped = scope is not None
         suffix = scope.sandbox_key_suffix if scope is not None else None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
@@ -783,7 +796,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             from ...config import get_sandbox_allow_local_fallback_on_capacity
 
-            if get_sandbox_allow_local_fallback_on_capacity():
+            if not scoped and get_sandbox_allow_local_fallback_on_capacity():
                 logger.warning(
                     "Sandbox capacity reached for workspace owner %s; "
                     "falling back to local execution "
@@ -794,14 +807,25 @@ class AgentServiceManager:
                 return None
             logger.warning(
                 "Sandbox capacity reached for workspace owner %s; "
-                "rejecting task %s: %s",
+                "rejecting task %s (scoped=%s): %s",
                 workspace_owner_id,
                 task_id,
+                scoped,
                 e,
             )
             raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            if scoped:
+                logger.error(
+                    "Sandbox creation failed for scoped task %s (workspace "
+                    "owner %s); failing closed instead of running the scoped "
+                    "workload locally: %s",
+                    task_id,
+                    workspace_owner_id,
+                    e,
+                )
+                raise
             logger.warning(
                 "Sandbox creation failed for workspace owner %s, "
                 "falling back to local execution: %s",
