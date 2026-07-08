@@ -1235,8 +1235,10 @@ class AgentServiceManager:
         scope_segments = scope.workspace_segments if scope is not None else ()
         # The sandbox bind mount covers the scope's mount prefix (the full
         # workspace_segments when no prefix is declared); the deeper
-        # workspace subtree lives inside it and stays confined by the
-        # tool/path-check layer, not by a per-subtree mount.
+        # workspace subtree lives inside it but is NOT isolated from a
+        # co-mounted sibling — the rw mount and the code-execution tools
+        # bypass scoped_user_root, so a mount prefix must only group scopes
+        # of the same trust principal (see ExecutionScope.sandbox_mount_segments).
         mount_segments = scope.effective_mount_segments if scope is not None else ()
         sandbox_workspace_config = {
             "base_dir": str(
@@ -1765,7 +1767,10 @@ class AgentServiceManager:
                 scope_segments = scope.workspace_segments if scope is not None else ()
                 # Sandbox mount covers the scope's mount prefix (full
                 # workspace_segments when no prefix is declared); the deeper
-                # workspace subtree is confined at the tool/path-check layer.
+                # subtree is NOT isolated from a co-mounted sibling (rw mount,
+                # code-execution tools bypass scoped_user_root), so a mount
+                # prefix must only group scopes of the same trust principal
+                # (see ExecutionScope.sandbox_mount_segments).
                 mount_segments = (
                     scope.effective_mount_segments if scope is not None else ()
                 )

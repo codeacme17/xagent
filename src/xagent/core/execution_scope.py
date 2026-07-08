@@ -95,13 +95,21 @@ class ExecutionScope:
             only this **prefix** of ``workspace_segments`` instead of the full
             tuple. Two scopes that share ``sandbox_key_suffix`` and this prefix
             then produce an identical mount and can share one container, while
-            their deeper ``workspace_segments`` keep them in disjoint subtrees
-            of that shared mount (isolation stays at the tool/path-check
-            layer). Must be a prefix of ``workspace_segments``. ``None`` (the
-            default) means the mount covers the full ``workspace_segments`` —
-            byte-identical to pre-existing behavior. Consumed only by the
-            sandbox-mount composition; workspace paths and storage keys always
-            use the full ``workspace_segments``.
+            their deeper ``workspace_segments`` place them in distinct subtrees
+            of that shared mount. **Security note:** those subtrees are *not*
+            an isolation boundary. The mount is read-write and the
+            code-execution tools (shell/python executors) run directly in the
+            sandbox with no ``scoped_user_root`` path check, so code in one
+            scope's task can read and write a co-mounted sibling's subtree.
+            Only the orchestrator-side file/workspace API enforces
+            ``scoped_user_root``. Therefore this field must only group scopes
+            that are already the **same trust principal**; never use it to
+            co-mount scopes belonging to different end users. Must be a prefix
+            of ``workspace_segments``. ``None`` (the default) means the mount
+            covers the full ``workspace_segments`` — byte-identical to
+            pre-existing behavior. Consumed only by the sandbox-mount
+            composition; workspace paths and storage keys always use the full
+            ``workspace_segments``.
         memory_dimensions: Extra metadata stamped on memory notes on add and
             filtered on scoped search.
         strict_memory_isolation: When True, unscoped searches also exclude
@@ -266,23 +274,31 @@ def metadata_carries_scope_dimensions(metadata: Mapping[str, Any]) -> bool:
 
 
 # Hashable identity of a scope's namespace-affecting fields:
-# (sandbox_key_suffix, workspace_segments, sorted memory_dimensions items).
-ScopeFingerprint = tuple[Optional[str], tuple[str, ...], tuple[tuple[str, str], ...]]
+# (sandbox_key_suffix, workspace_segments, effective_mount_segments,
+#  sorted memory_dimensions items).
+ScopeFingerprint = tuple[
+    Optional[str], tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]
+]
 
 
 def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerprint]:
     """Hashable fingerprint of the namespaces a scope selects.
 
     Per-task caches that bake scope-derived state in at build time (sandbox
-    keys, workspace paths, memory dimensions) key their eviction checks on
-    this. ``None`` is the sentinel for unscoped, distinct from an empty
-    scope's fingerprint.
+    keys, workspace paths, sandbox mount root, memory dimensions) key their
+    eviction checks on this. The mount root is captured via
+    ``effective_mount_segments`` so a changed mount prefix invalidates the
+    cache instead of silently reusing a stale ``base_dir`` (which a later
+    rebuild would then reject in ``SandboxManager._ensure_config_equivalent``).
+    ``None`` is the sentinel for unscoped, distinct from an empty scope's
+    fingerprint.
     """
     if scope is None:
         return None
     return (
         scope.sandbox_key_suffix,
         scope.workspace_segments,
+        scope.effective_mount_segments,
         tuple(sorted(scope.memory_dimensions.items())),
     )
 
