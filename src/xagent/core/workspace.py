@@ -744,15 +744,20 @@ class TaskWorkspace:
             if cwd_relative is not None:
                 return cwd_relative
 
-            # For relative paths, resolve relative to default directory
+            # For relative paths, resolve relative to the default directory,
+            # then re-check containment. ``.resolve()`` collapses ``..``
+            # segments, so a relative path such as ``../../other/file`` can
+            # escape the workspace; returning it without re-verifying would let
+            # a relative path reach outside the allowed subtree.
             if default_dir == "input":
-                return (self.input_dir / path).resolve()
+                candidate = (self.input_dir / path).resolve()
             elif default_dir == "output":
-                return (self.output_dir / path).resolve()
+                candidate = (self.output_dir / path).resolve()
             elif default_dir == "temp":
-                return (self.temp_dir / path).resolve()
+                candidate = (self.temp_dir / path).resolve()
             else:
-                return (self.workspace_dir / path).resolve()
+                candidate = (self.workspace_dir / path).resolve()
+            return self._resolve_allowed_absolute_path(candidate)
 
     @staticmethod
     def _normalize_filename_for_search(filename: str) -> str:
@@ -832,7 +837,9 @@ class TaskWorkspace:
             for _dir_name, dir_path in search_dirs:
                 candidate = dir_path / clean_path
                 if candidate.exists():
-                    return candidate.resolve()
+                    # Re-check containment: ``clean_path`` may carry ``..``
+                    # segments that resolve outside the workspace.
+                    return self._resolve_allowed_absolute_path(candidate)
 
             # 2. Try normalized filename (handles spaces, brackets, etc.)
             normalized_name = self._normalize_filename_for_search(clean_path.name)
@@ -845,7 +852,8 @@ class TaskWorkspace:
                             f"File '{file_path}' matched via normalized name: "
                             f"'{normalized_name}'"
                         )
-                        return candidate.resolve()
+                        # Re-check containment (see exact-match branch above).
+                        return self._resolve_allowed_absolute_path(candidate)
 
             # 3. Try fuzzy match — also collect file list for error message
             request_stem = clean_path.stem.replace(" ", "").replace("_", "")
