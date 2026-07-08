@@ -586,12 +586,54 @@ class TaskWorkspace:
         if record_user_id != owner_user_id:
             return False
 
+        # For a scoped workspace, an owner match is not sufficient: the record
+        # must also live under this workspace's scope subtree. Otherwise a task
+        # could resolve, by file_id, a record belonging to the same owner but a
+        # different scope (e.g. another end user's upload, which has
+        # task_id=None and would pass the checks below). Unscoped workspaces
+        # (no scope_segments) keep the owner-only behavior byte-for-byte.
+        if self.scope_segments and not self._record_in_scope_subtree(record, path):
+            return False
+
         record_task_id = getattr(record, "task_id", None)
         if record_task_id is None:
             return True
         return (
             self.current_task_id is not None and record_task_id == self.current_task_id
         )
+
+    def _record_in_scope_subtree(
+        self, record: Any, path: Optional[Path] = None
+    ) -> bool:
+        """Whether a file record lives under this workspace's scope subtree.
+
+        Only meaningful when ``scope_segments`` is non-empty. Confirms
+        containment via the durable storage key prefix
+        (``users/{owner}/{segments}/``) when present, else via the local
+        storage path under the scoped user root. Fails closed (returns False)
+        when neither can be confirmed, so an owner match alone can never admit
+        a sibling scope's file.
+        """
+        owner_user_id = self.owner_user_id
+        if owner_user_id is None:
+            return True
+
+        storage_key = getattr(record, "storage_key", None)
+        if storage_key:
+            key = str(storage_key)
+            key_prefix = "/".join(["users", str(owner_user_id), *self.scope_segments])
+            return key == key_prefix or key.startswith(key_prefix + "/")
+
+        candidate = path
+        if candidate is None:
+            storage_path = getattr(record, "storage_path", None)
+            candidate = Path(storage_path) if storage_path else None
+        if candidate is not None:
+            scoped_root = self._user_workspace_base_dir(int(owner_user_id)).resolve()
+            resolved = candidate.resolve()
+            return resolved == scoped_root or resolved.is_relative_to(scoped_root)
+
+        return False
 
     def resolve_file_id(self, file_id: str) -> Optional[Path]:
         file_id = str(file_id).strip()
