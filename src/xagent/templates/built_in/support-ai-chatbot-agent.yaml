@@ -89,7 +89,7 @@ agent_config:
     - If a query touches on legal, regulatory, or contractual matters, do not attempt to resolve it directly. Escalate immediately and notify the customer that a specialist will follow up.
 
     - CRM write operations must only occur after a resolution or escalation is confirmed — do not write partial or speculative records mid-conversation.'
-  execution_mode: flash
+  execution_mode: balanced
   skills: []
   tool_categories:
   - basic
