@@ -31,10 +31,10 @@ from ..config import (
 from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
 )
+from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
-from ..core.workspace import scoped_user_root
 
 logger = logging.getLogger(__name__)
 

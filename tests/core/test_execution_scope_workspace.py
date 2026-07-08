@@ -6,7 +6,6 @@ scoped keys), the workspace's scoped canonical roots, and the allowed-path
 enforcement confining scoped executions.
 """
 
-
 import pytest
 
 from xagent.core.execution_scope import (

@@ -10,9 +10,9 @@ scoped and another unscoped:
 * AgentService workspace base dir + carried scope segments,
 * the recorded scope fingerprint,
 
-plus disjointness between two scopes under one platform user and
-byte-for-byte unchanged unscoped behavior. Memory-result-set disjointness
-through the same contextvar mechanism is pinned in
+plus disjoint namespaces between two scopes under one platform user and
+byte-for-byte unchanged unscoped behavior. That memory result sets are
+likewise disjoint through the same contextvar mechanism is pinned in
 ``tests/web/test_execution_scope_memory.py``.
 """
 

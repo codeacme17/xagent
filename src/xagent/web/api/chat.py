@@ -30,8 +30,8 @@ from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
-from ...core.workspace import scoped_user_root
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
+from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
@@ -40,6 +40,12 @@ from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
+from ..sandbox_keys import (
+    USER_LIFECYCLE_TYPE,
+    make_user_lifecycle_id,
+    make_user_sandbox_key,
+    parse_user_sandbox_key,
+)
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
 from ..services.chat_history_service import (
@@ -57,12 +63,6 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
-from ..sandbox_keys import (
-    USER_LIFECYCLE_TYPE,
-    make_user_lifecycle_id,
-    make_user_sandbox_key,
-    parse_user_sandbox_key,
-)
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,

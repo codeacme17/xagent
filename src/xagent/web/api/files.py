@@ -25,9 +25,9 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.file_storage import get_user_file_storage
-from ...core.workspace import scoped_user_root
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
+from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
     BINARY_EXTENSIONS,
