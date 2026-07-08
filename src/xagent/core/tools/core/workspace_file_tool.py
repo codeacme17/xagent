@@ -819,6 +819,19 @@ class WorkspaceFileOperations:
             else:
                 resolved_path = (self.workspace.workspace_dir / path).resolve()
 
+            # Re-check containment. ``.resolve()`` collapses ``..`` segments, so
+            # a relative path such as ``../../other/file`` can escape the
+            # workspace; without this check the resolved path would be returned
+            # unverified (the absolute-path branch above is already checked).
+            workspace_abs = self.workspace.workspace_dir.resolve()
+            if not (
+                resolved_path == workspace_abs
+                or resolved_path.is_relative_to(workspace_abs)
+            ):
+                error_msg = f"Path '{file_path}' is not within the workspace"
+                logger.error("ValueError: %s", error_msg)
+                raise ValueError(error_msg)
+
             logger.debug("Relative path resolved to: %s", resolved_path)
             return resolved_path
 
