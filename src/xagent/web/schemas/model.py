@@ -399,6 +399,7 @@ class ProviderInfo(BaseModel):
     id: str
     name: str
     description: str
+    category: List[str]
     requires_base_url: bool
     default_base_url: Optional[str] = None
     compatibility: Optional[str] = None

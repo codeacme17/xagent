@@ -171,6 +171,7 @@ export interface Provider {
   id: string;
   name: string;
   description: string;
+  category?: string[];
   requires_base_url?: boolean;
   icon?: string;
   default_base_url?: string;
