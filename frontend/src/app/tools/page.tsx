@@ -42,6 +42,7 @@ import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-d
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
+import { getRuntimeConfigError } from "@/components/mcp/runtime-inputs-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
@@ -80,6 +81,9 @@ export interface MCPServer {
   provider?: string
   user_env?: Record<string, string>
   can_edit_global?: boolean
+  runtime_input_schema?: Record<string, any> | null
+  runtime_bindings?: Record<string, any>[] | null
+  allow_delegated_authorization?: boolean
 }
 
 interface ConfigurableToolField {
@@ -155,6 +159,7 @@ function ToolsPageContent() {
     method: "GET",
     headers: {}
   })
+  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
 
   const { t } = useI18n()
   const { user } = useAuth()
@@ -455,6 +460,7 @@ function ToolsPageContent() {
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
       setEditingServer(server)
+      setRuntimeValidationError(null)
       setMcpFormData({
         name: server.name,
         transport: server.transport,
@@ -463,7 +469,10 @@ function ToolsPageContent() {
         method: server.config?.method || "GET",
         headers: server.config?.headers || {},
         body: server.config?.body || "",
-        config: server.config || {}
+        config: server.config || {},
+        runtime_input_schema: server.runtime_input_schema ?? null,
+        runtime_bindings: server.runtime_bindings ?? null,
+        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
       })
 
       const configObj = server.config || {};
@@ -477,11 +486,15 @@ function ToolsPageContent() {
       setIsMcpDialogOpen(true)
     } else {
       setEditingServer(server)
+      setRuntimeValidationError(null)
       setMcpFormData({
         name: server.name,
         transport: server.transport,
         description: server.description || "",
-        config: server.config || {}
+        config: server.config || {},
+        runtime_input_schema: server.runtime_input_schema ?? null,
+        runtime_bindings: server.runtime_bindings ?? null,
+        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
       })
       setIsMcpDialogOpen(true)
     }
@@ -499,6 +512,13 @@ function ToolsPageContent() {
     }
 
     let payload: any = { ...mcpFormData }
+    const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp"
+    const runtimeError = runtimeValidationError || getRuntimeConfigError(payload, connectorType)
+    if (runtimeError) {
+      toast.error(t(runtimeError))
+      return
+    }
+
     if (payload.transport === "custom_api") {
       if (!mcpFormData.url?.trim()) {
         toast.error(t('tools.mcp.alerts.urlRequired'));
@@ -900,7 +920,13 @@ function ToolsPageContent() {
             <span className="hidden sm:inline">{t('tools.mcp.addConnector')}</span>
             <span className="sm:hidden">{t('common.add') || t('tools.mcp.addConnector')}</span>
           </Button>
-          <Dialog open={isMcpDialogOpen} onOpenChange={setIsMcpDialogOpen}>
+          <Dialog
+            open={isMcpDialogOpen}
+            onOpenChange={(nextOpen) => {
+              setIsMcpDialogOpen(nextOpen)
+              if (!nextOpen) setRuntimeValidationError(null)
+            }}
+          >
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>
@@ -919,6 +945,7 @@ function ToolsPageContent() {
                       setMcpFormData={setMcpFormData}
                       customApiEnv={customApiEnv}
                       setCustomApiEnv={setCustomApiEnv}
+                      onRuntimeValidationErrorChange={setRuntimeValidationError}
                       originalEnvObj={(() => {
                         let originalEnvObj: Record<string, any> = {};
                         if (editingServer?.config?.env) {
@@ -944,6 +971,7 @@ function ToolsPageContent() {
                       setMcpFormData={setMcpFormData}
                       serverId={editingServer?.id}
                       onOAuthStatusChange={loadMCPServers}
+                      onRuntimeValidationErrorChange={setRuntimeValidationError}
                     />
                   </>
                 )}
@@ -1296,6 +1324,7 @@ function ToolsPageContent() {
           if (app.is_custom && app.server) {
             setIsOfficialAppDialogOpen(false);
             setEditingServer(app.server);
+            setRuntimeValidationError(null);
 
             if (app.server.transport === "custom_api") {
               const configObj = app.server.config || {};
@@ -1315,14 +1344,20 @@ function ToolsPageContent() {
                 url: configObj.url || "",
                 method: configObj.method || "GET",
                 headers: configObj.headers || {},
-                config: configObj
+                config: configObj,
+                runtime_input_schema: app.server.runtime_input_schema ?? null,
+                runtime_bindings: app.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
               });
             } else {
               setMcpFormData({
                 name: app.server.name,
                 transport: app.server.transport,
                 description: app.server.description || "",
-                config: app.server.config || {}
+                config: app.server.config || {},
+                runtime_input_schema: app.server.runtime_input_schema ?? null,
+                runtime_bindings: app.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
               });
             }
             setIsMcpDialogOpen(true);

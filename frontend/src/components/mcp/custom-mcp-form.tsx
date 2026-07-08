@@ -11,12 +11,14 @@ import { toast } from "@/components/ui/sonner"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
+import { RuntimeInputsForm } from "./runtime-inputs-form"
 
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
   setMcpFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
   serverId?: number | null
   onOAuthStatusChange?: () => void
+  onRuntimeValidationErrorChange?: (error: string | null) => void
 }
 
 interface McpOAuthGrantStatus {
@@ -72,7 +74,8 @@ export function CustomMcpForm({
   mcpFormData,
   setMcpFormData,
   serverId,
-  onOAuthStatusChange
+  onOAuthStatusChange,
+  onRuntimeValidationErrorChange,
 }: CustomMcpFormProps) {
   const { t } = useI18n()
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
@@ -928,8 +931,17 @@ export function CustomMcpForm({
               </div>
             </>
           )}
+
         </>
       )}
+
+      <RuntimeInputsForm
+        connectorType="mcp"
+        formData={mcpFormData}
+        setFormData={setMcpFormData}
+        onValidationErrorChange={onRuntimeValidationErrorChange}
+        disabled={!canEditGlobal}
+      />
 
       <Collapsible open={isAdvancedOpen} onOpenChange={setIsAdvancedOpen} className="w-full space-y-2">
         <CollapsibleTrigger asChild>

@@ -29,6 +29,7 @@ making the loop byte-for-byte equivalent to the pre-concurrency behavior.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 from dataclasses import dataclass, replace
@@ -1941,6 +1942,7 @@ class ReActPattern(AgentPattern):
             tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
+        tool_call = self._with_trace_safe_tool_args(tool_call, tools)
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
         try:
@@ -2000,6 +2002,32 @@ class ReActPattern(AgentPattern):
                     error="tool execution aborted before completion",
                 )
 
+    def _with_trace_safe_tool_args(
+        self, tool_call: dict[str, Any], tools: list[Any]
+    ) -> dict[str, Any]:
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001
+            return tool_call
+
+        sanitizer = getattr(tool, "sanitize_tool_args_for_trace", None)
+        if not callable(sanitizer):
+            return tool_call
+
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            args: dict[str, Any] = {}
+            original_args: dict[str, Any] = {}
+        elif isinstance(raw_args, dict):
+            args = copy.deepcopy(raw_args)
+            original_args = copy.deepcopy(raw_args)
+        else:
+            return tool_call
+        sanitized = sanitizer(args)
+        if not isinstance(sanitized, dict) or sanitized == original_args:
+            return tool_call
+        return {**tool_call, "args": sanitized}
+
     def _with_runtime_step(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
     ) -> dict[str, Any]:
@@ -2040,7 +2068,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
-        args = dict(tool_call.get("args", {}))
+        args = self._tool_call_args_dict(tool_call)
         args_hash = self._args_hash(args)
         self.tool_ledger[tool_call_id] = ToolCallRecord(
             tool_call_id=tool_call_id,
@@ -2057,6 +2085,18 @@ class ReActPattern(AgentPattern):
             return json.dumps(args, sort_keys=True, default=str)
         except TypeError:
             return str(args)
+
+    def _tool_call_args_dict(
+        self, tool_call: dict[str, Any], *, require_mapping: bool = False
+    ) -> dict[str, Any]:
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            return {}
+        if isinstance(raw_args, dict):
+            return dict(raw_args)
+        if require_mapping:
+            raise ValueError("Tool call args must be a JSON object.")
+        return {}
 
     def _tool_name(self, tool: Any) -> str:
         metadata = getattr(tool, "metadata", None)
@@ -2166,7 +2206,7 @@ class ReActPattern(AgentPattern):
     def _tool_args_for_execution(
         self, tool_call: dict[str, Any], tool: Any
     ) -> dict[str, Any]:
-        args = dict(tool_call.get("args", {}))
+        args = self._tool_call_args_dict(tool_call, require_mapping=True)
         tool_name = self._tool_name(tool)
         if not tool_name.startswith("browser_"):
             return args

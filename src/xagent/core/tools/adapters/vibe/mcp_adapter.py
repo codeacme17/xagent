@@ -5,8 +5,10 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 """
 
 import asyncio
+import inspect
 import logging
 import os
+import re
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 from mcp.types import Tool as MCPTool
@@ -16,6 +18,17 @@ from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
 from .base import AbstractBaseTool, ToolVisibility
+from .connector_runtime import (
+    ERROR_DELEGATED_AUTHORIZATION_FAILED,
+    MISSING_RUNTIME_VALUE,
+    RUNTIME_INPUT_CONTEXT,
+    TARGET_MCP_META,
+    TARGET_TOOL_ARGUMENTS,
+    binding_source_value,
+    binding_target,
+    connector_runtime_from_config,
+    runtime_bindings_from_config,
+)
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
@@ -27,23 +40,51 @@ class EmptyArgsModel(BaseModel):
 
 
 logger = logging.getLogger(__name__)
+_RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
+_HTTP_401_TEXT_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
+    r"\b401\s+unauthorized\b",
+    re.IGNORECASE,
+)
 
 
-def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
-    """Flatten nested exception groups into a readable error string."""
-    messages: list[str] = []
+def _exception_indicates_http_401(exc: BaseException) -> bool:
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_exception_indicates_http_401(sub_exc) for sub_exc in exc.exceptions)
+    for attr in ("status_code", "status", "code"):
+        value = getattr(exc, attr, None)
+        if value == 401 or value == "401":
+            return True
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code == 401 or status_code == "401":
+            return True
+    text = str(exc).lower()
+    return bool(_HTTP_401_TEXT_RE.search(text))
 
-    def _collect(group: BaseExceptionGroup) -> None:
-        for sub_exc in group.exceptions:
-            if isinstance(sub_exc, BaseExceptionGroup):
-                _collect(sub_exc)
-            else:
-                messages.append(str(sub_exc))
 
-    _collect(exc)
-    if not messages:
-        return str(exc)
-    return f"{exc}: " + ", ".join(messages)
+def _delegated_authorization_failed_result() -> dict[str, Any]:
+    return {
+        "content": [
+            {
+                "text": (
+                    "Error executing MCP tool: delegated authorization failed "
+                    f"({ERROR_DELEGATED_AUTHORIZATION_FAILED})"
+                )
+            }
+        ],
+        "is_error": True,
+    }
+
+
+def _delegated_retry_failed_result() -> dict[str, Any]:
+    return {
+        "content": [
+            {"text": ("Error executing MCP tool after delegated authorization retry.")}
+        ],
+        "is_error": True,
+    }
 
 
 def _normalize_concurrent_tools(value: Any) -> list[str]:
@@ -128,6 +169,9 @@ class MCPToolAdapter(AbstractBaseTool):
             concurrency_safe=concurrency_safe,
             concurrent_tools=_normalize_concurrent_tools(concurrent_tools),
         )
+        runtime_config = connection if isinstance(connection, Mapping) else {}
+        self._runtime_bindings = runtime_bindings_from_config(runtime_config)
+        self._connector_runtime = connector_runtime_from_config(runtime_config)
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -201,8 +245,11 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
+            runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
 
             for field_name, field_schema in properties.items():
+                if field_name in runtime_bound_args:
+                    continue
                 field_type = self._json_schema_to_python_type(field_schema)
 
                 # Check if field is required
@@ -399,11 +446,28 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Validate arguments
             normalized_args = self._normalize_args_by_schema(args)
+            runtime_bound_args = self._runtime_bound_tool_argument_names(
+                self._input_schema_properties()
+            )
+            for field_name in runtime_bound_args:
+                if field_name in normalized_args:
+                    logger.warning(
+                        "Ignoring LLM-supplied runtime-bound MCP argument "
+                        "%s for tool %s",
+                        field_name,
+                        self.mcp_tool.name,
+                    )
+                    normalized_args.pop(field_name, None)
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
+            tool_args.update(self._runtime_tool_arguments())
+            tool_meta = self._runtime_mcp_meta()
 
             logger.debug(
-                f"Executing MCP tool {self.mcp_tool.name} with args: {tool_args} for user {current_user_id}"
+                "Executing MCP tool %s with args keys: %s for user %s",
+                self.mcp_tool.name,
+                sorted(tool_args),
+                current_user_id,
             )
 
             # Set user context for execution
@@ -413,45 +477,103 @@ class MCPToolAdapter(AbstractBaseTool):
             user_context = UserContext(current_user_id)
 
             with user_context.set_context():
-                # Create session and execute tool
-                async with create_session(self.connection) as session:
-                    await session.initialize()
-
-                    # Call MCP tool
-                    result = await session.call_tool(self.mcp_tool.name, tool_args)
-
-                    # Convert result to our format
-                    content = []
-                    if result.content:
-                        for content_item in result.content:
-                            if hasattr(content_item, "model_dump"):
-                                content.append(content_item.model_dump())
-                            else:
-                                content.append({"text": str(content_item)})
-
-                    return {
-                        "content": content,
-                        "is_error": result.isError
-                        if hasattr(result, "isError")
-                        else False,
-                    }
+                try:
+                    return await self._execute_mcp_call(
+                        self.connection, tool_args, tool_meta
+                    )
+                except (BaseExceptionGroup, Exception) as exc:
+                    retry_result = await self._retry_delegated_401(
+                        exc, tool_args, tool_meta
+                    )
+                    if retry_result is not None:
+                        return retry_result
+                    raise
 
         except BaseExceptionGroup as e:
             logger.error(
-                f"MCP tool {self.mcp_tool.name} execution failed with exception group: {e}"
+                "MCP tool %s execution failed with exception group %s",
+                self.mcp_tool.name,
+                type(e).__name__,
             )
-            error_msg = _format_exception_group_messages(e)
             return {
-                "content": [{"text": f"Error executing MCP tool: {error_msg}"}],
+                "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
 
         except Exception as e:
-            logger.error(f"MCP tool {self.mcp_tool.name} execution failed: {e}")
+            logger.error(
+                "MCP tool %s execution failed with %s",
+                self.mcp_tool.name,
+                type(e).__name__,
+            )
             return {
-                "content": [{"text": f"Error executing MCP tool: {e}"}],
+                "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
+
+    async def _execute_mcp_call(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        async with create_session(connection) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                self.mcp_tool.name,
+                dict(tool_args),
+                meta=dict(tool_meta) or None,
+            )
+
+            content = []
+            if result.content:
+                for content_item in result.content:
+                    if hasattr(content_item, "model_dump"):
+                        content.append(content_item.model_dump())
+                    else:
+                        content.append({"text": str(content_item)})
+
+            return {
+                "content": content,
+                "is_error": result.isError if hasattr(result, "isError") else False,
+            }
+
+    async def _retry_delegated_401(
+        self,
+        exc: BaseException,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not _exception_indicates_http_401(exc):
+            return None
+        if not isinstance(self.connection, Mapping):
+            return None
+        refresh = self.connection.get(_RUNTIME_CONNECTION_REFRESH_KEY)
+        if not callable(refresh):
+            return None
+
+        logger.info(
+            "Retrying MCP tool %s after delegated authorization failure",
+            self.mcp_tool.name,
+        )
+        refreshed = refresh()
+        if inspect.isawaitable(refreshed):
+            refreshed = await refreshed
+        if not isinstance(refreshed, dict):
+            return _delegated_authorization_failed_result()
+        try:
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
+        except (BaseExceptionGroup, Exception) as retry_exc:
+            if _exception_indicates_http_401(retry_exc):
+                return _delegated_authorization_failed_result()
+            logger.error(
+                "MCP tool %s delegated authorization retry failed with %s",
+                self.mcp_tool.name,
+                type(retry_exc).__name__,
+            )
+            return _delegated_retry_failed_result()
 
     def _get_current_user_id(self) -> Optional[str]:
         """Get current user ID from environment or context."""
@@ -466,6 +588,70 @@ class MCPToolAdapter(AbstractBaseTool):
             "No user ID found in environment, MCP tool may not be properly isolated"
         )
         return None
+
+    def _input_schema_properties(self) -> dict[str, Any]:
+        schema = self.mcp_tool.inputSchema
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        return properties if isinstance(properties, dict) else {}
+
+    def _runtime_bound_tool_argument_names(
+        self, properties: Mapping[str, Any]
+    ) -> set[str]:
+        bound: set[str] = set()
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
+                continue
+            target_key = target.get("key")
+            if isinstance(target_key, str) and target_key in properties:
+                bound.add(target_key)
+        return bound
+
+    def _runtime_tool_arguments(self) -> dict[str, Any]:
+        properties = self._input_schema_properties()
+        runtime_args: dict[str, Any] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
+                continue
+            target_key = target.get("key")
+            if not isinstance(target_key, str) or target_key not in properties:
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT},
+            )
+            if value is MISSING_RUNTIME_VALUE:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for missing "
+                    "context source while setting %s on tool %s",
+                    target_key,
+                    self.mcp_tool.name,
+                )
+                continue
+            runtime_args[target_key] = value
+        return runtime_args
+
+    def _runtime_mcp_meta(self) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_MCP_META:
+                continue
+            target_key = target.get("key")
+            if not isinstance(target_key, str) or not target_key:
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT},
+            )
+            if value is not MISSING_RUNTIME_VALUE:
+                meta[target_key] = value
+        return meta
 
     def _is_user_allowed(self, user_id: Optional[str]) -> bool:
         """Check if user is allowed to use this tool."""

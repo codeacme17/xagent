@@ -12,6 +12,7 @@ from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
+from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
@@ -167,6 +168,12 @@ class AgentService:
             llm.model_name if llm else None,
             compact_llm.model_name if compact_llm else None,
         )
+
+    def invalidate_tools(self) -> None:
+        """Force the next execution to rebuild tools from ``tool_config``."""
+
+        self._tools_initialized = False
+        self._tool_policy_signature = None
 
     async def execute_task(
         self,
@@ -629,6 +636,8 @@ class AgentService:
                     self._execution_adapter.config.tools = self.tools
                 self._tools_initialized = True
                 self._tool_policy_signature = policy_signature
+            except ConnectorRuntimeError:
+                raise
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
                 raise RuntimeError(

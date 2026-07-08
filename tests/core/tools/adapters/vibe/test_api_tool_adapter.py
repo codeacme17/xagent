@@ -141,6 +141,28 @@ async def test_run_json_async_uses_configured_endpoint_defaults():
 
 
 @pytest.mark.asyncio
+async def test_run_json_async_error_does_not_echo_raw_exception():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.side_effect = RuntimeError(
+            "transport failed with Bearer runtime-token"
+        )
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+        )
+
+        res = await tool.run_json_async({})
+
+        assert res["success"] is False
+        assert res["error"] == "Error executing Custom API."
+        assert "runtime-token" not in repr(res)
+
+
+@pytest.mark.asyncio
 async def test_run_json_async_merges_configured_and_call_headers():
     with (
         patch(
@@ -187,6 +209,304 @@ async def test_run_json_async_merges_configured_and_call_headers():
             },
             params={},
             body=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_applies_runtime_headers_and_body_fields():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            method="POST",
+            headers={"X-Account": "static"},
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "headers", "key": "X-Account"},
+                },
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "body_field",
+                        "path": "scope.account_id",
+                    },
+                },
+            ],
+            connector_runtime={
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        res = await tool.run_json_async({"body": {"scope": {"account_id": "llm"}}})
+        assert res["success"] is True
+
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="POST",
+            headers={"X-Account": "6185"},
+            params={},
+            body={"scope": {"account_id": "6185"}},
+        )
+
+
+def test_runtime_bindings_hide_custom_api_headers_and_body_from_llm_schema():
+    tool = CustomApiTool(
+        name="ShiftCare",
+        description="test",
+        env={},
+        url="https://api.example.com/clients",
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {
+                    "target_type": "body_field",
+                    "path": "scope.account_id",
+                },
+            },
+        ],
+    )
+
+    fields = tool.args_type().model_fields
+
+    assert "headers" not in fields
+    assert "body" not in fields
+    assert "url" in fields
+    assert "method" in fields
+    assert "params" in fields
+
+
+def test_runtime_bindings_sanitize_custom_api_trace_args_before_execution():
+    tool = CustomApiTool(
+        name="ShiftCare",
+        description="test",
+        env={},
+        url="https://api.example.com/clients",
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {
+                    "target_type": "body_field",
+                    "path": "scope.account_id",
+                },
+            },
+        ],
+    )
+
+    sanitized = tool.sanitize_tool_args_for_trace(
+        {
+            "headers": {"X-Account": "llm"},
+            "body": {"scope": {"account_id": "llm"}},
+            "params": {"q": "client"},
+        }
+    )
+
+    assert sanitized == {"params": {"q": "client"}}
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_requires_flag_for_runtime_authorization_header():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "secrets", "key": "authorization"},
+                    "target": {"target_type": "headers", "key": "Authorization"},
+                }
+            ],
+            connector_runtime={
+                "context": {},
+                "secrets": {"authorization": "Bearer tenant-token"},
+                "auth_selector": {},
+            },
+            allow_delegated_authorization=False,
+        )
+
+        res = await tool.run_json_async({})
+        assert res["success"] is True
+
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_ignores_non_scalar_runtime_header_values():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "tuple_value"},
+                    "target": {"target_type": "headers", "key": "X-Tuple"},
+                },
+                {
+                    "source": {"input_type": "context", "key": "set_value"},
+                    "target": {"target_type": "headers", "key": "X-Set"},
+                },
+            ],
+            connector_runtime={
+                "context": {
+                    "tuple_value": ("account", "6185"),
+                    "set_value": {"account", "6185"},
+                },
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        res = await tool.run_json_async({})
+        assert res["success"] is True
+
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_warns_when_runtime_body_binding_discards_non_object_body(
+    caplog,
+):
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            body='"static text body"',
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "body_field", "path": "account.id"},
+                },
+            ],
+            connector_runtime={
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        caplog.set_level("WARNING")
+        res = await tool.run_json_async({})
+
+        assert res["success"] is True
+        assert "discard non-object body" in caplog.text
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body={"account": {"id": "6185"}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_warns_when_runtime_body_binding_replaces_scalar_parent(
+    caplog,
+):
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "name"},
+                    "target": {"target_type": "body_field", "path": "user.name"},
+                },
+            ],
+            connector_runtime={
+                "context": {"name": "Alice"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        caplog.set_level("WARNING")
+        res = await tool.run_json_async({"body": {"user": "legacy"}})
+
+        assert res["success"] is True
+        assert "overrides non-object intermediate field user" in caplog.text
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body={"user": {"name": "Alice"}},
         )
 
 
