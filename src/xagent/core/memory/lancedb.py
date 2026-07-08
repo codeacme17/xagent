@@ -5,6 +5,8 @@ import logging
 from typing import Any, List, Optional, Union
 from uuid import uuid4
 
+import pyarrow as pa  # type: ignore
+
 from ...providers.vector_store.lancedb import (
     LanceDBConnectionManager,
     LanceDBVectorStore,
@@ -15,6 +17,11 @@ from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
+from .schema_migration import (
+    MemoryMismatchKind,
+    classify_memory_schema_mismatch,
+    migrate_table_swap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +176,142 @@ class LanceDBMemoryStore(MemoryStore):
             logger.error(f"Failed to generate embedding for text '{text[:50]}...': {e}")
             return None
 
+    def _current_embedding_dim(self) -> Optional[int]:
+        """Return the vector dimension the store currently produces, or None.
+
+        None means no embedding model is available and the store operates in
+        vector-less (text-search) mode.
+        """
+        if not self._embedding_model:
+            return None
+        try:
+            dim = self._embedding_model.get_dimension()
+            if dim:
+                return int(dim)
+        except Exception:
+            pass
+        sample = self._get_embedding("sample")
+        return len(sample) if sample else None
+
+    def _embed_texts_batch(
+        self, texts: list[str], target_dim: int
+    ) -> list[list[float]]:
+        """Re-embed all texts in a single batched encode call (all-or-nothing).
+
+        Raises if no model is available, the batch shape is unexpected, or any
+        row's embedding is missing or has the wrong dimension. The caller relies
+        on this raising so the migration aborts with the original table intact
+        (never a partially-vectorized table).
+        """
+        if not self._embedding_model:
+            raise RuntimeError(
+                "Cannot rebuild vector column without an embedding model"
+            )
+        if not texts:
+            return []
+        result = self._embedding_model.encode(texts)
+        if not isinstance(result, list) or len(result) != len(texts):
+            raise RuntimeError(
+                f"Embedding batch returned unexpected shape for {len(texts)} rows"
+            )
+        vectors: list[list[float]] = []
+        for index, vector in enumerate(result):
+            if not isinstance(vector, list) or len(vector) != target_dim:
+                raise RuntimeError(
+                    f"Re-embedding row {index} failed or produced the wrong "
+                    f"dimension (expected {target_dim})"
+                )
+            vectors.append([float(value) for value in vector])
+        return vectors
+
+    def _build_migrated_table(self, existing: Any, target_dim: Optional[int]) -> Any:
+        """Transform for the migration primitive: rebuild rows at the target schema.
+
+        Preserves every existing row's id/text/metadata. When ``target_dim`` is
+        set, re-embeds all rows into a fresh fixed-width vector column; when it
+        is None, produces a vector-less table (text-only search).
+        """
+        row_count = existing.num_rows
+        names = set(existing.schema.names)
+
+        def _string_column(name: str) -> list[Optional[str]]:
+            if name in names:
+                return [
+                    None if value is None else str(value)
+                    for value in existing.column(name).to_pylist()
+                ]
+            return [None] * row_count
+
+        columns: dict[str, Any] = {
+            "id": pa.array(_string_column("id"), pa.string()),
+            "text": pa.array(_string_column("text"), pa.string()),
+            "metadata": pa.array(_string_column("metadata"), pa.string()),
+        }
+
+        if target_dim is not None:
+            texts = [text or "" for text in _string_column("text")]
+            vectors = self._embed_texts_batch(texts, target_dim)
+            columns["vector"] = pa.array(vectors, pa.list_(pa.float32(), target_dim))
+
+        return pa.table(columns)
+
+    def _backfill_missing_columns(self, conn: Any, columns: tuple[str, ...]) -> None:
+        """Add missing non-vector columns in place (no data loss, no rebuild)."""
+        table = conn.open_table(self._collection_name)
+        try:
+            for column in columns:
+                # All non-vector memory columns are strings.
+                table.add_columns({column: "cast(null as string)"})
+        finally:
+            _safe_close_table(table)
+
+    def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
+        """Resolve a schema mismatch safely, routing through the 792-01 classifier.
+
+        Missing non-vector columns are backfilled in place; a vector
+        dimension/presence change rebuilds the table via transform-then-swap.
+        On any failure the original table is left intact and the error
+        propagates; no path drops or empties the table.
+        """
+        table = conn.open_table(self._collection_name)
+        try:
+            schema = table.schema
+        finally:
+            _safe_close_table(table)
+
+        # The dimension we are trying to store now determines the target schema.
+        if record.get("vector"):
+            expected_dim: Optional[int] = len(record["vector"])
+        elif self._embedding_model:
+            expected_dim = self._current_embedding_dim()
+        else:
+            expected_dim = None
+
+        mismatch = classify_memory_schema_mismatch(schema, expected_dim)
+
+        if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
+            self._backfill_missing_columns(conn, mismatch.missing_columns)
+        elif mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD:
+            target_dim = expected_dim
+            migrate_table_swap(
+                conn,
+                self._collection_name,
+                lambda existing: self._build_migrated_table(existing, target_dim),
+            )
+        else:
+            # add() failed but the schema looks compatible: do NOT drop the
+            # table. Surface the original failure to the caller.
+            raise RuntimeError(
+                "add() failed but no resolvable schema mismatch was detected"
+            )
+
+    def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
+        """Insert a record, adapting it to the (possibly migrated) table schema."""
+        schema_names = set(table.schema.names)
+        if "vector" in record and "vector" not in schema_names:
+            record = {k: v for k, v in record.items() if k != "vector"}
+        table.add([record])
+
     def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
         """Convert MemoryNote to dictionary for storage."""
         # Get embedding for the content
@@ -281,44 +424,35 @@ class LanceDBMemoryStore(MemoryStore):
                 if data["vector"]:
                     record["vector"] = data["vector"]
 
-                # Try to add the record, recreate table if schema mismatch
+                # Try to add the record. On a schema mismatch, migrate the
+                # existing table in place (preserving all rows) instead of
+                # dropping and recreating it.
                 try:
                     table.add([record])
                 except Exception as add_error:
                     logger.warning(
-                        f"Failed to add record due to schema mismatch: {add_error}"
+                        f"add() failed on possible schema mismatch: {add_error}; "
+                        "attempting safe in-place migration"
                     )
-                    # Recreate table and try again
-                    logger.info("Recreating table with fresh schema")
-                    inner_table = None
-                    try:
-                        # Try to drop the table if the method exists
-                        if hasattr(conn, "drop_table"):
-                            conn.drop_table(self._collection_name)
-                        else:
-                            # Alternative: try to use delete all records instead
-                            inner_table = conn.open_table(self._collection_name)
-                            inner_table.delete()
-                    except Exception:
-                        # If drop fails, continue with recreation
-                        pass
-                    finally:
-                        _safe_close_table(inner_table)
-                    self._create_empty_table()
                     _safe_close_table(table)
+                    table = None
+                    # Migrate safely; on any failure the original table is left
+                    # intact and we surface an error WITHOUT dropping data.
+                    try:
+                        self._migrate_schema_mismatch(conn, record)
+                    except Exception as migrate_error:
+                        logger.error(
+                            "Safe schema migration failed; table left intact: %s",
+                            migrate_error,
+                        )
+                        return MemoryResponse(
+                            success=False,
+                            error=f"Failed to add memory: {migrate_error}",
+                            memory_id=data["id"],
+                        )
+                    # Retry the insert against the migrated schema.
                     table = conn.open_table(self._collection_name)
-
-                    # After recreating, check if we should include vector
-                    # Get current table schema
-                    df = table.search().limit(1).to_pandas()
-                    if not df.empty and "vector" not in df.columns:
-                        # New table doesn't have vector column, remove vector from record
-                        record_without_vector = {
-                            k: v for k, v in record.items() if k != "vector"
-                        }
-                        table.add([record_without_vector])
-                    else:
-                        table.add([record])
+                    self._insert_record(table, record)
             finally:
                 _safe_close_table(table)
 
