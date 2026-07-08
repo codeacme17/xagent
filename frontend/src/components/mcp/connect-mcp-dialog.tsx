@@ -50,6 +50,7 @@ import type { AppIntegration } from "./types"
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
+import { getRuntimeConfigError } from "./runtime-inputs-form"
 
 interface ConnectMcpDialogProps {
   open: boolean
@@ -102,6 +103,7 @@ export function ConnectMcpDialog({
     description: "",
     config: {} as Record<string, any>
   })
+  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
 
   const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
 
@@ -144,6 +146,7 @@ export function ConnectMcpDialog({
       setLocalSelectedServers(selectedMcpServers || [])
       setActiveTab("library")
       setEditingCustomServerId(null)
+      setRuntimeValidationError(null)
     }
   }, [open, t, selectedMcpServers])
 
@@ -166,7 +169,13 @@ export function ConnectMcpDialog({
 
     let payload = { ...mcpFormData };
     let url = "";
-    let method = editingCustomServerId ? 'PUT' : 'POST';
+    const method = editingCustomServerId ? 'PUT' : 'POST';
+    const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp";
+    const runtimeError = runtimeValidationError || getRuntimeConfigError(payload, connectorType);
+    if (runtimeError) {
+      toast.error(t(runtimeError));
+      return;
+    }
 
     if (payload.transport === "custom_api") {
       if (!mcpFormData.url?.trim()) {
@@ -435,7 +444,13 @@ export function ConnectMcpDialog({
 
   return (
     <>
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen)
+        if (!nextOpen) setRuntimeValidationError(null)
+      }}
+    >
       <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
         <DialogHeader className="px-6 py-4 border-b bg-white shrink-0 pr-10">
           <DialogTitle className="text-xl flex items-center gap-2 font-bold text-left">
@@ -457,6 +472,7 @@ export function ConnectMcpDialog({
                 className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-blue-600 data-[state=active]:text-blue-600 rounded-none h-full px-0 font-semibold flex items-center gap-2 text-slate-500"
                 onClick={() => {
                   setEditingCustomServerId(null)
+                  setRuntimeValidationError(null)
                   setMcpFormData({
                     name: "",
                     transport: "custom_api",
@@ -477,6 +493,7 @@ export function ConnectMcpDialog({
                     onConnectCustom()
                   } else {
                     setEditingCustomServerId(null)
+                    setRuntimeValidationError(null)
                     setMcpFormData({
                       name: "",
                       transport: "stdio",
@@ -756,6 +773,7 @@ export function ConnectMcpDialog({
                   setMcpFormData={setMcpFormData}
                   customApiEnv={customApiEnv}
                   setCustomApiEnv={setCustomApiEnv}
+                  onRuntimeValidationErrorChange={setRuntimeValidationError}
                   originalEnvObj={
                     editingCustomServerId
                       ? globalMcpServers.find(s => s.id === editingCustomServerId && s.transport === "custom_api")?.config?.env || {}
@@ -799,6 +817,7 @@ export function ConnectMcpDialog({
                     setMcpFormData={setMcpFormData}
                     serverId={editingCustomServerId}
                     onOAuthStatusChange={loadApps}
+                    onRuntimeValidationErrorChange={setRuntimeValidationError}
                   />
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
@@ -892,11 +911,15 @@ export function ConnectMcpDialog({
           if (appToConfigure.is_custom && appToConfigure.server) {
             setSelectedApp(null);
             setEditingCustomServerId(appToConfigure.server.id);
+            setRuntimeValidationError(null);
             setMcpFormData({
               name: appToConfigure.server.name,
               transport: appToConfigure.server.transport,
               description: appToConfigure.server.description || "",
-              config: appToConfigure.server.config || {}
+              config: appToConfigure.server.config || {},
+              runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+              runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+              allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
             });
             if (appToConfigure.server.transport === "custom_api") {
               const configObj = appToConfigure.server.config || {};
@@ -916,7 +939,10 @@ export function ConnectMcpDialog({
                 method: configObj.method || "GET",
                 headers: configObj.headers || {},
                 body: configObj.body || "",
-                config: configObj
+                config: configObj,
+                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
               });
             } else {
               setMcpFormData({
@@ -925,7 +951,10 @@ export function ConnectMcpDialog({
                 description: appToConfigure.server.description || "",
                 config: appToConfigure.server.config || {},
                 user_env: appToConfigure.server.user_env || {},
-                can_edit_global: appToConfigure.server.can_edit_global ?? true
+                can_edit_global: appToConfigure.server.can_edit_global ?? true,
+                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
               });
             }
             setActiveTab(appToConfigure.server.transport === "custom_api" ? "custom_api" : "custom");

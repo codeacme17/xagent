@@ -381,9 +381,22 @@ class FileStorageStartupSyncGateMiddleware:
 
 
 @app.get("/health")
-async def health_check() -> dict[str, str]:
-    """Health check endpoint for container probes."""
-    return {"status": "ok"}
+async def health_check() -> dict[str, Any]:
+    """Health check endpoint for container probes.
+
+    Active degraded-mode signals ride along for monitoring to alert on;
+    the status stays "ok" so probes keep passing while degraded. Only
+    signal names are exposed — /health is unauthenticated, and the detail
+    strings describe security-relevant misconfiguration; those stay in the
+    logs and the in-process registry.
+    """
+    from .services.ops_signals import active_degradations
+
+    payload: dict[str, Any] = {"status": "ok"}
+    degradations = active_degradations()
+    if degradations:
+        payload["degradations"] = sorted(degradations)
+    return payload
 
 
 @app.get("/ready")
@@ -611,6 +624,12 @@ async def startup_event() -> None:
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
 
     warn_if_rate_limits_are_per_process()
+
+    from .services.trigger_providers.gmail import (
+        warn_if_gmail_oidc_verification_degraded,
+    )
+
+    warn_if_gmail_oidc_verification_degraded()
 
     initialize_langfuse()
 

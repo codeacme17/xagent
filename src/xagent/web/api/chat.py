@@ -54,6 +54,10 @@ from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
 )
+from ..services.connector_runtime import (
+    bind_connector_runtime_selection_snapshot,
+    prepare_connector_runtime_selection_snapshot,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -475,6 +479,7 @@ async def create_default_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
     scope: Optional[ExecutionScope] = None,
+    connector_runtime_turn_id: Optional[str] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -538,6 +543,7 @@ async def create_default_tools(
         parent_task_id=parent_task_id,
         parent_tracer=parent_tracer,
         agent_call_stack=agent_call_stack,
+        connector_runtime_turn_id=connector_runtime_turn_id,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1279,6 +1285,7 @@ class AgentServiceManager:
             agent_call_stack=workforce_runtime.agent_call_stack
             if workforce_runtime
             else None,
+            connector_runtime_turn_id=None,
         )
 
     async def get_agent_for_task(
@@ -1288,6 +1295,7 @@ class AgentServiceManager:
         user: Optional[User] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
         task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
     ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
@@ -1455,6 +1463,7 @@ class AgentServiceManager:
                             title=f"Task {task_id}",
                             description="Auto-created task",
                             status=TaskStatus.PENDING,
+                            connector_runtime_selected_refs=[],
                         )
                         db.add(new_task)
                         db.commit()
@@ -1504,6 +1513,9 @@ class AgentServiceManager:
                         await self._load_persisted_execution_context(task_id, db)
                         self._agent_owner_ids[task_id] = runtime_user_id
                         self._agent_scope_fingerprints[task_id] = fingerprint
+                        self._sync_connector_runtime_turn(
+                            task_id, connector_runtime_turn_id
+                        )
                         return self._agents[task_id]
                     except HTTPException:
                         raise
@@ -1808,6 +1820,7 @@ class AgentServiceManager:
                     agent_call_stack=workforce_runtime.agent_call_stack
                     if workforce_runtime
                     else None,
+                    connector_runtime_turn_id=connector_runtime_turn_id,
                 )
 
                 with UserContext(runtime_user_id):
@@ -1945,7 +1958,52 @@ class AgentServiceManager:
 
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
+        self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         return self._agents[task_id]
+
+    def _sync_connector_runtime_turn(
+        self, task_id: int, connector_runtime_turn_id: Optional[str]
+    ) -> None:
+        if not connector_runtime_turn_id:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s: no turn id",
+                task_id,
+            )
+            return
+
+        agent = self._agents.get(task_id)
+        if agent is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: "
+                "agent is not cached",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        tool_config = agent.tool_config
+        if tool_config is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: "
+                "agent has no tool config",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        if tool_config.set_connector_runtime_turn_id(connector_runtime_turn_id):
+            logger.info(
+                "Refreshing connector runtime tools for task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            agent.invalidate_tools()
+        else:
+            logger.debug(
+                "Connector runtime tools already use task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
         """Remove AgentService instance for completed task"""
@@ -2766,6 +2824,14 @@ async def create_task(
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
             is_visible=False if request.is_preview else request.is_visible,
+        )
+        selected_refs = prepare_connector_runtime_selection_snapshot(
+            db=db,
+            agent=selected_agent,
+            connector_user_id=int(user.id),
+        )
+        bind_connector_runtime_selection_snapshot(
+            task=task, selected_refs=selected_refs
         )
 
         # Set agent_type using the property to avoid Column type issues

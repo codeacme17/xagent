@@ -14,12 +14,14 @@ persist messages, schedule bg, sync output) is delegated to
 by the WebSocket UI path so both transports share one state machine.
 """
 
-from typing import Tuple
+import logging
+from typing import Any, NoReturn, Tuple, cast
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...models.agent import Agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
@@ -32,6 +34,13 @@ from ...schemas.v1 import (
     PublicStep,
     StepsResponse,
     TaskInfoResponse,
+)
+from ...services.connector_runtime import (
+    persist_create_connector_runtime_context,
+    pop_ephemeral_runtime_values,
+    prepare_append_connector_runtime,
+    prepare_create_connector_runtime,
+    store_ephemeral_runtime_values,
 )
 from ...services.hot_path_cache import (
     cache_get,
@@ -53,6 +62,79 @@ from .deps import get_agent_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
+
+
+def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
+    try:
+        code = V1ErrorCode(exc.code)
+    except ValueError:
+        code = V1ErrorCode.INVALID_RUNTIME_CONTEXT
+    raise V1ApiError(
+        code,
+        exc.status_code,
+        message=exc.safe_message,
+        details=exc.to_public_error().get("details"),
+    ) from exc
+
+
+def _rollback_runtime_setup_mark_failure(db: Session, task_id: int) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "Failed to roll back task %s session after connector runtime setup error",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> None:
+    """Best-effort terminal mark after pre-schedule runtime setup fails."""
+
+    try:
+        db.rollback()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None:
+            orm_task = cast(Any, task)
+            orm_task.status = TaskStatus.FAILED
+            orm_task.error_message = _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE
+            db.commit()
+    except Exception:
+        _rollback_runtime_setup_mark_failure(db, task_id)
+        logger.warning(
+            "Failed to mark task %s failed after connector runtime setup error",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _store_connector_runtime_values_or_fail(
+    *,
+    db: Session,
+    task_id: int,
+    turn_id: str,
+    values_by_ref: dict,
+    mark_task_failed: bool,
+) -> None:
+    try:
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+    except Exception as exc:
+        pop_ephemeral_runtime_values(turn_id)
+        if mark_task_failed:
+            _mark_task_failed_after_runtime_setup_error(db, task_id)
+        logger.warning(
+            "Connector runtime setup failed for task %s turn %s",
+            task_id,
+            turn_id,
+        )
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            500,
+            message=_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE,
+        ) from exc
 
 
 @router.post(
@@ -122,10 +204,14 @@ async def create_chat_task(
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
-    # Record usage here (not in the shared auth dependency) so read-only
-    # status/steps polling below doesn't count as a "call" -- only actual
-    # task-creating/message-appending requests do.
-    record_key_usage(str(_key.key_prefix))
+    try:
+        runtime_plan = prepare_create_connector_runtime(
+            db=db,
+            agent=agent,
+            payload_items=request.connector_runtime_context,
+        )
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
 
     # title is what the web UI shows in its task list. Truncate to
     # 50 chars (matches the WS handler convention) so very long
@@ -150,8 +236,15 @@ async def create_chat_task(
         input=request.message.content,
         source="sdk",
         is_visible=False,
+        connector_runtime_selected_refs=[
+            ref.to_wire() for ref in runtime_plan.selected_refs
+        ],
     )
     db.add(task)
+    db.flush()
+    persist_create_connector_runtime_context(
+        db=db, task_id=int(task.id), plan=runtime_plan
+    )
     db.commit()
     db.refresh(task)
 
@@ -160,20 +253,38 @@ async def create_chat_task(
     # commit, and bg coroutine scheduling under a lease lifecycle.
     # A brand-new task shouldn't ever hit busy -- but we map it
     # anyway for defense.
+    payload = TaskTurnPayload(transcript_message=request.message.content)
+    _store_connector_runtime_values_or_fail(
+        db=db,
+        task_id=int(task.id),
+        turn_id=payload.turn_id,
+        values_by_ref=runtime_plan.ephemeral_by_ref,
+        mark_task_failed=True,
+    )
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             task_owner_user_id=int(agent.user_id),
             # SDK key resolves to the agent owner; actor == owner here.
             actor_user_id=int(agent.user_id),
-            payload=TaskTurnPayload(transcript_message=request.message.content),
+            payload=payload,
             kind=TurnKind.CREATE,
             force_fresh=False,
         )
     except TaskTurnNotFoundError:
+        pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError:
+        pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+    except Exception:
+        pop_ephemeral_runtime_values(payload.turn_id)
+        raise
+
+    # Record usage here (not in the shared auth dependency) so read-only
+    # status/steps polling below doesn't count as a "call". Runtime validation
+    # and turn claim have already accepted this as a real task invocation.
+    record_key_usage(str(_key.key_prefix))
 
     # ``status`` comes from the orchestrator's committed-row snapshot
     # (``started.status`` == RUNNING), NOT the caller's ``task`` object --
@@ -307,28 +418,51 @@ async def append_message_to_task(
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
-    # See the matching comment in create_chat_task: recorded here, not in
-    # the shared auth dependency, so status polling elsewhere never counts.
-    record_key_usage(str(_key.key_prefix))
+    try:
+        runtime_plan = prepare_append_connector_runtime(
+            db=db,
+            agent=agent,
+            task=task,
+            payload_items=request.connector_runtime_context,
+        )
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
 
     # Orchestrator does the atomic claim (status must be terminal --
     # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
+    payload = TaskTurnPayload(transcript_message=request.message.content)
+    _store_connector_runtime_values_or_fail(
+        db=db,
+        task_id=int(task.id),
+        turn_id=payload.turn_id,
+        values_by_ref=runtime_plan.ephemeral_by_ref,
+        mark_task_failed=False,
+    )
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             task_owner_user_id=int(agent.user_id),
             # SDK key resolves to the agent owner; actor == owner here.
             actor_user_id=int(agent.user_id),
-            payload=TaskTurnPayload(transcript_message=request.message.content),
+            payload=payload,
             kind=TurnKind.APPEND,
             force_fresh=False,
         )
     except TaskTurnNotFoundError:
+        pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError:
+        pop_ephemeral_runtime_values(payload.turn_id)
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+    except Exception:
+        pop_ephemeral_runtime_values(payload.turn_id)
+        raise
+
+    # See the matching comment in create_chat_task: recorded here, not in
+    # the shared auth dependency, so status polling elsewhere never counts.
+    record_key_usage(str(_key.key_prefix))
 
     # ``status`` / ``accepted_at`` come from the orchestrator's committed-row
     # snapshot (``started``), not a post-call ``db.refresh(task)``. The

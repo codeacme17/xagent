@@ -8,8 +8,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from xagent.core.utils.encryption import decrypt_value
+from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
@@ -19,6 +21,11 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.connector_runtime import (
+    ConnectorRuntimeValues,
+    load_connector_runtime_view,
+    set_connector_runtime_resolver_for_testing,
+)
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
 from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
@@ -76,6 +83,71 @@ def _connect_gmail_account(
         db.commit()
         db.refresh(account)
         return int(account.id)
+    finally:
+        db.close()
+
+
+def _install_runtime_mcp_connector(
+    agent_id: int,
+    *,
+    context_required: bool = True,
+    secret_required: bool = False,
+) -> int:
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        server_name = f"ShiftCare Trigger {agent_id}"
+        runtime_input_schema = {
+            "context": {
+                "account_id": {
+                    "type": "string",
+                    "required": context_required,
+                }
+            }
+        }
+        runtime_bindings = [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "mcp_meta", "key": "account_id"},
+            }
+        ]
+        if secret_required:
+            runtime_input_schema["secrets"] = {
+                "authorization": {"type": "string", "required": True}
+            }
+            runtime_bindings.append(
+                {
+                    "source": {"input_type": "secrets", "key": "authorization"},
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "Authorization",
+                    },
+                }
+            )
+        server = MCPServer(
+            name=server_name,
+            description="ShiftCare trigger MCP",
+            managed="external",
+            transport="streamable_http",
+            url="https://mcp.shiftcare.test",
+            runtime_input_schema=runtime_input_schema,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=secret_required,
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(agent.user_id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                can_edit=True,
+                is_active=True,
+            )
+        )
+        agent.tool_categories = [f"mcp:{server_name}"]
+        db.commit()
+        return int(server.id)
     finally:
         db.close()
 
@@ -674,7 +746,7 @@ def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
         return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -719,7 +791,7 @@ def test_enabling_existing_gmail_trigger_provisions_bound_mailbox(
         return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -765,7 +837,7 @@ def test_listing_triggers_reflects_background_provisioning_convergence(
         return TriggerProvisioningStatus.PENDING.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -837,12 +909,12 @@ def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
         return True
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
     monkeypatch.setattr(
-        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
         fake_release_gmail_mailbox_if_unused,
         raising=False,
     )
@@ -897,12 +969,12 @@ def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
         return True
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
     monkeypatch.setattr(
-        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
         fake_release_gmail_mailbox_if_unused,
         raising=False,
     )
@@ -928,6 +1000,92 @@ def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
     assert deleted.status_code == 200, deleted.text
     assert provisioned == [account_id]
     assert released == [account_id]
+
+
+def test_trigger_crud_dispatches_through_provider_protocol() -> None:
+    """CRUD reaches provisioning only via TriggerProvider.register/unregister.
+
+    A recording provider swapped into the registry observes every CRUD
+    provisioning dispatch, proving the paths hold no provider-specific
+    branches: create registers, a binding change unregisters the previous
+    config and registers the new one, delete unregisters.
+    """
+    from xagent.web.services.trigger_providers.registry import (
+        get_trigger_provider,
+        register_trigger_provider,
+    )
+    from xagent.web.services.trigger_providers.schemas import RegistrationResult
+
+    real = get_trigger_provider("gmail")
+    calls: list[tuple[str, int]] = []
+
+    class RecordingProvider:
+        name = "gmail"
+        ack_policy = real.ack_policy
+
+        def validate_config(self, config):
+            return real.validate_config(config)
+
+        async def register(self, db, trigger, config) -> RegistrationResult:
+            calls.append(("register", int(config["oauth_account_id"])))
+            setattr(
+                trigger,
+                "provisioning_status",
+                TriggerProvisioningStatus.ACTIVE.value,
+            )
+            db.add(trigger)
+            db.commit()
+            return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
+
+        async def unregister(self, db, trigger, config) -> None:
+            calls.append(("unregister", int(config["oauth_account_id"])))
+
+    register_trigger_provider(RecordingProvider(), replace=True)
+    try:
+        headers = _admin_headers()
+        agent_id = _create_agent(headers)
+        first_account_id = _connect_gmail_account(email="first@gmail.example")
+        second_account_id = _connect_gmail_account(email="second@gmail.example")
+
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "gmail",
+                "name": "Support inbox",
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": first_account_id,
+                },
+            },
+        )
+        assert created.status_code == 200, created.text
+        assert calls == [("register", first_account_id)]
+
+        patched = client.patch(
+            f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+            headers=headers,
+            json={
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": second_account_id,
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        assert calls[1:] == [
+            ("unregister", first_account_id),
+            ("register", second_account_id),
+        ]
+
+        deleted = client.delete(
+            f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+            headers=headers,
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert calls[3:] == [("unregister", second_account_id)]
+    finally:
+        register_trigger_provider(real, replace=True)
 
 
 def test_gmail_trigger_requires_watch_label() -> None:
@@ -1061,6 +1219,282 @@ def test_scheduled_scan_fires_due_trigger_and_advances_next_run(
         db.close()
 
     assert mock_bg_scheduler.call_count == 1
+
+
+def test_trigger_config_rejects_persisted_runtime_secrets() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Runtime secret schedule",
+            "config": {
+                "interval_seconds": 60,
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": 1,
+                        },
+                        "secrets": {"authorization": "Bearer delegated"},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert created.status_code == 400, created.text
+    assert (
+        created.json()["detail"] == "Runtime secret is not allowed for this entrypoint."
+    )
+
+
+def test_trigger_config_update_rejects_persisted_runtime_secrets() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Runtime context schedule",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    patched = client.patch(
+        f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+        headers=headers,
+        json={
+            "config": {
+                "interval_seconds": 60,
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": 1,
+                        },
+                        "auth_selector": {"resource_owner_key": "xagent:user:1"},
+                    }
+                ],
+            }
+        },
+    )
+
+    assert patched.status_code == 400, patched.text
+    assert (
+        patched.json()["detail"] == "Runtime secret is not allowed for this entrypoint."
+    )
+
+
+def test_scheduled_scan_persists_connector_runtime_context() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    server_id = _install_runtime_mcp_connector(agent_id)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Tenant scoped schedule",
+            "config": {
+                "interval_seconds": 60,
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "context": {"account_id": "6185"},
+                    }
+                ],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        db.add(trigger)
+        db.commit()
+
+        runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        assert len(runs) == 1
+        run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+        assert run.status == TriggerRunStatus.PENDING.value
+        assert run.task_id is not None
+        task = db.query(Task).filter(Task.id == run.task_id).one()
+        assert task.connector_runtime_selected_refs == [
+            {"connector_type": "mcp", "connector_id": server_id}
+        ]
+        context_row = (
+            db.query(TaskConnectorRuntimeContext)
+            .filter(TaskConnectorRuntimeContext.task_id == run.task_id)
+            .one()
+        )
+        assert context_row.connector_type == "mcp"
+        assert context_row.connector_id == server_id
+        assert context_row.context == {"account_id": "6185"}
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _install_runtime_mcp_connector(
+        agent_id,
+        context_required=False,
+        secret_required=True,
+    )
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "scheduled",
+            "name": "Missing delegated token",
+            "config": {"interval_seconds": 60},
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = created.json()["id"]
+
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        db.add(trigger)
+        db.commit()
+
+        runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+        assert len(runs) == 1
+        run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+        assert run.status == TriggerRunStatus.FAILED.value
+        assert run.task_id is None
+        assert "scheduled_secret_unavailable" in str(run.error_message)
+    finally:
+        db.close()
+
+
+def test_scheduled_scan_allows_resolver_to_supply_required_runtime_secret() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        context_required=False,
+        secret_required=True,
+    )
+
+    def resolver(_request):
+        return ConnectorRuntimeValues(
+            context={},
+            secrets={"authorization": "Bearer fresh"},
+            auth_selector={},
+        )
+
+    set_connector_runtime_resolver_for_testing(resolver)
+    try:
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "scheduled",
+                "name": "Resolver delegated token",
+                "config": {"interval_seconds": 60},
+            },
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = created.json()["id"]
+
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            db.add(trigger)
+            db.commit()
+
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+            assert len(runs) == 1
+            run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+            assert run.status == TriggerRunStatus.PENDING.value
+            assert run.task_id is not None
+            task = db.query(Task).filter(Task.id == run.task_id).one()
+            assert task.connector_runtime_selected_refs == [
+                {"connector_type": "mcp", "connector_id": server_id}
+            ]
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+
+def test_scheduled_runtime_view_reports_scheduled_secret_when_resolver_omits_secret() -> (
+    None
+):
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        context_required=False,
+        secret_required=True,
+    )
+
+    def resolver(_request):
+        return None
+
+    set_connector_runtime_resolver_for_testing(resolver)
+    try:
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "scheduled",
+                "name": "Resolver missing delegated token",
+                "config": {"interval_seconds": 60},
+            },
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = created.json()["id"]
+
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            db.add(trigger)
+            db.commit()
+
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+            assert len(runs) == 1
+            run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+            assert run.status == TriggerRunStatus.PENDING.value
+            assert run.task_id is not None
+            task = db.query(Task).filter(Task.id == run.task_id).one()
+
+            with pytest.raises(Exception) as exc_info:
+                load_connector_runtime_view(
+                    db=db,
+                    task_id=int(task.id),
+                    turn_id="scheduled-turn",
+                    user_id=int(task.user_id),
+                )
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert getattr(exc_info.value, "code", None) == "scheduled_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "not_provided"
+    assert getattr(exc_info.value, "details", {}).get("connector_ref") == {
+        "connector_type": "mcp",
+        "connector_id": server_id,
+    }
 
 
 def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:

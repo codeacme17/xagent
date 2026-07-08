@@ -891,12 +891,14 @@ def _add_file_link_aliases(
     if not normalized_relative_path:
         return
 
-    path_to_file_id[normalized_relative_path] = file_id
-    path_to_file_id[f"/{normalized_relative_path}"] = file_id
-    path_to_file_id[f"preview/{normalized_relative_path}"] = file_id
-    path_to_file_id[f"/preview/{normalized_relative_path}"] = file_id
-    path_to_file_id[f"uploads/{normalized_relative_path}"] = file_id
-    path_to_file_id[f"/uploads/{normalized_relative_path}"] = file_id
+    for prefix in ("", "/", "preview/", "/preview/", "uploads/", "/uploads/"):
+        _set_file_link_alias(
+            path_to_file_id, f"{prefix}{normalized_relative_path}", file_id
+        )
+
+    basename = Path(normalized_relative_path).name
+    if basename and basename != normalized_relative_path:
+        _set_file_link_alias(path_to_file_id, basename, file_id)
 
     parts = Path(normalized_relative_path).parts
     task_local_parts: tuple[str, ...] = ()
@@ -916,8 +918,24 @@ def _add_file_link_aliases(
 
     if task_local_parts and task_local_parts[0] in {"input", "output", "temp"}:
         task_local_path = "/".join(task_local_parts)
-        path_to_file_id[task_local_path] = file_id
-        path_to_file_id[f"/{task_local_path}"] = file_id
+        _set_file_link_alias(path_to_file_id, task_local_path, file_id)
+        _set_file_link_alias(path_to_file_id, f"/{task_local_path}", file_id)
+
+
+def _set_file_link_alias(
+    path_to_file_id: Dict[str, str], alias: str, file_id: str
+) -> None:
+    existing_file_id = path_to_file_id.get(alias)
+    if existing_file_id is None or existing_file_id == file_id:
+        path_to_file_id[alias] = file_id
+        return
+
+    # A bare ``file:report.txt`` link is ambiguous when multiple outputs can
+    # claim the same alias. Keep scoped aliases but disable ambiguous rewriting
+    # so we never point the user at the wrong artifact. The empty string is a
+    # sticky sentinel for this alias: once ambiguous, later registrations cannot
+    # reclaim it for a single file.
+    path_to_file_id[alias] = ""
 
 
 def _uploaded_file_record_in_task_scope(
@@ -1040,12 +1058,14 @@ def _normalize_file_outputs(
         for raw_path in raw_paths:
             stripped = raw_path.strip()
             if stripped:
-                path_to_file_id[stripped] = final_file_id
-                path_to_file_id[stripped.lstrip("/")] = final_file_id
+                _set_file_link_alias(path_to_file_id, stripped, final_file_id)
+                _set_file_link_alias(
+                    path_to_file_id, stripped.lstrip("/"), final_file_id
+                )
 
         storage_path = getattr(file_record, "storage_path", None)
         if storage_path:
-            path_to_file_id[str(storage_path)] = final_file_id
+            _set_file_link_alias(path_to_file_id, str(storage_path), final_file_id)
 
         workspace_relative_path = getattr(file_record, "workspace_relative_path", None)
         if isinstance(workspace_relative_path, str) and workspace_relative_path.strip():
@@ -1229,12 +1249,11 @@ def _normalize_file_outputs(
 
         if workspace_relative_path != normalized_relative_path:
             final_file_id = str(file_record.file_id)
-            path_to_file_id[workspace_relative_path] = final_file_id
-            path_to_file_id[f"/{workspace_relative_path}"] = final_file_id
-            path_to_file_id[f"preview/{workspace_relative_path}"] = final_file_id
-            path_to_file_id[f"/preview/{workspace_relative_path}"] = final_file_id
-            path_to_file_id[f"uploads/{workspace_relative_path}"] = final_file_id
-            path_to_file_id[f"/uploads/{workspace_relative_path}"] = final_file_id
+            _add_file_link_aliases(
+                path_to_file_id,
+                workspace_relative_path,
+                final_file_id,
+            )
 
     if changed:
         db.commit()
@@ -1304,7 +1323,7 @@ def _task_user_id(task: Any) -> int | None:
 async def execute_task_background(
     task_id: int,
     user_message: str,
-    context: Dict[str, Any],
+    context: Dict[str, Any] | None,
     agent_manager: Any,
     task_owner_user_id: int | None,
     before_message_id: int | None = None,
@@ -1344,6 +1363,7 @@ async def execute_task_background(
     db_gen = get_db()
     try:
         db = next(db_gen)
+        context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
 
         task_user_id: Optional[int]
@@ -1394,6 +1414,9 @@ async def execute_task_background(
                 user=user,
                 task_setup_snapshot=task_setup_snapshot,
                 task_owner_user_id=effective_user_id,
+                connector_runtime_turn_id=context_dict.get("turn_id")
+                if isinstance(context_dict.get("turn_id"), str)
+                else None,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
@@ -1414,7 +1437,7 @@ async def execute_task_background(
             )
             _register_uploaded_files_for_agent(
                 agent_service,
-                context.get("file_info", []),
+                context_dict.get("file_info", []),
                 db,
             )
 
@@ -2579,6 +2602,7 @@ async def handle_chat_message(
                             description=user_message,
                             status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
                             execution_mode=get_default_task_execution_mode(),
+                            connector_runtime_selected_refs=[],
                         )
                         db.add(task)
                         db.commit()

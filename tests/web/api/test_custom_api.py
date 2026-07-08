@@ -36,6 +36,21 @@ def test_custom_api_models_env_validation():
     api_update = CustomApiUpdate(name="test", env={})
     assert api_update.env == {}
 
+    runtime_api = CustomApiCreate(
+        name="runtime",
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+    )
+    assert runtime_api.runtime_input_schema == {
+        "context": {"account_id": {"type": "string"}}
+    }
+    assert runtime_api.runtime_bindings is not None
+
 
 def test_process_env_vars():
     with patch(
@@ -90,7 +105,17 @@ async def test_create_custom_api():
     user = User(id=1)
 
     api_data = CustomApiCreate(
-        name="new_api", description="desc", env={"k1": "v1"}, is_active=True
+        name="new_api",
+        description="desc",
+        env={"k1": "v1"},
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+        is_active=True,
     )
 
     # Mock no existing api
@@ -127,6 +152,15 @@ async def test_create_custom_api():
 
         assert res.name == "new_api"
         assert res.env == {"k1": "********"}  # Response should mask env
+        assert res.runtime_input_schema == {
+            "context": {"account_id": {"type": "string"}}
+        }
+        assert res.runtime_bindings == [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ]
         db.add.assert_called()
         db.commit.assert_called()
 
@@ -144,6 +178,30 @@ async def test_create_custom_api_duplicate_name():
     with pytest.raises(HTTPException) as exc_info:
         await create_custom_api(api_data, current_user=user, db=db)
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_custom_api_rejects_runtime_static_header_conflict():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+    api_data = CustomApiCreate(
+        name="runtime_api",
+        headers={"X-Account-ID": "static"},
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+    )
+    db.query().filter().first.return_value = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_custom_api(api_data, current_user=user, db=db)
+
+    assert exc_info.value.status_code == 400
+    assert "Invalid runtime configuration" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
@@ -189,6 +247,8 @@ async def test_update_custom_api():
         id=10,
         name="old_name",
         env={"k1": "enc_old1"},
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[],
         created_at=datetime.now(),
         updated_at=datetime.now(),
     )
@@ -205,7 +265,16 @@ async def test_update_custom_api():
     # Return None for existing name check
     db.query().filter().first.side_effect = [mock_user_api, None]
 
-    api_data = CustomApiUpdate(name="new_name", env={"k1": "********", "k2": "v2"})
+    api_data = CustomApiUpdate(
+        name="new_name",
+        env={"k1": "********", "k2": "v2"},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+    )
 
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
@@ -214,7 +283,59 @@ async def test_update_custom_api():
 
         assert mock_api.name == "new_name"
         assert mock_api.env == {"k1": "enc_old1", "k2": "enc_v2"}
+        assert mock_api.runtime_input_schema == {
+            "context": {"account_id": {"type": "string"}}
+        }
+        assert mock_api.runtime_bindings == [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ]
         db.commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_update_custom_api_explicit_null_clears_runtime_config():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+
+    mock_api = CustomApi(
+        id=10,
+        name="old_name",
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+        allow_delegated_authorization=True,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    mock_user_api = UserCustomApi(
+        user_id=1,
+        custom_api_id=10,
+        can_edit=True,
+        is_active=True,
+        is_default=False,
+        custom_api=mock_api,
+    )
+    db.query().filter().first.return_value = mock_user_api
+
+    api_data = CustomApiUpdate(
+        runtime_input_schema=None,
+        runtime_bindings=None,
+        allow_delegated_authorization=False,
+    )
+
+    await update_custom_api(10, api_data, current_user=user, db=db)
+
+    assert mock_api.runtime_input_schema is None
+    assert mock_api.runtime_bindings is None
+    assert mock_api.allow_delegated_authorization is False
+    db.commit.assert_called()
 
 
 @pytest.mark.asyncio
