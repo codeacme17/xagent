@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
@@ -362,4 +363,63 @@ async def test_sandbox_unavailability_keeps_local_fallback(
     )
 
     assert sandbox is None
+    assert 1 not in manager._agent_sandbox_keys
+
+
+_SCOPE = ExecutionScope(
+    sandbox_key_suffix="client-3",
+    workspace_segments=("clients", "3", "end_users", "7"),
+)
+
+
+@pytest.mark.asyncio
+async def test_scoped_capacity_error_rejects_even_when_fallback_enabled(
+    sandbox_mgr, monkeypatch
+) -> None:
+    """A scoped task never takes the local fallback, even with the flag on.
+
+    Local fallback would run an isolated/untrusted scoped workload outside its
+    container, so capacity exhaustion must fail closed regardless of the flag.
+    """
+    monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=SandboxCapacityError(cap=2, in_use=2)
+    )
+
+    with pytest.raises(SandboxCapacityError):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            workspace_config={},
+            scope=_SCOPE,
+        )
+
+    assert 1 not in manager._agent_sandbox_keys
+
+
+@pytest.mark.asyncio
+async def test_scoped_sandbox_unavailability_fails_closed(
+    sandbox_mgr, monkeypatch
+) -> None:
+    """A non-capacity sandbox failure fails closed for a scoped task.
+
+    Unscoped tasks keep the local fallback (see
+    test_sandbox_unavailability_keeps_local_fallback); a scoped task must not
+    silently run its workload on the host during a sandbox outage.
+    """
+    monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
+        side_effect=RuntimeError("docker daemon unreachable")
+    )
+
+    with pytest.raises(RuntimeError):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            workspace_config={},
+            scope=_SCOPE,
+        )
+
     assert 1 not in manager._agent_sandbox_keys
