@@ -291,8 +291,6 @@ def test_list_all_with_date_filters(memory_store):
     """Test listing memories with date range filters."""
     from datetime import datetime, timedelta
 
-    import pytest
-
     # Add memories with different timestamps
     now = datetime.now()
     old_time = now - timedelta(days=1)
@@ -300,21 +298,8 @@ def test_list_all_with_date_filters(memory_store):
     old_memory = MemoryNote(content="Old memory", category="test", timestamp=old_time)
     recent_memory = MemoryNote(content="Recent memory", category="test", timestamp=now)
 
-    # Add memories - may fail due to schema issues
-    memory_store.add(old_memory)
-    memory_store.add(recent_memory)
-
-    # Check if memories were actually added by checking total count
-    initial_stats = memory_store.get_stats()
-    initial_count = initial_stats.get("total_count", 0)
-
-    # Skip test if we're seeing schema issues (indicated by no change in count)
-    # This is a workaround for LanceDB reporting success but not actually storing
-    final_stats = memory_store.get_stats()
-    final_count = final_stats.get("total_count", 0)
-
-    if final_count <= initial_count:
-        pytest.skip("LanceDB schema issues prevent adding test memories")
+    assert memory_store.add(old_memory).success
+    assert memory_store.add(recent_memory).success
 
     # Test date_from filter
     results = memory_store.list_all(filters={"date_from": now})
@@ -329,18 +314,48 @@ def test_list_all_with_date_filters(memory_store):
 
 def test_list_all_with_tag_filters(memory_store):
     """Test listing memories with tag filters."""
-    import pytest
+    assert memory_store.add(
+        MemoryNote(content="Work task", tags=["work", "urgent"])
+    ).success
+    assert memory_store.add(
+        MemoryNote(content="Personal note", tags=["personal"])
+    ).success
+    assert memory_store.add(
+        MemoryNote(content="Another work item", tags=["work"])
+    ).success
 
-    # Skip test due to persistent LanceDB schema issues
-    pytest.skip("LanceDB schema issues prevent adding test memories")
+    # Notes carrying the "work" tag
+    results = memory_store.list_all(filters={"tags": ["work"]})
+    assert len(results) == 2
+    assert all("work" in r.tags for r in results)
+
+    # A note must carry all requested tags
+    results = memory_store.list_all(filters={"tags": ["work", "urgent"]})
+    assert len(results) == 1
+    assert all({"work", "urgent"} <= set(r.tags) for r in results)
 
 
 def test_list_all_with_keyword_filters(memory_store):
     """Test listing memories with keyword filters."""
-    import pytest
+    assert memory_store.add(
+        MemoryNote(content="AI in Python", keywords=["python", "ai"])
+    ).success
+    assert memory_store.add(
+        MemoryNote(content="Cooking recipe", keywords=["cooking"])
+    ).success
+    assert memory_store.add(
+        MemoryNote(content="Python tips", keywords=["python"])
+    ).success
 
-    # Skip test due to persistent LanceDB schema issues
-    pytest.skip("LanceDB schema issues prevent adding test memories")
+    # Notes carrying the "python" keyword
+    results = memory_store.list_all(filters={"keywords": ["python"]})
+    assert len(results) == 2
+    assert all("python" in r.keywords for r in results)
+
+    # A note must carry all requested keywords
+    results = memory_store.list_all(filters={"keywords": ["python", "ai"]})
+    assert len(results) == 1
+    assert all({"python", "ai"} <= set(r.keywords) for r in results)
 
 
 def test_embedding_fallback(memory_store):

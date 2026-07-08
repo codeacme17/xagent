@@ -82,43 +82,41 @@ class LanceDBMemoryStore(MemoryStore):
         self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
-        """Ensure the table has the correct schema for memory storage."""
+        """Ensure the table has the correct schema for memory storage.
+
+        If the table is missing a required column, migrate it in place
+        (preserving all rows) instead of dropping and recreating it. This path
+        runs on every store construction, so a wipe here would destroy data with
+        no write in flight. On any migration failure the original table is left
+        intact and the error propagates; we never fall back to a wipe.
+        """
+        conn = self._vector_store.get_raw_connection()
+
+        # Determine whether the table already exists and read its columns.
         table = None
         try:
-            conn = self._vector_store.get_raw_connection()
             table = conn.open_table(self._collection_name)
-
-            # Check if table exists and has basic structure
-            df = table.search().limit(1).to_pandas()
-
-            # Table exists, check if it has required columns
-            if not all(col in df.columns for col in ["id", "text", "metadata"]):
-                # Schema is incompatible, drop and recreate
-                logger.warning(
-                    f"Table {self._collection_name} has incompatible schema, recreating"
-                )
-                inner_table = None
-                try:
-                    # Try to drop the table if the method exists
-                    if hasattr(conn, "drop_table"):
-                        conn.drop_table(self._collection_name)
-                    else:
-                        # Alternative: try to use delete all records instead
-                        inner_table = conn.open_table(self._collection_name)
-                        inner_table.delete()
-                except Exception:
-                    # If drop fails, continue with recreation
-                    pass
-                finally:
-                    _safe_close_table(inner_table)
-                self._create_empty_table()
-
+            column_names = set(table.schema.names)
         except Exception:
-            # Table doesn't exist, create it with basic schema
+            # Table doesn't exist yet, create it with the basic schema.
             logger.info(f"Creating table {self._collection_name} with basic schema")
             self._create_empty_table()
+            return
         finally:
             _safe_close_table(table)
+
+        # Table exists. Init's trigger is a missing required non-vector column;
+        # a vector-dimension mismatch is detected and migrated lazily on the
+        # add() path instead. Route the resolution through the shared classifier
+        # and transform-then-swap primitive so we migrate rather than wipe.
+        if not {"id", "text", "metadata"} <= column_names:
+            logger.warning(
+                f"Table {self._collection_name} has incompatible schema, "
+                "migrating in place"
+            )
+            self._resolve_schema_mismatch(
+                conn, self._current_embedding_dim(), raise_when_compatible=False
+            )
 
     def _create_empty_table(self) -> None:
         """Create an empty table with the correct schema."""
@@ -265,27 +263,26 @@ class LanceDBMemoryStore(MemoryStore):
         finally:
             _safe_close_table(table)
 
-    def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
-        """Resolve a schema mismatch safely, routing through the 792-01 classifier.
+    def _resolve_schema_mismatch(
+        self, conn: Any, expected_dim: Optional[int], *, raise_when_compatible: bool
+    ) -> None:
+        """Classify and safely resolve a schema mismatch (shared by add/init).
 
         Missing non-vector columns are backfilled in place; a vector
         dimension/presence change rebuilds the table via transform-then-swap.
         On any failure the original table is left intact and the error
         propagates; no path drops or empties the table.
+
+        When the schema is classified compatible, ``raise_when_compatible``
+        controls behavior: the ``add()`` path passes ``True`` (its insert failed,
+        so a compatible schema means an unexpected error to surface rather than
+        silently drop); the init path passes ``False`` (nothing to migrate).
         """
         table = conn.open_table(self._collection_name)
         try:
             schema = table.schema
         finally:
             _safe_close_table(table)
-
-        # The dimension we are trying to store now determines the target schema.
-        if record.get("vector"):
-            expected_dim: Optional[int] = len(record["vector"])
-        elif self._embedding_model:
-            expected_dim = self._current_embedding_dim()
-        else:
-            expected_dim = None
 
         mismatch = classify_memory_schema_mismatch(schema, expected_dim)
 
@@ -298,12 +295,24 @@ class LanceDBMemoryStore(MemoryStore):
                 self._collection_name,
                 lambda existing: self._build_migrated_table(existing, target_dim),
             )
-        else:
+        elif raise_when_compatible:
             # add() failed but the schema looks compatible: do NOT drop the
             # table. Surface the original failure to the caller.
             raise RuntimeError(
                 "add() failed but no resolvable schema mismatch was detected"
             )
+
+    def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
+        """Resolve the schema mismatch that made an ``add()`` insert fail."""
+        # The dimension we are trying to store now determines the target schema.
+        if record.get("vector"):
+            expected_dim: Optional[int] = len(record["vector"])
+        elif self._embedding_model:
+            expected_dim = self._current_embedding_dim()
+        else:
+            expected_dim = None
+
+        self._resolve_schema_mismatch(conn, expected_dim, raise_when_compatible=True)
 
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
         """Insert a record, adapting it to the (possibly migrated) table schema."""
@@ -676,11 +685,43 @@ class LanceDBMemoryStore(MemoryStore):
         except Exception as e:
             logger.error(f"Failed to clear memory store: {e}")
 
+    _LIST_SPECIAL_FILTERS = frozenset(
+        {"category", "date_from", "date_to", "tags", "keywords"}
+    )
+
+    def _note_matches_list_filters(
+        self, note: MemoryNote, filters: dict[str, Any]
+    ) -> bool:
+        """Apply list_all filter semantics to a note (mirrors InMemoryStore)."""
+        if "category" in filters and note.category != filters["category"]:
+            return False
+        if "date_from" in filters and note.timestamp < filters["date_from"]:
+            return False
+        if "date_to" in filters and note.timestamp > filters["date_to"]:
+            return False
+        if "tags" in filters and not all(tag in note.tags for tag in filters["tags"]):
+            return False
+        if "keywords" in filters and not all(
+            keyword in note.keywords for keyword in filters["keywords"]
+        ):
+            return False
+        # Remaining keys are direct metadata equality checks.
+        other = {
+            k: v for k, v in filters.items() if k not in self._LIST_SPECIAL_FILTERS
+        }
+        if other and not all(note.metadata.get(k) == v for k, v in other.items()):
+            return False
+        return True
+
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
         """List all memory notes with optional filtering."""
         try:
-            # Use empty query to get all results
-            return self.search(query="", k=10000, filters=filters or {})
+            # Fetch every note (empty query), then apply list-level filters such
+            # as category, date range, tags and keywords in Python.
+            notes = self.search(query="", k=10000)
+            if not filters:
+                return notes
+            return [n for n in notes if self._note_matches_list_filters(n, filters)]
         except Exception as e:
             logger.error(f"Failed to list all memories: {e}")
             return []

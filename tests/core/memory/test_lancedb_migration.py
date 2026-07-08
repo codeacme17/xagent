@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 
+import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
 import pytest
 
@@ -180,3 +181,75 @@ def test_build_migrated_table_reembeds_at_target_dim(temp_db_dir):
 
     assert migrated.column("vector").type.list_size == 128
     assert migrated.num_rows == 2
+
+
+def _seed_table_missing_metadata(temp_db_dir, name="mem"):
+    """Create a table with id/text/vector but no metadata column."""
+    conn = lancedb.connect(temp_db_dir)
+    table = conn.create_table(
+        name,
+        data=pa.table(
+            {
+                "id": ["a"],
+                "text": ["alpha"],
+                "vector": pa.array([[0.1] * 64], pa.list_(pa.float32(), 64)),
+            }
+        ),
+    )
+    _safe_close_table(table)
+
+
+def test_init_backfills_missing_column_without_wipe(temp_db_dir):
+    """Store init migrates a table missing a required column, preserving rows."""
+    _seed_table_missing_metadata(temp_db_dir)
+
+    # Constructing the store runs _ensure_table_schema, which must migrate.
+    store = _store(temp_db_dir, MockEmbedding(64))
+
+    conn = store._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    try:
+        arrow = table.to_arrow()
+    finally:
+        _safe_close_table(table)
+    assert "metadata" in arrow.schema.names
+    assert arrow.column("id").to_pylist() == ["a"]
+
+
+def test_init_does_not_wipe_on_dimension_change(temp_db_dir):
+    """Constructing a store over a different-dimension table preserves rows."""
+    store_a = _store(temp_db_dir, MockEmbedding(64))
+    added = store_a.add(MemoryNote(content="alpha"))
+    assert added.success
+
+    # A store at a different embedding dimension must not wipe on init; the
+    # dimension mismatch is migrated lazily on the add() path instead.
+    store_b = _store(temp_db_dir, MockEmbedding(128))
+    conn = store_b._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    try:
+        ids = table.to_arrow().column("id").to_pylist()
+    finally:
+        _safe_close_table(table)
+    assert added.memory_id in ids
+
+
+def test_init_migration_failure_leaves_table_intact(temp_db_dir):
+    """If init migration fails, the original table is left intact (no wipe)."""
+    _seed_table_missing_metadata(temp_db_dir)
+
+    # Missing metadata + a vector-dimension change whose batched re-embed fails
+    # forces a rebuild that aborts; init must surface the error, not wipe.
+    with pytest.raises(Exception):
+        _store(temp_db_dir, BatchFailEmbedding(128))
+
+    conn = lancedb.connect(temp_db_dir)
+    table = conn.open_table("mem")
+    try:
+        arrow = table.to_arrow()
+    finally:
+        _safe_close_table(table)
+    assert arrow.column("id").to_pylist() == ["a"]
+    # The vector column was not rebuilt; the table is untouched.
+    assert "vector" in arrow.schema.names
+    assert "metadata" not in arrow.schema.names
