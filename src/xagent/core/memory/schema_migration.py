@@ -30,6 +30,7 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 import pyarrow as pa  # type: ignore
+from lancedb.db import DBConnection
 
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
@@ -142,7 +143,7 @@ def classify_memory_schema_mismatch(
 
 
 def migrate_table_swap(
-    conn: object,
+    conn: DBConnection,
     table_name: str,
     transform: Callable[[Any], Any],
 ) -> None:
@@ -168,7 +169,7 @@ def migrate_table_swap(
         Exception: Any error raised while reading or transforming is propagated
             unchanged; the original table is left intact.
     """
-    table = conn.open_table(table_name)  # type: ignore[attr-defined]
+    table = conn.open_table(table_name)
     try:
         existing = table.to_arrow()
     finally:
@@ -185,9 +186,7 @@ def migrate_table_swap(
     # Replace the table atomically. mode="overwrite" commits a new table version
     # in a single transaction: if it fails, the previous version and its rows
     # remain intact. We never fall back to drop_table on error.
-    new_table = conn.create_table(  # type: ignore[attr-defined]
-        table_name, data=migrated, mode="overwrite"
-    )
+    new_table = conn.create_table(table_name, data=migrated, mode="overwrite")
     _safe_close_table(new_table)
     logger.info(
         "Migrated memory table '%s' via transform-then-swap (%d rows)",
