@@ -29,6 +29,13 @@ class UserIsolatedMemoryStore(MemoryStore):
     over rows already fetched from the vector search, so a strict search may
     return fewer than ``k`` results.
 
+    The by-id methods (``get``/``update``/``delete``) enforce the same scope
+    dimensions as ``search``/``list_all`` (see ``_scope_permits``), so a
+    caller cannot read, modify, or delete another scope's note by id even
+    when both notes share a ``user_id``. A mismatch returns the combined
+    "not found or access denied" response, indistinguishable from a genuine
+    miss.
+
     Scope is a cooperative namespace, not a security boundary: ``user_id``
     remains the only access-control key.
     """
@@ -95,6 +102,49 @@ class UserIsolatedMemoryStore(MemoryStore):
             if not metadata_carries_scope_dimensions(note.metadata)
         ]
 
+    @staticmethod
+    def _scope_gates_by_id_access() -> bool:
+        """Whether the active scope constrains by-id (get/update/delete)
+        access. An unscoped or empty non-strict scope gates nothing, so the
+        by-id path stays byte-for-byte unchanged when no scope is active."""
+        scope: Optional[ExecutionScope] = get_execution_scope()
+        if scope is None:
+            return False
+        return bool(scope.memory_dimensions) or scope.strict_memory_isolation
+
+    @staticmethod
+    def _scope_permits(note: MemoryNote) -> bool:
+        """Whether the active scope may touch ``note`` by id, mirroring the
+        equality-filter semantics of ``search``/``add``/``list_all``:
+
+        - a scoped caller (non-empty ``memory_dimensions``) matches only a
+          note carrying all of its dimension stamps;
+        - a dimension-less caller under ``strict_memory_isolation`` cannot
+          touch a scope-stamped note (mirrors ``_apply_strict_isolation``);
+        - unscoped / dimension-less non-strict callers keep one-way
+          visibility (access allowed).
+        """
+        scope: Optional[ExecutionScope] = get_execution_scope()
+        dimension_metadata = memory_dimension_metadata(scope)
+        if dimension_metadata:
+            return all(
+                note.metadata.get(key) == value
+                for key, value in dimension_metadata.items()
+            )
+        if scope is not None and scope.strict_memory_isolation:
+            return not metadata_carries_scope_dimensions(note.metadata)
+        return True
+
+    @staticmethod
+    def _not_found_or_denied(note_id: str) -> MemoryResponse:
+        """Combined miss/denial response: a scope or ownership mismatch is
+        indistinguishable from a genuine miss."""
+        return MemoryResponse(
+            success=False,
+            error="Memory note not found or access denied",
+            memory_id=note_id,
+        )
+
     def add(self, note: MemoryNote) -> MemoryResponse:
         """
         Add a memory note with user isolation.
@@ -132,11 +182,11 @@ class UserIsolatedMemoryStore(MemoryStore):
             # Check if the note belongs to the user
             user_id = self._get_current_user_id()
             if user_id is not None and note.metadata.get("user_id") != user_id:
-                return MemoryResponse(
-                    success=False,
-                    error="Memory note not found or access denied",
-                    memory_id=note_id,
-                )
+                return self._not_found_or_denied(note_id)
+            # Enforce the active scope's dimensions on the by-id path too
+            # (mirrors search/list_all). No-op when unscoped.
+            if not self._scope_permits(note):
+                return self._not_found_or_denied(note_id)
 
         return response
 
@@ -150,9 +200,11 @@ class UserIsolatedMemoryStore(MemoryStore):
         Returns:
             Memory response
         """
-        # First verify ownership
+        # First verify ownership and scope access. get() enforces both;
+        # call it whenever a user or a gating scope is present. When fully
+        # unscoped with no user context, the original no-check path is kept.
         user_id = self._get_current_user_id()
-        if user_id is not None and note.id:
+        if note.id and (user_id is not None or self._scope_gates_by_id_access()):
             existing_response = self.get(note.id)
             if not existing_response.success:
                 return existing_response
@@ -173,9 +225,10 @@ class UserIsolatedMemoryStore(MemoryStore):
         Returns:
             Memory response
         """
-        # First verify ownership
+        # First verify ownership and scope access (see update()). Unscoped
+        # with no user context keeps the original no-check path.
         user_id = self._get_current_user_id()
-        if user_id is not None:
+        if user_id is not None or self._scope_gates_by_id_access():
             existing_response = self.get(note_id)
             if not existing_response.success:
                 return existing_response

@@ -234,3 +234,89 @@ class TestResolverPathAndNestedReactivation:
             assert {n.id for n in store.search("nested")} == {nested_note.id}
         with UserContext(1), ExecutionScopeContext(SCOPE_B):
             assert store.search("nested") == []
+
+
+_DENIED = "Memory note not found or access denied"
+
+
+class TestScopedByIdAccess:
+    """get/update/delete enforce the active scope's dimensions, mirroring
+    search/list_all — a scoped caller cannot read, modify, or delete another
+    scope's note by id even under a shared user_id (#80 review point 4). A
+    mismatch is indistinguishable from a genuine miss."""
+
+    @staticmethod
+    def _note_in(store, scope, content):
+        with UserContext(1), ExecutionScopeContext(scope):
+            return _add(store, content)
+
+    def test_get_denied_across_dimensions(self, store):
+        note_b = self._note_in(store, SCOPE_B, "b note")
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            resp = store.get(note_b.id)
+        assert resp.success is False
+        assert resp.error == _DENIED
+
+    def test_get_allowed_for_own_dimensions(self, store):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            resp = store.get(note_a.id)
+        assert resp.success is True
+        assert resp.content.id == note_a.id
+
+    def test_update_denied_across_dimensions_leaves_note_intact(self, store):
+        note_b = self._note_in(store, SCOPE_B, "b note")
+        edited = note_b.model_copy(deep=True)
+        edited.content = "hijacked"
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            resp = store.update(edited)
+        assert resp.success is False
+        assert resp.error == _DENIED
+        assert store._base_store.notes[note_b.id].content == "b note"
+
+    def test_delete_denied_across_dimensions_leaves_note_intact(self, store):
+        note_b = self._note_in(store, SCOPE_B, "b note")
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            resp = store.delete(note_b.id)
+        assert resp.success is False
+        assert note_b.id in store._base_store.notes
+
+    def test_update_and_delete_allowed_for_own_dimensions(self, store):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        edited = note_a.model_copy(deep=True)
+        edited.content = "edited a"
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            assert store.update(edited).success is True
+            assert store.delete(note_a.id).success is True
+        assert note_a.id not in store._base_store.notes
+
+    def test_strict_dimensionless_cannot_touch_scoped_note_by_id(self, store):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        strict = ExecutionScope(strict_memory_isolation=True)
+        with UserContext(1), ExecutionScopeContext(strict):
+            assert store.get(note_a.id).success is False
+            assert store.delete(note_a.id).success is False
+        assert note_a.id in store._base_store.notes
+
+    def test_nonstrict_dimensionless_keeps_one_way_by_id_access(self, store):
+        """Default one-way visibility: a dimension-less non-strict caller can
+        still reach a scoped note by id (matches unscoped search seeing
+        everything under the user)."""
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        with UserContext(1):
+            assert store.get(note_a.id).success is True
+            assert store.delete(note_a.id).success is True
+        assert note_a.id not in store._base_store.notes
+
+    def test_unscoped_by_id_behavior_unchanged(self, store):
+        """No user context and no scope: the original no-check by-id path is
+        preserved (get/update/delete all succeed)."""
+        note = MemoryNote(content="free")
+        store.add(note)
+        assert store.get(note.id).success is True
+        edited = note.model_copy(deep=True)
+        edited.content = "free edited"
+        assert store.update(edited).success is True
+        assert store._base_store.notes[note.id].content == "free edited"
+        assert store.delete(note.id).success is True
+        assert note.id not in store._base_store.notes
