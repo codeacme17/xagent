@@ -758,6 +758,16 @@ class WorkspaceFileOperations:
         # Use the centralized workspace method
         return self.workspace.resolve_path_with_search(file_path)
 
+    @staticmethod
+    def _in_workspace(path: Path, workspace_abs: Path) -> bool:
+        """Return True if ``path`` is the workspace root or lives inside it.
+
+        ``Path.is_relative_to`` already treats a path equal to the base as
+        relative to it, so no separate equality check against ``workspace_abs``
+        is needed.
+        """
+        return path.is_relative_to(workspace_abs)
+
     def _resolve_path(self, file_path: str, default_dir: str = "output") -> Path:
         """Resolve file path within workspace"""
         logger.debug(
@@ -767,11 +777,11 @@ class WorkspaceFileOperations:
         )
 
         path = Path(file_path)
+        workspace_abs = self.workspace.workspace_dir.resolve()
 
         if path.is_absolute():
             # Absolute path: check if within workspace
             abs_path = path.resolve()
-            workspace_abs = self.workspace.workspace_dir.resolve()
 
             logger.debug(
                 "Absolute path check - abs_path: %s, workspace_abs: %s",
@@ -779,7 +789,7 @@ class WorkspaceFileOperations:
                 workspace_abs,
             )
 
-            if abs_path == workspace_abs or abs_path.is_relative_to(workspace_abs):
+            if self._in_workspace(abs_path, workspace_abs):
                 logger.debug("Absolute path resolved to: %s", abs_path)
                 return abs_path
 
@@ -823,11 +833,7 @@ class WorkspaceFileOperations:
             # a relative path such as ``../../other/file`` can escape the
             # workspace; without this check the resolved path would be returned
             # unverified (the absolute-path branch above is already checked).
-            workspace_abs = self.workspace.workspace_dir.resolve()
-            if not (
-                resolved_path == workspace_abs
-                or resolved_path.is_relative_to(workspace_abs)
-            ):
+            if not self._in_workspace(resolved_path, workspace_abs):
                 error_msg = f"Path '{file_path}' is not within the workspace"
                 logger.error("ValueError: %s", error_msg)
                 raise ValueError(error_msg)

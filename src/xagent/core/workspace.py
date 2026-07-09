@@ -850,7 +850,12 @@ class TaskWorkspace:
                 normalized_clean = clean_path.parent / normalized_name
                 for _dir_name, dir_path in search_dirs:
                     candidate = dir_path / normalized_clean
-                    # Containment before existence, as in the exact-match branch.
+                    # Containment before existence, mirroring the exact-match
+                    # branch. For a plain ``..`` traversal the exact-match loop
+                    # above shares this parent path and already raises, so this
+                    # check is load-bearing only when the normalized leaf name
+                    # itself resolves outside the workspace (e.g. an out-of-tree
+                    # symlink), not for traversal.
                     resolved_candidate = self._resolve_allowed_absolute_path(candidate)
                     if resolved_candidate.exists():
                         logger.info(
