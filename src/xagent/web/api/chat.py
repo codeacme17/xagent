@@ -761,20 +761,22 @@ class AgentServiceManager:
         local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
         and any other sandbox failure falls back to local execution.
 
-        A **scoped** execution (``scope is not None``) isolates an untrusted /
+        A scope that carries a ``sandbox_key_suffix`` isolates an untrusted /
         third-party workload in a per-scope container; running it outside that
         container would defeat the isolation the scope exists to provide. So
-        for any active scope both fallbacks are disabled and the task fails
+        when a suffix is present both fallbacks are disabled and the task fails
         closed regardless of configuration — neither capacity pressure (even
-        with the opt-in flag on) nor a sandbox-service failure may downgrade a
-        scoped task to local execution.
+        with the opt-in flag on) nor a sandbox-service failure may downgrade
+        such a task to local execution. A scope *without* a suffix shares the
+        unscoped ``user:{owner}`` container and thus has no isolation to
+        protect; it keeps the unscoped fallback behavior.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
-                evictable, and (unscoped) local fallback on capacity is not
-                enabled, or the execution is scoped.
-            Exception: A scoped execution hit a non-capacity sandbox failure;
-                re-raised instead of falling back to local execution.
+                evictable, and (for a task with no scope suffix) local fallback
+                on capacity is not enabled, or the scope carries a suffix.
+            Exception: A suffix-scoped execution hit a non-capacity sandbox
+                failure; re-raised instead of falling back to local execution.
         """
         from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 
@@ -783,9 +785,14 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
-        # A scoped execution must never silently run outside its sandbox.
-        scoped = scope is not None
+        # The isolation boundary is the per-scope key suffix, not
+        # scope-presence: a suffix-less scope resolves to the same
+        # ``user:{owner}`` lifecycle key as unscoped execution, so it has no
+        # container of its own to protect and must keep the unscoped fallback
+        # behavior. Gating on the suffix (not ``scope is not None``) honors the
+        # ExecutionScope contract that each field be consumed independently.
         suffix = scope.sandbox_key_suffix if scope is not None else None
+        scoped = suffix is not None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,

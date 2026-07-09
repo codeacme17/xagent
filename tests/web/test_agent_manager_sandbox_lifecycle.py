@@ -371,23 +371,54 @@ _SCOPE = ExecutionScope(
     workspace_segments=("clients", "3", "end_users", "7"),
 )
 
+# A scope that sets no ``sandbox_key_suffix`` resolves to the same
+# ``user:{owner}`` lifecycle key as unscoped execution, so it has no container
+# of its own to protect and must keep the unscoped fallback behavior.
+_SUFFIXLESS_SCOPE = ExecutionScope(
+    workspace_segments=("clients", "3", "end_users", "7"),
+)
+
 
 @pytest.mark.asyncio
-async def test_scoped_capacity_error_rejects_even_when_fallback_enabled(
-    sandbox_mgr, monkeypatch
+@pytest.mark.parametrize(
+    "fallback_flag, side_effect, expected_exc",
+    [
+        pytest.param(
+            "true",
+            SandboxCapacityError(cap=2, in_use=2),
+            SandboxCapacityError,
+            id="capacity-with-flag-on",
+        ),
+        pytest.param(
+            None,
+            RuntimeError("docker daemon unreachable"),
+            RuntimeError,
+            id="non-capacity-outage",
+        ),
+    ],
+)
+async def test_suffix_scoped_execution_fails_closed(
+    sandbox_mgr, monkeypatch, fallback_flag, side_effect, expected_exc
 ) -> None:
-    """A scoped task never takes the local fallback, even with the flag on.
+    """A suffix-scoped task never takes the local fallback.
 
     Local fallback would run an isolated/untrusted scoped workload outside its
-    container, so capacity exhaustion must fail closed regardless of the flag.
+    container, so both capacity exhaustion (even with the opt-in flag on) and a
+    non-capacity sandbox outage must fail closed rather than downgrade to
+    local execution.
     """
-    monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
+    if fallback_flag is None:
+        monkeypatch.delenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", fallback_flag
+        )
     manager = AgentServiceManager()
-    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
-        side_effect=SandboxCapacityError(cap=2, in_use=2)
-    )
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=side_effect)
 
-    with pytest.raises(SandboxCapacityError):
+    with pytest.raises(expected_exc):
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
@@ -399,27 +430,45 @@ async def test_scoped_capacity_error_rejects_even_when_fallback_enabled(
 
 
 @pytest.mark.asyncio
-async def test_scoped_sandbox_unavailability_fails_closed(
-    sandbox_mgr, monkeypatch
+@pytest.mark.parametrize(
+    "fallback_flag, side_effect",
+    [
+        pytest.param(
+            "true", SandboxCapacityError(cap=2, in_use=2), id="capacity-with-flag-on"
+        ),
+        pytest.param(
+            None, RuntimeError("docker daemon unreachable"), id="non-capacity-outage"
+        ),
+    ],
+)
+async def test_suffixless_scope_keeps_unscoped_fallback(
+    sandbox_mgr, monkeypatch, fallback_flag, side_effect
 ) -> None:
-    """A non-capacity sandbox failure fails closed for a scoped task.
+    """A scope without a suffix behaves exactly like unscoped execution.
 
-    Unscoped tasks keep the local fallback (see
-    test_sandbox_unavailability_keeps_local_fallback); a scoped task must not
-    silently run its workload on the host during a sandbox outage.
+    It shares the ``user:{owner}`` container, so there is no scope-owned
+    isolation to protect: capacity fallback (when the flag is on) and the
+    non-capacity local fallback both remain available. Gating fail-closed on
+    ``sandbox_key_suffix`` — not scope-presence — is what keeps this path from
+    becoming an availability regression.
     """
-    monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
+    if fallback_flag is None:
+        monkeypatch.delenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", fallback_flag
+        )
     manager = AgentServiceManager()
-    sandbox_mgr.get_or_create_lease_provider = AsyncMock(
-        side_effect=RuntimeError("docker daemon unreachable")
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=side_effect)
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        workspace_config={},
+        scope=_SUFFIXLESS_SCOPE,
     )
 
-    with pytest.raises(RuntimeError):
-        await manager._get_or_create_task_sandbox(
-            task_id=1,
-            workspace_owner_id=7,
-            workspace_config={},
-            scope=_SCOPE,
-        )
-
+    assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
