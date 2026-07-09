@@ -94,6 +94,57 @@ def test_scoped_path_under_workspace_dir_allowed(tmp_path):
     assert ws._file_record_allowed_for_workspace(record, inside) is True
 
 
+def test_scoped_rejects_in_scope_key_with_out_of_scope_local_path(tmp_path):
+    ws = _scoped_workspace(tmp_path)
+    # A record whose durable key is in scope but whose local storage_path
+    # points at a sibling scope. resolve_file_id's local-path branch hands
+    # back the local path, so an in-scope key must NOT admit it.
+    out_of_scope = (
+        tmp_path
+        / "user_5"
+        / "clients"
+        / "3"
+        / "end_users"
+        / "8"
+        / "uploads"
+        / "leak.txt"
+    )
+    record = _record(
+        user_id=5,
+        task_id=None,
+        storage_key="users/5/clients/3/end_users/7/uploads/f1/report.txt",
+        storage_path=str(out_of_scope),
+    )
+    # Called as resolve_file_id's local-path branch does: explicit path == the
+    # local storage_path that would be returned.
+    assert ws._file_record_allowed_for_workspace(record, out_of_scope) is False
+
+
+def test_scoped_durable_key_not_rejected_by_out_of_scope_local_path(tmp_path):
+    ws = _scoped_workspace(tmp_path)
+    # Same divergent record, but reached via the durable-materialize branch
+    # (no explicit path): resolution builds a fresh path from the in-scope
+    # key, so the stale/out-of-scope local storage_path must not cause a
+    # false rejection.
+    out_of_scope = (
+        tmp_path
+        / "user_5"
+        / "clients"
+        / "3"
+        / "end_users"
+        / "8"
+        / "uploads"
+        / "leak.txt"
+    )
+    record = _record(
+        user_id=5,
+        task_id=None,
+        storage_key="users/5/clients/3/end_users/7/uploads/f1/report.txt",
+        storage_path=str(out_of_scope),
+    )
+    assert ws._file_record_allowed_for_workspace(record) is True
+
+
 def test_unscoped_workspace_keeps_owner_only_behavior(tmp_path):
     # No scope_segments → the new confinement is skipped; owner + task_id only.
     ws = TaskWorkspace("web_task_10", str(tmp_path))

@@ -607,33 +607,51 @@ class TaskWorkspace:
     ) -> bool:
         """Whether a file record lives under this workspace's scope subtree.
 
-        Only meaningful when ``scope_segments`` is non-empty. Confirms
-        containment via the durable storage key prefix
-        (``users/{owner}/{segments}/``) when present, else via the local
-        storage path under the scoped user root. Fails closed (returns False)
-        when neither can be confirmed, so an owner match alone can never admit
-        a sibling scope's file.
+        Only meaningful when ``scope_segments`` is non-empty. Validates the
+        artifact that ``resolve_file_id`` will actually hand back:
+
+        - When an explicit local ``path`` is supplied, that path *is* the
+          return value, so it is authoritative and must lie under the scoped
+          user root. An in-scope durable ``storage_key`` must never admit an
+          out-of-scope local path.
+        - Otherwise resolution materializes from the durable handle, so the
+          ``storage_key`` prefix (``users/{owner}/{segments}/``) is checked,
+          falling back to the record's own ``storage_path`` only when no key
+          is present.
+
+        Fails closed (returns False) when nothing can be confirmed, so an
+        owner match alone can never admit a sibling scope's file.
         """
         owner_user_id = self.owner_user_id
         if owner_user_id is None:
             return True
 
+        # Branch 1: the explicit local path is what gets returned. Confine it
+        # regardless of any storage_key, so an in-scope key can't smuggle an
+        # out-of-scope local path past the gate.
+        if path is not None:
+            return self._path_under_scoped_user_root(path, owner_user_id)
+
+        # Branch 2: no local path, so resolution materializes from the durable
+        # handle -- validate the key prefix when present.
         storage_key = getattr(record, "storage_key", None)
         if storage_key:
             key = str(storage_key)
             key_prefix = "/".join(["users", str(owner_user_id), *self.scope_segments])
             return key == key_prefix or key.startswith(key_prefix + "/")
 
-        candidate = path
-        if candidate is None:
-            storage_path = getattr(record, "storage_path", None)
-            candidate = Path(storage_path) if storage_path else None
-        if candidate is not None:
-            scoped_root = self._user_workspace_base_dir(int(owner_user_id)).resolve()
-            resolved = candidate.resolve()
-            return resolved == scoped_root or resolved.is_relative_to(scoped_root)
+        # No key: fall back to the record's own local storage path.
+        storage_path = getattr(record, "storage_path", None)
+        if storage_path:
+            return self._path_under_scoped_user_root(Path(storage_path), owner_user_id)
 
         return False
+
+    def _path_under_scoped_user_root(self, candidate: Path, owner_user_id: Any) -> bool:
+        """Whether ``candidate`` resolves under the scoped user workspace root."""
+        scoped_root = self._user_workspace_base_dir(int(owner_user_id)).resolve()
+        resolved = candidate.resolve()
+        return resolved == scoped_root or resolved.is_relative_to(scoped_root)
 
     def resolve_file_id(self, file_id: str) -> Optional[Path]:
         file_id = str(file_id).strip()
