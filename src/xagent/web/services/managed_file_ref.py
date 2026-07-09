@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
+from ...core.execution_scope import ExecutionScope, get_execution_scope
 from ...core.file_storage import (
     FsspecFileStorage,
     ScopedFileStorage,
@@ -128,8 +129,23 @@ class ManagedFileRef:
 
     record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
+    execution_scope: ExecutionScope | None = None
+    _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Resolve the active scope once, at construction, so the bound handle
+        # and any key written through it (see ``sync_to_durable``) agree even
+        # if the ambient scope changes later or the ref outlives the turn. An
+        # explicitly passed scope wins over the contextvar — the same
+        # precedence agent tooling uses for off-turn construction.
+        scope = (
+            self.execution_scope
+            if self.execution_scope is not None
+            else get_execution_scope()
+        )
+        self._scope_segments = (
+            scope.durable_storage_segments if scope is not None else ()
+        )
         if self.storage is None:
             user_id = self.record.user_id
             if user_id is None:
@@ -137,7 +153,9 @@ class ManagedFileRef:
                     "Record user_id is required to bind user-scoped storage; "
                     "pass an explicit storage handle for records without an owner"
                 )
-            self.storage = get_user_file_storage(int(user_id))
+            self.storage = get_user_file_storage(
+                int(user_id), scope_segments=self._scope_segments
+            )
 
     @property
     def local_path(self) -> Path:
@@ -261,6 +279,7 @@ class ManagedFileRef:
                 int(self.record.user_id),
                 str(self.record.file_id),
                 self.filename or path.name,
+                scope_segments=self._scope_segments,
             )
         )
         try:

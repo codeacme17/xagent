@@ -9,12 +9,29 @@ from pathlib import Path
 
 import pytest
 
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    reset_execution_scope,
+    set_execution_scope,
+)
 from xagent.core.file_storage import StorageKeyScopeError
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services.managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
+)
+
+_ISOLATED_SCOPE = ExecutionScope(
+    workspace_segments=("clients", "3", "end_users", "7"),
+    isolate_external_dirs=True,
+)
+# Same segments, but not isolated: the handle must stay at the owner root so
+# legitimate shared owner-level reads still work (mirrors the sandbox
+# filesystem allowlist, which only narrows under ``isolate_external_dirs``).
+_NON_ISOLATED_SCOPE = ExecutionScope(
+    workspace_segments=("clients", "3", "end_users", "7"),
+    isolate_external_dirs=False,
 )
 
 
@@ -155,3 +172,75 @@ def test_record_without_owner_cannot_bind_default_scope(storage_env, tmp_path):
 
     with pytest.raises(ValueError, match="user_id is required"):
         ManagedFileRef(record)
+
+
+# --- scope-aware handle binding (#828 durable-storage half) -----------------
+
+
+def test_unscoped_construction_binds_owner_root(storage_env, tmp_path):
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    assert ManagedFileRef(record).storage.prefix == "users/7"
+
+
+def test_explicit_isolated_scope_narrows_handle_prefix(storage_env, tmp_path):
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    ref = ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE)
+    assert ref.storage.prefix == "users/7/clients/3/end_users/7"
+
+
+def test_non_isolated_scope_keeps_owner_root(storage_env, tmp_path):
+    # A scope with segments but no isolation must NOT narrow the handle, or it
+    # would block the shared owner-level reads such executions rely on.
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    ref = ManagedFileRef(record, execution_scope=_NON_ISOLATED_SCOPE)
+    assert ref.storage.prefix == "users/7"
+
+
+def test_ambient_isolated_scope_narrows_handle_prefix(storage_env, tmp_path):
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    token = set_execution_scope(_ISOLATED_SCOPE)
+    try:
+        assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
+    finally:
+        reset_execution_scope(token)
+
+
+def test_explicit_scope_overrides_ambient(storage_env, tmp_path):
+    record = _record(tmp_path / "uploads" / "missing.txt")
+    token = set_execution_scope(_NON_ISOLATED_SCOPE)
+    try:
+        ref = ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE)
+        assert ref.storage.prefix == "users/7/clients/3/end_users/7"
+    finally:
+        reset_execution_scope(token)
+
+
+def test_sync_to_durable_writes_into_scoped_subtree(storage_env, tmp_path):
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir()
+    source.write_text("scoped upload", encoding="utf-8")
+    record = _record(source)
+
+    stored = ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE).sync_to_durable()
+    assert stored.key == "users/7/clients/3/end_users/7/uploads/file-123/source.txt"
+    assert record.storage_status == "available"
+
+    # The same isolated handle round-trips its own object back.
+    source.unlink()
+    restored = ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE).ensure_local()
+    assert restored.read_text(encoding="utf-8") == "scoped upload"
+
+
+def test_isolated_handle_rejects_sibling_end_user_key(storage_env, tmp_path):
+    # Same owner, sibling end user (end_users/8). Without the handle narrowing
+    # this key sits under ``users/7`` and would be reachable; the scoped handle
+    # must reject it — the defense-in-depth this issue is about.
+    record = _record(
+        tmp_path / "uploads" / "missing.txt",
+        storage_key="users/7/clients/3/end_users/8/uploads/file-123/source.txt",
+        storage_backend="file",
+        storage_status="available",
+    )
+
+    with pytest.raises(StorageKeyScopeError):
+        ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE).delete_durable()
