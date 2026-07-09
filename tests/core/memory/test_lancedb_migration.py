@@ -253,3 +253,26 @@ def test_init_migration_failure_leaves_table_intact(temp_db_dir):
     # The vector column was not rebuilt; the table is untouched.
     assert "vector" in arrow.schema.names
     assert "metadata" not in arrow.schema.names
+
+
+def test_add_record_without_embedding_into_vector_table(temp_db_dir):
+    """A note with no embedding stored into a vector table keeps a null vector.
+
+    Exercises the `_insert_record` case where the record lacks a vector but the
+    table has a vector column: LanceDB accepts a null vector, the row persists,
+    and it stays retrievable (no migration, no data loss)."""
+    store = _store(temp_db_dir, MockEmbedding(64))
+    assert store.add(MemoryNote(id="withvec", content="alpha")).success
+
+    # Whitespace-only content yields no embedding, so the record has no vector.
+    assert store.add(MemoryNote(id="novec", content="   ")).success
+
+    conn = store._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    try:
+        ids = set(table.to_arrow().column("id").to_pylist())
+    finally:
+        _safe_close_table(table)
+    assert {"withvec", "novec"} <= ids
+    # The vector-less row still round-trips through get().
+    assert store.get("novec").success

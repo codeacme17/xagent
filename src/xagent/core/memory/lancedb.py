@@ -88,7 +88,9 @@ class LanceDBMemoryStore(MemoryStore):
         (preserving all rows) instead of dropping and recreating it. This path
         runs on every store construction, so a wipe here would destroy data with
         no write in flight. On any migration failure the original table is left
-        intact and the error propagates; we never fall back to a wipe.
+        intact and the error propagates (out of ``__init__``); we never fall back
+        to a wipe. Note the migration branch may perform a batched re-embed when
+        a table is both missing a base column and vector-mismatched.
         """
         conn = self._vector_store.get_raw_connection()
 

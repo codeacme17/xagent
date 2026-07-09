@@ -69,18 +69,10 @@ class MemorySchemaMismatch:
     kind: MemoryMismatchKind
     # Missing non-vector columns, in fixed order (subset of MEMORY_NON_VECTOR_COLUMNS).
     missing_columns: tuple[str, ...] = ()
-    # Whether the table currently has a vector column.
-    has_vector_column: bool = False
     # The table's current fixed vector width, or None if it has no fixed-width
-    # vector column.
+    # vector column. Retained as the only test-observable output of the private
+    # _vector_width helper.
     current_dim: Optional[int] = None
-    # The dimension the store now wants, or None when no vector is expected
-    # (no embedding model available).
-    expected_dim: Optional[int] = None
-
-    @property
-    def needs_migration(self) -> bool:
-        return self.kind is not MemoryMismatchKind.NONE
 
 
 def _vector_width(schema: Any) -> Optional[int]:
@@ -136,9 +128,7 @@ def classify_memory_schema_mismatch(
     return MemorySchemaMismatch(
         kind=kind,
         missing_columns=missing_columns,
-        has_vector_column=has_vector,
         current_dim=current_dim,
-        expected_dim=expected_dim,
     )
 
 
@@ -155,6 +145,13 @@ def migrate_table_swap(
     is touched, any failure in reading or transforming leaves the original table
     byte-for-byte intact and propagates the error. This function never drops or
     empties a table as a fallback.
+
+    Concurrency: the read snapshot (``to_arrow``) and the final overwrite are not
+    covered by a shared lock or transaction, and this store has no locking
+    elsewhere. A concurrent write that commits to the live table between the two
+    would be replaced by the overwrite (computed from the earlier snapshot) and
+    lost. The "never lose data" guarantee here is against migration *failure*,
+    not against concurrent writers during a migration.
 
     Args:
         conn: A LanceDB connection (must expose ``open_table`` and ``create_table``).

@@ -59,16 +59,13 @@ def test_classify_no_mismatch_vectorless():
     """No vector column and no vector expected -> no mismatch."""
     result = classify_memory_schema_mismatch(_non_vector_schema(), expected_dim=None)
     assert result.kind is MemoryMismatchKind.NONE
-    assert not result.needs_migration
 
 
 def test_classify_no_mismatch_matching_dim():
     """Vector width matches expected dimension -> no mismatch."""
     result = classify_memory_schema_mismatch(_vector_schema(64), expected_dim=64)
     assert result.kind is MemoryMismatchKind.NONE
-    assert not result.needs_migration
     assert result.current_dim == 64
-    assert result.expected_dim == 64
 
 
 def test_classify_missing_non_vector_column():
@@ -77,7 +74,6 @@ def test_classify_missing_non_vector_column():
     result = classify_memory_schema_mismatch(schema, expected_dim=None)
     assert result.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN
     assert result.missing_columns == ("metadata",)
-    assert result.needs_migration
 
 
 def test_classify_vector_dimension_change():
@@ -85,14 +81,12 @@ def test_classify_vector_dimension_change():
     result = classify_memory_schema_mismatch(_vector_schema(64), expected_dim=128)
     assert result.kind is MemoryMismatchKind.VECTOR_REBUILD
     assert result.current_dim == 64
-    assert result.expected_dim == 128
 
 
 def test_classify_vector_presence_added():
     """Table has no vector but store now produces one -> rebuild."""
     result = classify_memory_schema_mismatch(_non_vector_schema(), expected_dim=64)
     assert result.kind is MemoryMismatchKind.VECTOR_REBUILD
-    assert result.has_vector_column is False
     assert result.current_dim is None
 
 
@@ -100,8 +94,7 @@ def test_classify_vector_presence_removed():
     """Table has a vector but store no longer produces one -> rebuild (drop vector)."""
     result = classify_memory_schema_mismatch(_vector_schema(64), expected_dim=None)
     assert result.kind is MemoryMismatchKind.VECTOR_REBUILD
-    assert result.has_vector_column is True
-    assert result.expected_dim is None
+    assert result.current_dim == 64
 
 
 def test_classify_vector_rebuild_takes_precedence_over_missing_column():
