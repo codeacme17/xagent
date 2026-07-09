@@ -353,3 +353,16 @@ class TestSandboxManagerScopedKeys:
 
         unscoped = SandboxManager._workspace_mount_paths("user", "7", None)
         assert unscoped == [(tmp_path / "user_7", True)]
+
+    def test_ca_prefix_mount_is_shared_across_end_users(self, tmp_path) -> None:
+        """#79-01: two end users of one client application supply a
+        workspace_config whose ``base_dir`` is the CA-level mount prefix, so
+        both produce the identical mount root — the prerequisite for sharing
+        one container without tripping config-equivalence."""
+        ca_root = tmp_path / "user_5" / "clients" / "3"
+        cfg_eu7 = {"base_dir": str(ca_root)}
+        cfg_eu8 = {"base_dir": str(ca_root)}
+
+        paths_eu7 = SandboxManager._workspace_mount_paths("user", "5:client-3", cfg_eu7)
+        paths_eu8 = SandboxManager._workspace_mount_paths("user", "5:client-3", cfg_eu8)
+        assert paths_eu7 == paths_eu8 == [(ca_root, True)]
