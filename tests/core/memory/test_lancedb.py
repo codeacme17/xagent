@@ -312,6 +312,25 @@ def test_list_all_with_date_filters(memory_store):
     assert all(r.timestamp <= now for r in results)
 
 
+def test_list_all_with_nested_metadata_filter(memory_store):
+    """list_all must honor the nested {"metadata": {...}} shape (as used by
+    the user-isolation layer), matching search()'s filter semantics."""
+    assert memory_store.add(
+        MemoryNote(content="alice note", metadata={"user_id": 1})
+    ).success
+    assert memory_store.add(
+        MemoryNote(content="bob note", metadata={"user_id": 2})
+    ).success
+
+    nested = {"metadata": {"user_id": 1}}
+    # list_all must agree with search on the nested-metadata filter.
+    assert len(memory_store.search("", k=100, filters=nested)) == 1
+    results = memory_store.list_all(filters=nested)
+    assert len(results) == 1
+    assert results[0].metadata.get("user_id") == 1
+    assert results[0].content == "alice note"
+
+
 def test_list_all_with_tag_filters(memory_store):
     """Test listing memories with tag filters."""
     assert memory_store.add(

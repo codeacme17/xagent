@@ -686,16 +686,15 @@ class LanceDBMemoryStore(MemoryStore):
         except Exception as e:
             logger.error(f"Failed to clear memory store: {e}")
 
-    _LIST_SPECIAL_FILTERS = frozenset(
-        {"category", "date_from", "date_to", "tags", "keywords"}
-    )
+    # Filters that search() does not understand and must be applied here.
+    # Everything else (category, nested `metadata`, direct-field equality) is
+    # delegated to search()'s proven filter path so list_all cannot diverge.
+    _LIST_ONLY_FILTERS = frozenset({"date_from", "date_to", "tags", "keywords"})
 
-    def _note_matches_list_filters(
+    def _matches_list_only_filters(
         self, note: MemoryNote, filters: dict[str, Any]
     ) -> bool:
-        """Apply list_all filter semantics to a note (mirrors InMemoryStore)."""
-        if "category" in filters and note.category != filters["category"]:
-            return False
+        """Apply the date-range/tags/keywords filters search() does not handle."""
         if "date_from" in filters and note.timestamp < filters["date_from"]:
             return False
         if "date_to" in filters and note.timestamp > filters["date_to"]:
@@ -706,23 +705,35 @@ class LanceDBMemoryStore(MemoryStore):
             keyword in note.keywords for keyword in filters["keywords"]
         ):
             return False
-        # Remaining keys are direct metadata equality checks.
-        other = {
-            k: v for k, v in filters.items() if k not in self._LIST_SPECIAL_FILTERS
-        }
-        if other and not all(note.metadata.get(k) == v for k, v in other.items()):
-            return False
         return True
 
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
-        """List all memory notes with optional filtering."""
+        """List all memory notes with optional filtering.
+
+        Delegates category / nested-``metadata`` / direct-field filters to
+        search() (its filter logic is the single source of truth, including the
+        nested ``{"metadata": {...}}`` shape the user-isolation layer relies on),
+        and applies the date-range/tags/keywords filters here. Results are sorted
+        newest-first to match InMemoryStore.list_all.
+        """
         try:
-            # Fetch every note (empty query), then apply list-level filters such
-            # as category, date range, tags and keywords in Python.
-            notes = self.search(query="", k=10000)
-            if not filters:
-                return notes
-            return [n for n in notes if self._note_matches_list_filters(n, filters)]
+            filters = filters or {}
+            # Let search() handle everything it understands...
+            search_filters = {
+                k: v for k, v in filters.items() if k not in self._LIST_ONLY_FILTERS
+            }
+            notes = self.search(query="", k=10000, filters=search_filters or None)
+            # ...then apply the list-only filters it does not.
+            list_only = {
+                k: v for k, v in filters.items() if k in self._LIST_ONLY_FILTERS
+            }
+            if list_only:
+                notes = [
+                    n for n in notes if self._matches_list_only_filters(n, list_only)
+                ]
+            # Mirror InMemoryStore: newest first.
+            notes.sort(key=lambda n: n.timestamp, reverse=True)
+            return notes
         except Exception as e:
             logger.error(f"Failed to list all memories: {e}")
             return []
