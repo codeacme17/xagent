@@ -232,22 +232,23 @@ class LanceDBMemoryStore(MemoryStore):
         row_count = existing.num_rows
         names = set(existing.schema.names)
 
-        def _string_column(name: str) -> list[Optional[str]]:
+        def _string_column(name: str) -> Any:
+            # Stay in the Arrow format and let PyArrow cast natively instead of
+            # materializing Python lists per element.
             if name in names:
-                return [
-                    None if value is None else str(value)
-                    for value in existing.column(name).to_pylist()
-                ]
-            return [None] * row_count
+                return existing.column(name).cast(pa.string())
+            return pa.array([None] * row_count, pa.string())
 
         columns: dict[str, Any] = {
-            "id": pa.array(_string_column("id"), pa.string()),
-            "text": pa.array(_string_column("text"), pa.string()),
-            "metadata": pa.array(_string_column("metadata"), pa.string()),
+            "id": _string_column("id"),
+            "text": _string_column("text"),
+            "metadata": _string_column("metadata"),
         }
 
         if target_dim is not None:
-            texts = [text or "" for text in _string_column("text")]
+            # The batched embedding interface needs Python strings; reuse the
+            # already-cast text column so it is only materialized once.
+            texts = [text or "" for text in columns["text"].to_pylist()]
             vectors = self._embed_texts_batch(texts, target_dim)
             columns["vector"] = pa.array(vectors, pa.list_(pa.float32(), target_dim))
 
