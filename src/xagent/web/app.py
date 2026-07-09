@@ -197,7 +197,21 @@ async def _run_trigger_dispatcher(
 ) -> None:
     from .models.database import get_session_local
     from .services.gmail_triggers import scan_due_gmail_watch_renewals
-    from .services.triggers import dispatch_pending_trigger_runs
+    from .services.triggers import (
+        dispatch_pending_trigger_runs,
+        scan_due_scheduled_triggers,
+    )
+
+    def _scan_due_scheduled_triggers_tick() -> int:
+        # Scan in-process so scheduled triggers fire without a Celery
+        # beat/worker. Idempotent with the Celery beat scan (unique run key +
+        # next_run_at advanced in one committed txn), so running both is safe.
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            return len(scan_due_scheduled_triggers(db))
+        finally:
+            db.close()
 
     def _scan_due_gmail_watch_renewals_tick() -> int:
         SessionLocal = get_session_local()
@@ -246,6 +260,12 @@ async def _run_trigger_dispatcher(
                     next_gmail_watch_scan_at = (
                         now + get_gmail_watch_renewal_interval_seconds()
                     )
+
+            processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
+            if processed:
+                logger.info(
+                    "Trigger dispatcher processed %s due schedule(s)", processed
+                )
 
             SessionLocal = get_session_local()
             db = SessionLocal()
