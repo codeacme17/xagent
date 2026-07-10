@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
-from ...core.execution_scope import ExecutionScope, get_execution_scope
+from ...core.execution_scope import (
+    ExecutionScope,
+    get_execution_scope,
+    resolve_execution_scope,
+)
 from ...core.file_storage import (
     FsspecFileStorage,
     ScopedFileStorage,
@@ -135,14 +139,25 @@ class ManagedFileRef:
     def __post_init__(self) -> None:
         # Resolve the active scope once, at construction, so the bound handle
         # and any key written through it (see ``sync_to_durable``) agree even
-        # if the ambient scope changes later or the ref outlives the turn. An
-        # explicitly passed scope wins over the contextvar — the same
-        # precedence agent tooling uses for off-turn construction.
-        scope = (
-            self.execution_scope
-            if self.execution_scope is not None
-            else get_execution_scope()
-        )
+        # if the ambient scope changes later or the ref outlives the turn.
+        #
+        # Precedence mirrors ``AgentServiceManager.get_agent_for_task``:
+        # explicit arg -> ambient turn contextvar -> the per-task
+        # resolver/snapshot keyed on the record's ``task_id``. The last step
+        # matters on off-turn paths (bot/builder-chat handlers never enter
+        # ``turn_execution_scope``, so the contextvar is None): a workforce
+        # sub-task carries its scope only in the persisted snapshot, and
+        # without recovering it here ``sync_to_durable`` would write the file
+        # under the owner root instead of the sub-task's scoped subtree.
+        # Passing ``execution_scope=None`` is equivalent to omitting it — there
+        # is no way to force owner-root over an active ambient/persisted scope.
+        scope = self.execution_scope
+        if scope is None:
+            scope = get_execution_scope()
+        if scope is None:
+            task_id = getattr(self.record, "task_id", None)
+            if task_id is not None:
+                scope = resolve_execution_scope(task_id)
         self._scope_segments = (
             scope.durable_storage_segments if scope is not None else ()
         )

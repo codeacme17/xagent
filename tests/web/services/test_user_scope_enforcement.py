@@ -13,6 +13,7 @@ from xagent.core.execution_scope import (
     ExecutionScope,
     reset_execution_scope,
     set_execution_scope,
+    set_execution_scope_resolver,
 )
 from xagent.core.file_storage import StorageKeyScopeError
 from xagent.core.file_storage.factory import get_unscoped_file_storage
@@ -42,6 +43,14 @@ def storage_env(monkeypatch, tmp_path):
     get_unscoped_file_storage.cache_clear()
     yield tmp_path
     get_unscoped_file_storage.cache_clear()
+
+
+@pytest.fixture
+def clear_scope_resolver():
+    """Start and end each test with no registered resolver."""
+    set_execution_scope_resolver(None)
+    yield
+    set_execution_scope_resolver(None)
 
 
 def _record(local_path: Path, **overrides) -> UploadedFile:
@@ -244,3 +253,63 @@ def test_isolated_handle_rejects_sibling_end_user_key(storage_env, tmp_path):
 
     with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record, execution_scope=_ISOLATED_SCOPE).delete_durable()
+
+
+# --- resolver/snapshot fallback when the turn contextvar is absent ----------
+# Off-turn paths (bot/builder-chat handlers) never enter turn_execution_scope,
+# so the ambient contextvar is None while a workforce sub-task's scope is still
+# recoverable from the per-task resolver/snapshot keyed on record.task_id.
+
+
+def test_resolver_narrows_handle_when_contextvar_absent(
+    storage_env, tmp_path, clear_scope_resolver
+):
+    set_execution_scope_resolver(
+        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None
+    )
+    record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
+    # No ambient contextvar, no explicit scope: fall back to the resolver.
+    assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
+
+
+def test_contextvar_beats_resolver(storage_env, tmp_path, clear_scope_resolver):
+    set_execution_scope_resolver(lambda task_id: _NON_ISOLATED_SCOPE)
+    record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
+    token = set_execution_scope(_ISOLATED_SCOPE)
+    try:
+        assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
+    finally:
+        reset_execution_scope(token)
+
+
+def test_explicit_scope_beats_resolver(storage_env, tmp_path, clear_scope_resolver):
+    set_execution_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+    record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
+    ref = ManagedFileRef(record, execution_scope=_NON_ISOLATED_SCOPE)
+    assert ref.storage.prefix == "users/7"
+
+
+def test_resolver_not_consulted_without_task_id(
+    storage_env, tmp_path, clear_scope_resolver
+):
+    def _boom(task_id):
+        raise AssertionError("resolver must not run when the record has no task_id")
+
+    set_execution_scope_resolver(_boom)
+    record = _record(tmp_path / "uploads" / "missing.txt")  # task_id defaults to None
+    assert ManagedFileRef(record).storage.prefix == "users/7"
+
+
+def test_sync_to_durable_uses_resolved_scope(
+    storage_env, tmp_path, clear_scope_resolver
+):
+    set_execution_scope_resolver(
+        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None
+    )
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir()
+    source.write_text("workforce upload", encoding="utf-8")
+    record = _record(source, task_id=99)
+
+    stored = ManagedFileRef(record).sync_to_durable()
+    assert stored.key == "users/7/clients/3/end_users/7/uploads/file-123/source.txt"
