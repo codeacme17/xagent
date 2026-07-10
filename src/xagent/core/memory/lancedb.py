@@ -22,6 +22,13 @@ from .schema_migration import (
     classify_memory_schema_mismatch,
     migrate_table_swap,
 )
+from .scope_columns import (
+    SCOPE_DIMS_COLUMN,
+    USER_ID_COLUMN,
+    coerce_user_id,
+    derive_scope_columns,
+    encode_scope_dims,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +127,27 @@ class LanceDBMemoryStore(MemoryStore):
                 conn, self._current_embedding_dim(), raise_when_compatible=False
             )
 
+        # #822: promote user_id + scope_dims to real columns so scope filters
+        # can be pushed into a `where` prefilter (slice 002). Idempotent and
+        # data-preserving; runs after the base-schema resolution above so it sees
+        # a table that already has id/text/metadata.
+        self._ensure_scope_columns(conn)
+
     def _create_empty_table(self) -> None:
         """Create an empty table with the correct schema."""
         conn = self._vector_store.get_raw_connection()
+
+        # Base row carries the derived scope columns (#822) so their types are
+        # fixed at creation: user_id -> int64, scope_dims -> list<string>.
+        # Concrete values are only for schema inference; the sample row is
+        # deleted below.
+        base_sample = {
+            "id": "sample",
+            "text": "sample",
+            "metadata": "{}",
+            USER_ID_COLUMN: 0,
+            SCOPE_DIMS_COLUMN: ["sample"],
+        }
 
         # Check if we have an embedding model
         if self._embedding_model:
@@ -132,23 +157,16 @@ class LanceDBMemoryStore(MemoryStore):
                 sample_embedding = self._get_embedding("sample")
                 if sample_embedding:
                     # Create sample data with vector
-                    sample_data = [
-                        {
-                            "id": "sample",
-                            "text": "sample",
-                            "metadata": "{}",
-                            "vector": sample_embedding,
-                        }
-                    ]
+                    sample_data = [{**base_sample, "vector": sample_embedding}]
                 else:
                     # Fallback to non-vector schema
-                    sample_data = [{"id": "sample", "text": "sample", "metadata": "{}"}]
+                    sample_data = [base_sample]
             except Exception:
                 # If embedding fails, use non-vector schema
-                sample_data = [{"id": "sample", "text": "sample", "metadata": "{}"}]
+                sample_data = [base_sample]
         else:
             # No embedding model, create without vector column
-            sample_data = [{"id": "sample", "text": "sample", "metadata": "{}"}]
+            sample_data = [base_sample]
 
         # Create table with appropriate schema
         table = conn.create_table(self._collection_name, data=sample_data)
@@ -254,7 +272,73 @@ class LanceDBMemoryStore(MemoryStore):
             vectors = self._embed_texts_batch(texts, target_dim)
             columns["vector"] = pa.array(vectors, pa.list_(pa.float32(), target_dim))
 
+        # #822: keep the derived scope columns present through a vector rebuild so
+        # every migration path produces the full schema.
+        user_ids, scope_dims = self._derive_scope_arrays(columns["metadata"])
+        columns[USER_ID_COLUMN] = user_ids
+        columns[SCOPE_DIMS_COLUMN] = scope_dims
+
         return pa.table(columns)
+
+    def _derive_scope_arrays(self, metadata_column: Any) -> tuple[Any, Any]:
+        """Derive the (user_id, scope_dims) Arrow columns from a metadata column.
+
+        Shared by every migration transform so the write path and all rebuild
+        paths encode the columns identically.
+        """
+        user_ids: list[Optional[int]] = []
+        scope_dims: list[list[str]] = []
+        for metadata_json in metadata_column.to_pylist():
+            user_id, dims = derive_scope_columns(metadata_json)
+            user_ids.append(user_id)
+            scope_dims.append(dims)
+        return (
+            pa.array(user_ids, pa.int64()),
+            pa.array(scope_dims, pa.list_(pa.string())),
+        )
+
+    def _add_scope_columns(self, existing: Any) -> Any:
+        """Migration transform: add derived scope columns, preserve everything else.
+
+        Unlike the vector rebuild, this preserves the existing ``vector`` column
+        as-is (no re-embedding) — it only projects ``user_id`` / ``scope_dims``
+        out of each row's metadata JSON.
+        """
+        columns: dict[str, Any] = {
+            name: existing.column(name) for name in existing.schema.names
+        }
+        if "metadata" in columns:
+            metadata_column = columns["metadata"].cast(pa.string())
+        else:
+            metadata_column = pa.array([None] * existing.num_rows, pa.string())
+        user_ids, scope_dims = self._derive_scope_arrays(metadata_column)
+        columns[USER_ID_COLUMN] = user_ids
+        columns[SCOPE_DIMS_COLUMN] = scope_dims
+        return pa.table(columns)
+
+    def _ensure_scope_columns(self, conn: Any) -> None:
+        """Promote user_id + scope_dims to real columns on an existing table (#822).
+
+        Idempotent: does nothing when both columns already exist (fresh tables are
+        created with them). Otherwise rebuilds the table via transform-then-swap,
+        back-filling both columns from each row's metadata JSON and preserving all
+        other columns (including ``vector``). On failure the original table is left
+        intact and the error propagates — this never drops data.
+        """
+        table = conn.open_table(self._collection_name)
+        try:
+            names = set(table.schema.names)
+        finally:
+            _safe_close_table(table)
+
+        if {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names:
+            return
+
+        logger.info(
+            "Promoting user_id/scope_dims to real columns on table '%s'",
+            self._collection_name,
+        )
+        migrate_table_swap(conn, self._collection_name, self._add_scope_columns)
 
     def _backfill_missing_columns(self, conn: Any, columns: tuple[str, ...]) -> None:
         """Add missing non-vector columns in place (no data loss, no rebuild)."""
@@ -348,6 +432,11 @@ class LanceDBMemoryStore(MemoryStore):
             "vector": embedding,
             "text": note.content,
             "metadata": json.dumps(metadata, ensure_ascii=False),
+            # #822: derived filter projections; the metadata JSON stays
+            # authoritative. Computed from the scope stamps the isolation layer
+            # writes onto note.metadata (user_id + execution_scope_* keys).
+            USER_ID_COLUMN: coerce_user_id(note.metadata.get("user_id")),
+            SCOPE_DIMS_COLUMN: encode_scope_dims(note.metadata),
         }
 
     def _dict_to_memory_note(self, data: dict[str, Any]) -> MemoryNote:
@@ -430,6 +519,8 @@ class LanceDBMemoryStore(MemoryStore):
                     "id": data["id"],
                     "text": data["text"],
                     "metadata": data["metadata"],
+                    USER_ID_COLUMN: data[USER_ID_COLUMN],
+                    SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
                 }
 
                 # Add vector if available
