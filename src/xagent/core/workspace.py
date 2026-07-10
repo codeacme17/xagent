@@ -902,11 +902,21 @@ class TaskWorkspace:
                             or existing_stem in request_stem
                         )
                     ):
+                        # Containment gate, mirroring the exact-match and
+                        # normalized-name branches. ``iterdir`` can surface a
+                        # symlink that resolves outside the workspace; skip such
+                        # a rogue candidate and keep searching rather than
+                        # aborting, so a legitimate later match is still found.
+                        resolved = existing_file.resolve()
+                        try:
+                            self._resolve_allowed_absolute_path(resolved)
+                        except ValueError:
+                            continue
                         logger.info(
                             f"File '{file_path}' fuzzy matched to: "
                             f"'{existing_file.name}'"
                         )
-                        return existing_file.resolve()
+                        return resolved
 
             # 4. Not found — include available files in error message
             hint = ""

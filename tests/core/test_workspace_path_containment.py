@@ -89,6 +89,49 @@ def test_resolve_path_with_search_finds_legitimate_file(workspace):
     assert resolved == target.resolve()
 
 
+def test_resolve_path_with_search_rejects_symlink_escape_in_fuzzy_match(
+    workspace, tmp_path
+):
+    # A symlink inside a search dir that resolves outside the workspace must
+    # not be returned by the fuzzy-match branch, even when its stem fuzzy-
+    # matches the request. Under the pre-fix code the out-of-tree target was
+    # returned unchecked; now containment rejects it and, with no other match,
+    # the search reports the file as not found.
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "other" / "secret.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("out-of-tree secret", encoding="utf-8")
+
+    link = workspace.output_dir / "report.txt"
+    link.symlink_to(secret)
+
+    with pytest.raises(FileNotFoundError):
+        workspace.resolve_path_with_search("reportt.txt")
+
+
+def test_resolve_path_with_search_skips_symlink_escape_but_finds_legit_match(
+    workspace, tmp_path
+):
+    # The containment gate skips a rogue candidate and keeps searching, so a
+    # legitimate fuzzy match in a later directory is still returned.
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    workspace.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    secret = tmp_path / "other" / "secret.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("out-of-tree secret", encoding="utf-8")
+    # Rogue escaping symlink in output/ (searched before temp/).
+    (workspace.output_dir / "report.txt").symlink_to(secret)
+    # Legitimate in-workspace file that also fuzzy-matches the request.
+    legit = workspace.temp_dir / "report.txt"
+    legit.write_text("in-workspace report", encoding="utf-8")
+
+    resolved = workspace.resolve_path_with_search("reportt.txt")
+
+    assert resolved == legit.resolve()
+    assert resolved.is_relative_to(workspace.workspace_dir.resolve())
+
+
 def test_resolve_path_still_rejects_absolute_escape(workspace, tmp_path):
     # Regression: the absolute-path branch keeps rejecting out-of-workspace paths.
     outside = tmp_path / "outside.txt"
