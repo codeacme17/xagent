@@ -15,7 +15,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from uuid import uuid4
 
 from ..config import get_uploads_dir
@@ -720,6 +720,29 @@ class TaskWorkspace:
         except ValueError:
             return None
 
+    def _find_existing_candidate(
+        self,
+        search_dirs: List[Tuple[str, Path]],
+        candidate_fn: Callable[[Path], Path],
+    ) -> Optional[Path]:
+        """Return the first existing candidate across ``search_dirs``, else None.
+
+        ``candidate_fn(dir_path)`` builds the candidate path for each search
+        directory. Containment is validated (via
+        ``_resolve_allowed_absolute_path``) BEFORE touching the filesystem, so a
+        ``..`` traversal raises the same ``ValueError`` whether or not the target
+        exists — otherwise the ``ValueError``/``FileNotFoundError`` split would
+        be a cross-workspace file-existence oracle. A candidate whose leaf name
+        itself resolves outside the workspace (e.g. an out-of-tree symlink) is
+        rejected here too.
+        """
+        for _dir_name, dir_path in search_dirs:
+            candidate = candidate_fn(dir_path)
+            resolved_candidate = self._resolve_allowed_absolute_path(candidate)
+            if resolved_candidate.exists():
+                return resolved_candidate
+        return None
+
     def resolve_path(self, file_path: str, default_dir: str = "output") -> Path:
         """
         Resolve a file path within the workspace or allowed external directories.
@@ -834,35 +857,25 @@ class TaskWorkspace:
             ]
 
             # 1. Try exact match first
-            for _dir_name, dir_path in search_dirs:
-                candidate = dir_path / clean_path
-                # Validate containment BEFORE touching the filesystem, so a
-                # ``..`` traversal raises the same ValueError whether or not the
-                # target exists — otherwise the ValueError/FileNotFoundError
-                # split would be a cross-workspace file-existence oracle.
-                resolved_candidate = self._resolve_allowed_absolute_path(candidate)
-                if resolved_candidate.exists():
-                    return resolved_candidate
+            match = self._find_existing_candidate(
+                search_dirs, lambda dir_path: dir_path / clean_path
+            )
+            if match is not None:
+                return match
 
             # 2. Try normalized filename (handles spaces, brackets, etc.)
             normalized_name = self._normalize_filename_for_search(clean_path.name)
             if normalized_name != clean_path.name:
                 normalized_clean = clean_path.parent / normalized_name
-                for _dir_name, dir_path in search_dirs:
-                    candidate = dir_path / normalized_clean
-                    # Containment before existence, mirroring the exact-match
-                    # branch. For a plain ``..`` traversal the exact-match loop
-                    # above shares this parent path and already raises, so this
-                    # check is load-bearing only when the normalized leaf name
-                    # itself resolves outside the workspace (e.g. an out-of-tree
-                    # symlink), not for traversal.
-                    resolved_candidate = self._resolve_allowed_absolute_path(candidate)
-                    if resolved_candidate.exists():
-                        logger.info(
-                            f"File '{file_path}' matched via normalized name: "
-                            f"'{normalized_name}'"
-                        )
-                        return resolved_candidate
+                match = self._find_existing_candidate(
+                    search_dirs, lambda dir_path: dir_path / normalized_clean
+                )
+                if match is not None:
+                    logger.info(
+                        f"File '{file_path}' matched via normalized name: "
+                        f"'{normalized_name}'"
+                    )
+                    return match
 
             # 3. Try fuzzy match — also collect file list for error message
             request_stem = clean_path.stem.replace(" ", "").replace("_", "")

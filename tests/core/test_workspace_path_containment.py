@@ -14,37 +14,46 @@ import pytest
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import TaskWorkspace
 
+# Relative inputs that resolve outside the workspace and must be rejected.
+# ``plain`` climbs out directly; ``prefixed`` starts under a legit "output/"
+# prefix before climbing out — both share the same expected outcome.
+TRAVERSAL_PATHS = [
+    pytest.param("../../other/secret.txt", id="plain"),
+    pytest.param("output/../../../escape.txt", id="prefixed"),
+]
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    return TaskWorkspace("task7", str(tmp_path))
+
+
+@pytest.fixture
+def ops(workspace):
+    return WorkspaceFileOperations(workspace)
+
+
 # --------------------------------------------------------------------------
 # SITE 1 — TaskWorkspace.resolve_path / resolve_path_with_search
 # --------------------------------------------------------------------------
 
 
-def test_resolve_path_rejects_relative_traversal_out_of_workspace(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
-
+@pytest.mark.parametrize("rel_path", TRAVERSAL_PATHS)
+def test_resolve_path_rejects_relative_traversal(workspace, rel_path):
     with pytest.raises(ValueError):
-        workspace.resolve_path("../../other/secret.txt")
+        workspace.resolve_path(rel_path)
 
 
-def test_resolve_path_rejects_prefixed_relative_traversal(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
-
-    # An "output/"-prefixed path that then climbs out must still be rejected.
-    with pytest.raises(ValueError):
-        workspace.resolve_path("output/../../../escape.txt")
-
-
-def test_resolve_path_allows_legitimate_relative_path(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
-
+def test_resolve_path_allows_legitimate_relative_path(workspace):
     resolved = workspace.resolve_path("report.txt")
 
     assert resolved.is_relative_to(workspace.workspace_dir.resolve())
     assert resolved == (workspace.output_dir / "report.txt").resolve()
 
 
-def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
+def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(
+    workspace, tmp_path
+):
     workspace.input_dir.mkdir(parents=True, exist_ok=True)
 
     # A real file outside the workspace that a traversal would otherwise reach:
@@ -58,21 +67,19 @@ def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(tmp_pat
 
 
 def test_resolve_path_with_search_rejects_nonexistent_traversal_without_oracle(
-    tmp_path,
+    workspace,
 ):
     # Containment is checked before existence, so a traversal to a path that
     # does NOT exist raises ValueError (the same as an existing target) rather
     # than FileNotFoundError. Otherwise the exception type would leak whether a
     # file exists outside the workspace.
-    workspace = TaskWorkspace("task7", str(tmp_path))
     workspace.input_dir.mkdir(parents=True, exist_ok=True)
 
     with pytest.raises(ValueError):
         workspace.resolve_path_with_search("../../other/does_not_exist.txt")
 
 
-def test_resolve_path_with_search_finds_legitimate_file(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
+def test_resolve_path_with_search_finds_legitimate_file(workspace):
     target = workspace.output_dir / "data.csv"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("a,b\n1,2\n", encoding="utf-8")
@@ -82,9 +89,8 @@ def test_resolve_path_with_search_finds_legitimate_file(tmp_path):
     assert resolved == target.resolve()
 
 
-def test_resolve_path_still_rejects_absolute_escape(tmp_path):
+def test_resolve_path_still_rejects_absolute_escape(workspace, tmp_path):
     # Regression: the absolute-path branch keeps rejecting out-of-workspace paths.
-    workspace = TaskWorkspace("task7", str(tmp_path))
     outside = tmp_path / "outside.txt"
     outside.write_text("x", encoding="utf-8")
 
@@ -98,34 +104,20 @@ def test_resolve_path_still_rejects_absolute_escape(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_ops_resolve_path_rejects_relative_traversal(tmp_path):
-    ops = WorkspaceFileOperations(TaskWorkspace("task7", str(tmp_path)))
-
+@pytest.mark.parametrize("rel_path", TRAVERSAL_PATHS)
+def test_ops_resolve_path_rejects_relative_traversal(ops, rel_path):
     with pytest.raises(ValueError):
-        ops._resolve_path("../../other/secret.txt", "output")
+        ops._resolve_path(rel_path, "output")
 
 
-def test_ops_resolve_path_rejects_prefixed_relative_traversal(tmp_path):
-    ops = WorkspaceFileOperations(TaskWorkspace("task7", str(tmp_path)))
-
-    with pytest.raises(ValueError):
-        ops._resolve_path("output/../../../escape.txt", "output")
-
-
-def test_ops_resolve_path_allows_legitimate_relative(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
-    ops = WorkspaceFileOperations(workspace)
-
+def test_ops_resolve_path_allows_legitimate_relative(workspace, ops):
     resolved = ops._resolve_path("report.txt", "output")
 
     assert resolved.is_relative_to(workspace.workspace_dir.resolve())
     assert resolved == (workspace.output_dir / "report.txt").resolve()
 
 
-def test_write_file_refuses_relative_traversal_end_to_end(tmp_path):
-    workspace = TaskWorkspace("task7", str(tmp_path))
-    ops = WorkspaceFileOperations(workspace)
-
+def test_write_file_refuses_relative_traversal_end_to_end(ops, tmp_path):
     with pytest.raises(ValueError):
         ops.write_file("../../other/pwned.txt", "malicious content")
 
