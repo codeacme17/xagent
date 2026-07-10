@@ -24,6 +24,7 @@ from .schema_migration import (
 )
 from .scope_columns import (
     SCOPE_DIMS_COLUMN,
+    SCOPE_EXCLUSIVE_FILTER_KEY,
     USER_ID_COLUMN,
     build_scope_where,
     coerce_user_id,
@@ -480,7 +481,13 @@ class LanceDBMemoryStore(MemoryStore):
     ) -> bool:
         """Apply filters to metadata dict for text search results."""
         for key, value in filters.items():
-            if key == "metadata":
+            if key == SCOPE_EXCLUSIVE_FILTER_KEY:
+                # #822: the text-fallback form of the strict dimension-less
+                # exclusion the vector path pushes into `where`. Only notes
+                # carrying no scope dimensions pass.
+                if value and encode_scope_dims(metadata_dict):
+                    return False
+            elif key == "metadata":
                 # Handle nested metadata filters
                 if not self._apply_metadata_filters(metadata_dict, value):
                     return False

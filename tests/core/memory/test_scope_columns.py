@@ -1,10 +1,11 @@
-"""Unit tests for the derived scope-column encoding + where builder (#822)."""
+"""Unit tests for the derived scope-column encoding (#822, slice 001/002)."""
 
 from __future__ import annotations
 
 from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.scope_columns import (
     SCOPE_DIMS_COLUMN,
+    SCOPE_EXCLUSIVE_FILTER_KEY,
     USER_ID_COLUMN,
     build_scope_where,
     coerce_user_id,
@@ -80,7 +81,7 @@ def test_scope_dim_where_term_is_exact_array_contains():
         scope_dim_where_term("tenant", "acme")
         == f"array_contains({SCOPE_DIMS_COLUMN}, 'tenant=acme')"
     )
-    # Values with SQL-special quotes are doubled; no wildcard escaping needed.
+    # Values with SQL-special quotes are doubled; no LIKE wildcards to escape.
     assert scope_dim_where_term("t", "a'b") == (
         f"array_contains({SCOPE_DIMS_COLUMN}, 't=a''b')"
     )
@@ -124,3 +125,14 @@ def test_build_scope_where_unparsable_user_id_falls_back_to_python():
     where_sql, residual = build_scope_where({"metadata": {"user_id": "abc"}})
     assert where_sql is None
     assert residual == {"metadata": {"user_id": "abc"}}
+
+
+def test_build_scope_where_exclusive_directive():
+    where_sql, residual = build_scope_where(
+        {"metadata": {"user_id": 1}, SCOPE_EXCLUSIVE_FILTER_KEY: True}
+    )
+    assert where_sql == (
+        f"{USER_ID_COLUMN} = 1 AND array_length({SCOPE_DIMS_COLUMN}) = 0"
+    )
+    # The reserved directive is consumed, never left for equality matching.
+    assert residual == {}

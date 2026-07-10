@@ -23,6 +23,7 @@ import pytest
 from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
@@ -210,7 +211,9 @@ def test_subset_match_superset_returned_missing_excluded(temp_db_dir):
         for n in store.search(
             "x",
             k=10,
-            filters={"metadata": {"user_id": 1, f"{P}tenant": "acme", f"{P}agent": "x"}},
+            filters={
+                "metadata": {"user_id": 1, f"{P}tenant": "acme", f"{P}agent": "x"}
+            },
         )
     }
     assert got == {"A"}
@@ -227,3 +230,90 @@ def test_scoped_search_excludes_other_users(temp_db_dir):
 
     got = {n.content for n in store.search("x", k=10, filters=_scope_filter("acme", 1))}
     assert got == {"u1"}
+
+
+def _bulk_build_with_unscoped(db_dir, n_principals, r=10, name="mem"):
+    """Shared collection: N scoped principals plus R unscoped notes for user 1."""
+    db = lancedb.connect(db_dir)
+    ts = "2026-01-01T00:00:00"
+    rows = []
+
+    def _row(note_id, dims, meta_extra):
+        metadata = {"content": note_id, "timestamp": ts, "user_id": 1, **meta_extra}
+        return {
+            "id": note_id,
+            "text": note_id,
+            "metadata": json.dumps(metadata),
+            "user_id": 1,
+            "scope_dims": dims,
+            "vector": list(_VECTOR),
+        }
+
+    for j in range(r):
+        rows.append(_row(f"unscoped-{j}", [], {}))
+        for p in range(n_principals):
+            rows.append(_row(f"t{p}-{j}", [f"tenant=t{p}"], {f"{P}tenant": f"t{p}"}))
+    table = db.create_table(name, data=rows)
+    _safe_close_table(table)
+
+
+@pytest.mark.parametrize("n_principals", [10, 100, 1000])
+def test_strict_exclusion_recall_is_population_independent(temp_db_dir, n_principals):
+    """The pushed-down strict exclusion (scope_exclusive) keeps recall of a
+    dimension-less strict search independent of how many scoped notes crowd the
+    collection."""
+    r = 10
+    _bulk_build_with_unscoped(temp_db_dir, n_principals, r=r)
+    store = _store(temp_db_dir)
+
+    # A strict dimension-less search: user_id only + the scope_exclusive directive.
+    results = store.search(
+        "anything",
+        k=r,
+        filters={"metadata": {"user_id": 1}, SCOPE_EXCLUSIVE_FILTER_KEY: True},
+    )
+    returned = {n.content for n in results}
+    expected = {f"unscoped-{j}" for j in range(r)}
+    recall = len(returned & expected) / r
+    assert recall == 1.0, f"N={n_principals}: strict recall collapsed to {recall}"
+    # No scope-stamped note leaked in.
+    assert returned <= expected
+
+
+def test_text_fallback_honors_scope_exclusive_and_dims(temp_db_dir):
+    """With no embedding model the store uses the text-search fallback, which
+    applies the `scope_exclusive` directive and dimension filters in Python
+    (the vector `where` path is never taken)."""
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir, collection_name="mem", embedding_model=None
+    )
+    store.add(MemoryNote(id="u", content="hello unscoped", metadata={"user_id": 1}))
+    store.add(
+        MemoryNote(
+            id="s",
+            content="hello scoped",
+            metadata={"user_id": 1, f"{P}tenant": "acme"},
+        )
+    )
+
+    # scope_exclusive over the text fallback keeps only the dimension-less note.
+    got = {
+        n.content
+        for n in store.search(
+            "hello",
+            k=10,
+            filters={"metadata": {"user_id": 1}, SCOPE_EXCLUSIVE_FILTER_KEY: True},
+        )
+    }
+    assert got == {"hello unscoped"}
+
+    # A dimension filter over the text fallback returns only the scoped note.
+    got = {
+        n.content
+        for n in store.search(
+            "hello",
+            k=10,
+            filters={"metadata": {"user_id": 1, f"{P}tenant": "acme"}},
+        )
+    }
+    assert got == {"hello scoped"}

@@ -11,6 +11,7 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
 
 
@@ -24,10 +25,11 @@ class UserIsolatedMemoryStore(MemoryStore):
     only see notes carrying their dimensions, while unscoped searches see
     everything under the user — including scoped notes. With
     ``strict_memory_isolation`` on the active scope, dimension-less searches
-    additionally post-filter out any scope-stamped note (the flag is
-    consumed even when the rest of the scope is empty). The post-filter runs
-    over rows already fetched from the vector search, so a strict search may
-    return fewer than ``k`` results.
+    additionally exclude any scope-stamped note (the flag is consumed even
+    when the rest of the scope is empty). That exclusion is carried to the
+    store as the ``scope_exclusive`` filter directive: pushed into the ``where``
+    prefilter on the vector path (so it no longer crowds the top-k) and applied
+    in Python on the text-search fallback.
 
     The by-id methods (``get``/``update``/``delete``) enforce the same scope
     dimensions as ``search``/``list_all`` (see ``_scope_permits``), so a
@@ -77,30 +79,24 @@ class UserIsolatedMemoryStore(MemoryStore):
         # Scoped searches filter on the active scope's memory dimensions;
         # dimension-less scopes add nothing (unscoped searches see
         # everything under the user — one-way visibility by default).
-        metadata_filters.update(memory_dimension_metadata(get_execution_scope()))
+        scope = get_execution_scope()
+        metadata_filters.update(memory_dimension_metadata(scope))
 
         filters["metadata"] = metadata_filters
-        return filters
 
-    @staticmethod
-    def _apply_strict_isolation(notes: List[MemoryNote]) -> List[MemoryNote]:
-        """Post-filter for ``strict_memory_isolation``: a dimension-less
-        search under a strict scope excludes scope-stamped notes. Python-
-        level on purpose — the metadata filters are equality checks over
-        already-fetched rows, so "key absent" needs no backend support.
-        May shrink results below ``k``."""
-        scope: Optional[ExecutionScope] = get_execution_scope()
+        # strict_memory_isolation on a dimension-less scope: exclude any
+        # scope-stamped note. Pushed into the store's filter (#822 slice 003) as
+        # a `where` prefilter on the vector path — so a strict search over a
+        # collection dominated by scoped notes no longer has its own notes
+        # crowded out of the top-k — and honored in Python on the text fallback.
         if (
-            scope is None
-            or not scope.strict_memory_isolation
-            or scope.memory_dimensions
+            scope is not None
+            and scope.strict_memory_isolation
+            and not scope.memory_dimensions
         ):
-            return notes
-        return [
-            note
-            for note in notes
-            if not metadata_carries_scope_dimensions(note.metadata)
-        ]
+            filters[SCOPE_EXCLUSIVE_FILTER_KEY] = True
+
+        return filters
 
     @staticmethod
     def _scope_gates_by_id_access() -> bool:
@@ -120,7 +116,8 @@ class UserIsolatedMemoryStore(MemoryStore):
         - a scoped caller (non-empty ``memory_dimensions``) matches only a
           note carrying all of its dimension stamps;
         - a dimension-less caller under ``strict_memory_isolation`` cannot
-          touch a scope-stamped note (mirrors ``_apply_strict_isolation``);
+          touch a scope-stamped note (the same exclusion ``search``/``list_all``
+          push into the store via the ``scope_exclusive`` directive);
         - unscoped / dimension-less non-strict callers keep one-way
           visibility (access allowed).
         """
@@ -254,16 +251,16 @@ class UserIsolatedMemoryStore(MemoryStore):
         Returns:
             List of matching memory notes
         """
-        # Add user (and scope-dimension) filters to existing filters
+        # Add user (and scope-dimension) filters to existing filters. Strict
+        # dimension-less isolation is carried inside the filters and applied by
+        # the store (prefilter on the vector path), not post-filtered here.
         filtered_filters = self._add_user_filter(filters)
 
-        return self._apply_strict_isolation(
-            self._base_store.search(
-                query=query,
-                k=k,
-                filters=filtered_filters,
-                similarity_threshold=similarity_threshold,
-            )
+        return self._base_store.search(
+            query=query,
+            k=k,
+            filters=filtered_filters,
+            similarity_threshold=similarity_threshold,
         )
 
     def clear(self) -> None:
@@ -290,10 +287,12 @@ class UserIsolatedMemoryStore(MemoryStore):
         Returns:
             List of memory notes
         """
-        # Add user (and scope-dimension) filters to existing filters
+        # Add user (and scope-dimension) filters to existing filters. Strict
+        # dimension-less isolation is carried inside the filters and applied by
+        # the store, not post-filtered here.
         filtered_filters = self._add_user_filter(filters)
 
-        return self._apply_strict_isolation(self._base_store.list_all(filtered_filters))
+        return self._base_store.list_all(filtered_filters)
 
     def get_stats(self) -> dict[str, Any]:
         """

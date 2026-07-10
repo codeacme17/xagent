@@ -3,10 +3,13 @@
 ``UserIsolatedMemoryStore`` stamps the active scope's ``memory_dimensions``
 onto note metadata on add and filters on them on search, alongside the
 existing ``user_id`` handling. Default visibility is one-way; strict
-isolation post-filters scope-stamped notes out of dimension-less searches.
+isolation excludes scope-stamped notes from dimension-less searches. That
+exclusion is carried in the filters as ``scope_exclusive`` and applied by the
+store (#822 slice 003), not post-filtered in the wrapper.
 
 The fake base store mirrors the LanceDB filter semantics: nested
-``filters["metadata"]`` entries applied as string-equality checks.
+``filters["metadata"]`` entries applied as string-equality checks, plus the
+``scope_exclusive`` directive.
 """
 
 from typing import Any, List, Optional
@@ -21,6 +24,10 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.scope_columns import (
+    SCOPE_EXCLUSIVE_FILTER_KEY,
+    encode_scope_dims,
+)
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 SCOPE_A = ExecutionScope(memory_dimensions={"tenant": "a"})
@@ -52,7 +59,12 @@ class FakeBaseStore(MemoryStore):
         return MemoryResponse(success=True, memory_id=note_id)
 
     def _matches(self, note: MemoryNote, filters: Optional[dict]) -> bool:
-        metadata_filters = (filters or {}).get("metadata", {})
+        filters = filters or {}
+        # Mirror the store's scope_exclusive handling: strict dimension-less
+        # searches exclude any scope-stamped note.
+        if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
+            return False
+        metadata_filters = filters.get("metadata", {})
         return all(
             str(note.metadata.get(key, "")) == str(value)
             for key, value in metadata_filters.items()

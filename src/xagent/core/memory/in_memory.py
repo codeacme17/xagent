@@ -5,11 +5,20 @@ from typing import Any, List, Optional
 
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
+from .scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY, encode_scope_dims
 
 
 class InMemoryMemoryStore(MemoryStore):
     def __init__(self) -> None:
         self._store: dict[str, MemoryNote] = {}
+
+    @staticmethod
+    def _is_scope_excluded(note: MemoryNote, filters: dict[str, Any]) -> bool:
+        """#822: strict dimension-less exclusion (``scope_exclusive``) — a note
+        carrying any scope dimension is excluded."""
+        return bool(filters.get(SCOPE_EXCLUSIVE_FILTER_KEY)) and bool(
+            encode_scope_dims(note.metadata)
+        )
 
     def add(self, note: MemoryNote) -> MemoryResponse:
         note_id = note.id or str(uuid.uuid4())
@@ -56,13 +65,18 @@ class InMemoryMemoryStore(MemoryStore):
                 if filters:
                     match = True
 
+                    if self._is_scope_excluded(note, filters):
+                        match = False
+
                     # Category filter
                     if "category" in filters and note.category != filters["category"]:
                         match = False
 
                     # Other metadata filters
                     other_filters = {
-                        k: v for k, v in filters.items() if k != "category"
+                        k: v
+                        for k, v in filters.items()
+                        if k not in ("category", SCOPE_EXCLUSIVE_FILTER_KEY)
                     }
                     if other_filters and not all(
                         note.metadata.get(k) == v for k, v in other_filters.items()
@@ -85,6 +99,9 @@ class InMemoryMemoryStore(MemoryStore):
             filtered_results = []
             for note in results:
                 match = True
+
+                if self._is_scope_excluded(note, filters):
+                    match = False
 
                 # Category filter
                 if "category" in filters and note.category != filters["category"]:

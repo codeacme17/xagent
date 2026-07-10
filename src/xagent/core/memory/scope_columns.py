@@ -1,19 +1,18 @@
 """Derived filter columns for the LanceDB memory store (#822).
 
-Promotes the two fields that scope searches filter on — the owner ``user_id``
-and the execution-scope memory dimensions — out of the JSON ``metadata`` string
-into real, top-level columns. LanceDB ``where`` cannot reach fields inside the
-metadata JSON string, so these columns are the prerequisite for pushing the
-filters into a ``where`` prefilter (slice 002) instead of the Python
-post-filtering that collapses recall under shared collections (see #822).
+Promotes the two fields scope searches filter on — the owner ``user_id`` and the
+execution-scope memory dimensions — out of the JSON ``metadata`` string into
+real, top-level columns, so they can be pushed into a LanceDB ``where`` prefilter
+instead of the Python post-filtering that collapses recall under shared
+collections (see #822).
 
-The ``metadata`` JSON stays authoritative: these columns are **derived
-projections**, computed from a note's metadata on write and back-filled from it
-on migration. Nothing reconstructs a note from them.
+The ``metadata`` JSON stays authoritative: these columns are derived
+projections, computed from a note's metadata on write and back-filled from it on
+migration. Nothing reconstructs a note from them.
 
 ``scope_dims`` is a ``list<string>`` column holding one ``"key=value"`` element
-per dimension (e.g. ``["agent=x", "tenant=acme"]``). Membership is tested with
-DataFusion's ``array_contains`` (slice 002), which is exact per-element string
+per dimension (e.g. ``["agent=x", "tenant=acme"]``). Dimension membership is
+tested with DataFusion's ``array_contains``, which is exact per-element string
 equality — so values may contain any character (``=``, ``/``, ``_`` …) with no
 escaping, and there is no substring-collision surface (``tenant=a`` never matches
 ``tenant=ab``).
@@ -29,6 +28,14 @@ from ..execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 # Real column names the memory dimensions are promoted into.
 USER_ID_COLUMN = "user_id"
 SCOPE_DIMS_COLUMN = "scope_dims"
+
+# Reserved, namespaced top-level filter key (#822). When truthy, the search must
+# return only notes carrying NO scope dimensions — the pushdown form of
+# ``strict_memory_isolation`` for a dimension-less scope. The ``__`` prefix keeps
+# it from colliding with a caller's real equality-filter key. It is consumed by
+# the store's filter layer (an ``array_length`` term on the vector path, a Python
+# check on the text fallback) and never reaches equality matching.
+SCOPE_EXCLUSIVE_FILTER_KEY = "__scope_exclusive__"
 
 
 def scope_dim_element(dim_key: str, value: Any) -> str:
@@ -117,6 +124,12 @@ def build_scope_where(
             residual["metadata"] = residual_metadata
         else:
             residual.pop("metadata", None)
+    # Strict dimension-less exclusion: only notes with an empty dimension list.
+    # Popped from residual so it never reaches equality matching. DataFusion
+    # returns 0 (not NULL) for an empty list, so `= 0` matches exactly the
+    # dimension-less notes (covered by the strict-exclusion integration test).
+    if residual.pop(SCOPE_EXCLUSIVE_FILTER_KEY, None):
+        clauses.append(f"array_length({SCOPE_DIMS_COLUMN}) = 0")
     where_sql = " AND ".join(clauses) if clauses else None
     return where_sql, residual
 

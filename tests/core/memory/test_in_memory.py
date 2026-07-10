@@ -4,8 +4,10 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 
 
 @pytest.fixture
@@ -357,3 +359,23 @@ def test_clear(memory_store):
 
     results = memory_store.search("temporary")
     assert len(results) == 0
+
+
+def test_scope_exclusive_filters_scoped_notes(memory_store):
+    """#822: the `scope_exclusive` directive (strict dimension-less isolation)
+    excludes any scope-stamped note on the real InMemoryMemoryStore, via
+    `_is_scope_excluded`, on both search() and list_all()."""
+    prefix = MEMORY_DIMENSION_METADATA_PREFIX
+    memory_store.add(MemoryNote(id="u", content="hello unscoped", metadata={}))
+    memory_store.add(
+        MemoryNote(id="s", content="hello scoped", metadata={f"{prefix}tenant": "acme"})
+    )
+
+    got = memory_store.search("hello", k=10, filters={SCOPE_EXCLUSIVE_FILTER_KEY: True})
+    assert {n.content for n in got} == {"hello unscoped"}
+
+    got = memory_store.list_all(filters={SCOPE_EXCLUSIVE_FILTER_KEY: True})
+    assert {n.content for n in got} == {"hello unscoped"}
+
+    # Without the directive, both notes are visible.
+    assert len(memory_store.search("hello", k=10)) == 2
