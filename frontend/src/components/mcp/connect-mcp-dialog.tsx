@@ -325,15 +325,22 @@ export function ConnectMcpDialog({
   }
 
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
-    const provider = app.provider;
-    if (!provider) {
-      // Key-based (non-oauth) catalog app: collect the key. Only these declare
-      // required_env; any other provider-less app is not connectable this way.
-      if (app.launch_config?.required_env?.length) {
+    if (app.auth_type !== "builtin_oauth") {
+      // Key-based catalog app: collect the key. Anything else is a mis-authored
+      // entry (neither OAuth nor a launchable key-based command).
+      if (app.auth_type === "api_key") {
         openKeyConnect(app);
       } else {
-        toast.error("Error: App provider is not defined");
+        toast.error(t('tools.mcp.alerts.notConfigured'));
       }
+      return;
+    }
+
+    const provider = app.provider;
+    if (!provider) {
+      // Mis-authored OAuth entry: transport says oauth but no provider to
+      // build the auth URL. Fail clearly instead of opening a broken popup.
+      toast.error(t('tools.mcp.alerts.providerNotDefined'));
       return;
     }
 

@@ -455,7 +455,11 @@ function ToolsPageContent() {
         is_connected: true,
         provider: provider,
         connected_account: server.connected_account,
-        is_custom: false
+        is_custom: false,
+        // This reconstruction path is only reached for oauth servers (gated
+        // above); set auth_type explicitly so the settings dialog's isKeyBased
+        // check stays correct if this path is ever reused for other transports.
+        auth_type: "builtin_oauth"
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
