@@ -25,6 +25,7 @@ from .schema_migration import (
 from .scope_columns import (
     SCOPE_DIMS_COLUMN,
     USER_ID_COLUMN,
+    build_scope_where,
     coerce_user_id,
     derive_scope_columns,
     encode_scope_dims,
@@ -670,6 +671,11 @@ class LanceDBMemoryStore(MemoryStore):
             )
             results = []
 
+            # #822: push user_id + scope-dimension filters into a `where`
+            # prefilter so the ANN returns k already-scoped neighbours; the rest
+            # (category, arbitrary metadata keys) stays a Python post-filter.
+            where_sql, residual_filters = build_scope_where(filters)
+
             # Try vector search first
             try:
                 query_embedding = self._get_embedding(query)
@@ -679,13 +685,17 @@ class LanceDBMemoryStore(MemoryStore):
                     if not sample_df.empty and "vector" in sample_df.columns:
                         # Try vector search
                         try:
-                            vector_df = (
-                                table.search(
-                                    query_embedding, vector_column_name="vector"
-                                )
-                                .limit(k)
-                                .to_pandas()
+                            vector_query = table.search(
+                                query_embedding, vector_column_name="vector"
                             )
+                            if where_sql:
+                                # Prefilter: scope BEFORE the top-k selection, so
+                                # crowd-out from other principals cannot collapse
+                                # recall.
+                                vector_query = vector_query.where(
+                                    where_sql, prefilter=True
+                                )
+                            vector_df = vector_query.limit(k).to_pandas()
 
                             for _, row in vector_df.iterrows():
                                 # Check similarity threshold
@@ -712,17 +722,38 @@ class LanceDBMemoryStore(MemoryStore):
                                 }
                                 note = self._dict_to_memory_note(note_data)
 
-                                # Apply metadata filters to vector search results too
-                                if filters:
-                                    filter_match = self._apply_filters(note, filters)
+                                # user_id + scope dimensions were already applied
+                                # as a `where` prefilter; only residual filters
+                                # (category, arbitrary metadata keys) remain.
+                                if residual_filters:
+                                    filter_match = self._apply_filters(
+                                        note, residual_filters
+                                    )
                                     if not filter_match:
                                         continue
 
                                 results.append(note)
                         except Exception as vector_error:
-                            logger.warning(
-                                f"Vector search failed, falling back to text search: {vector_error}"
-                            )
+                            if where_sql:
+                                # Distinguish a pushdown-specific failure: the
+                                # text fallback re-applies the full filters in
+                                # Python, so isolation is preserved, but the
+                                # population-independent recall pushdown (#822)
+                                # is silently bypassed until the query is fixed.
+                                logger.warning(
+                                    "Scoped vector search with where-prefilter "
+                                    "%r failed; falling back to text search "
+                                    "(isolation preserved via Python filtering, "
+                                    "but the recall pushdown is bypassed): %s",
+                                    where_sql,
+                                    vector_error,
+                                )
+                            else:
+                                logger.warning(
+                                    "Vector search failed, falling back to text "
+                                    "search: %s",
+                                    vector_error,
+                                )
             except Exception as embedding_error:
                 logger.warning(
                     f"Embedding generation failed, using text search: {embedding_error}"

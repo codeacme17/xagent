@@ -59,6 +59,68 @@ def coerce_user_id(value: Any) -> Optional[int]:
         return None
 
 
+def _sql_string_literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def user_id_where_term(value: Any) -> Optional[str]:
+    """Equality predicate on the ``user_id`` column, or ``None`` if unparsable."""
+    user_id = coerce_user_id(value)
+    if user_id is None:
+        return None
+    return f"{USER_ID_COLUMN} = {user_id}"
+
+
+def scope_dim_where_term(dim_key: str, value: Any) -> str:
+    """An ``array_contains`` predicate matching notes carrying this dimension.
+
+    Exact per-element string equality, so a note carrying a superset of the
+    queried dimensions still matches while a different value or a prefix does
+    not — no escaping or collision reasoning required.
+    """
+    element = _sql_string_literal(scope_dim_element(dim_key, value))
+    return f"array_contains({SCOPE_DIMS_COLUMN}, {element})"
+
+
+def build_scope_where(
+    filters: Optional[Mapping[str, Any]],
+) -> tuple[Optional[str], dict[str, Any]]:
+    """Split ``filters`` into a pushable ``where`` clause and residual filters.
+
+    Extracts ``user_id`` and the ``execution_scope_*`` dimensions from the nested
+    ``filters["metadata"]`` into column predicates (``user_id`` equality +
+    ``array_contains`` per dimension), AND-ed together and applied as a prefilter
+    so the ANN returns ``k`` already-scoped neighbours. Everything the clause
+    cannot express — category, arbitrary metadata keys, an unparsable
+    ``user_id`` — is returned as residual filters for the Python post-filter.
+
+    Returns ``(where_sql or None, residual_filters)``.
+    """
+    if not filters:
+        return None, {}
+    residual: dict[str, Any] = dict(filters)
+    clauses: list[str] = []
+    metadata = filters.get("metadata")
+    if isinstance(metadata, Mapping):
+        residual_metadata = dict(metadata)
+        if "user_id" in residual_metadata:
+            term = user_id_where_term(residual_metadata["user_id"])
+            if term is not None:
+                clauses.append(term)
+                residual_metadata.pop("user_id")
+        for key in list(residual_metadata):
+            if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX):
+                dim = key[len(MEMORY_DIMENSION_METADATA_PREFIX) :]
+                clauses.append(scope_dim_where_term(dim, residual_metadata[key]))
+                residual_metadata.pop(key)
+        if residual_metadata:
+            residual["metadata"] = residual_metadata
+        else:
+            residual.pop("metadata", None)
+    where_sql = " AND ".join(clauses) if clauses else None
+    return where_sql, residual
+
+
 def derive_scope_columns(
     metadata_json: Optional[str],
 ) -> tuple[Optional[int], list[str]]:
