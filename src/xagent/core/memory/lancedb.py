@@ -130,7 +130,7 @@ class LanceDBMemoryStore(MemoryStore):
             )
 
         # #822: promote user_id + scope_dims to real columns so scope filters
-        # can be pushed into a `where` prefilter (slice 002). Idempotent and
+        # can be pushed into a `where` prefilter (slice 001). Idempotent and
         # data-preserving; runs after the base-schema resolution above so it sees
         # a table that already has id/text/metadata.
         self._ensure_scope_columns(conn)

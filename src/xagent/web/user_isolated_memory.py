@@ -27,7 +27,7 @@ class UserIsolatedMemoryStore(MemoryStore):
     ``strict_memory_isolation`` on the active scope, dimension-less searches
     additionally exclude any scope-stamped note (the flag is consumed even
     when the rest of the scope is empty). That exclusion is carried to the
-    store as the ``scope_exclusive`` filter directive: pushed into the ``where``
+    store as the ``__scope_exclusive__`` filter directive: pushed into the ``where``
     prefilter on the vector path (so it no longer crowds the top-k) and applied
     in Python on the text-search fallback.
 
@@ -67,11 +67,13 @@ class UserIsolatedMemoryStore(MemoryStore):
         Returns:
             Updated filters with user isolation
         """
-        if filters is None:
-            filters = {}
+        # Work on shallow copies so a caller-supplied ``filters`` dict (and its
+        # nested ``metadata`` dict) is never mutated in place — callers may
+        # reuse the same object across scopes.
+        filters = dict(filters) if filters else {}
 
         # Add user ID to metadata filters
-        metadata_filters = filters.get("metadata", {})
+        metadata_filters = dict(filters.get("metadata", {}))
         user_id = self._get_current_user_id()
         if user_id is not None:
             metadata_filters["user_id"] = user_id
@@ -117,7 +119,7 @@ class UserIsolatedMemoryStore(MemoryStore):
           note carrying all of its dimension stamps;
         - a dimension-less caller under ``strict_memory_isolation`` cannot
           touch a scope-stamped note (the same exclusion ``search``/``list_all``
-          push into the store via the ``scope_exclusive`` directive);
+          push into the store via the ``__scope_exclusive__`` directive);
         - unscoped / dimension-less non-strict callers keep one-way
           visibility (access allowed).
         """

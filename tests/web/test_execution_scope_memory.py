@@ -216,6 +216,35 @@ class TestStrictIsolation:
         assert [str(n.content) for n in results] == ["note tenant a"]
 
 
+class TestCallerFiltersNotMutated:
+    """``_add_user_filter`` must work on copies: a caller-supplied ``filters``
+    dict (and its nested ``metadata`` dict) is never mutated in place, so the
+    same object can be reused across scopes."""
+
+    def test_search_leaves_caller_filters_untouched(self, store):
+        _seed_user_notes(store)
+        original = {"metadata": {"foo": "bar"}}
+        strict = ExecutionScope(strict_memory_isolation=True)
+        with UserContext(1), ExecutionScopeContext(strict):
+            store.search("note", filters=original)
+        # No injected user_id / scope-exclusive directive leaked back out.
+        assert original == {"metadata": {"foo": "bar"}}
+
+    def test_same_filters_dict_reused_across_scopes(self, store):
+        _seed_user_notes(store)
+        shared = {"metadata": {}}
+        with UserContext(1):
+            with ExecutionScopeContext(SCOPE_A):
+                seen_a = {n.id for n in store.search("note", filters=shared)}
+            with ExecutionScopeContext(SCOPE_B):
+                seen_b = {n.id for n in store.search("note", filters=shared)}
+        # A leaked SCOPE_A dimension would empty (or cross-contaminate) the
+        # SCOPE_B search; disjoint results prove no state carried over.
+        assert seen_a and seen_b
+        assert seen_a.isdisjoint(seen_b)
+        assert shared == {"metadata": {}}
+
+
 class TestResolverPathAndNestedReactivation:
     def test_turn_scope_reaches_memory_via_resolver(self, store):
         """The resolver path: memory operations inside a turn carry the

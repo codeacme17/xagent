@@ -14,8 +14,9 @@ class InMemoryMemoryStore(MemoryStore):
 
     @staticmethod
     def _is_scope_excluded(note: MemoryNote, filters: dict[str, Any]) -> bool:
-        """#822: strict dimension-less exclusion (``scope_exclusive``) — a note
-        carrying any scope dimension is excluded."""
+        """#822: strict dimension-less exclusion (the ``__scope_exclusive__``
+        directive, ``SCOPE_EXCLUSIVE_FILTER_KEY``) — a note carrying any scope
+        dimension is excluded."""
         return bool(filters.get(SCOPE_EXCLUSIVE_FILTER_KEY)) and bool(
             encode_scope_dims(note.metadata)
         )

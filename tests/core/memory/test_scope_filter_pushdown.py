@@ -280,6 +280,45 @@ def test_strict_exclusion_recall_is_population_independent(temp_db_dir, n_princi
     assert returned <= expected
 
 
+def test_where_prefilter_query_failure_falls_back_with_isolation(
+    temp_db_dir, monkeypatch, caplog
+):
+    """If the where-prefiltered vector query itself raises (not embedding
+    generation — the embedding model here works), the except branch falls back
+    to text search, which re-applies the full filters in Python so isolation is
+    preserved, and logs the distinguishable pushdown-bypassed warning."""
+    import logging
+
+    from xagent.core.memory import lancedb as lancedb_module
+    from xagent.core.memory.scope_columns import build_scope_where
+
+    store = _store(temp_db_dir)
+    store.add(
+        MemoryNote(id="a", content="x", metadata={"user_id": 1, f"{P}tenant": "acme"})
+    )
+    store.add(
+        MemoryNote(id="b", content="x", metadata={"user_id": 1, f"{P}tenant": "other"})
+    )
+
+    # Force only the pushdown clause to be invalid SQL so `.where(...)` raises at
+    # query time; keep the residual filters build intact so the full `filters`
+    # dict the text fallback re-applies is unchanged.
+    def _broken_where(filters):
+        _, residual = build_scope_where(filters)
+        return "this is not valid sql !!!", residual
+
+    monkeypatch.setattr(lancedb_module, "build_scope_where", _broken_where)
+
+    with caplog.at_level(logging.WARNING):
+        results = store.search("x", k=10, filters=_scope_filter("acme"))
+
+    # Isolation preserved by the text-fallback's Python filtering.
+    assert {n.content for n in results} == {"x"}
+    assert {n.id for n in results} == {"a"}
+    # Distinguishable pushdown-bypassed warning fired (not the generic one).
+    assert any("recall pushdown is bypassed" in r.getMessage() for r in caplog.records)
+
+
 def test_text_fallback_honors_scope_exclusive_and_dims(temp_db_dir):
     """With no embedding model the store uses the text-search fallback, which
     applies the `scope_exclusive` directive and dimension filters in Python
