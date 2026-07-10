@@ -27,6 +27,7 @@ class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     llm_calls: int = 0
+    tool_calls: int = 0
     details: List[Dict] = field(default_factory=list)
 
     @property
@@ -68,11 +69,16 @@ class TokenUsage:
         """Increment the LLM call counter."""
         self.llm_calls += 1
 
+    def increment_tool_calls(self, count: int = 1) -> None:
+        """Increment the tool-call counter (one per tool invocation)."""
+        self.tool_calls += count
+
     def merge(self, other: "TokenUsage") -> None:
         """Merge another TokenUsage into this one."""
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.llm_calls += other.llm_calls
+        self.tool_calls += other.tool_calls
         self.details.extend(other.details)
 
     def to_dict(self) -> Dict:
@@ -82,6 +88,7 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
             "llm_calls": self.llm_calls,
+            "tool_calls": self.tool_calls,
             "details": self.details,
         }
 
@@ -92,13 +99,17 @@ class TokenUsage:
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             llm_calls=data.get("llm_calls", 0),
+            tool_calls=data.get("tool_calls", 0),
             details=data.get("details", []),
         )
 
 
-# ContextVar for thread-local token tracking
-token_context: contextvars.ContextVar[TokenUsage] = contextvars.ContextVar(
-    "token_context", default=TokenUsage()
+# ContextVar for thread-local token tracking. Default is None (not a shared
+# TokenUsage instance): a single shared default would accumulate forever for
+# untracked paths (preview/builder that never call set_token_usage), leaking
+# memory. get_token_usage() lazily creates a per-context instance instead.
+token_context: contextvars.ContextVar[Optional[TokenUsage]] = contextvars.ContextVar(
+    "token_context", default=None
 )
 
 
@@ -131,12 +142,13 @@ class TokenContextManager:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the context and restore previous state."""
-        if self._previous_token is not None:
-            token_context.set(self._previous_token)
-        else:
-            # Clear the context
-            token_context.set(TokenUsage())
+        """Exit the context and restore the previous state.
+
+        Restores whatever was there before (``None`` when nothing was set), so
+        leaving a manager block doesn't reintroduce a lingering shared
+        TokenUsage instance — matching the None default on the ContextVar.
+        """
+        token_context.set(self._previous_token)
 
     def get_usage(self) -> TokenUsage:
         """Get the current token usage."""
@@ -159,8 +171,27 @@ class TokenContextManager:
 
 
 def get_token_usage() -> TokenUsage:
-    """Get the current token usage from context."""
-    return token_context.get()
+    """Get the current token usage, lazily creating a per-context instance."""
+    usage = token_context.get()
+    if usage is None:
+        usage = TokenUsage()
+        token_context.set(usage)
+    return usage
+
+
+def _coerce_int(value: Any) -> int:
+    """Best-effort int; 0 if the value isn't a usable number (e.g. None/mock)."""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        # None/absent is expected (provider omitted the field) — stay quiet.
+        # A present-but-malformed value signals a provider-adapter bug worth
+        # surfacing rather than silently billing it as zero.
+        if value is not None:
+            logger.warning("Discarding non-numeric token count: %r", value)
+        return 0
 
 
 def add_token_usage(
@@ -177,7 +208,12 @@ def add_token_usage(
         model: Model name for tracking
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
     """
-    usage = token_context.get()
+    # Coerce defensively: a provider/response that yields a non-int token count
+    # (or a mock in tests) must never crash the LLM call over accounting.
+    input_tokens = _coerce_int(input_tokens)
+    output_tokens = _coerce_int(output_tokens)
+
+    usage = get_token_usage()
     if input_tokens or output_tokens:
         # Increment LLM call counter for each API call
         usage.increment_llm_calls()
@@ -194,6 +230,11 @@ def add_token_usage(
     )
 
 
+def add_tool_call_usage(count: int = 1) -> None:
+    """Record one (or more) tool invocations on the current context."""
+    get_token_usage().increment_tool_calls(count)
+
+
 def reset_token_usage() -> TokenUsage:
     """Reset and return the current token usage."""
     new_usage = TokenUsage()
@@ -208,6 +249,6 @@ def set_token_usage(usage: TokenUsage) -> TokenUsage:
 
 def get_and_reset_token_usage() -> TokenUsage:
     """Get current usage and reset the context."""
-    usage = token_context.get()
+    usage = get_token_usage()
     reset_token_usage()
     return usage

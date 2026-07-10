@@ -1405,8 +1405,7 @@ class AgentServiceManager:
             and self._agent_owner_ids.get(task_id) != runtime_user_id
         ):
             logger.warning(
-                "Evicting cached AgentService for task %s: built for owner %s, "
-                "requested %s",
+                "Evicting cached AgentService for task %s: built for owner %s, requested %s",
                 task_id,
                 self._agent_owner_ids.get(task_id),
                 runtime_user_id,
@@ -1638,8 +1637,7 @@ class AgentServiceManager:
 
                     if snapshot.agent is not None:
                         logger.info(
-                            f"Task {task_id} using Agent Builder config: "
-                            f"{snapshot.agent.name}"
+                            f"Task {task_id} using Agent Builder config: {snapshot.agent.name}"
                         )
                         if agent_config is not None:
                             logger.info(
@@ -2021,8 +2019,7 @@ class AgentServiceManager:
         agent = self._agents.get(task_id)
         if agent is None:
             logger.debug(
-                "Skipping connector runtime turn sync for task %s turn %s: "
-                "agent is not cached",
+                "Skipping connector runtime turn sync for task %s turn %s: agent is not cached",
                 task_id,
                 connector_runtime_turn_id,
             )
@@ -2123,6 +2120,43 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
+        # Reused below for the workforce-status sync so we don't re-query the row.
+        gate_task = None
+
+        # Quota gate: refuse to start a run when the team is out of monthly
+        # quota. Fails open if the check itself errors, so quota infra problems
+        # never block execution.
+        if db_session and tracker_task_id:
+            try:
+                from ..services.quota_hooks import check_run_gate
+
+                gate_task = (
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
+                )
+                if gate_task is None:
+                    # Fail open (a delete-race can legitimately leave no row),
+                    # but surface it rather than silently allowing the run.
+                    logger.warning(
+                        "Quota gate: task %s not found; allowing run", tracker_task_id
+                    )
+                gate_reason = check_run_gate(
+                    db_session, getattr(gate_task, "user_id", None)
+                )
+                if gate_reason:
+                    # `output` is what every result consumer surfaces as the
+                    # assistant message; set it so the quota reason reaches the
+                    # user instead of a misleading "Task completed".
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": gate_reason,
+                        "error": gate_reason,
+                    }
+            except Exception:
+                logger.warning("Quota gate check failed open", exc_info=True)
+
         if manage_task_lease and db_session and tracker_task_id:
             lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:
@@ -2138,11 +2172,15 @@ class AgentServiceManager:
 
         if db_session and tracker_task_id:
             try:
-                task_for_sync = (
-                    db_session.query(Task)
-                    .filter(Task.id == int(tracker_task_id))
-                    .first()
-                )
+                # Reuse the row already fetched for the quota gate; only re-query
+                # if the gate path didn't run or errored before assigning it.
+                task_for_sync = gate_task
+                if task_for_sync is None:
+                    task_for_sync = (
+                        db_session.query(Task)
+                        .filter(Task.id == int(tracker_task_id))
+                        .first()
+                    )
                 if task_for_sync is not None and sync_workforce_run_status(
                     db_session, task_for_sync, TaskStatus.RUNNING
                 ):
@@ -2431,13 +2469,11 @@ class AgentServiceManager:
                         )
                     else:
                         raise ValueError(
-                            f"Task {task_id} not found in database during "
-                            "agent reconstruction"
+                            f"Task {task_id} not found in database during agent reconstruction"
                         )
                 except Exception as e:
                     logger.error(
-                        f"Failed to rebuild runtime configuration for task "
-                        f"{task_id}: {e}"
+                        f"Failed to rebuild runtime configuration for task {task_id}: {e}"
                     )
                     raise
 
