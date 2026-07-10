@@ -15,7 +15,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from uuid import uuid4
 
 from ..config import get_uploads_dir
@@ -720,25 +720,54 @@ class TaskWorkspace:
         except ValueError:
             return None
 
+    def _escapes_before_symlinks(self, candidate: Path) -> bool:
+        """True if ``candidate`` leaves every allowed root by path arithmetic alone.
+
+        ``os.path.normpath`` collapses ``..`` lexically without following
+        symlinks, so a ``..`` traversal is detected independently of what is on
+        disk — distinguishing it from a lexically-contained candidate whose
+        leaf only escapes once a symlink is resolved.
+        """
+        lexical = Path(os.path.normpath(candidate))
+        roots = [self.workspace_dir, *self.allowed_external_dirs]
+        for root in roots:
+            root_lexical = Path(os.path.normpath(root))
+            if lexical == root_lexical or lexical.is_relative_to(root_lexical):
+                return False
+        return True
+
     def _find_existing_candidate(
         self,
         search_dirs: List[Tuple[str, Path]],
-        candidate_fn: Callable[[Path], Path],
+        relative_path: Path,
     ) -> Optional[Path]:
-        """Return the first existing candidate across ``search_dirs``, else None.
+        """Return the first existing ``dir_path / relative_path``, else None.
 
-        ``candidate_fn(dir_path)`` builds the candidate path for each search
-        directory. Containment is validated (via
-        ``_resolve_allowed_absolute_path``) BEFORE touching the filesystem, so a
-        ``..`` traversal raises the same ``ValueError`` whether or not the target
-        exists — otherwise the ``ValueError``/``FileNotFoundError`` split would
-        be a cross-workspace file-existence oracle. A candidate whose leaf name
-        itself resolves outside the workspace (e.g. an out-of-tree symlink) is
-        rejected here too.
+        Containment is validated (via ``_resolve_allowed_absolute_path``)
+        BEFORE touching the filesystem, so the check runs before ``.exists()``
+        and a traversal cannot become a ``ValueError``/``FileNotFoundError``
+        cross-workspace existence oracle.
+
+        Two kinds of escape raise ``ValueError`` from the containment check and
+        are handled differently:
+
+        * A ``..`` traversal escapes lexically — by path arithmetic alone,
+          before any symlink is followed — and does so identically for every
+          (sibling) search dir, so no in-workspace match is possible. Re-raise
+          to fail closed uniformly; this is also the existence-oracle guard,
+          which must raise regardless of whether the out-of-tree target exists.
+        * A candidate that is lexically contained but escapes only when a
+          symlinked leaf is resolved is per-entry: skip it and keep searching
+          so a legitimate same-named file in a later dir stays reachable.
         """
         for _dir_name, dir_path in search_dirs:
-            candidate = candidate_fn(dir_path)
-            resolved_candidate = self._resolve_allowed_absolute_path(candidate)
+            candidate = dir_path / relative_path
+            try:
+                resolved_candidate = self._resolve_allowed_absolute_path(candidate)
+            except ValueError:
+                if self._escapes_before_symlinks(candidate):
+                    raise
+                continue
             if resolved_candidate.exists():
                 return resolved_candidate
         return None
@@ -857,9 +886,7 @@ class TaskWorkspace:
             ]
 
             # 1. Try exact match first
-            match = self._find_existing_candidate(
-                search_dirs, lambda dir_path: dir_path / clean_path
-            )
+            match = self._find_existing_candidate(search_dirs, clean_path)
             if match is not None:
                 return match
 
@@ -867,9 +894,7 @@ class TaskWorkspace:
             normalized_name = self._normalize_filename_for_search(clean_path.name)
             if normalized_name != clean_path.name:
                 normalized_clean = clean_path.parent / normalized_name
-                match = self._find_existing_candidate(
-                    search_dirs, lambda dir_path: dir_path / normalized_clean
-                )
+                match = self._find_existing_candidate(search_dirs, normalized_clean)
                 if match is not None:
                     logger.info(
                         f"File '{file_path}' matched via normalized name: "

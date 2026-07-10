@@ -44,6 +44,15 @@ def test_resolve_path_rejects_relative_traversal(workspace, rel_path):
         workspace.resolve_path(rel_path)
 
 
+@pytest.mark.parametrize("default_dir", ["input", "output", "temp", "other"])
+def test_resolve_path_rejects_traversal_for_every_default_dir(workspace, default_dir):
+    # The input/temp branches and the ``else`` fallback (resolving against
+    # workspace_dir) share the output branch's logic; pin that each still
+    # rejects an out-of-workspace traversal, not just default_dir="output".
+    with pytest.raises(ValueError):
+        workspace.resolve_path("../../other/secret.txt", default_dir=default_dir)
+
+
 def test_resolve_path_allows_legitimate_relative_path(workspace):
     resolved = workspace.resolve_path("report.txt")
 
@@ -132,6 +141,30 @@ def test_resolve_path_with_search_skips_symlink_escape_but_finds_legit_match(
     assert resolved.is_relative_to(workspace.workspace_dir.resolve())
 
 
+def test_resolve_path_with_search_skips_exact_match_symlink_escape_for_legit_later(
+    workspace, tmp_path
+):
+    # An escaping symlink named exactly like the request in an EARLIER search
+    # dir (input/) must not abort the search: a legitimate same-named file in a
+    # LATER dir (output/) stays reachable via exact match. Only a lexical
+    # ``..`` traversal hard-aborts; a symlinked leaf is skipped.
+    workspace.input_dir.mkdir(parents=True, exist_ok=True)
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+
+    secret = tmp_path / "other" / "notes.txt"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("out-of-tree secret", encoding="utf-8")
+    (workspace.input_dir / "notes.txt").symlink_to(secret)
+
+    legit = workspace.output_dir / "notes.txt"
+    legit.write_text("in-workspace notes", encoding="utf-8")
+
+    resolved = workspace.resolve_path_with_search("notes.txt")
+
+    assert resolved == legit.resolve()
+    assert resolved.is_relative_to(workspace.workspace_dir.resolve())
+
+
 def test_resolve_path_still_rejects_absolute_escape(workspace, tmp_path):
     # Regression: the absolute-path branch keeps rejecting out-of-workspace paths.
     outside = tmp_path / "outside.txt"
@@ -139,6 +172,24 @@ def test_resolve_path_still_rejects_absolute_escape(workspace, tmp_path):
 
     with pytest.raises(ValueError):
         workspace.resolve_path(str(outside))
+
+
+def test_resolve_path_accepts_traversal_into_allowed_external_dir(tmp_path):
+    # The other half of #824's expected behavior: a relative path that climbs
+    # out of the workspace but lands inside a legitimately-allowed external dir
+    # is ACCEPTED, not rejected.
+    external = tmp_path / "external"
+    external.mkdir(parents=True, exist_ok=True)
+    target = external / "shared.txt"
+    target.write_text("shared", encoding="utf-8")
+
+    workspace = TaskWorkspace(
+        "task7", str(tmp_path), allowed_external_dirs=[str(external)]
+    )
+    # output_dir/../../external/shared.txt == tmp_path/external/shared.txt.
+    resolved = workspace.resolve_path("../../external/shared.txt", default_dir="output")
+
+    assert resolved == target.resolve()
 
 
 # --------------------------------------------------------------------------
@@ -166,3 +217,22 @@ def test_write_file_refuses_relative_traversal_end_to_end(ops, tmp_path):
 
     # Nothing was written outside the workspace.
     assert not (tmp_path / "other" / "pwned.txt").exists()
+
+
+def test_ops_resolve_path_ignores_allowed_external_dirs(tmp_path):
+    # WorkspaceFileOperations confines strictly to workspace_dir and, unlike
+    # TaskWorkspace, does NOT honor allowed_external_dirs. Prove the documented
+    # difference: the same path is accepted by TaskWorkspace but rejected here.
+    external = tmp_path / "external"
+    external.mkdir(parents=True, exist_ok=True)
+    target = external / "shared.txt"
+    target.write_text("shared", encoding="utf-8")
+
+    workspace = TaskWorkspace(
+        "task7", str(tmp_path), allowed_external_dirs=[str(external)]
+    )
+    assert workspace.resolve_path(str(target)) == target.resolve()
+
+    ops = WorkspaceFileOperations(workspace)
+    with pytest.raises(ValueError):
+        ops._resolve_path(str(target), "output")
