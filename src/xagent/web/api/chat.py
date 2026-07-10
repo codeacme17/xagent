@@ -756,14 +756,27 @@ class AgentServiceManager:
         producing ``user:{owner}`` and reuses today's containers untouched.
 
         Capacity exhaustion and sandbox-service unavailability are distinct
-        failure classes: a ``SandboxCapacityError`` rejects the task by
-        default (opt-in local fallback via
-        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), while any other
-        sandbox failure keeps the local-execution fallback.
+        failure classes. For **unscoped** execution the historical behavior is
+        kept: a ``SandboxCapacityError`` rejects the task by default (opt-in
+        local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
+        and any other sandbox failure falls back to local execution.
+
+        A scope that carries a ``sandbox_key_suffix`` isolates an untrusted /
+        third-party workload in a per-scope container; running it outside that
+        container would defeat the isolation the scope exists to provide. So
+        when a suffix is present both fallbacks are disabled and the task fails
+        closed regardless of configuration — neither capacity pressure (even
+        with the opt-in flag on) nor a sandbox-service failure may downgrade
+        such a task to local execution. A scope *without* a suffix shares the
+        unscoped ``user:{owner}`` container and thus has no isolation to
+        protect; it keeps the unscoped fallback behavior.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
-                evictable, and local fallback on capacity is not enabled.
+                evictable, and (for a task with no scope suffix) local fallback
+                on capacity is not enabled, or the scope carries a suffix.
+            Exception: A suffix-scoped execution hit a non-capacity sandbox
+                failure; re-raised instead of falling back to local execution.
         """
         from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 
@@ -772,7 +785,14 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
+        # The isolation boundary is the per-scope key suffix, not
+        # scope-presence: a suffix-less scope resolves to the same
+        # ``user:{owner}`` lifecycle key as unscoped execution, so it has no
+        # container of its own to protect and must keep the unscoped fallback
+        # behavior. Gating on the suffix (not ``scope is not None``) honors the
+        # ExecutionScope contract that each field be consumed independently.
         suffix = scope.sandbox_key_suffix if scope is not None else None
+        scoped = suffix is not None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
@@ -783,7 +803,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             from ...config import get_sandbox_allow_local_fallback_on_capacity
 
-            if get_sandbox_allow_local_fallback_on_capacity():
+            if not scoped and get_sandbox_allow_local_fallback_on_capacity():
                 logger.warning(
                     "Sandbox capacity reached for workspace owner %s; "
                     "falling back to local execution "
@@ -794,14 +814,25 @@ class AgentServiceManager:
                 return None
             logger.warning(
                 "Sandbox capacity reached for workspace owner %s; "
-                "rejecting task %s: %s",
+                "rejecting task %s (scoped=%s): %s",
                 workspace_owner_id,
                 task_id,
+                scoped,
                 e,
             )
             raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            if scoped:
+                logger.error(
+                    "Sandbox creation failed for scoped task %s (workspace "
+                    "owner %s); failing closed instead of running the scoped "
+                    "workload locally: %s",
+                    task_id,
+                    workspace_owner_id,
+                    e,
+                )
+                raise
             logger.warning(
                 "Sandbox creation failed for workspace owner %s, "
                 "falling back to local execution: %s",
