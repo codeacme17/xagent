@@ -460,7 +460,14 @@ class LanceDBMemoryStore(MemoryStore):
         )
 
     def _apply_filters(self, note: MemoryNote, filters: dict[str, Any]) -> bool:
-        """Apply filters to a MemoryNote for vector search results."""
+        """Apply filters to a MemoryNote for vector search results.
+
+        Unlike ``_apply_text_search_filters``, this never checks
+        ``SCOPE_EXCLUSIVE_FILTER_KEY``: on the vector path that directive is
+        already turned into an ``array_length`` ``where`` term and popped out of
+        the residual filters by ``build_scope_where`` before it reaches here, so
+        it can only appear among these residual filters on the text fallback.
+        """
         for key, value in filters.items():
             # Special handling for category - check note.category first
             if key == "category":

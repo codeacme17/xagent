@@ -128,8 +128,15 @@ def build_scope_where(
     # Popped from residual so it never reaches equality matching. DataFusion
     # returns 0 (not NULL) for an empty list, so `= 0` matches exactly the
     # dimension-less notes (covered by the strict-exclusion integration test).
+    # Every write/migration path (encode_scope_dims / derive_scope_columns /
+    # _derive_scope_arrays; _backfill_missing_columns never touches scope_dims)
+    # produces `[]`, never NULL — but since `array_length(NULL) IS NULL` would
+    # silently drop a NULL row from a strict search, guard the invariant with an
+    # explicit `IS NULL` branch so a future write path cannot break isolation.
     if residual.pop(SCOPE_EXCLUSIVE_FILTER_KEY, None):
-        clauses.append(f"array_length({SCOPE_DIMS_COLUMN}) = 0")
+        clauses.append(
+            f"(array_length({SCOPE_DIMS_COLUMN}) = 0 OR {SCOPE_DIMS_COLUMN} IS NULL)"
+        )
     where_sql = " AND ".join(clauses) if clauses else None
     return where_sql, residual
 

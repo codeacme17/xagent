@@ -259,14 +259,14 @@ def _bulk_build_with_unscoped(db_dir, n_principals, r=10, name="mem"):
 
 @pytest.mark.parametrize("n_principals", [10, 100, 1000])
 def test_strict_exclusion_recall_is_population_independent(temp_db_dir, n_principals):
-    """The pushed-down strict exclusion (scope_exclusive) keeps recall of a
-    dimension-less strict search independent of how many scoped notes crowd the
+    """The pushed-down strict exclusion (``__scope_exclusive__``) keeps recall of
+    a dimension-less strict search independent of how many scoped notes crowd the
     collection."""
     r = 10
     _bulk_build_with_unscoped(temp_db_dir, n_principals, r=r)
     store = _store(temp_db_dir)
 
-    # A strict dimension-less search: user_id only + the scope_exclusive directive.
+    # A strict dimension-less search: user_id only + the __scope_exclusive__ directive.
     results = store.search(
         "anything",
         k=r,
@@ -321,7 +321,7 @@ def test_where_prefilter_query_failure_falls_back_with_isolation(
 
 def test_text_fallback_honors_scope_exclusive_and_dims(temp_db_dir):
     """With no embedding model the store uses the text-search fallback, which
-    applies the `scope_exclusive` directive and dimension filters in Python
+    applies the `__scope_exclusive__` directive and dimension filters in Python
     (the vector `where` path is never taken)."""
     store = LanceDBMemoryStore(
         db_dir=temp_db_dir, collection_name="mem", embedding_model=None
@@ -335,7 +335,7 @@ def test_text_fallback_honors_scope_exclusive_and_dims(temp_db_dir):
         )
     )
 
-    # scope_exclusive over the text fallback keeps only the dimension-less note.
+    # __scope_exclusive__ over the text fallback keeps only the dimension-less note.
     got = {
         n.content
         for n in store.search(

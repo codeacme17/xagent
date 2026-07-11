@@ -4,12 +4,12 @@
 onto note metadata on add and filters on them on search, alongside the
 existing ``user_id`` handling. Default visibility is one-way; strict
 isolation excludes scope-stamped notes from dimension-less searches. That
-exclusion is carried in the filters as ``scope_exclusive`` and applied by the
-store (#822 slice 003), not post-filtered in the wrapper.
+exclusion is carried in the filters as ``__scope_exclusive__`` and applied by
+the store (#822 slice 003), not post-filtered in the wrapper.
 
 The fake base store mirrors the LanceDB filter semantics: nested
 ``filters["metadata"]`` entries applied as string-equality checks, plus the
-``scope_exclusive`` directive.
+``__scope_exclusive__`` directive.
 """
 
 from typing import Any, List, Optional
@@ -60,7 +60,7 @@ class FakeBaseStore(MemoryStore):
 
     def _matches(self, note: MemoryNote, filters: Optional[dict]) -> bool:
         filters = filters or {}
-        # Mirror the store's scope_exclusive handling: strict dimension-less
+        # Mirror the store's __scope_exclusive__ handling: strict dimension-less
         # searches exclude any scope-stamped note.
         if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
             return False

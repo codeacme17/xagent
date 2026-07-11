@@ -362,9 +362,9 @@ def test_clear(memory_store):
 
 
 def test_scope_exclusive_filters_scoped_notes(memory_store):
-    """#822: the `scope_exclusive` directive (strict dimension-less isolation)
-    excludes any scope-stamped note on the real InMemoryMemoryStore, via
-    `_is_scope_excluded`, on both search() and list_all()."""
+    """#822: the `__scope_exclusive__` directive (strict dimension-less
+    isolation) excludes any scope-stamped note on the real InMemoryMemoryStore,
+    via `_is_scope_excluded`, on both search() and list_all()."""
     prefix = MEMORY_DIMENSION_METADATA_PREFIX
     memory_store.add(MemoryNote(id="u", content="hello unscoped", metadata={}))
     memory_store.add(
