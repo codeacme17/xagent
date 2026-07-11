@@ -19,27 +19,11 @@ from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN
-from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
+from .conftest import ConstantEmbedding
+
 P = MEMORY_DIMENSION_METADATA_PREFIX
-
-
-class MockEmbedding(BaseEmbedding):
-    def __init__(self, dim: int = 64):
-        self._dimension = dim
-
-    def encode(self, text, dimension=None, instruct=None):
-        if isinstance(text, str):
-            return [0.1] * self._dimension
-        return [[0.1] * self._dimension for _ in text]
-
-    def get_dimension(self):
-        return self._dimension
-
-    @property
-    def abilities(self):
-        return ["embed"]
 
 
 @pytest.fixture
@@ -53,7 +37,7 @@ def _store(temp_db_dir, name="mem", embedding=None):
     return LanceDBMemoryStore(
         db_dir=temp_db_dir,
         collection_name=name,
-        embedding_model=embedding if embedding is not None else MockEmbedding(64),
+        embedding_model=embedding if embedding is not None else ConstantEmbedding(64),
     )
 
 

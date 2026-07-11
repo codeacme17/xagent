@@ -24,28 +24,13 @@ from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
-from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+
+from .conftest import ConstantEmbedding, VaryingEmbedding
 
 P = MEMORY_DIMENSION_METADATA_PREFIX
 DIM = 8
 _VECTOR = [0.1] * DIM
-
-
-class FixedEmbedding(BaseEmbedding):
-    """Every text embeds to the same vector, so distance cannot rank principals."""
-
-    def encode(self, text, dimension=None, instruct=None):
-        if isinstance(text, str):
-            return list(_VECTOR)
-        return [list(_VECTOR) for _ in text]
-
-    def get_dimension(self):
-        return DIM
-
-    @property
-    def abilities(self):
-        return ["embed"]
 
 
 @pytest.fixture
@@ -96,7 +81,7 @@ def _bulk_build(db_dir, n_principals, r=10, name="mem"):
 
 def _store(db_dir, name="mem"):
     return LanceDBMemoryStore(
-        db_dir=db_dir, collection_name=name, embedding_model=FixedEmbedding()
+        db_dir=db_dir, collection_name=name, embedding_model=ConstantEmbedding(DIM)
     )
 
 
@@ -182,6 +167,50 @@ def test_pushed_dims_combine_with_residual_category_filter(temp_db_dir):
         )
     }
     assert got == {"w"}
+
+
+def test_where_prefilter_preserves_similarity_ranking(temp_db_dir):
+    """With genuinely varying embeddings the where-prefilter restricts candidates
+    to the scoped rows while distance still orders them: a closer *other-tenant*
+    note is excluded, and the scoped rows come back nearest-first (guards against
+    the prefilter silently flattening or reordering similarity ranking)."""
+    vectors = {
+        "acme near": [1.0, 0.0, 0.0],
+        "acme far": [0.0, 0.0, 1.0],
+        # Identical to the query — the single closest note overall, but wrong
+        # tenant, so the prefilter must drop it despite its rank.
+        "other near": [1.0, 0.0, 0.0],
+        "q": [1.0, 0.0, 0.0],
+    }
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="mem",
+        embedding_model=VaryingEmbedding(vectors, dim=3),
+    )
+    store.add(
+        MemoryNote(
+            id="an", content="acme near", metadata={"user_id": 1, f"{P}tenant": "acme"}
+        )
+    )
+    store.add(
+        MemoryNote(
+            id="af", content="acme far", metadata={"user_id": 1, f"{P}tenant": "acme"}
+        )
+    )
+    store.add(
+        MemoryNote(
+            id="on",
+            content="other near",
+            metadata={"user_id": 1, f"{P}tenant": "other"},
+        )
+    )
+
+    # Large threshold so the far scoped note is not dropped on distance alone.
+    results = store.search(
+        "q", k=10, filters=_scope_filter("acme"), similarity_threshold=10.0
+    )
+    # Only the scoped tenant survives, and nearest-first within it.
+    assert [n.content for n in results] == ["acme near", "acme far"]
 
 
 def test_subset_match_superset_returned_missing_excluded(temp_db_dir):
