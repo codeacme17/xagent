@@ -3,10 +3,13 @@
 ``UserIsolatedMemoryStore`` stamps the active scope's ``memory_dimensions``
 onto note metadata on add and filters on them on search, alongside the
 existing ``user_id`` handling. Default visibility is one-way; strict
-isolation post-filters scope-stamped notes out of dimension-less searches.
+isolation excludes scope-stamped notes from dimension-less searches. That
+exclusion is carried in the filters as ``__scope_exclusive__`` and applied by
+the store (#822 slice 003), not post-filtered in the wrapper.
 
 The fake base store mirrors the LanceDB filter semantics: nested
-``filters["metadata"]`` entries applied as string-equality checks.
+``filters["metadata"]`` entries applied as string-equality checks, plus the
+``__scope_exclusive__`` directive.
 """
 
 from typing import Any, List, Optional
@@ -21,6 +24,10 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.scope_columns import (
+    SCOPE_EXCLUSIVE_FILTER_KEY,
+    encode_scope_dims,
+)
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 SCOPE_A = ExecutionScope(memory_dimensions={"tenant": "a"})
@@ -52,7 +59,12 @@ class FakeBaseStore(MemoryStore):
         return MemoryResponse(success=True, memory_id=note_id)
 
     def _matches(self, note: MemoryNote, filters: Optional[dict]) -> bool:
-        metadata_filters = (filters or {}).get("metadata", {})
+        filters = filters or {}
+        # Mirror the store's __scope_exclusive__ handling: strict dimension-less
+        # searches exclude any scope-stamped note.
+        if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
+            return False
+        metadata_filters = filters.get("metadata", {})
         return all(
             str(note.metadata.get(key, "")) == str(value)
             for key, value in metadata_filters.items()
@@ -202,6 +214,35 @@ class TestStrictIsolation:
         with UserContext(1), ExecutionScopeContext(strict_a):
             results = store.search("note")
         assert [str(n.content) for n in results] == ["note tenant a"]
+
+
+class TestCallerFiltersNotMutated:
+    """``_add_user_filter`` must work on copies: a caller-supplied ``filters``
+    dict (and its nested ``metadata`` dict) is never mutated in place, so the
+    same object can be reused across scopes."""
+
+    def test_search_leaves_caller_filters_untouched(self, store):
+        _seed_user_notes(store)
+        original = {"metadata": {"foo": "bar"}}
+        strict = ExecutionScope(strict_memory_isolation=True)
+        with UserContext(1), ExecutionScopeContext(strict):
+            store.search("note", filters=original)
+        # No injected user_id / scope-exclusive directive leaked back out.
+        assert original == {"metadata": {"foo": "bar"}}
+
+    def test_same_filters_dict_reused_across_scopes(self, store):
+        _seed_user_notes(store)
+        shared = {"metadata": {}}
+        with UserContext(1):
+            with ExecutionScopeContext(SCOPE_A):
+                seen_a = {n.id for n in store.search("note", filters=shared)}
+            with ExecutionScopeContext(SCOPE_B):
+                seen_b = {n.id for n in store.search("note", filters=shared)}
+        # A leaked SCOPE_A dimension would empty (or cross-contaminate) the
+        # SCOPE_B search; disjoint results prove no state carried over.
+        assert seen_a and seen_b
+        assert seen_a.isdisjoint(seen_b)
+        assert shared == {"metadata": {}}
 
 
 class TestResolverPathAndNestedReactivation:
