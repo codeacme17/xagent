@@ -12,6 +12,7 @@ from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
+from ..tools.adapters.vibe.config import normalize_tool_allowlist
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
@@ -700,12 +701,8 @@ class AgentService:
             else tuple(str(name) for name in allowed_tools)
         )
 
-        tool_allowlist = _get_conf("get_user_tool_allowlist")
-        tool_allowlist_items = (
-            None
-            if tool_allowlist is None
-            else tuple(str(name) for name in tool_allowlist)
-        )
+        tool_allowlist = normalize_tool_allowlist(_get_conf("get_user_tool_allowlist"))
+        tool_allowlist_items = None if tool_allowlist is None else tuple(tool_allowlist)
 
         allowed_agent_ids = _get_conf("get_allowed_agent_ids")
         allowed_agent_items = (

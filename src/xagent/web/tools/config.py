@@ -7,7 +7,6 @@ and other web-specific sources.
 
 import logging
 import os
-from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,7 +14,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ...config import get_uploads_dir
-from ...core.tools.adapters.vibe.config import BaseToolConfig
+from ...core.tools.adapters.vibe.config import (
+    BaseToolConfig,
+    normalize_tool_allowlist,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     MISSING_RUNTIME_VALUE,
@@ -35,21 +37,6 @@ from ..services.tool_credentials import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_allowlist(value: Any) -> Optional[List[str]]:
-    """Coerce a tool-allowlist hook result into a list of tool-name strings.
-
-    ``None`` passes through unchanged ("no allowlist configured"). A bare
-    scalar (str/bytes or any non-iterable such as int/float/bool) is treated
-    as a single tool name rather than being iterated character-by-character or
-    raising. Any other iterable yields one stringified name per item.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
-        return [str(value)]
-    return [str(item) for item in value]
 
 
 async def refresh_oauth_token_if_needed(
@@ -722,7 +709,7 @@ class WebToolConfig(BaseToolConfig):
         if self._tool_allowlist_cached:
             return self._cached_tool_allowlist
         try:
-            self._cached_tool_allowlist = _normalize_allowlist(
+            self._cached_tool_allowlist = normalize_tool_allowlist(
                 get_user_tool_allowlist(self.db, self._user)
             )
         except Exception:
@@ -1192,9 +1179,7 @@ class WebToolConfig(BaseToolConfig):
                     )
                     if delegated_connection:
                         delegated_connection["_connector_runtime_refresh"] = (
-                            lambda _server=server,
-                            _runtime_bindings=runtime_bindings,
-                            _allow_delegated_authorization=allow_delegated_authorization: (
+                            lambda _server=server, _runtime_bindings=runtime_bindings, _allow_delegated_authorization=allow_delegated_authorization: (
                                 self._refresh_delegated_mcp_connection(
                                     server=_server,
                                     runtime_bindings=_runtime_bindings,

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from .....config import get_uploads_dir
 from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
-from .config import BaseToolConfig
+from .config import BaseToolConfig, normalize_tool_allowlist
 from .connector_runtime import ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
@@ -359,7 +359,9 @@ class ToolFactory:
             # MCP tools — so no tool-universe enumeration is needed. ``None``
             # means "no allowlist configured" and skips filtering; an empty
             # list is an explicit "no tools allowed".
-            allowlist = getattr(config, "get_user_tool_allowlist", lambda: None)()
+            allowlist = normalize_tool_allowlist(
+                getattr(config, "get_user_tool_allowlist", lambda: None)()
+            )
             if allowlist is not None:
                 allowed_by_hook = set(allowlist)
                 tools = [tool for tool in tools if tool.name in allowed_by_hook]

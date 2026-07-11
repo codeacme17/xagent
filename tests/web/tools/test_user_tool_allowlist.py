@@ -181,6 +181,13 @@ def test_factory_display_layer_ignores_allowlist(fake_registry):
     assert _build(_FakeConfig(["web_search"]), apply_user_override_filter=False) == _UNIVERSE
 
 
+def test_factory_normalizes_scalar_allowlist(fake_registry):
+    # A non-WebToolConfig config may hand back a bare string; the factory must
+    # treat it as a single tool name, not split it into characters (which would
+    # match nothing and silently drop every tool).
+    assert _build(_FakeConfig("web_search")) == ["web_search"]
+
+
 # --------------------------------------------------------------------------- #
 # Tool-policy signature includes the allowlist (cache isolation across turns)
 # --------------------------------------------------------------------------- #
@@ -216,6 +223,12 @@ def test_signature_differs_by_allowlist():
 
 def test_signature_stable_for_same_allowlist():
     assert _signature(_SigConfig(["a", "b"])) == _signature(_SigConfig(["a", "b"]))
+
+
+def test_signature_normalizes_scalar_allowlist():
+    # A scalar allowlist and its single-element list form must hash identically,
+    # so the signature does not depend on which the config happens to return.
+    assert _signature(_SigConfig("a")) == _signature(_SigConfig(["a"]))
 
 
 def test_signature_backward_compatible_without_allowlist_methods():
