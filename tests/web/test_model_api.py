@@ -428,6 +428,36 @@ class TestModelAPI:
         assert data["status"] == "passed"
         mock_fetch.assert_awaited_once()
 
+    def test_test_connection_sound_effect_does_not_require_catalog_match(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Sound-effect checks should probe auth without a billed generation."""
+        sound_effect_model = Mock()
+        sound_effect_model.validate_connection = AsyncMock(return_value=None)
+        sound_effect_model.aclose = AsyncMock(return_value=None)
+
+        with patch(
+            "xagent.core.model.sound_effect.create_sound_effect_model",
+            return_value=sound_effect_model,
+        ) as create_model:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "future-sfx-model",
+                    "api_key": "test-api-key",
+                    "category": "sound_effect",
+                    "abilities": ["generate"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        assert create_model.call_args.args[0].model_name == "future-sfx-model"
+        sound_effect_model.validate_connection.assert_awaited_once_with()
+        sound_effect_model.aclose.assert_awaited_once_with()
+
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):
@@ -804,6 +834,70 @@ class TestModelAPI:
         assert defaults["asr"] == sample_speech_model_data["model_id"]
         assert defaults["tts"] == sample_speech_model_data["model_id"]
 
+    def test_create_sound_effect_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "sound-effect-default",
+                "category": "sound_effect",
+                "model_provider": "elevenlabs",
+                "model_name": "eleven_text_to_sound_v2",
+                "api_key": "test-key",
+                "abilities": ["generate"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        assert create_response.json()["category"] == "sound_effect"
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={
+                "model_id": create_response.json()["id"],
+                "config_type": "sound_effect",
+            },
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "sound_effect"
+
+    def test_create_music_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "music-default",
+                "category": "music",
+                "model_provider": "elevenlabs",
+                "model_name": "music_v2",
+                "api_key": "test-key",
+                "abilities": ["generate"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        assert create_response.json()["category"] == "music"
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={
+                "model_id": create_response.json()["id"],
+                "config_type": "music",
+            },
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "music"
+
     def test_transcribe_speech_requires_asr_model(
         self,
         test_db,
@@ -1052,7 +1146,7 @@ class TestModelAPI:
         assert openai["category"] == ["llm", "embedding"]
         assert openai["default_base_url"] == "https://api.openai.com/v1"
 
-    def test_list_supported_providers_scopes_elevenlabs_to_speech(
+    def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers
     ):
         response = client.get(
@@ -1068,7 +1162,7 @@ class TestModelAPI:
         )
         assert elevenlabs is not None
         assert elevenlabs["name"] == "ElevenLabs"
-        assert elevenlabs["category"] == ["speech"]
+        assert elevenlabs["category"] == ["speech", "sound_effect", "music"]
 
     def test_list_supported_providers_includes_ark_platforms(
         self, test_db, regular_user, regular_headers

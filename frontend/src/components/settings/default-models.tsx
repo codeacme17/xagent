@@ -17,6 +17,7 @@ import {
   Video,
   Mic,
   Volume2,
+  Music,
   Loader2,
   CheckCircle,
   AlertCircle,
@@ -78,6 +79,14 @@ const modelTypeConfig = {
     icon: Volume2,
     color: "bg-sky-500",
   },
+  sound_effect: {
+    icon: Volume2,
+    color: "bg-amber-500",
+  },
+  music: {
+    icon: Music,
+    color: "bg-violet-500",
+  },
 }
 
 const defaultModelTypes = Object.keys(modelTypeConfig) as DefaultModelType[]
@@ -124,6 +133,12 @@ const getCompatibleModels = (models: Model[], configType: DefaultModelType): Mod
       const abilities = getModelAbilities(model)
       return getModelCategory(model) === 'speech' && abilities.includes('asr') && abilities.includes('tts')
     })
+  }
+  if (configType === 'sound_effect') {
+    return models.filter((model) => getModelCategory(model) === 'sound_effect')
+  }
+  if (configType === 'music') {
+    return models.filter((model) => getModelCategory(model) === 'music')
   }
   return models.filter((model) => getModelCategory(model) === 'llm')
 }

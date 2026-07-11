@@ -77,6 +77,18 @@ class SpeechModelConfig(ModelConfig):
     sample_rate: Optional[int] = None  # Sample rate for TTS in Hz (e.g., 24000, 48000)
 
 
+class SoundEffectModelConfig(ModelConfig):
+    """Configuration for text-to-sound-effect models."""
+
+    model_provider: str = "elevenlabs"
+
+
+class MusicModelConfig(ModelConfig):
+    """Configuration for prompt-to-music models."""
+
+    model_provider: str = "elevenlabs"
+
+
 class VectorDBConfig(ModelConfig):
     """Configuration for vector database backend (e.g. LanceDB, Weaviate).
 

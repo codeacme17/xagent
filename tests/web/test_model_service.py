@@ -13,7 +13,11 @@ from xagent.web.services.model_service import (
     _is_model_visible_to_user,
     get_asr_models,
     get_default_model,
+    get_default_music_model,
+    get_default_sound_effect_model,
     get_image_models,
+    get_music_models,
+    get_sound_effect_models,
     get_tts_models,
     get_vision_model,
 )
@@ -600,6 +604,85 @@ class TestModelService:
             result = get_asr_models(mock_db, user_id=42)
 
             assert result == {"scribe_v2": mock_instance}
+
+    def test_get_sound_effect_models_uses_independent_category(self):
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user",
+                return_value=True,
+            ),
+            patch(
+                "xagent.core.model.sound_effect.get_sound_effect_model_instance"
+            ) as mock_instance_factory,
+        ):
+            mock_db = MagicMock()
+            db_model = MagicMock()
+            db_model.id = 1
+            db_model.model_id = "sound-effect-default"
+            db_model.model_name = "eleven_text_to_sound_v2"
+            db_model.category = "sound_effect"
+            db_model.is_active = True
+            mock_db.query.return_value.filter.return_value.all.return_value = [db_model]
+            model = MagicMock()
+            mock_instance_factory.return_value = model
+
+            result = get_sound_effect_models(mock_db, user_id=42)
+
+            assert result == {"sound-effect-default": model}
+            mock_instance_factory.assert_called_once_with(db_model)
+
+    def test_get_music_models_uses_independent_category(self):
+        with (
+            patch(
+                "xagent.web.services.model_service._is_model_visible_to_user",
+                return_value=True,
+            ),
+            patch(
+                "xagent.core.model.music.get_music_model_instance"
+            ) as mock_instance_factory,
+        ):
+            mock_db = MagicMock()
+            db_model = MagicMock()
+            db_model.id = 1
+            db_model.model_id = "music-default"
+            db_model.model_name = "music_v2"
+            db_model.category = "music"
+            db_model.is_active = True
+            mock_db.query.return_value.filter.return_value.all.return_value = [db_model]
+            model = MagicMock()
+            mock_instance_factory.return_value = model
+
+            result = get_music_models(mock_db, user_id=42)
+
+            assert result == {"music-default": model}
+            mock_instance_factory.assert_called_once_with(db_model)
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_sound_effect_model, get_default_music_model],
+    )
+    def test_audio_generation_default_closes_database_generator(self, get_default):
+        mock_db = MagicMock()
+        filter_query = (
+            mock_db.query.return_value.join.return_value.join.return_value.filter
+        )
+        shared_query = filter_query.return_value
+        shared_query.limit.return_value.all.return_value = []
+        db_gen = MagicMock()
+        db_gen.__next__.return_value = mock_db
+
+        with patch(
+            "xagent.web.models.database.get_db",
+            return_value=db_gen,
+        ):
+            result = get_default(user_id=None)
+
+        assert result is None
+        assert any(
+            getattr(getattr(condition, "right", None), "value", None) == '"generate"'
+            for condition in filter_query.call_args.args
+        )
+        db_gen.close.assert_called_once_with()
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""
