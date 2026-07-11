@@ -16,16 +16,29 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
-from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
+from ...config import get_checkpoint_encoding_v2_enabled
+from ...core.agent.checkpoint import (
+    READABLE_CHECKPOINT_TYPES,
+    checkpoint_execution_id,
+)
 from ..models.task import TraceCheckpointBlob, TraceMessageBlob
 
 logger = logging.getLogger(__name__)
 
 MESSAGE_REFS_ENCODING = "xagent.message_refs_v1"
 CHECKPOINT_BLOB_REF_ENCODING = "xagent.checkpoint_blob_ref_v1"
+LEDGER_REFS_ENCODING = "xagent.ledger_refs_v1"
 MESSAGE_HASH_PREFIX = "sha256:"
 MESSAGE_REFS_DECODE_ERROR_KEY = "_decode_error"
 SQL_IN_CLAUSE_CHUNK_SIZE = 900
+CONTEXT_SYSTEM_PROMPT_KIND = "context.system_prompt"
+CONTEXT_METADATA_KIND = "context.metadata"
+TOOL_LEDGER_RECORD_KIND = "pattern_state.tool_ledger.record"
+# Prompts below this size are cheaper inline than as a blob row + ref dict.
+SYSTEM_PROMPT_BLOB_MIN_CHARS = 256
+# Snapshot trees nest as auto -> dag -> react frames; real depth stays in
+# single digits, the cap only guards against pathological payloads.
+MAX_SNAPSHOT_WALK_DEPTH = 24
 CheckpointMessageStorageState = Literal["inline", "refs", "none"]
 CheckpointStorageState = Literal["inline", "refs", "mixed", "none"]
 
@@ -54,6 +67,18 @@ CHECKPOINT_BLOB_FIELDS: tuple[CheckpointBlobField, ...] = (
     ),
     CheckpointBlobField("context.metadata", ("snapshot", "context", "metadata")),
 )
+
+
+@dataclass(frozen=True)
+class EncodablePayload:
+    """One inline snapshot value the v2 encoder would replace with a ref.
+
+    ``kind`` doubles as the payload's key in ``parent``.
+    """
+
+    parent: dict[str, Any]
+    kind: Literal["messages", "system_prompt", "metadata", "tool_ledger"]
+    value: Any
 
 
 class CheckpointMessageDecodeError(ValueError):
@@ -113,6 +138,16 @@ def checkpoint_storage_payload_bytes(data: Any) -> int:
     if not _is_readable_checkpoint_data(data):
         return 0
 
+    if _resolve_use_v2(None):
+        total = sum(
+            len(canonical_json_bytes(payload.value))
+            for payload in _find_v2_encodable_payloads(data)
+        )
+        total += sum(
+            len(canonical_json_bytes(marker)) for marker in _find_storage_markers(data)
+        )
+        return total
+
     total = 0
     messages = _get_checkpoint_messages_payload(data)
     if isinstance(messages, list) or _is_message_refs_payload(messages):
@@ -127,13 +162,23 @@ def checkpoint_storage_payload_bytes(data: Any) -> int:
     return total
 
 
+def _resolve_use_v2(use_v2: bool | None) -> bool:
+    if use_v2 is None:
+        return get_checkpoint_encoding_v2_enabled()
+    return use_v2
+
+
 def encode_checkpoint_data_for_storage(
     db: Session,
     *,
     task_id: int,
     data: Any,
+    use_v2: bool | None = None,
 ) -> Any:
     """Encode all storage-optimized checkpoint fields."""
+
+    if _resolve_use_v2(use_v2):
+        return _encode_checkpoint_data_v2(db, task_id=task_id, data=data)
 
     should_encode_messages = get_checkpoint_messages_storage_state(data) == "inline"
     fields_to_encode = _checkpoint_blob_fields_to_encode(data)
@@ -151,6 +196,276 @@ def encode_checkpoint_data_for_storage(
             fields_to_encode=fields_to_encode,
         )
     return encoded
+
+
+def _encode_checkpoint_data_v2(
+    db: Session,
+    *,
+    task_id: int,
+    data: Any,
+) -> Any:
+    """Encode every ref-able payload anywhere in the snapshot tree.
+
+    Beyond the v1 root-context fields, this covers nested DAG/auto contexts
+    (``active_step_context(s)`` and ``execution_snapshot`` frames) and encodes
+    tool ledgers per record instead of as one cumulative blob, so a ledger
+    that only grows produces one new small blob per tool call rather than a
+    fresh copy of the whole history.
+    """
+
+    if not _has_v2_encodable_payloads(data):
+        return data
+
+    encoded = copy.deepcopy(data)
+    message_blobs: dict[str, BlobCandidate] = {}
+    blob_candidates: dict[tuple[str, str], BlobCandidate] = {}
+    for payload in _find_v2_encodable_payloads(encoded):
+        if payload.kind == "messages":
+            payload.parent[payload.kind] = _encode_messages_payload(
+                payload.value,
+                task_id=task_id,
+                message_blobs=message_blobs,
+            )
+        elif payload.kind == "system_prompt":
+            payload.parent[payload.kind] = _encode_blob_ref_payload(
+                payload.value,
+                kind=CONTEXT_SYSTEM_PROMPT_KIND,
+                task_id=task_id,
+                blob_candidates=blob_candidates,
+            )
+        elif payload.kind == "metadata":
+            payload.parent[payload.kind] = _encode_blob_ref_payload(
+                payload.value,
+                kind=CONTEXT_METADATA_KIND,
+                task_id=task_id,
+                blob_candidates=blob_candidates,
+            )
+        else:
+            payload.parent[payload.kind] = _encode_ledger_payload(
+                payload.value,
+                task_id=task_id,
+                blob_candidates=blob_candidates,
+            )
+
+    execution_id = checkpoint_execution_id(encoded)
+    _upsert_message_blobs(
+        db,
+        task_id=task_id,
+        execution_id=execution_id,
+        blobs_by_hash=message_blobs,
+    )
+    _upsert_checkpoint_blobs(
+        db,
+        task_id=task_id,
+        execution_id=execution_id,
+        blobs_by_ref=blob_candidates,
+    )
+    return encoded
+
+
+def _encode_messages_payload(
+    messages: list[Any],
+    *,
+    task_id: int,
+    message_blobs: dict[str, BlobCandidate],
+) -> dict[str, Any]:
+    refs: list[str] = []
+    for message in messages:
+        message_payload = canonical_json_bytes(message)
+        message_hash = canonical_json_hash_from_bytes(message_payload)
+        _remember_blob_candidate(
+            message_blobs,
+            blob_hash=message_hash,
+            # Parse the canonical bytes back so the candidate owns an
+            # independent copy: the snapshot tree may alias these objects
+            # and must never mutate what gets persisted.
+            data=json.loads(message_payload),
+            payload_bytes=len(message_payload),
+            collision_message=(
+                f"trace message blob hash collision for task {task_id}: {message_hash}"
+            ),
+        )
+        refs.append(message_hash)
+    return {
+        "__encoding": MESSAGE_REFS_ENCODING,
+        "count": len(refs),
+        "hash": canonical_json_hash(refs),
+        "refs": refs,
+    }
+
+
+def _encode_blob_ref_payload(
+    value: Any,
+    *,
+    kind: str,
+    task_id: int,
+    blob_candidates: dict[tuple[str, str], BlobCandidate],
+) -> dict[str, Any]:
+    blob_payload = canonical_json_bytes(value)
+    blob_hash = canonical_json_hash_from_bytes(blob_payload)
+    _remember_blob_candidate(
+        blob_candidates,
+        blob_hash=(kind, blob_hash),
+        data=json.loads(blob_payload),
+        payload_bytes=len(blob_payload),
+        collision_message=(
+            f"trace checkpoint blob hash collision for task {task_id}: "
+            f"{kind} {blob_hash}"
+        ),
+    )
+    return {
+        "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
+        "kind": kind,
+        "hash": blob_hash,
+    }
+
+
+def _encode_ledger_payload(
+    ledger: dict[str, Any],
+    *,
+    task_id: int,
+    blob_candidates: dict[tuple[str, str], BlobCandidate],
+) -> dict[str, Any]:
+    records: list[list[str]] = []
+    for key, record in ledger.items():
+        record_payload = canonical_json_bytes(record)
+        record_hash = canonical_json_hash_from_bytes(record_payload)
+        _remember_blob_candidate(
+            blob_candidates,
+            blob_hash=(TOOL_LEDGER_RECORD_KIND, record_hash),
+            data=json.loads(record_payload),
+            payload_bytes=len(record_payload),
+            collision_message=(
+                f"trace checkpoint blob hash collision for task {task_id}: "
+                f"{TOOL_LEDGER_RECORD_KIND} {record_hash}"
+            ),
+        )
+        records.append([str(key), record_hash])
+    return {
+        "__encoding": LEDGER_REFS_ENCODING,
+        "count": len(records),
+        "records": records,
+    }
+
+
+def _iter_v2_encodable_payloads(data: Any) -> Iterator[EncodablePayload]:
+    """Yield every inline payload the v2 encoder should replace with refs.
+
+    The walk never descends into payloads it reports (or into existing ref
+    markers): their contents get persisted as blobs, and encoding something
+    nested inside a blob-bound object would corrupt the stored payload.
+    Lazily evaluated so presence checks can stop at the first hit.
+    """
+
+    if not _is_readable_checkpoint_data(data):
+        return
+    snapshot = data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return
+
+    root_context = snapshot.get("context")
+    visited: set[int] = set()
+
+    def visit_context(
+        node: dict[str, Any],
+    ) -> tuple[set[str], list[EncodablePayload]]:
+        consumed: set[str] = set()
+        found: list[EncodablePayload] = []
+        messages = node.get("messages")
+        if isinstance(messages, list):
+            found.append(EncodablePayload(node, "messages", messages))
+            consumed.add("messages")
+        elif _is_message_refs_payload(messages):
+            consumed.add("messages")
+        system_prompt = node.get("system_prompt")
+        if (
+            isinstance(system_prompt, str)
+            and len(system_prompt) >= SYSTEM_PROMPT_BLOB_MIN_CHARS
+        ):
+            found.append(EncodablePayload(node, "system_prompt", system_prompt))
+            consumed.add("system_prompt")
+        elif _is_checkpoint_blob_ref_payload(system_prompt):
+            consumed.add("system_prompt")
+        metadata = node.get("metadata")
+        if _should_store_checkpoint_blob_payload(metadata):
+            found.append(EncodablePayload(node, "metadata", metadata))
+            consumed.add("metadata")
+        elif _is_checkpoint_blob_ref_payload(metadata):
+            consumed.add("metadata")
+        return consumed, found
+
+    def walk(node: Any, depth: int) -> Iterator[EncodablePayload]:
+        if depth > MAX_SNAPSHOT_WALK_DEPTH:
+            return
+        if isinstance(node, list):
+            for item in node:
+                yield from walk(item, depth + 1)
+            return
+        if not isinstance(node, dict) or "__encoding" in node:
+            return
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+
+        consumed: set[str] = set()
+        if node is root_context or _is_context_payload_shape(node):
+            consumed, found = visit_context(node)
+            yield from found
+        ledger = node.get("tool_ledger")
+        if _is_ledger_payload_shape(ledger):
+            yield EncodablePayload(node, "tool_ledger", ledger)
+            consumed.add("tool_ledger")
+        elif _is_ledger_refs_payload(ledger) or _is_checkpoint_blob_ref_payload(ledger):
+            consumed.add("tool_ledger")
+
+        for key, value in node.items():
+            if key in consumed:
+                continue
+            yield from walk(value, depth + 1)
+
+    yield from walk(snapshot, 0)
+
+
+def _find_v2_encodable_payloads(data: Any) -> list[EncodablePayload]:
+    return list(_iter_v2_encodable_payloads(data))
+
+
+def _has_v2_encodable_payloads(data: Any) -> bool:
+    return next(_iter_v2_encodable_payloads(data), None) is not None
+
+
+def _iter_storage_markers(data: Any) -> Iterator[dict[str, Any]]:
+    """Yield every storage-encoding marker dict inside a checkpoint payload.
+
+    Lazily evaluated so presence checks stop at the first marker instead of
+    walking the whole snapshot tree.
+    """
+
+    if not _is_readable_checkpoint_data(data):
+        return
+
+    stack: list[tuple[Any, int]] = [(data.get("snapshot"), 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_SNAPSHOT_WALK_DEPTH:
+            continue
+        if isinstance(node, list):
+            stack.extend((item, depth + 1) for item in node)
+            continue
+        if not isinstance(node, dict):
+            continue
+        if node.get("__encoding") in (
+            MESSAGE_REFS_ENCODING,
+            CHECKPOINT_BLOB_REF_ENCODING,
+            LEDGER_REFS_ENCODING,
+        ):
+            yield node
+            continue
+        stack.extend((value, depth + 1) for value in node.values())
+
+
+def _find_storage_markers(data: Any) -> list[dict[str, Any]]:
+    return list(_iter_storage_markers(data))
 
 
 def encode_checkpoint_messages_for_storage(
@@ -184,7 +499,7 @@ def _encode_checkpoint_messages_in_place(
         return
 
     encoded_context = data["snapshot"]["context"]
-    execution_id = _checkpoint_execution_id(data)
+    execution_id = checkpoint_execution_id(data)
     refs: list[str] = []
     blobs_by_hash: dict[str, BlobCandidate] = {}
     for message in messages:
@@ -253,15 +568,6 @@ def _checkpoint_blob_fields_to_encode(
     return fields_to_encode
 
 
-def _checkpoint_execution_id(data: dict[str, Any]) -> str:
-    return str(
-        data.get("root_execution_id")
-        or data.get("execution_id")
-        or _get_nested(data, ("snapshot", "execution_id"))
-        or ""
-    )
-
-
 def _encode_checkpoint_blob_fields_in_place(
     db: Session,
     *,
@@ -269,7 +575,7 @@ def _encode_checkpoint_blob_fields_in_place(
     data: dict[str, Any],
     fields_to_encode: list[tuple[CheckpointBlobField, Any]],
 ) -> None:
-    execution_id = _checkpoint_execution_id(data)
+    execution_id = checkpoint_execution_id(data)
 
     blobs_by_ref: dict[tuple[str, str], BlobCandidate] = {}
     refs_by_field: dict[CheckpointBlobField, str] = {}
@@ -323,12 +629,31 @@ def decode_trace_event_data(
     decode error marker for debug/raw API callers.
     """
 
+    if not _is_readable_checkpoint_data(data) or not _has_storage_markers(data):
+        return data
+
+    # Prefetch referenced blobs in bulk; per-record ledger refs would
+    # otherwise issue one query per tool call during checkpoint restore.
+    try:
+        lookup: TraceBlobLookup | None = _load_trace_blob_lookup(
+            db, task_id=task_id, data_items=[data]
+        )
+    except Exception:
+        if strict:
+            raise
+        logger.warning(
+            "Trace-blob lookup failed for task %s; decoding without prefetch",
+            task_id,
+            exc_info=True,
+        )
+        lookup = None
+
     try:
         return _decode_trace_event_data(
             db,
             task_id=task_id,
             data=data,
-            lookup=None,
+            lookup=lookup,
             verify_blob_hashes=verify_blob_hashes,
         )
     except CheckpointMessageDecodeError as exc:
@@ -400,72 +725,162 @@ def _decode_trace_event_data(
     lookup: TraceBlobLookup | None,
     verify_blob_hashes: bool,
 ) -> Any:
-    decoded = data
+    if not _is_readable_checkpoint_data(data):
+        return data
+    if not _has_storage_markers(data):
+        return data
 
-    messages_payload = _get_checkpoint_messages_payload(data)
-    if isinstance(messages_payload, list):
-        pass
-    elif (
-        isinstance(messages_payload, dict)
-        and messages_payload.get("__encoding") == MESSAGE_REFS_ENCODING
-        and not _is_message_refs_payload(messages_payload)
-    ):
-        raise CheckpointMessageDecodeError(
-            "checkpoint message refs payload is malformed"
+    decoded = copy.deepcopy(data)
+    _decode_tree_in_place(
+        db,
+        decoded["snapshot"],
+        task_id=task_id,
+        lookup=lookup,
+        verify_blob_hashes=verify_blob_hashes,
+        depth=0,
+    )
+    return decoded
+
+
+def _decode_tree_in_place(
+    db: Session,
+    node: Any,
+    *,
+    task_id: int,
+    lookup: TraceBlobLookup | None,
+    verify_blob_hashes: bool,
+    depth: int,
+) -> None:
+    if depth > MAX_SNAPSHOT_WALK_DEPTH:
+        return
+    if isinstance(node, list):
+        for index, value in enumerate(node):
+            replacement = _decode_marker_payload(
+                db,
+                value,
+                task_id=task_id,
+                lookup=lookup,
+                verify_blob_hashes=verify_blob_hashes,
+            )
+            if replacement is not None:
+                node[index] = replacement.value
+            else:
+                _decode_tree_in_place(
+                    db,
+                    value,
+                    task_id=task_id,
+                    lookup=lookup,
+                    verify_blob_hashes=verify_blob_hashes,
+                    depth=depth + 1,
+                )
+        return
+    if not isinstance(node, dict):
+        return
+    for key, value in list(node.items()):
+        replacement = _decode_marker_payload(
+            db,
+            value,
+            task_id=task_id,
+            lookup=lookup,
+            verify_blob_hashes=verify_blob_hashes,
         )
-    elif _is_message_refs_payload(messages_payload):
-        refs = messages_payload["refs"]
-        expected_count = messages_payload["count"]
+        if replacement is not None:
+            node[key] = replacement.value
+        else:
+            _decode_tree_in_place(
+                db,
+                value,
+                task_id=task_id,
+                lookup=lookup,
+                verify_blob_hashes=verify_blob_hashes,
+                depth=depth + 1,
+            )
+
+
+@dataclass(frozen=True)
+class _DecodedValue:
+    """Wrapper so ``None``-valued blobs are distinguishable from 'no marker'."""
+
+    value: Any
+
+
+def _decode_marker_payload(
+    db: Session,
+    payload: Any,
+    *,
+    task_id: int,
+    lookup: TraceBlobLookup | None,
+    verify_blob_hashes: bool,
+) -> _DecodedValue | None:
+    if not isinstance(payload, dict):
+        return None
+    encoding = payload.get("__encoding")
+    if encoding == MESSAGE_REFS_ENCODING:
+        if not _is_message_refs_payload(payload):
+            raise CheckpointMessageDecodeError(
+                "checkpoint message refs payload is malformed"
+            )
+        refs = payload["refs"]
+        expected_count = payload["count"]
         if expected_count != len(refs):
             raise CheckpointMessageDecodeError(
                 f"checkpoint message refs count mismatch: expected {expected_count}, got {len(refs)}"
             )
-
-        expected_sequence_hash = messages_payload["hash"]
-        actual_sequence_hash = canonical_json_hash(refs)
-        if expected_sequence_hash != actual_sequence_hash:
+        if payload["hash"] != canonical_json_hash(refs):
             raise CheckpointMessageDecodeError(
                 "checkpoint message refs sequence hash mismatch"
             )
-
-        messages = _load_messages_by_refs(
-            db,
-            task_id=task_id,
-            refs=refs,
-            lookup=lookup,
-            verify_blob_hashes=verify_blob_hashes,
-        )
-        decoded = _ensure_decoded_copy(data, decoded)
-        decoded["snapshot"]["context"]["messages"] = messages
-
-    for field in CHECKPOINT_BLOB_FIELDS:
-        payload = _get_nested(decoded, field.path)
-        if (
-            isinstance(payload, dict)
-            and payload.get("__encoding") == CHECKPOINT_BLOB_REF_ENCODING
-            and not _is_checkpoint_blob_ref_payload(payload)
-        ):
-            raise CheckpointMessageDecodeError(
-                f"checkpoint blob refs payload is malformed for {field.kind}"
+        return _DecodedValue(
+            _load_messages_by_refs(
+                db,
+                task_id=task_id,
+                refs=refs,
+                lookup=lookup,
+                verify_blob_hashes=verify_blob_hashes,
             )
+        )
+    if encoding == CHECKPOINT_BLOB_REF_ENCODING:
         if not _is_checkpoint_blob_ref_payload(payload):
-            continue
-        if payload["kind"] != field.kind:
             raise CheckpointMessageDecodeError(
-                f"checkpoint blob refs kind mismatch: expected {field.kind}, got {payload['kind']}"
+                "checkpoint blob refs payload is malformed"
             )
-
-        blob_data = _load_checkpoint_blob_by_ref(
-            db,
-            task_id=task_id,
-            blob_kind=field.kind,
-            blob_hash=payload["hash"],
-            lookup=lookup,
-            verify_blob_hashes=verify_blob_hashes,
+        return _DecodedValue(
+            _load_checkpoint_blob_by_ref(
+                db,
+                task_id=task_id,
+                blob_kind=payload["kind"],
+                blob_hash=payload["hash"],
+                lookup=lookup,
+                verify_blob_hashes=verify_blob_hashes,
+            )
         )
-        decoded = _ensure_decoded_copy(data, decoded)
-        _set_nested(decoded, field.path, blob_data)
-    return decoded
+    if encoding == LEDGER_REFS_ENCODING:
+        if not _is_ledger_refs_payload(payload):
+            raise CheckpointMessageDecodeError(
+                "checkpoint ledger refs payload is malformed"
+            )
+        records = payload["records"]
+        expected_count = payload["count"]
+        if expected_count != len(records):
+            raise CheckpointMessageDecodeError(
+                f"checkpoint ledger refs count mismatch: expected {expected_count}, got {len(records)}"
+            )
+        ledger: dict[str, Any] = {}
+        for record_key, record_hash in records:
+            ledger[record_key] = _load_checkpoint_blob_by_ref(
+                db,
+                task_id=task_id,
+                blob_kind=TOOL_LEDGER_RECORD_KIND,
+                blob_hash=record_hash,
+                lookup=lookup,
+                verify_blob_hashes=verify_blob_hashes,
+            )
+        return _DecodedValue(ledger)
+    return None
+
+
+def _has_storage_markers(data: Any) -> bool:
+    return next(_iter_storage_markers(data), None) is not None
 
 
 def _is_readable_checkpoint_data(data: Any) -> bool:
@@ -476,7 +891,15 @@ def _is_readable_checkpoint_data(data: Any) -> bool:
 
 
 def _checkpoint_storage_field_states(data: Any) -> list[Literal["inline", "refs"]]:
-    states: list[Literal["inline", "refs"]] = []
+    if _resolve_use_v2(None):
+        states: list[Literal["inline", "refs"]] = []
+        if _find_v2_encodable_payloads(data):
+            states.append("inline")
+        if _find_storage_markers(data):
+            states.append("refs")
+        return states
+
+    states = []
     messages_state = get_checkpoint_messages_storage_state(data)
     if messages_state == "inline":
         states.append("inline")
@@ -548,19 +971,47 @@ def _is_checkpoint_blob_ref_payload(value: Any) -> bool:
     return isinstance(value.get("kind"), str) and isinstance(value.get("hash"), str)
 
 
+def _is_ledger_refs_payload(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("__encoding") != LEDGER_REFS_ENCODING:
+        return False
+    records = value.get("records")
+    if not isinstance(records, list) or not isinstance(value.get("count"), int):
+        return False
+    return all(
+        isinstance(record, list)
+        and len(record) == 2
+        and isinstance(record[0], str)
+        and isinstance(record[1], str)
+        for record in records
+    )
+
+
+def _is_context_payload_shape(value: Any) -> bool:
+    """Match serialized ``ExecutionContext`` dicts nested inside snapshots."""
+
+    if not isinstance(value, dict) or "execution_id" not in value:
+        return False
+    messages = value.get("messages")
+    return isinstance(messages, list) or _is_message_refs_payload(messages)
+
+
+def _is_ledger_payload_shape(value: Any) -> bool:
+    """Match inline tool-ledger dicts (tool_call_id -> record dict)."""
+
+    if not isinstance(value, dict) or not value or "__encoding" in value:
+        return False
+    return all(isinstance(record, dict) for record in value.values())
+
+
 def _should_store_checkpoint_blob_payload(value: Any) -> bool:
     if _is_checkpoint_blob_ref_payload(value):
         return False
     return isinstance(value, dict) and bool(value)
 
 
-def _ensure_decoded_copy(original: Any, current: Any) -> Any:
-    if current is original:
-        return copy.deepcopy(original)
-    return current
-
-
-def _chunks(values: list[Any], size: int) -> Iterator[list[Any]]:
+def chunks(values: list[Any], size: int) -> Iterator[list[Any]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
 
@@ -607,7 +1058,7 @@ def _load_trace_blob_lookup(
     message_data_by_hash: dict[str, Any] = {}
     if message_refs:
         chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-        for refs_chunk in _chunks(sorted(message_refs), chunk_size):
+        for refs_chunk in chunks(sorted(message_refs), chunk_size):
             rows = (
                 db.query(TraceMessageBlob)
                 .filter(
@@ -628,7 +1079,7 @@ def _load_trace_blob_lookup(
 
         for kind, blob_hashes in refs_by_kind.items():
             chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=2)
-            for hash_chunk in _chunks(sorted(blob_hashes), chunk_size):
+            for hash_chunk in chunks(sorted(blob_hashes), chunk_size):
                 rows = (
                     db.query(TraceCheckpointBlob)
                     .filter(
@@ -654,21 +1105,16 @@ def _collect_trace_blob_refs(data: Any) -> tuple[set[str], set[tuple[str, str]]]
     message_refs: set[str] = set()
     checkpoint_refs: set[tuple[str, str]] = set()
 
-    messages_payload = _get_checkpoint_messages_payload(data)
-    if _is_message_refs_payload(messages_payload):
-        message_refs.update(
-            ref for ref in messages_payload["refs"] if isinstance(ref, str)
-        )
-
-    for field in CHECKPOINT_BLOB_FIELDS:
-        payload = _get_nested(data, field.path)
-        if not _is_checkpoint_blob_ref_payload(payload):
-            continue
-        if payload["kind"] != field.kind:
-            continue
-        blob_hash = payload["hash"]
-        if isinstance(blob_hash, str):
-            checkpoint_refs.add((field.kind, blob_hash))
+    for marker in _find_storage_markers(data):
+        if _is_message_refs_payload(marker):
+            message_refs.update(ref for ref in marker["refs"] if isinstance(ref, str))
+        elif _is_checkpoint_blob_ref_payload(marker):
+            checkpoint_refs.add((marker["kind"], marker["hash"]))
+        elif _is_ledger_refs_payload(marker):
+            checkpoint_refs.update(
+                (TOOL_LEDGER_RECORD_KIND, record_hash)
+                for _record_key, record_hash in marker["records"]
+            )
 
     return message_refs, checkpoint_refs
 
@@ -692,7 +1138,7 @@ def _load_messages_by_refs(
     if lookup is None:
         by_hash: dict[str, Any] = {}
         chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-        for refs_chunk in _chunks(unique_refs, chunk_size):
+        for refs_chunk in chunks(unique_refs, chunk_size):
             rows = (
                 db.query(TraceMessageBlob)
                 .filter(
@@ -813,7 +1259,7 @@ def _upsert_message_blobs(
     hashes_to_query = sorted(set(blobs_by_hash) - pending_hashes)
     existing_hashes: set[str] = set()
     chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
-    for hashes_chunk in _chunks(hashes_to_query, chunk_size):
+    for hashes_chunk in chunks(hashes_to_query, chunk_size):
         rows = (
             db.query(TraceMessageBlob.message_hash, TraceMessageBlob.message_bytes)
             .filter(
@@ -898,7 +1344,7 @@ def _upsert_checkpoint_blobs(
 
         for kind, blob_hashes in refs_by_kind.items():
             chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=2)
-            for hash_chunk in _chunks(sorted(blob_hashes), chunk_size):
+            for hash_chunk in chunks(sorted(blob_hashes), chunk_size):
                 rows = (
                     db.query(
                         TraceCheckpointBlob.blob_kind,

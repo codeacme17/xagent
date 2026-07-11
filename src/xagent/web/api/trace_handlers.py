@@ -5,10 +5,16 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...core.agent.checkpoint import CHECKPOINT_TYPE, READABLE_CHECKPOINT_TYPES
+from ...config import get_checkpoint_history_limit
+from ...core.agent.checkpoint import (
+    CHECKPOINT_TYPE,
+    READABLE_CHECKPOINT_TYPES,
+    checkpoint_execution_id,
+)
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -18,8 +24,15 @@ from ...web.models.database import get_db
 from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
+from ...web.services.ops_signals import (
+    CHECKPOINT_DECODE_FALLBACK,
+    clear_degradation,
+    register_degradation,
+)
 from ...web.services.trace_message_storage import (
+    SQL_IN_CLAUSE_CHUNK_SIZE,
     CheckpointMessageDecodeError,
+    chunks,
     decode_trace_event_data,
     encode_checkpoint_data_for_storage,
 )
@@ -130,9 +143,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
                 if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
                     continue
-                if str(
-                    data.get("root_execution_id") or data.get("execution_id")
-                ) != str(execution_id):
+                if checkpoint_execution_id(data) != str(execution_id):
                     continue
                 try:
                     data = decode_trace_event_data(
@@ -149,6 +160,27 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         exc,
                     )
                     continue
+                except Exception:
+                    # E.g. a transient DB error from the blob prefetch. Fall
+                    # back to an older readable checkpoint instead of letting
+                    # the error abort loading for the whole task. Surface the
+                    # degradation on /health so a systemic decode failure is
+                    # observable instead of only a per-row warning log; the
+                    # signal self-clears on the next successful decode.
+                    register_degradation(
+                        CHECKPOINT_DECODE_FALLBACK,
+                        f"task {self.task_id}: checkpoint decode failed, "
+                        f"fell back past event {row.event_id}",
+                    )
+                    logger.warning(
+                        "Skipping checkpoint trace event %s for task %s after "
+                        "decode failure",
+                        row.event_id,
+                        self.task_id,
+                        exc_info=True,
+                    )
+                    continue
+                clear_degradation(CHECKPOINT_DECODE_FALLBACK)
                 snapshot = data.get("snapshot")
                 return dict(snapshot) if isinstance(snapshot, dict) else None
             return None
@@ -260,6 +292,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             db.commit()
 
+            if (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            ):
+                self._prune_checkpoint_history(db, data)
+
             logger.debug(
                 f"Saved trace event {event.id} of type {event_type_str} to database"
             )
@@ -288,6 +327,86 @@ class DatabaseTraceHandler(BaseTraceHandler):
             logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
+
+    def _prune_checkpoint_history(self, db: Session, data: Dict[str, Any]) -> None:
+        """Drop checkpoint rows beyond the retention limit for one execution.
+
+        Resume only reads the most recent readable checkpoint; a few older
+        rows are kept so an unreadable latest can fall back. Runs in its own
+        transaction after the checkpoint commit so a prune failure can never
+        take the checkpoint write down with it. Blobs are not touched: most
+        stay referenced by the surviving checkpoints thanks to content
+        dedup, but a blob referenced only by pruned rows (e.g. a message
+        later dropped by context compaction) is orphaned until whole-task
+        deletion cleans it up.
+        """
+        limit = get_checkpoint_history_limit()
+        if limit <= 0:
+            return
+        execution_id = checkpoint_execution_id(data)
+        if not execution_id:
+            return
+        try:
+            build_filter = (
+                DatabaseTraceEvent.build_id == self.build_id
+                if self.build_id is not None
+                else DatabaseTraceEvent.build_id.is_(None)
+            )
+            stale_rows = (
+                db.query(DatabaseTraceEvent.id)
+                .filter(
+                    DatabaseTraceEvent.task_id == self.task_id,
+                    build_filter,
+                    DatabaseTraceEvent.event_type == "system_update_general",
+                    DatabaseTraceEvent.data["checkpoint_type"]
+                    .as_string()
+                    .in_(sorted(READABLE_CHECKPOINT_TYPES)),
+                    # SQL mirror of checkpoint_execution_id(): root wins,
+                    # then the flat field, then the snapshot's own id, so
+                    # legacy rows that only set one of them are not skipped.
+                    func.coalesce(
+                        func.nullif(
+                            DatabaseTraceEvent.data["root_execution_id"].as_string(),
+                            "",
+                        ),
+                        func.nullif(
+                            DatabaseTraceEvent.data["execution_id"].as_string(),
+                            "",
+                        ),
+                        DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
+                    )
+                    == execution_id,
+                )
+                .order_by(
+                    DatabaseTraceEvent.timestamp.desc(),
+                    DatabaseTraceEvent.id.desc(),
+                )
+                .offset(limit)
+                .all()
+            )
+            if not stale_rows:
+                return
+            stale_ids = [row_id for (row_id,) in stale_rows]
+            # Chunk the IN clause: a backlog from previously-disabled pruning
+            # can exceed SQLite's bind-parameter limit in one statement.
+            for chunk in chunks(stale_ids, SQL_IN_CLAUSE_CHUNK_SIZE):
+                db.query(DatabaseTraceEvent).filter(
+                    DatabaseTraceEvent.id.in_(chunk)
+                ).delete(synchronize_session=False)
+            db.commit()
+            logger.debug(
+                "Pruned %d checkpoint rows for task %s execution %s",
+                len(stale_ids),
+                self.task_id,
+                execution_id,
+            )
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "Failed to prune checkpoint history for task %s",
+                self.task_id,
+                exc_info=True,
+            )
 
     def _is_duplicate_user_message_turn(
         self,
