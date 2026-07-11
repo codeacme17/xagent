@@ -1179,7 +1179,9 @@ class WebToolConfig(BaseToolConfig):
                     )
                     if delegated_connection:
                         delegated_connection["_connector_runtime_refresh"] = (
-                            lambda _server=server, _runtime_bindings=runtime_bindings, _allow_delegated_authorization=allow_delegated_authorization: (
+                            lambda _server=server,
+                            _runtime_bindings=runtime_bindings,
+                            _allow_delegated_authorization=allow_delegated_authorization: (
                                 self._refresh_delegated_mcp_connection(
                                     server=_server,
                                     runtime_bindings=_runtime_bindings,

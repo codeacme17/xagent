@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
 import xagent.core.tools.adapters.vibe.factory as factory_module
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.services.tool_credentials import (
@@ -93,7 +94,9 @@ def test_config_swallows_hook_errors(clear_allowlist_hook):
         (("a", 2), ["a", "2"]),  # any iterable stringified per item
     ],
 )
-def test_config_normalizes_scalar_allowlist(clear_allowlist_hook, hook_result, expected):
+def test_config_normalizes_scalar_allowlist(
+    clear_allowlist_hook, hook_result, expected
+):
     # A hook that violates the ``Optional[list]`` contract must not iterate a
     # string character-by-character or crash on a non-iterable scalar; it is
     # coerced to a list of tool-name strings at the WebToolConfig boundary.
@@ -157,7 +160,9 @@ def _build(config, *, apply_user_override_filter=True):
     import asyncio
 
     tools = asyncio.run(
-        ToolFactory.create_all_tools(config, apply_user_override_filter=apply_user_override_filter)
+        ToolFactory.create_all_tools(
+            config, apply_user_override_filter=apply_user_override_filter
+        )
     )
     return [t.name for t in tools]
 
@@ -178,7 +183,10 @@ def test_factory_empty_allowlist_drops_all(fake_registry):
 
 
 def test_factory_display_layer_ignores_allowlist(fake_registry):
-    assert _build(_FakeConfig(["web_search"]), apply_user_override_filter=False) == _UNIVERSE
+    assert (
+        _build(_FakeConfig(["web_search"]), apply_user_override_filter=False)
+        == _UNIVERSE
+    )
 
 
 def test_factory_normalizes_scalar_allowlist(fake_registry):
