@@ -613,7 +613,9 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
     assert "runtime_bindings" not in unavailable
     assert "allow_delegated_authorization" not in unavailable
     assert "connector_runtime" not in unavailable
-    assert cfg.get_mcp_oauth_diagnostics() == [
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert "actor_id" not in diagnostics[0]
+    assert diagnostics == [
         {
             "code": "oauth_token_resolver_failed",
             "message": "OAuth token resolver failed",
@@ -669,6 +671,145 @@ async def test_hook_failure_diagnostic_includes_bounded_resource(db_session):
     diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
     assert diagnostic["resource"] == f"{resource[:125]}..."
     assert len(diagnostic["resource"]) == 128
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_diagnostic_includes_bounded_actor_id_without_secrets(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.com/oauth/resource"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+    actor_id = "actor-" + "x" * 200
+
+    class DelegatedRefreshFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = actor_id
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise DelegatedRefreshFailure("secret-token-in-exception")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    unavailable = configs[0]
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert unavailable["transport"] == "unavailable"
+    assert diagnostic["resource"] == resource
+    assert diagnostic["actor_id"] == f"{actor_id[:125]}..."
+    assert len(diagnostic["actor_id"]) == 128
+    assert "secret-token-in-exception" not in str(unavailable)
+    assert "secret-token-in-exception" not in diagnostic["message"]
+    assert "secret-token-in-exception" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_with_raising_actor_attribute_stays_sanitized(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_stdio_server(db, user, name="after")
+
+    class AttributeReadFailure(RuntimeError):
+        @property
+        def oauth_token_resolver_diagnostic_actor_id(self) -> str:
+            raise RuntimeError("secret-token-from-diagnostic-property")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise AttributeReadFailure("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    unavailable = configs[1]
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert unavailable["transport"] == "unavailable"
+    assert unavailable["config"]["server_id"] == oauth_server.id
+    assert diagnostic["exception_type"] == "AttributeReadFailure"
+    assert "actor_id" not in diagnostic
+    assert "secret-token-from-diagnostic-property" not in str(unavailable)
+    assert "secret-token-from-diagnostic-property" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_with_raising_actor_string_subclass_stays_sanitized(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_stdio_server(db, user, name="after")
+
+    class RaisingStr(str):
+        def __str__(self) -> str:
+            raise RuntimeError("secret-from-string-conversion")
+
+    class ResolverFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = RaisingStr("actor-1")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ResolverFailure("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    unavailable = configs[1]
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert unavailable["transport"] == "unavailable"
+    assert unavailable["config"]["server_id"] == oauth_server.id
+    assert diagnostic["exception_type"] == "ResolverFailure"
+    assert "actor_id" not in diagnostic
+    assert "secret-from-string-conversion" not in str(unavailable)
+    assert "secret-from-string-conversion" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_actor_id", [123, 1.5, True, ""])
+async def test_hook_failure_drops_non_string_or_empty_actor_id(
+    db_session,
+    raw_actor_id,
+):
+    db, user = db_session
+    _add_oauth_server(db, user, launch_config=_launch_config())
+
+    class ResolverFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = raw_actor_id
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ResolverFailure("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert configs[0]["transport"] == "unavailable"
+    assert diagnostic["exception_type"] == "ResolverFailure"
+    assert "actor_id" not in diagnostic
 
 
 @pytest.mark.asyncio
