@@ -353,6 +353,17 @@ class ToolFactory:
                         tool for tool in tools if tool.name not in disabled_by_hook
                     ]
 
+            # Positive allowlist filter (execution layer). When the hook
+            # returns a concrete list, keep only tools whose name is in it.
+            # Applied to the already-built list — including dynamically loaded
+            # MCP tools — so no tool-universe enumeration is needed. ``None``
+            # means "no allowlist configured" and skips filtering; an empty
+            # list is an explicit "no tools allowed".
+            allowlist = getattr(config, "get_user_tool_allowlist", lambda: None)()
+            if allowlist is not None:
+                allowed_by_hook = set(allowlist)
+                tools = [tool for tool in tools if tool.name in allowed_by_hook]
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
