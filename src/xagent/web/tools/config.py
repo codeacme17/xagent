@@ -17,7 +17,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 import httpx
 
 from ...config import get_uploads_dir
-from ...core.tools.adapters.vibe.config import BaseToolConfig
+from ...core.tools.adapters.vibe.config import (
+    BaseToolConfig,
+    normalize_tool_allowlist,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     MISSING_RUNTIME_VALUE,
@@ -31,6 +34,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 )
 from ..services.tool_credentials import (
     get_sql_connection_map,
+    get_user_tool_allowlist,
     get_user_tool_overrides,
     resolve_tool_credential,
 )
@@ -492,6 +496,10 @@ class WebToolConfig(BaseToolConfig):
         # Use explicit user param first; fall back to request.user.
         self._user = user if user is not None else getattr(request, "user", None)
         self._cached_tool_overrides: Optional[dict] = None
+        # ``None`` is a meaningful allowlist value ("no allowlist"), so a
+        # separate flag tracks whether the hook has been consulted yet.
+        self._cached_tool_allowlist: Optional[list] = None
+        self._tool_allowlist_cached: bool = False
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
         self._sandbox: Optional[Any] = sandbox
@@ -948,6 +956,34 @@ class WebToolConfig(BaseToolConfig):
         # The policy can change while an AgentService instance is reused.
         self._cached_tool_overrides = None
         return self.get_user_tool_overrides()
+
+    def get_user_tool_allowlist(self) -> Optional[list]:
+        """Return the positive tool allowlist from the registered hook.
+
+        ``None`` means "no allowlist configured" — no filtering. A concrete
+        list means keep only those tool names (execution layer only). The
+        allowlist is resolved from the active execution scope by the hook, so
+        it can differ per turn even for the same user.
+        """
+        if self._tool_allowlist_cached:
+            return self._cached_tool_allowlist
+        try:
+            self._cached_tool_allowlist = normalize_tool_allowlist(
+                get_user_tool_allowlist(self.db, self._user)
+            )
+        except Exception:
+            logger.exception("Failed to get user tool allowlist")
+            self._cached_tool_allowlist = None
+        self._tool_allowlist_cached = True
+        return self._cached_tool_allowlist
+
+    def refresh_user_tool_allowlist(self) -> Optional[list]:
+        """Reload the positive tool allowlist from the registered hook."""
+        # The active execution scope (hence the CA allowlist) can change while
+        # an AgentService instance is reused across turns.
+        self._tool_allowlist_cached = False
+        self._cached_tool_allowlist = None
+        return self.get_user_tool_allowlist()
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""

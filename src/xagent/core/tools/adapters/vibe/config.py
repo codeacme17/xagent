@@ -7,9 +7,31 @@ to the ToolFactory in a unified way.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import Any, Dict, List, Optional
 
 from ..... import config as _root_config
+
+
+def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
+    """Coerce a tool-allowlist hook result into a list of tool-name strings.
+
+    The positive tool-allowlist hook is documented as ``Optional[list]``, but
+    it is user-registered and consumed against a duck-typed config, so callers
+    cannot assume the contract holds. Normalizing here keeps a single, uniform
+    policy at every consumption point:
+
+    - ``None`` passes through unchanged ("no allowlist configured").
+    - A bare scalar — ``str``/``bytes`` or any non-iterable such as
+      ``int``/``float``/``bool`` — is treated as a single tool name rather than
+      being iterated character-by-character or raising on a non-iterable.
+    - Any other iterable yields one stringified name per item.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return [str(value)]
+    return [str(item) for item in value]
 
 
 class BaseToolConfig(ABC):

@@ -70,6 +70,15 @@ class V1ErrorCode(str, Enum):
     # it stays in the enum so SDK clients can encode the mapping now.
     RATE_LIMITED = "rate_limited"
 
+    # Monthly execution quota exhausted. 402 Payment Required. Two distinct
+    # codes so a client application can tell "my own sub-quota is spent" apart
+    # from "the whole team's ceiling is spent" — the team ceiling always wins,
+    # so QUOTA_EXCEEDED means there is no headroom at all, while
+    # CLIENT_QUOTA_EXCEEDED means the team still has room but this application's
+    # slice is used up.
+    QUOTA_EXCEEDED = "quota_exceeded"
+    CLIENT_QUOTA_EXCEEDED = "client_quota_exceeded"
+
     # Server-side bug. Detail is sanitized; the raw exception stays in
     # the server log.
     INTERNAL_ERROR = "internal_error"
@@ -97,6 +106,10 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
     V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
     V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",
+    V1ErrorCode.QUOTA_EXCEEDED: "Monthly execution quota exceeded for this team.",
+    V1ErrorCode.CLIENT_QUOTA_EXCEEDED: (
+        "Monthly execution quota exceeded for this client application."
+    ),
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",

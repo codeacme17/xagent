@@ -1401,6 +1401,11 @@ async def test_factory_all_mode_keeps_all_tools(isolated_registry):
     cfg.get_sandbox.return_value = None
     cfg.get_workspace_config.return_value = None
     cfg.get_user_tool_overrides.return_value = {}
+    # MagicMock auto-creates every attribute, so an unstubbed
+    # get_user_tool_allowlist() would return a truthy mock that the factory's
+    # positive-allowlist filter reads as "an allowlist containing no tools",
+    # dropping every tool. None = "no allowlist configured" (no filtering).
+    cfg.get_user_tool_allowlist.return_value = None
     cfg.get_max_output_length.return_value = None
     cfg.get_max_field_count.return_value = None
     cfg.get_max_recursion_depth.return_value = None
@@ -1424,6 +1429,11 @@ async def test_factory_none_mode_filters_to_empty(isolated_registry):
     cfg.get_sandbox.return_value = None
     cfg.get_workspace_config.return_value = None
     cfg.get_user_tool_overrides.return_value = {}
+    # MagicMock auto-creates every attribute, so an unstubbed
+    # get_user_tool_allowlist() would return a truthy mock that the factory's
+    # positive-allowlist filter reads as "an allowlist containing no tools",
+    # dropping every tool. None = "no allowlist configured" (no filtering).
+    cfg.get_user_tool_allowlist.return_value = None
     cfg.get_max_output_length.return_value = None
     cfg.get_max_field_count.return_value = None
     cfg.get_max_recursion_depth.return_value = None
@@ -1459,6 +1469,11 @@ async def test_factory_by_categories_filters_by_compute_allowed_names(
     cfg.get_sandbox.return_value = None
     cfg.get_workspace_config.return_value = None
     cfg.get_user_tool_overrides.return_value = {}
+    # MagicMock auto-creates every attribute, so an unstubbed
+    # get_user_tool_allowlist() would return a truthy mock that the factory's
+    # positive-allowlist filter reads as "an allowlist containing no tools",
+    # dropping every tool. None = "no allowlist configured" (no filtering).
+    cfg.get_user_tool_allowlist.return_value = None
     cfg.get_max_output_length.return_value = None
     cfg.get_max_field_count.return_value = None
     cfg.get_max_recursion_depth.return_value = None
@@ -1615,6 +1630,11 @@ def test_factory_falls_back_to_get_allowed_tools_when_spec_none():
     cfg.get_sandbox.return_value = None
     cfg.get_workspace_config.return_value = None
     cfg.get_user_tool_overrides.return_value = {}
+    # MagicMock auto-creates every attribute, so an unstubbed
+    # get_user_tool_allowlist() would return a truthy mock that the factory's
+    # positive-allowlist filter reads as "an allowlist containing no tools",
+    # dropping every tool. None = "no allowlist configured" (no filtering).
+    cfg.get_user_tool_allowlist.return_value = None
     cfg.get_max_output_length.return_value = None
     cfg.get_max_field_count.return_value = None
     cfg.get_max_recursion_depth.return_value = None
@@ -1661,6 +1681,11 @@ def test_factory_prefers_spec_and_warns_when_allowed_tools_also_set(caplog):
     cfg.get_sandbox.return_value = None
     cfg.get_workspace_config.return_value = None
     cfg.get_user_tool_overrides.return_value = {}
+    # MagicMock auto-creates every attribute, so an unstubbed
+    # get_user_tool_allowlist() would return a truthy mock that the factory's
+    # positive-allowlist filter reads as "an allowlist containing no tools",
+    # dropping every tool. None = "no allowlist configured" (no filtering).
+    cfg.get_user_tool_allowlist.return_value = None
     cfg.get_max_output_length.return_value = None
     cfg.get_max_field_count.return_value = None
     cfg.get_max_recursion_depth.return_value = None

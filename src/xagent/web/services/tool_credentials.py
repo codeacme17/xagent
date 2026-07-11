@@ -35,6 +35,29 @@ def get_user_tool_overrides(db: Session, user: Any) -> dict:
     return {}
 
 
+# Hook signature: (db: Session, user: Any) -> list[str] | None
+# Returns a positive tool allowlist for the current execution: only tools whose
+# name is in the list are kept. ``None`` means "no allowlist configured" (no
+# filtering); an empty list means "no tools allowed". Unlike the disable-set
+# override hook above, this filters positively against the already-built tool
+# list, so dynamically-loaded MCP tools are covered without enumerating a tool
+# universe. Application layers inject it via set_user_tool_allowlist_hook().
+_get_user_tool_allowlist_hook: Callable[[Session, Any], list[str] | None] | None = None
+
+
+def set_user_tool_allowlist_hook(
+    hook: Callable[[Session, Any], list[str] | None] | None,
+) -> None:
+    global _get_user_tool_allowlist_hook
+    _get_user_tool_allowlist_hook = hook
+
+
+def get_user_tool_allowlist(db: Session, user: Any) -> list[str] | None:
+    if _get_user_tool_allowlist_hook is not None:
+        return _get_user_tool_allowlist_hook(db, user)
+    return None
+
+
 TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     "exa_web_search": {
         "api_key": {

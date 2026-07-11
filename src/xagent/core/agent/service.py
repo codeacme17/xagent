@@ -12,6 +12,7 @@ from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
+from ..tools.adapters.vibe.config import normalize_tool_allowlist
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
@@ -673,6 +674,14 @@ class AgentService:
             # Re-read the hook-backed policy before comparing signatures.
             refresh_overrides()
 
+        refresh_allowlist = getattr(
+            self.tool_config, "refresh_user_tool_allowlist", None
+        )
+        if callable(refresh_allowlist):
+            # The CA allowlist is resolved from the active execution scope, so
+            # it can change between turns even when the config is reused.
+            refresh_allowlist()
+
         overrides: Any = _get_conf("get_user_tool_overrides", {})
         if isinstance(overrides, dict):
             override_items = tuple(
@@ -693,6 +702,9 @@ class AgentService:
             if allowed_tools is None
             else tuple(str(name) for name in allowed_tools)
         )
+
+        tool_allowlist = normalize_tool_allowlist(_get_conf("get_user_tool_allowlist"))
+        tool_allowlist_items = None if tool_allowlist is None else tuple(tool_allowlist)
 
         allowed_agent_ids = _get_conf("get_allowed_agent_ids")
         allowed_agent_items = (
@@ -734,6 +746,7 @@ class AgentService:
         return (
             override_items,
             allowed_items,
+            tool_allowlist_items,
             allowed_agent_items,
             agent_override_items,
             bool(enable_global_agent_tools),
