@@ -84,6 +84,23 @@ def test_config_swallows_hook_errors(clear_allowlist_hook):
     assert cfg.get_user_tool_allowlist() is None
 
 
+@pytest.mark.parametrize(
+    ("hook_result", "expected"),
+    [
+        ("only_this", ["only_this"]),  # bare string is one tool name, not chars
+        (5, ["5"]),  # non-iterable scalar coerced to a single name
+        (True, ["True"]),
+        (("a", 2), ["a", "2"]),  # any iterable stringified per item
+    ],
+)
+def test_config_normalizes_scalar_allowlist(clear_allowlist_hook, hook_result, expected):
+    # A hook that violates the ``Optional[list]`` contract must not iterate a
+    # string character-by-character or crash on a non-iterable scalar; it is
+    # coerced to a list of tool-name strings at the WebToolConfig boundary.
+    set_user_tool_allowlist_hook(lambda db, user: hook_result)
+    assert _config().get_user_tool_allowlist() == expected
+
+
 # --------------------------------------------------------------------------- #
 # Factory positive filter
 # --------------------------------------------------------------------------- #
