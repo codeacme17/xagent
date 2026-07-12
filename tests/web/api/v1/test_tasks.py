@@ -16,9 +16,10 @@ drive the mapping.
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
@@ -54,7 +55,32 @@ from xagent.web.tools.config import (
     set_oauth_token_resolver_hook,
 )
 
-from ..conftest import _admin_headers, _direct_db_session, client
+from ..conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _register_second_user,
+    client,
+)
+
+
+def _create_agent_with_key_for(headers: dict[str, str]) -> tuple[int, str]:
+    """Create an agent + api key under the user owning ``headers``."""
+    agent_resp = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "v1 tasks test agent",
+            "description": "test",
+            "instructions": "you are a test agent",
+            "execution_mode": "balanced",
+        },
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    agent_id = agent_resp.json()["id"]
+    key_resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_resp.status_code == 200, key_resp.text
+    return agent_id, key_resp.json()["full_key"]
+
 
 # Opt this file into the shared conftest ``_test_db`` fixture; see the
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
@@ -351,6 +377,338 @@ def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
     try:
         row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
         assert row.usage_month_calls == 2
+    finally:
+        db.close()
+
+
+# ===== POST /v1/chat/files + message.files =====
+
+
+def test_upload_and_attach_files_to_task(mock_start_task):
+    """Upload via /v1/chat/files, then attach the file_id to a task turn.
+
+    Asserts the returned file_id round-trips into the turn payload: the
+    execution_message carries the file reference context (so the agent
+    sees it) while the transcript stays the raw user text.
+    """
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("lesson_plan.txt", b"lesson content", "text/plain"))],
+    )
+    assert up.status_code == 200, up.text
+    files = up.json()["files"]
+    assert len(files) == 1
+    file_id = files[0]["file_id"]
+    assert files[0]["filename"] == "lesson_plan.txt"
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this lesson plan",
+                "files": [file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # Transcript is the raw text; execution channel is file-enriched.
+    assert payload.transcript_message == "check this lesson plan"
+    assert payload.execution_message is not None
+    assert file_id in payload.execution_message
+    assert "UPLOADED FILES" in payload.execution_message
+    assert payload.attachments
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+
+    # File is bound to the task after the turn is claimed (not before).
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_upload_rejects_unsupported_type_with_v1_envelope(mock_start_task):
+    """Unsupported extension -> 400 invalid_input in the v1 envelope.
+
+    Guards against the shared ``store_uploaded_files`` leaking its bare
+    HTTPException (a 500 {"detail": ...}) past the v1 error handler.
+    """
+    _agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("payload.xyz", b"junk", "application/octet-stream"))],
+    )
+    assert up.status_code == 400, up.text
+    body = up.json()
+    assert body["error"]["code"] == "invalid_input"
+    # Must be the stable v1 envelope, not FastAPI's default {"detail": ...}.
+    assert "detail" not in body
+
+
+def test_attach_unknown_file_id_is_rejected_without_orphan(mock_start_task):
+    """A bad file_id -> 400 and NO task row is created (no orphan)."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this",
+                "files": ["does-not-exist"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    # #2 regression: validation happens before task creation, so nothing is
+    # left behind. The background kickoff must never have fired either.
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0, (
+            "a bad file id must not leave an orphan task"
+        )
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
+
+
+def test_partial_file_set_is_all_or_nothing(mock_start_task):
+    """[good, bad] -> 400; the good file is left unbound (not half-attached)."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("good.txt", b"content", "text/plain"))],
+    )
+    good_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check these",
+                "files": [good_id, "typo-id"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == good_id).first()
+        assert rec is not None
+        assert rec.task_id is None, "good file must stay unbound on all-or-nothing"
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
+
+
+def test_repeated_file_id_is_deduped(mock_start_task):
+    """The same file_id twice in one request attaches once, not twice."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("dup.txt", b"content", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check it",
+                "files": [file_id, file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # One context line and one chip, despite the duplicate id.
+    assert payload.execution_message.count(f"file_id={file_id}") == 1
+    assert [a.get("file_id") for a in payload.attachments] == [file_id]
+
+
+def test_append_message_with_files(mock_start_task):
+    """The append route also accepts and attaches files."""
+    agent_id, full_key = _create_agent_with_key()
+
+    created = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "turn one"},
+        },
+    )
+    task_id = created.json()["task_id"]
+
+    # Append is only allowed once the task leaves RUNNING.
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.COMPLETED}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("turn2.txt", b"more", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "look at this too",
+                "files": [file_id],
+            },
+        },
+    )
+    assert appended.status_code == 202, appended.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    assert payload.transcript_message == "look at this too"
+    assert file_id in payload.execution_message
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_upload_files_requires_api_key(mock_start_task):
+    """POST /v1/chat/files without a key -> 401 invalid_api_key envelope."""
+    resp = client.post(
+        "/v1/chat/files",
+        files=[("files", ("x.txt", b"data", "text/plain"))],
+    )
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_upload_oversized_maps_to_413(mock_start_task):
+    """A 413 from the shared uploader surfaces as a v1-enveloped 413."""
+    _agent_id, full_key = _create_agent_with_key()
+
+    with patch(
+        "xagent.web.api.files.store_uploaded_files",
+        new=AsyncMock(side_effect=HTTPException(status_code=413, detail="too big")),
+    ):
+        resp = client.post(
+            "/v1/chat/files",
+            headers=_bearer(full_key),
+            files=[("files", ("big.txt", b"data", "text/plain"))],
+        )
+    assert resp.status_code == 413, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body  # not FastAPI's default envelope
+
+
+def test_upload_storage_unavailable_maps_to_503(mock_start_task):
+    """A 503 from the shared uploader surfaces as a retryable v1 503."""
+    _agent_id, full_key = _create_agent_with_key()
+
+    with patch(
+        "xagent.web.api.files.store_uploaded_files",
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="down")),
+    ):
+        resp = client.post(
+            "/v1/chat/files",
+            headers=_bearer(full_key),
+            files=[("files", ("f.txt", b"data", "text/plain"))],
+        )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert "detail" not in body
+
+
+def test_cross_user_file_not_attachable(mock_start_task):
+    """User B's agent key cannot attach a file uploaded by user A."""
+    # User A (admin) uploads a file under their own agent key.
+    _agent_a, key_a = _create_agent_with_key()
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(key_a),
+        files=[("files", ("secret.txt", b"private", "text/plain"))],
+    )
+    file_id_a = up.json()["files"][0]["file_id"]
+
+    # User B has a separate account, agent, and key.
+    bob_headers = _register_second_user()
+    agent_b, key_b = _create_agent_with_key_for(bob_headers)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(key_b),
+        json={
+            "agent_id": agent_b,
+            "message": {
+                "role": "user",
+                "content": "read A's file",
+                "files": [file_id_a],
+            },
+        },
+    )
+    # user_id filter makes A's file invisible to B -> unresolvable -> 400.
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    # A's file must remain unbound (B's failed attempt cannot touch it).
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id_a).first()
+        assert rec is not None
+        assert rec.task_id is None
     finally:
         db.close()
 
