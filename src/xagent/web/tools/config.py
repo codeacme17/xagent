@@ -9,14 +9,16 @@ import inspect
 import logging
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional
 
 import httpx
 
 from ...config import get_uploads_dir
+from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
     normalize_tool_allowlist,
@@ -43,20 +45,30 @@ logger = logging.getLogger(__name__)
 
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
+OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
 OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
 
 
 @dataclass(frozen=True)
+class OAuthRefreshContext:
+    reason: Literal["invalid_token"]
+    resource_metadata_url: str | None
+    challenge_scope: str | None
+    failed_generation: str | None = field(repr=False)
+
+
+@dataclass(frozen=True)
 class TokenRequest:
     """Request passed to the OAuth token resolver hook.
 
-    Providers are requested in the same candidate order used by the built-in
-    UserOAuth lookup: provider name first, then app id, de-duplicated. The
-    first resolver hit wins. ``resource`` is the configured MCP OAuth resource
-    URI for the current app/server when present, passed verbatim without
-    canonicalization. ``scope`` is the current execution scope from
+    Registered MCP apps use provider name followed by app id, de-duplicated.
+    Remote MCP servers without a matching app use the server name as a neutral
+    compatibility candidate; embedders must not treat that name as an identity
+    boundary. The first resolver hit wins. ``resource`` is the configured MCP
+    OAuth resource URI for the current app/server when present, passed verbatim
+    without canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
     """
@@ -65,6 +77,7 @@ class TokenRequest:
     user_id: int
     scope: Optional[Any] = None
     resource: str | None = None
+    refresh: OAuthRefreshContext | None = None
 
 
 @dataclass(frozen=True)
@@ -78,8 +91,9 @@ class ResolvedToken:
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
     """
 
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: datetime | None = None
+    generation: str | None = field(default=None, repr=False)
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -110,6 +124,15 @@ def _get_oauth_token_resolver_hook() -> tuple[TokenResolver | None, int]:
     return _oauth_token_resolver_hook, _oauth_token_resolver_generation
 
 
+def _oauth_token_resolver_registration_matches(
+    resolver: TokenResolver, registration_generation: int
+) -> bool:
+    current_resolver, current_generation = _get_oauth_token_resolver_hook()
+    return (
+        current_resolver is resolver and current_generation == registration_generation
+    )
+
+
 async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
     if inspect.isawaitable(result):
         return await result
@@ -119,8 +142,9 @@ async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
 @dataclass(frozen=True)
 class _ResolvedHookToken:
     provider: str
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: datetime | None
+    generation: str | None = field(repr=False)
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -131,12 +155,14 @@ class _OAuthTokenResolverFailed(Exception):
         exception_type: str,
         resource: str | None = None,
         actor_id: str | None = None,
+        failure_code: str | None = None,
     ) -> None:
         super().__init__(OAUTH_TOKEN_RESOLVER_FAILURE_CODE)
         self.providers = providers
         self.exception_type = exception_type
         self.resource = resource
         self.actor_id = actor_id
+        self.failure_code = normalize_tool_failure_code(failure_code)
 
 
 class _OAuthLaunchConfigInvalid(Exception):
@@ -160,6 +186,14 @@ def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | N
         return _bounded_oauth_metadata(raw_actor_id)
     except Exception:
         return None
+
+
+def _extract_oauth_token_resolver_failure_code(exc: Exception) -> str | None:
+    try:
+        raw_failure_code = getattr(exc, "oauth_token_resolver_failure_code", None)
+    except Exception:
+        return None
+    return normalize_tool_failure_code(raw_failure_code)
 
 
 def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:
@@ -763,6 +797,7 @@ class WebToolConfig(BaseToolConfig):
         runtime_values: Optional[Dict[str, Any]],
         runtime_bindings: Any,
         allow_delegated_authorization: bool,
+        warn_on_rejected_authorization: bool = True,
     ) -> Dict[str, str]:
         if not isinstance(runtime_values, dict):
             return {}
@@ -780,10 +815,11 @@ class WebToolConfig(BaseToolConfig):
                 header_name.lower() == "authorization"
                 and not allow_delegated_authorization
             ):
-                logger.warning(
-                    "Ignoring runtime MCP Authorization header binding because "
-                    "delegated authorization is disabled"
-                )
+                if warn_on_rejected_authorization:
+                    logger.warning(
+                        "Ignoring runtime MCP Authorization header binding because "
+                        "delegated authorization is disabled"
+                    )
                 continue
             value = binding_source_value(
                 binding,
@@ -803,8 +839,6 @@ class WebToolConfig(BaseToolConfig):
         runtime_bindings: Any,
         allow_delegated_authorization: bool,
     ) -> dict[str, Any] | None:
-        from ...web.services.mcp_runtime import headers_without_authorization
-
         delegated_headers = self._runtime_transport_headers(
             runtime_values=runtime_values,
             runtime_bindings=runtime_bindings,
@@ -812,16 +846,37 @@ class WebToolConfig(BaseToolConfig):
         )
         if not delegated_headers:
             return None
-        connection = dict(server.to_connection_dict())
-        headers = headers_without_authorization(
-            connection.get("headers")
-            if isinstance(connection.get("headers"), dict)
-            else None
+        return self._mcp_connection_with_runtime_headers(
+            server=server, runtime_headers=delegated_headers
         )
-        headers.update(delegated_headers)
-        connection["headers"] = headers
+
+    @staticmethod
+    def _mcp_connection_with_runtime_headers(
+        *, server: Any, runtime_headers: Mapping[str, str]
+    ) -> dict[str, Any]:
+        from ...web.services.mcp_runtime import connection_without_authorization
+
+        connection = connection_without_authorization(server.to_connection_dict())
+        connection["headers"].update(runtime_headers)
         connection.pop("auth", None)
         return connection
+
+    def _non_auth_mcp_connection(
+        self,
+        *,
+        server: Any,
+        runtime_values: Optional[Dict[str, Any]],
+        runtime_bindings: Any,
+    ) -> dict[str, Any]:
+        runtime_headers = self._runtime_transport_headers(
+            runtime_values=runtime_values,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=False,
+            warn_on_rejected_authorization=False,
+        )
+        return self._mcp_connection_with_runtime_headers(
+            server=server, runtime_headers=runtime_headers
+        )
 
     def _refresh_delegated_mcp_connection(
         self,
@@ -1289,8 +1344,10 @@ class WebToolConfig(BaseToolConfig):
         *,
         providers: list[str],
         resource: str | None,
+        resolver: TokenResolver | None = None,
     ) -> _ResolvedHookToken | None:
-        resolver, _ = _get_oauth_token_resolver_hook()
+        if resolver is None:
+            resolver, _ = _get_oauth_token_resolver_hook()
         if resolver is None or not providers or self._user_id is None:
             return None
 
@@ -1313,6 +1370,7 @@ class WebToolConfig(BaseToolConfig):
                     exception_type=_bounded_oauth_metadata(type(exc).__name__),
                     resource=resource,
                     actor_id=_extract_oauth_token_resolver_diagnostic_actor_id(exc),
+                    failure_code=_extract_oauth_token_resolver_failure_code(exc),
                 ) from exc
 
             if resolved is None:
@@ -1325,6 +1383,123 @@ class WebToolConfig(BaseToolConfig):
             )
 
         return None
+
+    async def _refresh_resolver_owned_mcp_connection(
+        self,
+        *,
+        challenge: object,
+        resolver: TokenResolver,
+        registration_generation: int,
+        provider: str,
+        providers: list[str],
+        user_id: int,
+        scope: Any,
+        resource: str | None,
+        failed_generation: str | None,
+        non_auth_connection: dict[str, Any],
+    ) -> dict[str, Any] | ClassifiedToolFailure | None:
+        from ...web.services.mcp_oauth import MCPAuthorizationChallenge
+
+        if (
+            not isinstance(challenge, MCPAuthorizationChallenge)
+            or failed_generation is None
+        ):
+            return None
+        if not _oauth_token_resolver_registration_matches(
+            resolver, registration_generation
+        ):
+            return None
+
+        request = TokenRequest(
+            provider=provider,
+            user_id=user_id,
+            scope=scope,
+            resource=resource,
+            refresh=OAuthRefreshContext(
+                reason="invalid_token",
+                resource_metadata_url=challenge.resource_metadata_url,
+                challenge_scope=challenge.scope,
+                failed_generation=failed_generation,
+            ),
+        )
+        try:
+            resolved = await _maybe_await_oauth_token_resolver_result(resolver(request))
+        except Exception as exc:
+            if not _oauth_token_resolver_registration_matches(
+                resolver, registration_generation
+            ):
+                return None
+            failure_code = _extract_oauth_token_resolver_failure_code(exc)
+            if failure_code is not None:
+                return ClassifiedToolFailure(failure_code=failure_code)
+            return None
+
+        if (
+            not _oauth_token_resolver_registration_matches(
+                resolver, registration_generation
+            )
+            or resolved is None
+        ):
+            return None
+        try:
+            normalized = self._normalize_resolved_oauth_token_from_hook(
+                provider=provider,
+                providers=providers,
+                resource=resource,
+                resolved=resolved,
+            )
+        except _OAuthTokenResolverFailed:
+            return None
+        if normalized.generation is None or normalized.generation == failed_generation:
+            return None
+
+        return self._build_resolver_owned_mcp_connection(
+            resolver=resolver,
+            registration_generation=registration_generation,
+            resolved=normalized,
+            providers=providers,
+            user_id=user_id,
+            scope=scope,
+            resource=resource,
+            non_auth_connection=non_auth_connection,
+        )
+
+    def _build_resolver_owned_mcp_connection(
+        self,
+        *,
+        resolver: TokenResolver,
+        registration_generation: int,
+        resolved: _ResolvedHookToken,
+        providers: list[str],
+        user_id: int,
+        scope: Any,
+        resource: str | None,
+        non_auth_connection: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ...web.services.mcp_runtime import connection_with_bearer_authorization
+
+        async def refresh(
+            challenge: object,
+        ) -> dict[str, Any] | ClassifiedToolFailure | None:
+            return await self._refresh_resolver_owned_mcp_connection(
+                challenge=challenge,
+                resolver=resolver,
+                registration_generation=registration_generation,
+                provider=resolved.provider,
+                providers=providers,
+                user_id=user_id,
+                scope=scope,
+                resource=resource,
+                failed_generation=resolved.generation,
+                non_auth_connection=non_auth_connection,
+            )
+
+        connection = connection_with_bearer_authorization(
+            non_auth_connection, resolved.access_token
+        )
+        connection["_oauth_token_resolver_refresh"] = refresh
+        connection.pop("_connector_runtime_refresh", None)
+        return connection
 
     def _normalize_resolved_oauth_token_from_hook(
         self,
@@ -1354,6 +1529,16 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidExpiresAt",
                 resource=resource,
             )
+        if resolved.generation is not None and (
+            type(resolved.generation) is not str
+            or not resolved.generation
+            or len(resolved.generation) > OAUTH_TOKEN_GENERATION_MAX_LENGTH
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidGeneration",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -1367,6 +1552,7 @@ class WebToolConfig(BaseToolConfig):
             provider=provider,
             access_token=resolved.access_token,
             expires_at=expires_at,
+            generation=resolved.generation,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
@@ -1408,23 +1594,50 @@ class WebToolConfig(BaseToolConfig):
             diagnostic["actor_id"] = error.actor_id
         return diagnostic
 
+    def _resolver_failure_config(
+        self,
+        *,
+        server: Any,
+        error: _OAuthTokenResolverFailed,
+    ) -> Dict[str, Any]:
+        self._mcp_hook_resolution_failed = True
+        diagnostic = self._build_oauth_token_resolver_diagnostic(
+            server=server,
+            error=error,
+        )
+        self._mcp_oauth_diagnostics.append(diagnostic)
+        logger.warning(
+            "OAuth token resolver failed for MCP server '%s' with %s",
+            getattr(server, "name", "<unknown>"),
+            error.exception_type,
+        )
+        return self._build_unavailable_oauth_mcp_config(
+            server=server,
+            diagnostic=diagnostic,
+            failure_code=error.failure_code,
+        )
+
     def _build_unavailable_oauth_mcp_config(
         self,
         *,
         server: Any,
         diagnostic: Dict[str, Any],
+        failure_code: str | None,
     ) -> Dict[str, Any]:
+        inner_config: Dict[str, Any] = {
+            "unavailable": True,
+            "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+            "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+            "server_id": getattr(server, "id", None),
+            "diagnostic": diagnostic,
+        }
+        if failure_code is not None:
+            inner_config["failure_code"] = failure_code
         return {
             "name": server.name,
             "transport": "unavailable",
             "description": server.description,
-            "config": {
-                "unavailable": True,
-                "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
-                "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
-                "server_id": getattr(server, "id", None),
-                "diagnostic": diagnostic,
-            },
+            "config": inner_config,
             "user_id": str(self._user_id),
             "allow_users": [str(self._user_id)],
         }
@@ -1574,23 +1787,10 @@ class WebToolConfig(BaseToolConfig):
                                 resource=configured_resource,
                             )
                         except _OAuthTokenResolverFailed as error:
-                            self._mcp_hook_resolution_failed = True
-                            diagnostic = self._build_oauth_token_resolver_diagnostic(
-                                server=server,
-                                error=error,
-                            )
-                            self._mcp_oauth_diagnostics.append(diagnostic)
-                            # Do not log the resolver exception message or
-                            # traceback here; they can contain token material.
-                            logger.warning(
-                                "OAuth token resolver failed for MCP server '%s' with %s",
-                                getattr(server, "name", "<unknown>"),
-                                error.exception_type,
-                            )
                             configs.append(
-                                self._build_unavailable_oauth_mcp_config(
+                                self._resolver_failure_config(
                                     server=server,
-                                    diagnostic=diagnostic,
+                                    error=error,
                                 )
                             )
                             continue
@@ -1714,51 +1914,104 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["cwd"] = server.cwd
 
                 elif server.transport in ["sse", "websocket", "streamable_http"]:
+                    from ...web.mcp_apps import get_app_by_name
                     from ...web.services.mcp_runtime import (
                         build_mcp_runtime_connection,
                         connection_to_transport_config,
+                        effective_mcp_oauth_resource,
                     )
 
-                    delegated_connection = self._delegated_mcp_connection(
-                        server=server,
+                    auth_context = self._mcp_auth_context_for_server(
+                        server_id=int(server.id),
                         runtime_values=runtime_values,
-                        runtime_bindings=runtime_bindings,
-                        allow_delegated_authorization=allow_delegated_authorization,
                     )
-                    if delegated_connection:
-                        delegated_connection["_connector_runtime_refresh"] = (
-                            lambda _server=server,
-                            _runtime_bindings=runtime_bindings,
-                            _allow_delegated_authorization=allow_delegated_authorization: (
-                                self._refresh_delegated_mcp_connection(
-                                    server=_server,
-                                    runtime_bindings=_runtime_bindings,
-                                    allow_delegated_authorization=_allow_delegated_authorization,
-                                )
-                            )
+                    resolver, registration_generation = _get_oauth_token_resolver_hook()
+                    remote_providers_to_resolve: list[str] = []
+                    remote_configured_resource: str | None = None
+                    remote_hook_token: _ResolvedHookToken | None = None
+                    if resolver is not None:
+                        app_info = get_app_by_name(self.db, str(server.name))
+                        remote_providers_to_resolve = (
+                            _oauth_token_provider_candidates(app_info)
+                            if app_info
+                            else [str(server.name)]
                         )
-                        transport_config.update(
-                            connection_to_transport_config(delegated_connection)
-                        )
-                    else:
-                        runtime_build = await build_mcp_runtime_connection(
-                            self.db,
+                        remote_configured_resource = effective_mcp_oauth_resource(
                             server,
-                            user_id=self._user_id,
-                            mcp_auth_context=self._mcp_auth_context_for_server(
-                                server_id=int(server.id),
+                            mcp_auth_context=auth_context,
+                        )
+                        if remote_providers_to_resolve:
+                            try:
+                                remote_hook_token = (
+                                    await self._resolve_oauth_token_from_hook(
+                                        providers=remote_providers_to_resolve,
+                                        resource=remote_configured_resource,
+                                        resolver=resolver,
+                                    )
+                                )
+                            except _OAuthTokenResolverFailed as error:
+                                configs.append(
+                                    self._resolver_failure_config(
+                                        server=server,
+                                        error=error,
+                                    )
+                                )
+                                continue
+
+                    if remote_hook_token is not None and resolver is not None:
+                        self._mark_hook_token_cache_metadata(remote_hook_token)
+                        resolver_connection = self._build_resolver_owned_mcp_connection(
+                            resolver=resolver,
+                            registration_generation=registration_generation,
+                            resolved=remote_hook_token,
+                            providers=remote_providers_to_resolve,
+                            user_id=int(self._user_id),
+                            scope=self.get_execution_scope(),
+                            resource=remote_configured_resource,
+                            non_auth_connection=self._non_auth_mcp_connection(
+                                server=server,
                                 runtime_values=runtime_values,
+                                runtime_bindings=runtime_bindings,
                             ),
                         )
-                        if runtime_build.connection is None:
-                            if runtime_build.diagnostic is not None:
-                                self._mcp_oauth_diagnostics.append(
-                                    runtime_build.diagnostic
-                                )
-                            continue
                         transport_config.update(
-                            connection_to_transport_config(runtime_build.connection)
+                            connection_to_transport_config(resolver_connection)
                         )
+                    else:
+                        delegated_connection = self._delegated_mcp_connection(
+                            server=server,
+                            runtime_values=runtime_values,
+                            runtime_bindings=runtime_bindings,
+                            allow_delegated_authorization=allow_delegated_authorization,
+                        )
+                        if delegated_connection:
+                            delegated_connection["_connector_runtime_refresh"] = (
+                                partial(
+                                    self._refresh_delegated_mcp_connection,
+                                    server=server,
+                                    runtime_bindings=runtime_bindings,
+                                    allow_delegated_authorization=allow_delegated_authorization,
+                                )
+                            )
+                            transport_config.update(
+                                connection_to_transport_config(delegated_connection)
+                            )
+                        else:
+                            runtime_build = await build_mcp_runtime_connection(
+                                self.db,
+                                server,
+                                user_id=self._user_id,
+                                mcp_auth_context=auth_context,
+                            )
+                            if runtime_build.connection is None:
+                                if runtime_build.diagnostic is not None:
+                                    self._mcp_oauth_diagnostics.append(
+                                        runtime_build.diagnostic
+                                    )
+                                continue
+                            transport_config.update(
+                                connection_to_transport_config(runtime_build.connection)
+                            )
 
                 transport_config["concurrency_safe"] = bool(
                     getattr(server, "concurrency_safe", False)

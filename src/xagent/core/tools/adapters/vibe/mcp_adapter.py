@@ -9,8 +9,10 @@ import inspect
 import logging
 import os
 import re
+from collections.abc import Iterator
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
+import httpx
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
@@ -41,11 +43,95 @@ class EmptyArgsModel(BaseModel):
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
+_OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
+_RESOLVER_HTTP_401_NODE_LIMIT = 64
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
+
+
+def _bounded_exception_nodes(
+    exc: BaseException, *, excluded_subtree_ids: frozenset[int] = frozenset()
+) -> Iterator[BaseException]:
+    pending = [(exc, True)]
+    visited: set[int] = set()
+    visited_count = 0
+    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+        current, is_root = pending.pop()
+        current_id = id(current)
+        if current_id in visited or (
+            current_id in excluded_subtree_ids and not is_root
+        ):
+            continue
+        visited.add(current_id)
+        visited_count += 1
+        yield current
+
+        if current_id in excluded_subtree_ids:
+            continue
+        linked: list[BaseException] = []
+        if isinstance(current, BaseExceptionGroup):
+            linked.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            linked.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            linked.append(current.__context__)
+        pending.extend((node, False) for node in reversed(linked))
+
+
+def _strict_http_401_responses(
+    exc: BaseException,
+    *,
+    excluded_response_ids: frozenset[int] = frozenset(),
+    excluded_subtree_ids: frozenset[int] = frozenset(),
+) -> Iterator[httpx.Response]:
+    for current in _bounded_exception_nodes(
+        exc, excluded_subtree_ids=excluded_subtree_ids
+    ):
+        if not isinstance(current, httpx.HTTPStatusError):
+            continue
+        response = current.response
+        if (
+            isinstance(response, httpx.Response)
+            and response.status_code == 401
+            and id(response) not in excluded_response_ids
+        ):
+            yield response
+
+
+def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
+    # Lazy import keeps the core adapter independent from the web layer at import time.
+    from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+
+    challenge = None
+    response_ids: set[int] = set()
+    for response in _strict_http_401_responses(exc):
+        response_ids.add(id(response))
+        if challenge is not None:
+            continue
+        candidate = parse_www_authenticate_bearer(
+            response.headers.get_list("WWW-Authenticate")
+        )
+        if candidate is not None and candidate.params.get("error") == "invalid_token":
+            challenge = candidate
+    return challenge, frozenset(response_ids)
+
+
+def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
+    challenge, _ = _resolver_401_evidence(exc)
+    return challenge
+
+
+def _is_executable_remote_connection(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    transport = value.get("transport")
+    if transport not in {"sse", "streamable_http", "websocket"}:
+        return False
+    url = value.get("url")
+    return isinstance(url, str) and bool(url)
 
 
 def _exception_indicates_http_401(exc: BaseException) -> bool:
@@ -64,8 +150,12 @@ def _exception_indicates_http_401(exc: BaseException) -> bool:
     return bool(_HTTP_401_TEXT_RE.search(text))
 
 
-def _delegated_authorization_failed_result() -> dict[str, Any]:
-    return {
+def _delegated_authorization_failed_result(
+    *, failure_code: object = None
+) -> dict[str, Any]:
+    from ....agent.result import normalize_tool_failure_code
+
+    result: dict[str, Any] = {
         "content": [
             {
                 "text": (
@@ -76,6 +166,10 @@ def _delegated_authorization_failed_result() -> dict[str, Any]:
         ],
         "is_error": True,
     }
+    normalized_failure_code = normalize_tool_failure_code(failure_code)
+    if normalized_failure_code is not None:
+        result["failure_code"] = normalized_failure_code
+    return result
 
 
 def _delegated_retry_failed_result() -> dict[str, Any]:
@@ -554,7 +648,7 @@ class MCPToolAdapter(AbstractBaseTool):
                         self.connection, tool_args, tool_meta
                     )
                 except (BaseExceptionGroup, Exception) as exc:
-                    retry_result = await self._retry_delegated_401(
+                    retry_result = await self._retry_after_authorization_failure(
                         exc, tool_args, tool_meta
                     )
                     if retry_result is not None:
@@ -610,12 +704,17 @@ class MCPToolAdapter(AbstractBaseTool):
                 "is_error": result.isError if hasattr(result, "isError") else False,
             }
 
-    async def _retry_delegated_401(
+    async def _retry_after_authorization_failure(
         self,
         exc: BaseException,
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any] | None:
+        if isinstance(self.connection, Mapping) and (
+            _OAUTH_TOKEN_RESOLVER_REFRESH_KEY in self.connection
+        ):
+            return await self._retry_resolver_401(exc, tool_args, tool_meta)
+
         if not _exception_indicates_http_401(exc):
             return None
         if not isinstance(self.connection, Mapping):
@@ -642,6 +741,73 @@ class MCPToolAdapter(AbstractBaseTool):
                 return _delegated_authorization_failed_result()
             logger.error(
                 "MCP tool %s delegated authorization retry failed with %s",
+                self.mcp_tool.name,
+                type(retry_exc).__name__,
+            )
+            return _delegated_retry_failed_result()
+
+    async def _retry_resolver_401(
+        self,
+        exc: BaseException,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        challenge, initial_response_ids = _resolver_401_evidence(exc)
+        if not initial_response_ids:
+            return None
+
+        refresh = self.connection.get(_OAUTH_TOKEN_RESOLVER_REFRESH_KEY)
+        if challenge is None or not callable(refresh):
+            return _delegated_authorization_failed_result()
+
+        logger.info(
+            "Retrying MCP tool %s after resolver authorization failure",
+            self.mcp_tool.name,
+        )
+        try:
+            refreshed = refresh(challenge)
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except (BaseExceptionGroup, Exception) as refresh_exc:
+            logger.error(
+                "MCP tool %s resolver authorization refresh failed with %s",
+                self.mcp_tool.name,
+                type(refresh_exc).__name__,
+            )
+            return _delegated_authorization_failed_result()
+
+        from ....agent.result import ClassifiedToolFailure
+
+        if isinstance(refreshed, ClassifiedToolFailure):
+            return _delegated_authorization_failed_result(
+                failure_code=refreshed.failure_code
+            )
+
+        if not _is_executable_remote_connection(refreshed):
+            return _delegated_authorization_failed_result()
+
+        try:
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
+        except (BaseExceptionGroup, Exception) as retry_exc:
+            excluded_response_ids = (
+                frozenset() if retry_exc is exc else initial_response_ids
+            )
+            if (
+                next(
+                    _strict_http_401_responses(
+                        retry_exc,
+                        excluded_response_ids=excluded_response_ids,
+                        excluded_subtree_ids=frozenset({id(exc)}),
+                    ),
+                    None,
+                )
+                is not None
+            ):
+                return _delegated_authorization_failed_result()
+            logger.error(
+                "MCP tool %s resolver authorization retry failed with %s",
                 self.mcp_tool.name,
                 type(retry_exc).__name__,
             )
@@ -739,6 +905,14 @@ class MCPToolAdapter(AbstractBaseTool):
 
 
 class _UnavailableMCPToolResult(BaseModel):
+    success: bool = Field(default=False, description="Whether execution succeeded")
+    status: str = Field(default="error", description="Tool execution status")
+    error: str | None = Field(
+        default=None, description="Public-safe tool failure message when available"
+    )
+    failure_code: str | None = Field(
+        default=None, description="Allowlisted public tool failure classification"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -760,13 +934,16 @@ class UnavailableMCPTool(AbstractBaseTool):
         server_name: str,
         server_id: Any | None,
         allow_users: Optional[List[str]] = None,
+        failure_code: str | None = None,
     ) -> None:
+        from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
         from .selection_spec import normalize_mcp_server_name
 
         self._server_name = server_name
         self._server_id = server_id
         self._allow_users = allow_users
+        self._failure_code = normalize_tool_failure_code(failure_code)
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -796,7 +973,10 @@ class UnavailableMCPTool(AbstractBaseTool):
         current_user_id = _get_current_mcp_user_id()
         if not _is_mcp_user_allowed(current_user_id, self._allow_users):
             return _mcp_access_denied_result(current_user_id, self.name)
-        return {
+        result: Dict[str, Any] = {
+            "success": False,
+            "status": "error",
+            "error": "MCP server credentials are unavailable.",
             "content": [
                 {
                     "text": (
@@ -807,6 +987,9 @@ class UnavailableMCPTool(AbstractBaseTool):
             ],
             "is_error": True,
         }
+        if self._failure_code is not None:
+            result["failure_code"] = self._failure_code
+        return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         return self._run_unavailable()

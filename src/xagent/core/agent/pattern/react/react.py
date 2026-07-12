@@ -46,7 +46,7 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...language import final_answer_language_rule
-from ...result import unwrap_final_answer_content
+from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
@@ -2044,12 +2044,7 @@ class ReActPattern(AgentPattern):
         }
 
     def _tool_result_success(self, result: Any) -> bool:
-        if not isinstance(result, dict):
-            return True
-        if result.get("success") is False:
-            return False
-        status = result.get("status")
-        return not (isinstance(status, str) and status.lower() == "error")
+        return tool_result_succeeded(result)
 
     def _latest_tool_result_success(self, context: Any) -> bool:
         for message in reversed(getattr(context, "messages", [])):
