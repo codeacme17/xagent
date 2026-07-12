@@ -265,6 +265,33 @@ async def test_runtime_interrupt_converts_active_llm_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_should_interrupt_string_result_becomes_reason() -> None:
+    # A checker returning a string interrupts AND supplies the reason (used by
+    # the mid-run quota gate so the run surfaces *why* it was stopped).
+    runtime = PatternRuntime(interrupt_checker=lambda: "Monthly quota reached")
+    assert await runtime.should_interrupt() is True
+    assert runtime.interrupt_reason == "Monthly quota reached"
+
+
+@pytest.mark.asyncio
+async def test_should_interrupt_falsey_checker_does_not_interrupt() -> None:
+    runtime = PatternRuntime(interrupt_checker=lambda: None)
+    assert await runtime.should_interrupt() is False
+    assert runtime.interrupt_reason is None
+
+
+@pytest.mark.asyncio
+async def test_should_interrupt_empty_string_neither_interrupts_nor_sets_reason() -> (
+    None
+):
+    # "" is falsey: it must not interrupt, and must not clobber interrupt_reason.
+    runtime = PatternRuntime(interrupt_checker=lambda: "")
+    runtime.interrupt_reason = "prior"
+    assert await runtime.should_interrupt() is False
+    assert runtime.interrupt_reason == "prior"
+
+
+@pytest.mark.asyncio
 async def test_runtime_preserves_non_interrupt_cancelled_error() -> None:
     runtime = PatternRuntime()
 

@@ -92,6 +92,107 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_interrupt_reason_for_quota_passes_turn_delta(self, db_session):
+        """The per-step quota gate must see the same this-turn delta the metering
+        path computes, and surface the gate's reason (or None when open)."""
+        from xagent.core.model.chat.token_context import add_tool_call_usage
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 100
+        task.output_tokens = 50
+        task.llm_calls = 1
+        task.token_usage_details = [
+            {"type": "input", "tokens": 100, "model": "m", "call_type": "chat"},
+        ]
+
+        captured = {}
+
+        def _gate(db, user_id, delta_details, delta_actions):
+            captured.update(
+                user_id=user_id, details=delta_details, actions=delta_actions
+            )
+            return "over credits" if delta_actions >= 2 else None
+
+        quota_hooks.set_run_progress_gate_hook(_gate)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            # Before tracking starts, the checker is a no-op (fails open).
+            assert tracker.interrupt_reason_for_quota() is None
+            await tracker.start_tracking()
+            add_token_usage(
+                input_tokens=10, output_tokens=5, model="m", call_type="chat"
+            )
+            add_tool_call_usage(2)
+            reason = tracker.interrupt_reason_for_quota()
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        assert reason == "over credits"
+        # The reason is recorded so the run's caller can surface why it stopped.
+        assert tracker.quota_interrupt_reason == "over credits"
+        assert captured["user_id"] == 42
+        assert captured["actions"] == 2  # only this turn's tool calls
+        # Only this turn's input+output entries, not the seeded baseline one.
+        assert len(captured["details"]) == 2
+        assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
+
+    @pytest.mark.asyncio
+    async def test_quota_gate_caches_user_id_and_logs_once(self, db_session, caplog):
+        """F1: user_id is cached at construction (not re-read per step). F3: the
+        fail-open warning is logged once per run, not once per step."""
+        import logging
+
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 7
+
+        def _boom(db, user_id, dd, da):
+            raise RuntimeError("gate infra down")
+
+        quota_hooks.set_run_progress_gate_hook(_boom)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            assert tracker._user_id == 7  # F1: cached at construction
+            await tracker.start_tracking()
+            with caplog.at_level(logging.WARNING):
+                assert tracker.interrupt_reason_for_quota() is None
+                assert tracker.interrupt_reason_for_quota() is None
+                assert tracker.interrupt_reason_for_quota() is None
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        warnings = [r for r in caplog.records if "failed open" in r.getMessage()]
+        assert len(warnings) == 1  # F3: one log despite three failing calls
+        assert tracker.quota_interrupt_reason is None  # never tripped → no reason
+
+    @pytest.mark.asyncio
+    async def test_runtime_should_interrupt_drives_tracker_gate(self, db_session):
+        """End-to-end seam: the runtime's should_interrupt — the exact call the
+        pattern loop makes at each safe point — wired to the tracker's real gate
+        method fires and records the reason when a registered hook trips."""
+        from xagent.core.agent.runtime import PatternRuntime
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 5
+
+        quota_hooks.set_run_progress_gate_hook(lambda db, uid, dd, da: "Out of credits")
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+            runtime = PatternRuntime(
+                interrupt_checker=tracker.interrupt_reason_for_quota
+            )
+            assert await runtime.should_interrupt() is True
+            assert runtime.interrupt_reason == "Out of credits"
+            assert tracker.quota_interrupt_reason == "Out of credits"
+        finally:
+            quota_hooks.set_run_progress_gate_hook(None)
+
+    @pytest.mark.asyncio
     async def test_init_task_tracker_with_custom_interval(self, db_session):
         """Test TaskTracker with custom update interval."""
         tracker = TaskTracker(
@@ -483,3 +584,27 @@ class TestTaskTrackerIntegration:
         types = [d.get("type") for d in final_usage.details]
         assert "input" in types
         assert "output" in types
+
+
+def test_check_run_progress_gate_guards():
+    """The quota-gate seam is a no-op when no hook is registered or user_id is
+    None, and otherwise forwards to the hook and returns its reason."""
+    from xagent.web.services import quota_hooks
+
+    # No hook registered → None regardless of args.
+    quota_hooks.set_run_progress_gate_hook(None)
+    assert quota_hooks.check_run_progress_gate("db", 1, [], 0) is None
+
+    seen = []
+    quota_hooks.set_run_progress_gate_hook(
+        lambda db, uid, dd, da: (seen.append(uid), "OVER")[1]
+    )
+    try:
+        # user_id None short-circuits before the hook is called.
+        assert quota_hooks.check_run_progress_gate("db", None, [], 0) is None
+        assert seen == []
+        # Otherwise the hook runs and its reason is returned verbatim.
+        assert quota_hooks.check_run_progress_gate("db", 7, [], 3) == "OVER"
+        assert seen == [7]
+    finally:
+        quota_hooks.set_run_progress_gate_hook(None)

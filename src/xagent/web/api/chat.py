@@ -2238,6 +2238,12 @@ class AgentServiceManager:
                     db_session=db_session,
                 )
                 await tracker.start_tracking()
+                # Enforce quota mid-run: the pattern loop polls this every step
+                # (each LLM reply / tool call) and stops the run once its live
+                # cost would push the team over quota, instead of only metering at
+                # completion. Cleared in the finally so a reused agent_service
+                # never keeps a finished run's tracker as its checker.
+                agent_service.set_interrupt_checker(tracker.interrupt_reason_for_quota)
                 logger.info(f"Started token tracking for task {tracker_task_id}")
             except Exception as e:
                 logger.warning(
@@ -2259,6 +2265,21 @@ class AgentServiceManager:
             result = await agent_service.execute_task(
                 task=task, context=context, task_id=task_id
             )
+
+            # If a mid-run quota gate stopped the run, surface the reason the way
+            # the start gate does — a terminal quota_exceeded result carrying the
+            # reason as output — instead of the pattern-interrupt path's silent
+            # flip to PAUSED (which persists no message).
+            if tracker is not None and isinstance(result, dict):
+                quota_reason = getattr(tracker, "quota_interrupt_reason", None)
+                if quota_reason:
+                    result = {
+                        **result,
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": quota_reason,
+                        "error": quota_reason,
+                    }
 
             logger.info("=== Task executed successfully, updating title if needed ===")
 
@@ -2289,6 +2310,9 @@ class AgentServiceManager:
                 )
             # Complete tracking if it was started
             if tracker:
+                # Drop the mid-run quota checker before metering so a reused
+                # agent_service can't keep calling this finished run's tracker.
+                agent_service.set_interrupt_checker(None)
                 try:
                     await tracker.complete_tracking()
                     logger.info(f"Completed token tracking for task {tracker_task_id}")

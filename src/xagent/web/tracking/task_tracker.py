@@ -73,6 +73,17 @@ class TaskTracker:
         if not self.task:
             raise ValueError(f"Task {task_id} not found")
 
+        # Cache user_id at construction: the per-step quota checker reads it every
+        # step, and `self.task` is expired after periodic_update commits
+        # (expire_on_commit), so a fresh `self.task.user_id` would trigger an
+        # implicit blocking SELECT. user_id never changes for a task.
+        self._user_id = getattr(self.task, "user_id", None)
+        # Fail-open logging in the per-step gate must not flood: log once per run.
+        self._quota_gate_warned = False
+        # Set to the gate reason if the mid-run quota gate trips, so the run's
+        # caller can surface why the run stopped instead of a silent PAUSE.
+        self.quota_interrupt_reason: str | None = None
+
     async def start_tracking(self) -> None:
         """Start tracking token usage for this task."""
         if self._is_tracking:
@@ -257,6 +268,56 @@ class TaskTracker:
         self._is_tracking = False
         logger.info(f"Stopped periodic token updates for task {self.task_id}")
 
+    def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
+        """This turn's (detail entries, tool-call count) over the baseline seeded
+        in start_tracking. Single source for the completion meter and the mid-run
+        gate so they can't disagree on what 'this run's usage' means."""
+        if usage is None:
+            usage = get_token_usage()
+        return (
+            usage.details[self._initial_details_len :],
+            max(0, usage.tool_calls - self._initial_tool_calls),
+        )
+
+    def interrupt_reason_for_quota(self) -> str | None:
+        """Per-step interrupt-checker: return a reason when this run's live-so-far
+        usage would push the team over a run-gated quota, so a single long or
+        expensive run is stopped mid-flight instead of only being metered at
+        completion (``complete_tracking`` still meters the partial usage on exit).
+
+        Wired as the run's ``interrupt_checker`` and polled at every safe point
+        (each LLM reply / tool call). Synchronous and best-effort: it reuses the
+        exact turn-delta the metering path computes, and swallows errors so a
+        quota-infra hiccup fails open rather than wedging a run.
+
+        When it trips it records the reason in ``quota_interrupt_reason`` so the
+        run's caller can surface *why* the run stopped (the pattern interrupt
+        path itself would otherwise flip silently to PAUSED).
+        """
+        if not self._is_tracking:
+            return None
+        try:
+            from ..services.quota_hooks import check_run_progress_gate
+
+            delta_details, delta_actions = self._turn_delta()
+            reason = check_run_progress_gate(
+                self.db_session,
+                self._user_id,
+                delta_details,
+                delta_actions,
+            )
+            if reason is not None:
+                self.quota_interrupt_reason = reason
+            return reason
+        except Exception as e:  # noqa: BLE001
+            # Runs per step; log once per run so a persistent failure can't flood.
+            if not self._quota_gate_warned:
+                self._quota_gate_warned = True
+                logger.warning(
+                    f"Quota progress gate failed open for task {self.task_id}: {e}"
+                )
+            return None
+
     async def complete_tracking(self) -> TokenUsage:
         """Complete tracking and return final statistics.
 
@@ -284,11 +345,10 @@ class TaskTracker:
         try:
             from ..services.quota_hooks import record_usage
 
-            delta_details = usage.details[self._initial_details_len :]
-            delta_actions = max(0, usage.tool_calls - self._initial_tool_calls)
+            delta_details, delta_actions = self._turn_delta(usage)
             record_usage(
                 self.db_session,
-                getattr(self.task, "user_id", None),
+                self._user_id,
                 delta_details,
                 delta_actions,
             )
