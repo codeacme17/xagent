@@ -193,6 +193,85 @@ describe('InlineFilePreview', () => {
     })
   })
 
+  it('loads managed audio files through authenticated preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'audio', fileId: 'audio-file-id', filename: 'podcast.mp3' }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/audio-file-id',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const audio = await screen.findByLabelText('podcast.mp3')
+    expect(audio.tagName.toLowerCase()).toBe('audio')
+    expect(audio.getAttribute('src')).toMatch(/^blob:/)
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+  })
+
+  it('falls back to the public audio preview when authenticated loading fails', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 401 })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'audio', fileId: 'audio-file-id', filename: 'podcast.mp3' }}
+      />
+    )
+
+    const audio = await screen.findByLabelText('podcast.mp3')
+    expect(audio).toHaveAttribute(
+      'src',
+      'http://api.local/api/files/public/preview/audio-file-id'
+    )
+    expect(screen.getByRole('link', { name: 'Open' })).toHaveAttribute(
+      'href',
+      'http://api.local/api/files/public/preview/audio-file-id'
+    )
+  })
+
+  it('loads legacy workspace audio paths through authenticated preview', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
+    })
+
+    render(
+      <InlineFilePreview
+        source={{
+          type: 'audio',
+          fileId: 'output/xagent_061_podcast.mp3',
+          filename: 'xagent_061_podcast.mp3',
+        }}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        'http://api.local/api/files/preview/output%2Fxagent_061_podcast.mp3',
+        expect.objectContaining({ cache: 'no-cache' })
+      )
+    })
+
+    const audio = await screen.findByLabelText('xagent_061_podcast.mp3')
+    await waitFor(() => {
+      expect(audio.getAttribute('src')).toMatch(/^blob:/)
+    })
+    expect(screen.getByRole('link', { name: 'Open' }).getAttribute('href')).toMatch(
+      /^blob:/
+    )
+  })
+
   it('mounts PptxPreviewRenderer immediately with fileId without eager byte fetch', () => {
     // PDF-first path: when a managed fileId is available, InlineFilePreview
     // skips the eager /api/files/public/preview bytes download and mounts
