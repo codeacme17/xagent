@@ -206,6 +206,89 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
+    """Aggregate persisted token detail entries by the actual model used.
+
+    ``model_id`` is preferred as the identity because different configured
+    models can share a provider-facing name. A legacy name-only group is
+    merged into an id-backed group only when that name identifies exactly one
+    configured model. Entries without either an id or name are retained as an
+    unattributed group rather than silently dropping tokens from the breakdown.
+    """
+    if not isinstance(details, list):
+        return []
+
+    grouped: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        token_type = detail.get("type")
+        if token_type not in {"input", "output"}:
+            continue
+        tokens = max(0, _coerce_int(detail.get("tokens")))
+        if tokens == 0:
+            continue
+
+        raw_model_id = detail.get("model_id")
+        raw_model_name = detail.get("model")
+        model_id = raw_model_id.strip() if isinstance(raw_model_id, str) else ""
+        model_name = raw_model_name.strip() if isinstance(raw_model_name, str) else ""
+        key = ("id", model_id) if model_id else ("name", model_name)
+        if not model_id and not model_name:
+            key = ("unknown", "")
+
+        aggregate = grouped.setdefault(
+            key,
+            {
+                "model_id": model_id,
+                "model_name": model_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+        # Some legacy adapters only stamped the name on one of the pair.
+        if not aggregate["model_name"] and model_name:
+            aggregate["model_name"] = model_name
+        aggregate[f"{token_type}_tokens"] += tokens
+        aggregate["total_tokens"] += tokens
+
+    id_keys_by_name: Dict[str, List[tuple[str, str]]] = {}
+    for key, aggregate in grouped.items():
+        if key[0] == "id" and aggregate["model_name"]:
+            id_keys_by_name.setdefault(aggregate["model_name"], []).append(key)
+
+    for key, aggregate in list(grouped.items()):
+        if key[0] != "name":
+            continue
+        matching_id_keys = id_keys_by_name.get(aggregate["model_name"], [])
+        if len(matching_id_keys) != 1:
+            continue
+        target = grouped[matching_id_keys[0]]
+        target["input_tokens"] += aggregate["input_tokens"]
+        target["output_tokens"] += aggregate["output_tokens"]
+        target["total_tokens"] += aggregate["total_tokens"]
+        del grouped[key]
+
+    sorted_groups = sorted(
+        grouped.values(),
+        key=lambda item: (
+            -item["total_tokens"],
+            item["model_name"].casefold(),
+            item["model_id"].casefold(),
+        ),
+    )
+    return [
+        {
+            "model_id": item["model_id"],
+            "model_name": item["model_name"],
+            "input_tokens": item["input_tokens"],
+            "output_tokens": item["output_tokens"],
+        }
+        for item in sorted_groups
+    ]
+
+
 def add_token_usage(
     input_tokens: int = 0,
     output_tokens: int = 0,

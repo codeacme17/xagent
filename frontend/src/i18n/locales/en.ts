@@ -275,6 +275,17 @@ const en = {
     tokenUsage: {
       input: "Input tokens",
       output: "Output tokens",
+      inputShort: "Input",
+      outputShort: "Output",
+      oneModel: "{count} model",
+      models: "{count} models",
+      oneModelWithUnattributed: "{count} model + {unattributed} unattributed",
+      modelsWithUnattributed: "{count} models + {unattributed} unattributed",
+      unattributedCount: "{count} unattributed",
+      byModel: "Usage by model",
+      model: "Model",
+      unknownModel: "Unknown model",
+      unattributed: "Unattributed",
     },
     contextUsage: {
       tooltip: "Context window {pct}% ({used}/{total} tokens)",

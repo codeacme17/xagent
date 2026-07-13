@@ -275,6 +275,17 @@ const zh = {
     tokenUsage: {
       input: "输入tokens",
       output: "输出tokens",
+      inputShort: "输入",
+      outputShort: "输出",
+      oneModel: "{count} 个模型",
+      models: "{count} 个模型",
+      oneModelWithUnattributed: "{count} 个模型 + {unattributed} 个未归属",
+      modelsWithUnattributed: "{count} 个模型 + {unattributed} 个未归属",
+      unattributedCount: "{count} 个未归属",
+      byModel: "各模型用量",
+      model: "模型",
+      unknownModel: "未知模型",
+      unattributed: "未归属",
     },
     contextUsage: {
       tooltip: "上下文窗口 {pct}%（{used}/{total} tokens）",
