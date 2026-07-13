@@ -68,6 +68,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus,
     processStatus,
     showEmptyStatus,
+    onOpenExecutionPlan,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -75,6 +76,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus?: string
     processStatus?: string
     showEmptyStatus?: boolean
+    onOpenExecutionPlan?: () => void
   }) => (
     <div
       data-testid="chat-message"
@@ -85,6 +87,21 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
     >
       {content}
+      {onOpenExecutionPlan && traceEvents?.some((event) => {
+        if (!event || typeof event !== "object" || !("event_type" in event)) return false
+        return typeof event.event_type === "string" && (
+          event.event_type === "dag_execution" ||
+          event.event_type === "dag_execute_start" ||
+          event.event_type === "dag_execute_end" ||
+          event.event_type === "dag_plan_start" ||
+          event.event_type === "dag_plan_end" ||
+          event.event_type.startsWith("dag_step_")
+        )
+      }) && (
+        <button type="button" title="chatPage.executionPlan.tooltip" onClick={onOpenExecutionPlan}>
+          chatPage.executionPlan.view
+        </button>
+      )}
     </div>
   ),
 }))
@@ -551,9 +568,71 @@ describe("TaskConversationPanel", () => {
     expect(screen.getByText("Context compacted (56860→449 tokens)")).toBeInTheDocument()
   })
 
+  it("scopes the execution plan action to the DAG turn instead of task actions", () => {
+    appState.messages = [
+      {
+        id: "user-react",
+        role: "user",
+        content: "Use tools",
+        timestamp: 1000,
+      },
+      {
+        id: "result-react",
+        role: "assistant",
+        content: "Done",
+        timestamp: 1500,
+        isResult: true,
+      },
+      {
+        id: "user-dag",
+        role: "user",
+        content: "Create a plan",
+        timestamp: 2000,
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "react-start",
+        event_type: "react_task_start",
+        step_id: "react-step",
+        timestamp: 1100,
+        data: {},
+      },
+      {
+        event_id: "dag-execution",
+        event_type: "dag_execution",
+        timestamp: 2100,
+        data: {
+          phase: "executing",
+          steps: [{ id: "dag-step", task: "Create output", dependencies: [] }],
+        },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      isDag: true,
+    } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getAllByTitle("chatPage.executionPlan.tooltip")).toHaveLength(1)
+  })
+
   it("ignores malformed DAG layout failures without throwing", async () => {
     appState.messages = []
-    appState.traceEvents = []
+    appState.traceEvents = [
+      {
+        event_id: "dag-execution",
+        event_type: "dag_execution",
+        timestamp: 1000,
+        data: { phase: "executing", steps: [] },
+      },
+    ] as any
     appState.currentTask = {
       id: "42",
       title: "Task",
@@ -586,7 +665,7 @@ describe("TaskConversationPanel", () => {
     appState.filePreview = { isOpen: false } as any
 
     expect(() => render(<TaskConversationPanel mode="page" />)).not.toThrow()
-    fireEvent.click(screen.getByTitle("chatPage.executionPlan.title"))
+    fireEvent.click(screen.getByTitle("chatPage.executionPlan.tooltip"))
 
     expect(await screen.findByTestId("center-panel")).toHaveAttribute("data-node-count", "3")
     expect(screen.getByTestId("center-panel")).toHaveAttribute("data-edge-count", "0")

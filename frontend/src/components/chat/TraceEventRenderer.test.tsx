@@ -14,6 +14,7 @@ vi.mock("@/contexts/i18n-context", () => ({
     t: (key: string, vars?: Record<string, string | number>) => {
       if (vars?.tool) return `${key}:${vars.tool}`
       if (vars?.worker) return `${key}:${vars.worker}`
+      if (vars && "count" in vars) return `${key}:${vars.count}`
       return key
     },
   }),
@@ -495,6 +496,68 @@ describe("TraceEventRenderer", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(screen.getByText("traceEventRenderer.hideProcess")).toBeInTheDocument()
     expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
+  })
+
+  it("shows the execution plan action only in a process with DAG execution events", () => {
+    const onOpenExecutionPlan = vi.fn()
+    const { rerender } = render(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "react-start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByTitle("chatPage.executionPlan.tooltip")).not.toBeInTheDocument()
+
+    rerender(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "dag-execution",
+            event_type: "dag_execution",
+            timestamp: 1000,
+            data: {
+              phase: "executing",
+              steps: [{ id: "1", task: "Create audio", dependencies: [] }],
+            },
+          },
+        ]}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.executionPlan.dagSectionOne:1"))
+    expect(onOpenExecutionPlan).toHaveBeenCalledOnce()
+
+    rerender(
+      <TraceEventRenderer
+        onOpenExecutionPlan={onOpenExecutionPlan}
+        events={[
+          {
+            event_id: "dag-execution",
+            event_type: "dag_execution",
+            timestamp: 1000,
+            data: {
+              phase: "executing",
+              steps: [
+                { id: "1", task: "Create audio", dependencies: [] },
+                { id: "2", task: "Edit audio", dependencies: ["1"] },
+              ],
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText("chatPage.executionPlan.dagSectionOther:2")).toBeInTheDocument()
   })
 
   it("stops running process spinners when the parent task has failed", () => {

@@ -262,6 +262,10 @@ const zh = {
     executionPlan: {
       title: "执行计划",
       tooltip: "点击查看执行计划",
+      dagSection: "DAG 执行",
+      dagSectionOne: "DAG 执行 · {count} 个步骤",
+      dagSectionOther: "DAG 执行 · {count} 个步骤",
+      view: "查看计划",
     },
     aiOutput: {
       title: "AI 输出",
