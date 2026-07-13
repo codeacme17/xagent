@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api.websocket import (
+    _handle_pause_task_unserialized,
+    _handle_resume_task_unserialized,
     background_task_manager,
     execute_resume_background,
     handle_chat_message,
@@ -25,12 +27,14 @@ from xagent.web.api.websocket import (
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_PENDING,
 )
+from xagent.web.services.task_execution_controller import StaleTaskRunError
 
 
 @pytest.fixture()
@@ -132,6 +136,12 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
                 "files": [],
             },
         )
+        for _ in range(100):
+            if begin_turn.await_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable admin message was not dispatched in time")
 
     begin_turn.assert_awaited_once()
     assert begin_turn.await_args.kwargs["task_owner_user_id"] == int(owner.id)
@@ -144,6 +154,48 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
     assert len(accepted) == 1
     assert accepted[0]["client_message_id"] == "client-turn-1"
     assert accepted[0]["turn_id"] == "client-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_chat_without_client_id_uses_durable_command_id_as_turn_id(
+    db_session,
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    begin_turn = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {"message": "server generated identity", "user": owner, "files": []},
+        )
+        for _ in range(100):
+            if begin_turn.await_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable message was not dispatched in time")
+
+    db_session.expire_all()
+    command = (
+        db_session.query(TaskExecutionCommand)
+        .filter(TaskExecutionCommand.task_id == int(task.id))
+        .one()
+    )
+    assert command.command_id.startswith("message:")
+    assert command.payload["client_message_id"] == command.command_id
+    assert begin_turn.await_args.kwargs["payload"].turn_id == command.command_id
 
 
 @pytest.mark.asyncio
@@ -180,6 +232,12 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
                 "files": [],
             },
         )
+        for _ in range(100):
+            if bg_mgr.register_reserved_resume.call_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable live message was not dispatched in time")
 
     stored = (
         db_session.query(TaskChatMessage)
@@ -203,7 +261,7 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
 
 
 @pytest.mark.asyncio
-async def test_deferred_chat_message_waits_for_real_injection_before_ack(
+async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     db_session,
 ) -> None:
     owner = _user(db_session, "owner")
@@ -239,15 +297,35 @@ async def test_deferred_chat_message_waits_for_real_injection_before_ack(
                 "files": [],
             },
         )
+        for _ in range(100):
+            db_session.expire_all()
+            stored_command = (
+                db_session.query(TaskExecutionCommand)
+                .filter_by(task_id=int(task.id), command_id="deferred-turn-1")
+                .one()
+            )
+            if stored_command.status == "pending":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("deferred command claim was not released in time")
 
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "deferred-turn-1"
+    assert stored_command.status == "pending"
     assert not any(
-        call.args[0].get("type") == "message_accepted"
+        call.args[0].get("type") == "message_rejected"
         for call in ws_manager.send_personal_message.call_args_list
     )
     kwargs = resume_bg.call_args.kwargs
     assert kwargs["delivery_already_dispatched"] is False
-    assert kwargs["delivery_websocket"] is websocket
-    assert kwargs["delivery_client_message_id"] == "deferred-turn-1"
+    assert kwargs["delivery_websocket"] is None
+    assert kwargs["delivery_client_message_id"] is None
 
 
 @pytest.mark.asyncio
@@ -291,6 +369,12 @@ async def test_resume_registration_failure_preserves_dispatched_delivery(
                 "files": [],
             },
         )
+        for _ in range(100):
+            if bg_handle.cancel.called:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("resume registration failure was not handled in time")
 
     bg_handle.cancel.assert_called_once()
     db_session.expire_all()
@@ -484,6 +568,55 @@ async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None
 
 
 @pytest.mark.asyncio
+async def test_durable_pause_propagates_stale_run_error(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id)
+    _captured, _agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.api.websocket.apply_task_control_transition",
+            side_effect=StaleTaskRunError("run rotated"),
+        ),
+        pytest.raises(StaleTaskRunError, match="run rotated"),
+    ):
+        await _handle_pause_task_unserialized(
+            MagicMock(),
+            int(task.id),
+            {"user": owner, "_durable_ack_sent": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control.return_value = True
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.task_execution_controller.transition",
+            new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
+        ),
+        pytest.raises(StaleTaskRunError, match="run rotated"),
+    ):
+        await _handle_resume_task_unserialized(
+            MagicMock(),
+            int(task.id),
+            {"user": owner, "_durable_ack_sent": True},
+        )
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
 async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
     owner = _user(db_session, "owner")
     stranger = _user(db_session, "stranger")  # not admin, not owner
@@ -610,6 +743,12 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
+        for _ in range(100):
+            if bg_handle.cancel.called:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("resume command did not finish in time")
 
     bg_handle.cancel.assert_called_once()
 

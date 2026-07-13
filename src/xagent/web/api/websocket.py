@@ -34,6 +34,7 @@ from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.execution_scope import resolve_execution_scope, turn_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db, get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
@@ -47,6 +48,7 @@ from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_PENDING,
     UserMessageDeliveryClaim,
     claim_user_message_delivery,
     get_latest_waiting_question,
@@ -80,7 +82,22 @@ from ..services.hot_path_cache import (
 from ..services.managed_file_ref import (
     DurableStorageOperationError,
 )
+from ..services.task_command_transport import (
+    COMMAND_FAILED,
+    COMMAND_ID_PATTERN,
+    MAX_COMMAND_DEFERS,
+    MAX_COMMAND_FAILURES,
+    ClaimedTaskCommand,
+    EnqueuedTaskCommand,
+    TaskCommandDeferred,
+    TaskCommandKind,
+    TaskCommandRejected,
+    dispatch_task_command_promptly,
+    enqueue_task_command,
+    task_has_live_foreign_runner,
+)
 from ..services.task_execution_controller import (
+    StaleTaskRunError,
     TaskControlState,
     apply_task_control_transition,
     task_control_snapshot,
@@ -169,7 +186,7 @@ def _client_message_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", normalized):
+    if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
         return None
     return normalized
 
@@ -2962,10 +2979,167 @@ async def get_authenticated_user(
 async def handle_chat_message(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
-    """Serialize one inbound WebSocket message against task control commands."""
+    """Durably accept a chat command before acknowledging the client."""
 
-    async with task_execution_controller.command(task_id):
-        await _handle_chat_message_unserialized(websocket, task_id, message_data)
+    try:
+        enqueued = await _enqueue_websocket_task_command(
+            task_id=task_id,
+            message_data=message_data,
+            kind=TaskCommandKind.MESSAGE,
+            command_id=_client_message_id(message_data.get("client_message_id")),
+            allow_missing_task=True,
+        )
+    except (PermissionError, ValueError) as exc:
+        client_message_id = _client_message_id(message_data.get("client_message_id"))
+        await _send_message_delivery(
+            websocket,
+            client_message_id=client_message_id,
+            turn_id=client_message_id or str(uuid.uuid4()),
+            accepted=False,
+            message=str(exc),
+        )
+        await manager.send_personal_message(
+            {"type": "error", "message": str(exc)}, websocket
+        )
+        return
+    if enqueued is None:
+        # Legacy recovery path for a client still connected to a task that was
+        # deleted. The existing handler creates the replacement task first;
+        # subsequent commands use the durable transport normally.
+        async with task_execution_controller.command(task_id):
+            await _handle_chat_message_unserialized(websocket, task_id, message_data)
+        return
+    if not enqueued.payload_matches:
+        await _send_message_delivery(
+            websocket,
+            client_message_id=_client_message_id(message_data.get("client_message_id")),
+            turn_id=enqueued.client_command_id,
+            accepted=False,
+            message="Message id was already used for different content or files.",
+            retry_with_new_id=True,
+        )
+        return
+    if enqueued.status == COMMAND_FAILED:
+        await _send_message_delivery(
+            websocket,
+            client_message_id=_client_message_id(message_data.get("client_message_id")),
+            turn_id=enqueued.client_command_id,
+            accepted=False,
+            message="The previous delivery attempt failed. Please retry the draft.",
+            retry_with_new_id=True,
+        )
+        return
+    await _send_message_delivery(
+        websocket,
+        client_message_id=_client_message_id(message_data.get("client_message_id")),
+        turn_id=enqueued.client_command_id,
+        accepted=True,
+    )
+    if enqueued.command_id:
+        await dispatch_task_command_promptly(
+            execute_durable_task_command,
+            command_db_id=enqueued.command_id,
+        )
+
+
+def _enqueue_websocket_task_command_sync(
+    *,
+    task_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+    command_id: str,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+    allow_missing_task: bool,
+) -> EnqueuedTaskCommand | None:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is None:
+            if allow_missing_task:
+                return None
+            raise ValueError(f"Task {task_id} not found")
+        if not actor_is_admin and int(task.user_id) != actor_user_id:
+            raise PermissionError(
+                f"Access denied: Task {task_id} does not belong to you"
+            )
+        if kind == TaskCommandKind.MESSAGE:
+            from ..services.chat_history_service import (
+                inspect_user_message_delivery,
+            )
+
+            existing_delivery = inspect_user_message_delivery(
+                db,
+                task_id,
+                str(payload.get("message") or ""),
+                attachments=(
+                    payload.get("files")
+                    if isinstance(payload.get("files"), list)
+                    else None
+                ),
+                turn_id=command_id,
+            )
+            if (
+                existing_delivery is not None
+                and not existing_delivery.pending
+                and not payload.get("files")
+            ):
+                return EnqueuedTaskCommand(
+                    command_id=0,
+                    client_command_id=command_id,
+                    created=False,
+                    payload_matches=existing_delivery.payload_matches,
+                    status=(
+                        DELIVERY_FAILED
+                        if existing_delivery.failed
+                        else DELIVERY_COMPLETED
+                    ),
+                )
+        result = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=actor_user_id,
+            command_id=command_id,
+            kind=kind,
+            payload=payload,
+        )
+        return result
+
+
+async def _enqueue_websocket_task_command(
+    *,
+    task_id: int,
+    message_data: dict[str, Any],
+    kind: TaskCommandKind,
+    command_id: str | None = None,
+    allow_missing_task: bool = False,
+) -> EnqueuedTaskCommand | None:
+    user = message_data.get("user")
+    if user is None:
+        raise ValueError("User authentication required for task command")
+    resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
+    # User ORM instances and server-only authentication fields are never put
+    # into the JSON inbox. The consumer re-resolves the actor by id.
+    payload = {
+        key: value
+        for key, value in message_data.items()
+        if key not in {"user", "user_id"} and not key.startswith("_durable_")
+    }
+    if kind == TaskCommandKind.MESSAGE:
+        # The durable command identity is also the delivery/turn identity.
+        # This remains stable across retries even when an API client omitted
+        # or supplied an invalid client_message_id.
+        payload["client_message_id"] = resolved_command_id
+    return await asyncio.to_thread(
+        _enqueue_websocket_task_command_sync,
+        task_id=int(task_id),
+        actor_user_id=int(user.id),
+        actor_is_admin=bool(user.is_admin),
+        command_id=resolved_command_id,
+        kind=kind,
+        payload=payload,
+        allow_missing_task=allow_missing_task,
+    )
 
 
 async def _handle_chat_message_unserialized(
@@ -2974,9 +3148,11 @@ async def _handle_chat_message_unserialized(
     """Handle chat message"""
     client_message_id = _client_message_id(message_data.get("client_message_id"))
     turn_id = client_message_id or str(uuid.uuid4())
+    suppress_delivery_ack = bool(message_data.get("_durable_ack_sent"))
     delivery_finished = False
     delivery_dispatched = False
     delivery_claimed = False
+    recovered_delivery: UserMessageDeliveryClaim | None = None
 
     async def finish_delivery(
         accepted: bool,
@@ -2988,6 +3164,10 @@ async def _handle_chat_message_unserialized(
         if delivery_finished:
             return
         delivery_finished = True
+        if not accepted:
+            message_data["_durable_command_error"] = message or "Message was rejected"
+        if suppress_delivery_ack:
+            return
         await _send_message_delivery(
             websocket,
             client_message_id=client_message_id,
@@ -3352,8 +3532,42 @@ async def _handle_chat_message_unserialized(
                         turn_id=turn_id,
                     )
                     if existing_delivery is not None:
-                        await finish_existing_delivery(existing_delivery)
-                        return
+                        durable_replay = (
+                            int(message_data.get("_durable_attempt_count") or 0) > 1
+                        )
+                        if (
+                            durable_replay
+                            and existing_delivery.pending
+                            and existing_delivery.payload_matches
+                        ):
+                            # The command claim is the exclusive replay lease,
+                            # so it may safely adopt a PENDING transcript row
+                            # left by a worker that died mid-application.
+                            recovered_delivery = UserMessageDeliveryClaim(
+                                message=existing_delivery.message,
+                                claimed=True,
+                                payload_matches=True,
+                            )
+                            delivery_claimed = True
+                            if (
+                                task.status == TaskStatus.RUNNING
+                                and str(task.input or "").strip()
+                                == display_user_message.strip()
+                            ):
+                                # New-turn claim committed before the old
+                                # worker died. Do not start or inject it again.
+                                mark_user_message_delivery(
+                                    db,
+                                    task_id=task_id,
+                                    turn_id=turn_id,
+                                    status=DELIVERY_DISPATCHED,
+                                )
+                                delivery_dispatched = True
+                                await finish_delivery(True)
+                                return
+                        else:
+                            await finish_existing_delivery(existing_delivery)
+                            return
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -3371,6 +3585,14 @@ async def _handle_chat_message_unserialized(
                     control_state=_task_control_state_value(task),
                     pause_accepted=pause_accepted,
                 )
+                if (
+                    recovered_delivery is not None
+                    and message_data.get("_durable_target_run_id") == task.run_id
+                ):
+                    # A crashed owner may have already interrupted the run and
+                    # persisted PAUSED before its command claim was completed.
+                    # This is the same durable guidance command, not a new turn.
+                    task_uses_live_control = True
                 agent_service = None
                 dag_pattern = None
                 supports_live_control = False
@@ -3407,7 +3629,7 @@ async def _handle_chat_message_unserialized(
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
 
-                    delivery_claim = claim_user_message_delivery(
+                    delivery_claim = recovered_delivery or claim_user_message_delivery(
                         db,
                         task_id=task_id,
                         user_id=int(task.user_id),
@@ -3415,6 +3637,7 @@ async def _handle_chat_message_unserialized(
                         attachments=persisted_attachments or None,
                         turn_id=turn_id,
                     )
+                    recovered_delivery = None
                     if not delivery_claim.claimed:
                         await finish_existing_delivery(delivery_claim)
                         return
@@ -3544,14 +3767,18 @@ async def _handle_chat_message_unserialized(
                     # keeps its own immediate trace.
                     bg_task: asyncio.Task[None] | None = None
                     try:
-                        delivery_claim = claim_user_message_delivery(
-                            db,
-                            task_id=task_id,
-                            user_id=int(task.user_id),
-                            content=display_user_message,
-                            attachments=persisted_attachments or None,
-                            turn_id=turn_id,
+                        delivery_claim = (
+                            recovered_delivery
+                            or claim_user_message_delivery(
+                                db,
+                                task_id=task_id,
+                                user_id=int(task.user_id),
+                                content=display_user_message,
+                                attachments=persisted_attachments or None,
+                                turn_id=turn_id,
+                            )
                         )
+                        recovered_delivery = None
                         if not delivery_claim.claimed:
                             background_task_manager.release_resume_reservation(task_id)
                             await finish_existing_delivery(delivery_claim)
@@ -3614,9 +3841,15 @@ async def _handle_chat_message_unserialized(
                                 ),
                                 delivery_turn_id=turn_id,
                                 delivery_already_dispatched=posted,
-                                delivery_websocket=None if posted else websocket,
+                                delivery_websocket=(
+                                    None
+                                    if posted or suppress_delivery_ack
+                                    else websocket
+                                ),
                                 delivery_client_message_id=(
-                                    None if posted else client_message_id
+                                    None
+                                    if posted or suppress_delivery_ack
+                                    else client_message_id
                                 ),
                             )
                         )
@@ -4224,7 +4457,6 @@ async def send_historical_data_as_stream(
     try:
         # Load historical data directly from database
         from ..models.agent import Agent
-        from ..models.chat_message import TaskChatMessage
         from ..models.database import get_db
         from ..models.task import Task, TaskStatus, TraceEvent
 
@@ -4854,10 +5086,43 @@ async def handle_intervention(
 async def handle_pause_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
-    """Serialize pause against messages and resume requests for this task."""
+    """Persist a pause request; the lease owner applies it in command order."""
 
-    async with task_execution_controller.command(task_id):
-        await _handle_pause_task_unserialized(websocket, task_id, message_data)
+    try:
+        enqueued = await _enqueue_websocket_task_command(
+            task_id=task_id,
+            message_data=message_data,
+            kind=TaskCommandKind.PAUSE,
+            command_id=_client_message_id(message_data.get("command_id")),
+        )
+    except (PermissionError, ValueError) as exc:
+        await manager.send_personal_message(
+            {"type": "error", "message": str(exc)}, websocket
+        )
+        return
+    assert enqueued is not None
+    if not enqueued.payload_matches:
+        await manager.send_personal_message(
+            {
+                "type": "error",
+                "message": "Command id was already used for a different request.",
+            },
+            websocket,
+        )
+        return
+    await manager.send_personal_message(
+        {
+            "type": "task_command_accepted",
+            "task_id": task_id,
+            "command_id": enqueued.client_command_id,
+            "command": TaskCommandKind.PAUSE.value,
+        },
+        websocket,
+    )
+    await dispatch_task_command_promptly(
+        execute_durable_task_command,
+        command_db_id=enqueued.command_id,
+    )
 
 
 async def _handle_pause_task_unserialized(
@@ -4914,6 +5179,9 @@ async def _handle_pause_task_unserialized(
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
+                message_data["_durable_command_error"] = (
+                    "No live execution found to pause"
+                )
                 await manager.send_personal_message(
                     _task_error_payload(
                         db,
@@ -4927,6 +5195,9 @@ async def _handle_pause_task_unserialized(
             logger.info("Agent pause_execution completed")
             db.refresh(task)
             if task.status != TaskStatus.RUNNING:
+                message_data["_durable_command_error"] = (
+                    "Task finished before the pause request was applied"
+                )
                 await manager.send_personal_message(
                     _task_error_payload(
                         db,
@@ -4960,6 +5231,9 @@ async def _handle_pause_task_unserialized(
             logger.info(f"Task {task_id} pause requested successfully")
         else:
             # If pause not supported, send error message
+            message_data["_durable_command_error"] = (
+                "Current agent does not support pause functionality"
+            )
             await manager.send_personal_message(
                 _task_error_payload(
                     db,
@@ -4974,6 +5248,7 @@ async def _handle_pause_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
+        message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error pausing task {task_id}: {e}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
@@ -4984,6 +5259,7 @@ async def _handle_pause_task_unserialized(
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
+        raise
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error pausing task {task_id}: {e}")
@@ -4996,10 +5272,43 @@ async def _handle_pause_task_unserialized(
 async def handle_resume_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
-    """Serialize resume against messages and pause requests for this task."""
+    """Persist a resume request; a worker applies it in command order."""
 
-    async with task_execution_controller.command(task_id):
-        await _handle_resume_task_unserialized(websocket, task_id, message_data)
+    try:
+        enqueued = await _enqueue_websocket_task_command(
+            task_id=task_id,
+            message_data=message_data,
+            kind=TaskCommandKind.RESUME,
+            command_id=_client_message_id(message_data.get("command_id")),
+        )
+    except (PermissionError, ValueError) as exc:
+        await manager.send_personal_message(
+            {"type": "error", "message": str(exc)}, websocket
+        )
+        return
+    assert enqueued is not None
+    if not enqueued.payload_matches:
+        await manager.send_personal_message(
+            {
+                "type": "error",
+                "message": "Command id was already used for a different request.",
+            },
+            websocket,
+        )
+        return
+    await manager.send_personal_message(
+        {
+            "type": "task_command_accepted",
+            "task_id": task_id,
+            "command_id": enqueued.client_command_id,
+            "command": TaskCommandKind.RESUME.value,
+        },
+        websocket,
+    )
+    await dispatch_task_command_promptly(
+        execute_durable_task_command,
+        command_db_id=enqueued.command_id,
+    )
 
 
 async def _handle_resume_task_unserialized(
@@ -5051,6 +5360,7 @@ async def _handle_resume_task_unserialized(
             db.close()
 
         if task is None:
+            message_data["_durable_command_error"] = "Task not found or access denied"
             await manager.send_personal_message(
                 {"type": "error", "message": "Task not found or access denied"},
                 websocket,
@@ -5060,6 +5370,9 @@ async def _handle_resume_task_unserialized(
         resume_control_state = task_control_snapshot(task).as_dict()
         if getattr(agent_service, "supports_live_control", lambda: False)():
             if task.status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                message_data["_durable_command_error"] = (
+                    "Task is not paused and cannot be resumed."
+                )
                 await manager.send_personal_message(
                     {
                         "type": "error",
@@ -5079,14 +5392,15 @@ async def _handle_resume_task_unserialized(
                     websocket,
                 )
                 return
-            resume_snapshot = await task_execution_controller.transition(
-                task_id,
-                TaskControlState.RESUME_REQUESTED,
-                expected_run_id=_task_run_id(task),
-            )
-            previous_task = background_task_manager.running_tasks.get(task_id)
+            resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
+                resume_snapshot = await task_execution_controller.transition(
+                    task_id,
+                    TaskControlState.RESUME_REQUESTED,
+                    expected_run_id=_task_run_id(task),
+                )
+                previous_task = background_task_manager.running_tasks.get(task_id)
                 bg_task = asyncio.create_task(
                     execute_resume_background(
                         task_id=task_id,
@@ -5101,17 +5415,18 @@ async def _handle_resume_task_unserialized(
                 if bg_task is not None:
                     bg_task.cancel()
                 background_task_manager.release_resume_reservation(task_id)
-                await asyncio.shield(
-                    task_execution_controller.transition(
-                        task_id,
-                        (
-                            TaskControlState.WAITING_FOR_USER
-                            if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
-                            else TaskControlState.PAUSED
-                        ),
-                        expected_run_id=resume_snapshot.run_id,
+                if resume_snapshot is not None:
+                    await asyncio.shield(
+                        task_execution_controller.transition(
+                            task_id,
+                            (
+                                TaskControlState.WAITING_FOR_USER
+                                if resume_snapshot.status == TaskStatus.WAITING_FOR_USER
+                                else TaskControlState.PAUSED
+                            ),
+                            expected_run_id=resume_snapshot.run_id,
+                        )
                     )
-                )
                 raise
             logger.info(f"Task {task_id} v2 resume scheduled")
             return
@@ -5144,6 +5459,9 @@ async def _handle_resume_task_unserialized(
             logger.info(f"Task {task_id} resumed successfully")
         else:
             # If resume not supported, send error message
+            message_data["_durable_command_error"] = (
+                "Current agent does not support resume functionality"
+            )
             await manager.send_personal_message(
                 {
                     "type": "error",
@@ -5157,6 +5475,7 @@ async def _handle_resume_task_unserialized(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
+        message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error resuming task {task_id}: {e}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
@@ -5167,10 +5486,203 @@ async def _handle_resume_task_unserialized(
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
+        raise
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error resuming task {task_id}: {e}")
         raise
+
+
+class _DiscardingCommandWebSocket:
+    """Minimal sink used when a recovered command has no originating socket."""
+
+    async def send_text(self, _message: str) -> None:
+        return None
+
+
+def _load_command_actor(actor_user_id: int | None) -> User:
+    if actor_user_id is None:
+        raise ValueError("Task command has no actor")
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.id == actor_user_id).first()
+        if user is None:
+            raise ValueError(f"Task command actor {actor_user_id} no longer exists")
+        db.expunge(user)
+        return user
+
+
+async def _execute_durable_task_command(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any] | None:
+    """Apply one DB-claimed command using the existing transport adapters.
+
+    The handler is independent of the originating connection. If the socket is
+    still connected, personal validation errors go there; after a crash or on a
+    different worker they are discarded while task-level state/error events are
+    still broadcast normally.
+    """
+
+    connections = manager.active_connections.get(command.task_id, [])
+    websocket: Any = connections[0] if connections else _DiscardingCommandWebSocket()
+    message_data = dict(command.payload)
+    message_data.update(
+        {
+            "_durable_ack_sent": True,
+            "_durable_attempt_count": command.attempt_count,
+            "_durable_target_run_id": command.target_run_id,
+        }
+    )
+    if command.kind != TaskCommandKind.CANCEL:
+        user = await asyncio.to_thread(_load_command_actor, command.actor_user_id)
+        message_data.update({"user": user, "user_id": int(user.id)})
+    if command.kind != TaskCommandKind.MESSAGE and command.target_run_id is not None:
+        current_run_id = await asyncio.to_thread(
+            _load_command_task_run_id, command.task_id
+        )
+        if current_run_id != command.target_run_id:
+            raise TaskCommandRejected(
+                f"Task run changed before {command.kind.value} command "
+                f"{command.command_id} was applied",
+                reason="stale_run",
+            )
+    if command.kind in {
+        TaskCommandKind.PAUSE,
+        TaskCommandKind.RESUME,
+        TaskCommandKind.CANCEL,
+    } and await asyncio.to_thread(
+        task_has_live_foreign_runner,
+        command.task_id,
+    ):
+        raise TaskCommandDeferred(
+            f"{command.kind.value.title()} command {command.command_id} is waiting "
+            "for the active task lease owner"
+        )
+
+    if command.kind == TaskCommandKind.MESSAGE:
+        await _handle_chat_message_unserialized(
+            websocket, command.task_id, message_data
+        )
+        delivery_status = await asyncio.to_thread(
+            _load_command_message_delivery_status,
+            command.task_id,
+            command.command_id,
+        )
+        if delivery_status == DELIVERY_PENDING:
+            raise TaskCommandDeferred(
+                f"Message {command.command_id} is waiting for runtime injection"
+            )
+        if delivery_status == DELIVERY_FAILED:
+            raise TaskCommandRejected(
+                f"Message {command.command_id} could not be applied"
+            )
+    elif command.kind == TaskCommandKind.PAUSE:
+        await _handle_pause_task_unserialized(websocket, command.task_id, message_data)
+    elif command.kind == TaskCommandKind.RESUME:
+        await _handle_resume_task_unserialized(websocket, command.task_id, message_data)
+    elif command.kind == TaskCommandKind.CANCEL:
+        from ..models.agent import Agent
+        from .a2a import _cancel_task_unserialized
+
+        agent_id_value = message_data.get("agent_id")
+        if agent_id_value is None:
+            raise ValueError("Agent ID is missing or null in cancel command payload")
+        try:
+            agent_id = int(agent_id_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Agent ID {agent_id_value!r} is invalid in cancel command payload"
+            ) from exc
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            agent = db.query(Agent).filter(Agent.id == agent_id).first()
+            if agent is None:
+                raise ValueError(f"Agent {agent_id} not found for cancel command")
+            try:
+                await _cancel_task_unserialized(
+                    task_id=command.task_id,
+                    agent=agent,
+                    db=db,
+                )
+            except StaleTaskRunError as exc:
+                raise TaskCommandRejected(str(exc), reason="stale_run") from exc
+    else:  # pragma: no cover - enum construction rejects this earlier
+        raise ValueError(f"Unsupported task command kind: {command.kind}")
+    durable_error = message_data.get("_durable_command_error")
+    if isinstance(durable_error, str) and durable_error:
+        raise TaskCommandRejected(durable_error)
+    return {
+        "task_id": command.task_id,
+        "command_id": command.command_id,
+        "kind": command.kind.value,
+    }
+
+
+async def _broadcast_terminal_command_error(
+    command: ClaimedTaskCommand,
+    error: BaseException,
+) -> None:
+    await manager.broadcast_to_task(
+        {
+            "type": "agent_error",
+            "message": (f"Task command {command.kind.value} failed: {error}"),
+            "task_id": command.task_id,
+            "command_id": command.command_id,
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+        },
+        command.task_id,
+    )
+
+
+async def execute_durable_task_command(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any] | None:
+    """Apply one command and expose only terminal transport failures to clients."""
+
+    try:
+        return await _execute_durable_task_command(command)
+    except TaskCommandDeferred as exc:
+        if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+            await _broadcast_terminal_command_error(command, exc)
+        raise
+    except TaskCommandRejected:
+        # Rejections come from handlers that already expose their durable
+        # domain-level outcome. The dispatcher makes them terminal immediately.
+        raise
+    except Exception as exc:
+        if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            await _broadcast_terminal_command_error(command, exc)
+        raise
+
+
+def _load_command_message_delivery_status(
+    task_id: int,
+    turn_id: str,
+) -> str | None:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        message = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+            )
+            .first()
+        )
+        if message is None:
+            return None
+        delivery_status = getattr(message, "delivery_status", None)
+        return delivery_status if isinstance(delivery_status, str) else None
+
+
+def _load_command_task_run_id(task_id: int) -> str | None:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is None:
+            raise ValueError(f"Task {task_id} no longer exists")
+        return str(task.run_id) if task.run_id is not None else None
 
 
 @ws_router.websocket("/ws/build/chat")

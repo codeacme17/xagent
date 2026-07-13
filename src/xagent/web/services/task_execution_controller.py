@@ -1,10 +1,9 @@
-"""Serialized task control commands and versioned execution state.
+"""Process-local task gate and versioned execution state.
 
-P1 keeps command serialization process-local. Cross-worker command transport is
-deliberately a later concern; the database state tuple written here is the
-authoritative ordering contract shared by every transport and by the frontend.
-Channel transports share this gate and state tuple but do not yet use the turn
-orchestrator or runner-lease lifecycle.
+The durable P2 inbox lives in :mod:`task_command_transport`; after one worker
+claims a command, this controller remains the local reentrant guard around the
+state transition. The database state tuple written here is the ordering
+contract shared by every transport and by the frontend.
 """
 
 from __future__ import annotations
@@ -94,6 +93,7 @@ def apply_task_control_transition(
     status: TaskStatus | None = None,
     new_run: bool = False,
     expected_run_id: str | None = None,
+    expected_state_version: int | None = None,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
@@ -102,9 +102,18 @@ def apply_task_control_transition(
     """
 
     current_run_id = getattr(task, "run_id", None)
+    current_state_version = int(getattr(task, "state_version", 0) or 0)
     if expected_run_id is not None and current_run_id != expected_run_id:
         raise StaleTaskRunError(
             f"task {task.id} run changed from {expected_run_id} to {current_run_id}"
+        )
+    if (
+        expected_state_version is not None
+        and current_state_version != expected_state_version
+    ):
+        raise StaleTaskRunError(
+            f"task {task.id} state changed from version "
+            f"{expected_state_version} to {current_state_version}"
         )
 
     if new_run:
@@ -134,6 +143,10 @@ def apply_task_control_transition(
         statement = update(Task).where(Task.id == int(task_id))
         if expected_run_id is not None:
             statement = statement.where(Task.run_id == expected_run_id)
+        if expected_state_version is not None:
+            statement = statement.where(
+                func.coalesce(Task.state_version, 0) == expected_state_version
+            )
         # Keep unrelated caller-owned pending objects out of this helper's
         # atomic UPDATE and refresh. ``Session.execute`` and ``refresh`` can
         # otherwise trigger another session-wide autoflush.
@@ -167,6 +180,7 @@ def transition_task_control_state_sync(
     status: TaskStatus | None = None,
     new_run: bool = False,
     expected_run_id: str | None = None,
+    expected_state_version: int | None = None,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
 
@@ -181,6 +195,7 @@ def transition_task_control_state_sync(
             status=status,
             new_run=new_run,
             expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
         )
         db.commit()
         return snapshot
