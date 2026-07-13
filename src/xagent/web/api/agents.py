@@ -39,6 +39,7 @@ from ..services.agent_management import (
 from ..services.agent_store import AgentStore, new_widget_key
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
+from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
 
@@ -121,6 +122,11 @@ class AgentResponse(BaseModel):
     allowed_domains: List[str]
     share_enabled: bool
     share_updated_at: Optional[str]
+    # False when an admin is viewing another user's agent read-only (#783 follow-up):
+    # writes stay owner-only, so the builder disables editing instead of letting a
+    # save fail with "Agent not found".
+    readonly: bool = False
+    can_edit: bool = True
 
 
 class AgentListItem(BaseModel):
@@ -566,11 +572,27 @@ async def get_agent(
     try:
         store = AgentStore(db)
         response = store.get_agent_response(int(current_user.id), agent_id)
-        if response is None and is_admin_user(current_user):
-            response = store.get_agent_response_for_admin(agent_id)
+        readonly = False
+        if response is None:
+            # Owner path missed. Admins may read any agent; other users may read
+            # agents shared to them read-only via policy (e.g. workforce policies)
+            # — the same agents the list endpoint now links to. Check the policy
+            # id set directly instead of materializing every accessible agent.
+            if is_admin_user(current_user):
+                response = store.get_agent_response_for_admin(agent_id)
+                readonly = response is not None
+            else:
+                visible_ids = get_visible_agent_ids(db, current_user, "agent_list")
+                if visible_ids and agent_id in visible_ids:
+                    response = store.get_agent_response_for_admin(agent_id)
+                    readonly = response is not None
         if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
-        return AgentResponse.model_validate(response)
+        result = AgentResponse.model_validate(response)
+        if readonly:
+            result.readonly = True
+            result.can_edit = False
+        return result
 
     except HTTPException:
         raise
