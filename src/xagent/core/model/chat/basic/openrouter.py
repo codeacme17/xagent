@@ -2,7 +2,9 @@ import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .....config import get_openrouter_official_providers_only
+from ..exceptions import LLMRetryableError
 from ..timeout_config import TimeoutConfig
+from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
 from ..types import StreamChunk
 from .deepseek_tool_protocol import (
     adapt_deepseek_stream,
@@ -38,7 +40,7 @@ def _openrouter_model_author(model_name: str) -> str:
 def _strip_assistant_tool_call_prefixes(
     messages: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], bool]:
-    """Remove text prefixes from historical assistant function-call messages."""
+    """Remove assistant prefixes that DeepSeek cannot combine with tools."""
     sanitized: List[Dict[str, Any]] = []
     changed = False
     for message in messages:
@@ -51,7 +53,58 @@ def _strip_assistant_tool_call_prefixes(
             sanitized_message["content"] = ""
             changed = True
         sanitized.append(sanitized_message)
+
+    # A non-blocking ``send_message`` control call records its result and may
+    # leave a standalone assistant progress message at the end of older
+    # checkpoints. OpenRouter treats that trailing assistant turn as prefix
+    # completion, which DeepSeek rejects when tools are also present. The tool
+    # result already contains the same progress text, so dropping only trailing
+    # assistant-only turns preserves the tool chain and avoids replaying stale
+    # progress as a generation prefix.
+    has_completed_tool_chain = any(
+        message.get("role") == "assistant" and message.get("tool_calls")
+        for message in sanitized
+    ) and any(message.get("role") == "tool" for message in sanitized)
+    if has_completed_tool_chain:
+        while (
+            sanitized
+            and sanitized[-1].get("role") == "assistant"
+            and not sanitized[-1].get("tool_calls")
+        ):
+            sanitized.pop()
+            changed = True
     return sanitized, changed
+
+
+def _force_single_required_deepseek_tool(
+    tools: Optional[List[Any]],
+    tool_choice: Optional[str | Dict[str, Any]],
+) -> Optional[str | Dict[str, Any]]:
+    """Turn DeepSeek's ambiguous single-tool requirement into a named choice."""
+    if tool_choice != "required" or not tools or len(tools) != 1:
+        return tool_choice
+    tool = tools[0]
+    if not isinstance(tool, dict):
+        return tool_choice
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        return tool_choice
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        return tool_choice
+    return {
+        "type": "function",
+        "function": {"name": name},
+    }
+
+
+def _deepseek_tool_protocol_retry_error(response: Any) -> LLMRetryableError | None:
+    error = get_tool_protocol_error(response)
+    if error is None:
+        return None
+    code = str(error.get("code") or "invalid_tool_protocol")
+    message = str(error.get("message") or "DeepSeek returned an invalid tool call.")
+    return LLMRetryableError(f"DeepSeek tool protocol error ({code}): {message}")
 
 
 class OpenRouterLLM(OpenAILLM):
@@ -110,6 +163,8 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
+        if self._uses_deepseek_tool_protocol:
+            tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         try:
             response = await super().chat(
                 messages=messages,
@@ -147,7 +202,11 @@ class OpenRouterLLM(OpenAILLM):
 
         if not self._uses_deepseek_tool_protocol:
             return response
-        return normalize_deepseek_response(response, tools=tools)
+        response = normalize_deepseek_response(response, tools=tools)
+        retry_error = _deepseek_tool_protocol_retry_error(response)
+        if retry_error is not None:
+            raise retry_error
+        return response
 
     async def _stream_chat_with_prefix_retry(
         self,
@@ -213,6 +272,8 @@ class OpenRouterLLM(OpenAILLM):
         output_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
+        if self._uses_deepseek_tool_protocol:
+            tool_choice = _force_single_required_deepseek_tool(tools, tool_choice)
         stream = self._stream_chat_with_prefix_retry(
             messages=messages,
             temperature=temperature,
@@ -228,7 +289,33 @@ class OpenRouterLLM(OpenAILLM):
             async for chunk in stream:
                 yield chunk
             return
-        async for chunk in adapt_deepseek_stream(stream, tools=tools):
+        adapted_stream = adapt_deepseek_stream(stream, tools=tools)
+
+        # A named tool choice cannot validly finish as assistant text. Buffer
+        # this narrow stream until DeepSeek's tool protocol has been validated,
+        # so a malformed serialized call raises before any chunk escapes and the
+        # shared LLM retry wrapper can safely replay the request.
+        if isinstance(tool_choice, dict):
+            buffered_chunks: list[StreamChunk] = []
+            async for chunk in adapted_stream:
+                if chunk.is_protocol_error():
+                    retry_error = _deepseek_tool_protocol_retry_error(
+                        {TOOL_PROTOCOL_ERROR_KEY: chunk.protocol_error}
+                    )
+                    if retry_error is not None:
+                        raise retry_error
+                buffered_chunks.append(chunk)
+            for chunk in buffered_chunks:
+                yield chunk
+            return
+
+        async for chunk in adapted_stream:
+            if chunk.is_protocol_error():
+                retry_error = _deepseek_tool_protocol_retry_error(
+                    {TOOL_PROTOCOL_ERROR_KEY: chunk.protocol_error}
+                )
+                if retry_error is not None:
+                    raise retry_error
             yield chunk
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
