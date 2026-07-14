@@ -555,3 +555,116 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(clientSecret).toHaveValue("")
   })
 })
+
+describe("CustomMcpForm environment key identity", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    cleanup()
+  })
+
+  function renderUserEnvForm(userEnv: Record<string, string>) {
+    function Harness() {
+      const [formData, setFormData] = React.useState<MCPServerFormData>({
+        name: "local",
+        transport: "stdio",
+        description: "",
+        config: { command: "python" },
+        user_env: userEnv,
+        can_edit_global: false,
+      })
+      return (
+        <CustomMcpForm
+          mcpFormData={formData}
+          setMcpFormData={setFormData}
+          serverId={42}
+        />
+      )
+    }
+
+    return render(<Harness />)
+  }
+
+  function getRemoveButtonForEnvKey(key: string): HTMLButtonElement {
+    const row = screen.getByDisplayValue(key).parentElement
+    const button = row?.querySelector("button")
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error(`Remove button not found for environment key ${key}`)
+    }
+    return button
+  }
+
+  it("keeps persisted masked env key identities immutable", async () => {
+    function Harness() {
+      const [formData, setFormData] = React.useState<MCPServerFormData>({
+        name: "local",
+        transport: "stdio",
+        description: "",
+        config: {
+          command: "python",
+          env: { GLOBAL_TOKEN: "********" },
+        },
+        user_env: { USER_TOKEN: "********" },
+        can_edit_global: true,
+      })
+      return (
+        <CustomMcpForm
+          mcpFormData={formData}
+          setMcpFormData={setFormData}
+          serverId={42}
+        />
+      )
+    }
+
+    render(<Harness />)
+    const keyInputs = screen.getAllByPlaceholderText("tools.mcp.dialog.envKeyPlaceholder")
+    const valueInputs = screen.getAllByPlaceholderText("tools.mcp.dialog.envValuePlaceholder")
+
+    expect(keyInputs).toHaveLength(2)
+    expect(keyInputs[0]).toHaveValue("USER_TOKEN")
+    expect(keyInputs[0]).toBeDisabled()
+    expect(keyInputs[1]).toHaveValue("GLOBAL_TOKEN")
+    expect(keyInputs[1]).toBeDisabled()
+
+    fireEvent.change(valueInputs[0], { target: { value: "replacement-secret" } })
+    await waitFor(() => expect(valueInputs[0]).toHaveValue("replacement-secret"))
+    expect(keyInputs[0]).toBeDisabled()
+    expect(keyInputs[1]).toBeDisabled()
+
+    fireEvent.change(valueInputs[0], { target: { value: "" } })
+    fireEvent.blur(valueInputs[0])
+    await waitFor(() => expect(valueInputs[0]).toHaveValue("********"))
+  })
+
+  it("keeps a persisted env secret when deletion is not confirmed", () => {
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(false)
+    renderUserEnvForm({ USER_TOKEN: "********" })
+
+    fireEvent.click(getRemoveButtonForEnvKey("USER_TOKEN"))
+
+    expect(confirmMock).toHaveBeenCalledWith("tools.mcp.dialog.removeSecretConfirm")
+    expect(screen.getByDisplayValue("USER_TOKEN")).toBeInTheDocument()
+  })
+
+  it("removes a persisted env secret after deletion is confirmed", () => {
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true)
+    renderUserEnvForm({ USER_TOKEN: "********" })
+
+    fireEvent.click(getRemoveButtonForEnvKey("USER_TOKEN"))
+
+    expect(confirmMock).toHaveBeenCalledWith("tools.mcp.dialog.removeSecretConfirm")
+    expect(screen.queryByDisplayValue("USER_TOKEN")).not.toBeInTheDocument()
+  })
+
+  it("removes a new env entry without confirmation", () => {
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(false)
+    renderUserEnvForm({})
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.addEnvVariable" }))
+    const keyInput = screen.getByPlaceholderText("tools.mcp.dialog.envKeyPlaceholder")
+    fireEvent.change(keyInput, { target: { value: "DRAFT_TOKEN" } })
+    fireEvent.click(getRemoveButtonForEnvKey("DRAFT_TOKEN"))
+
+    expect(confirmMock).not.toHaveBeenCalled()
+    expect(screen.queryByDisplayValue("DRAFT_TOKEN")).not.toBeInTheDocument()
+  })
+})
