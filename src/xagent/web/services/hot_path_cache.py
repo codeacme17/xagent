@@ -230,11 +230,31 @@ def web_task_history_key(task_id: int) -> str:
     return f"task:web:history:{task_id}"
 
 
-def agent_list_key(user_id: int) -> str:
+def agent_list_key(
+    user_id: int, team_id: int | None = None, is_team_admin: bool = False
+) -> str:
+    if team_id is not None:
+        # user_id is part of the key: owned_agent_clause still matches a user's
+        # own legacy (team_id IS NULL) agents, so the result set is user-specific
+        # and must never be served from a key shared across team members.
+        return f"agent:list:team:{team_id}:{user_id}:{'a' if is_team_admin else 'm'}"
     return f"agent:list:{user_id}"
 
 
-def agent_detail_key(user_id: int, agent_id: int) -> str:
+def agent_detail_key(
+    user_id: int,
+    agent_id: int,
+    team_id: int | None = None,
+    is_team_admin: bool = False,
+) -> str:
+    if team_id is not None:
+        # user_id in the key: see agent_list_key -- a user's own legacy
+        # (team_id IS NULL) agents are visible only to them, so the detail
+        # cache must be per-user even within a team.
+        return (
+            f"agent:detail:team:{team_id}:{user_id}:"
+            f"{'a' if is_team_admin else 'm'}:{agent_id}"
+        )
     return f"agent:detail:{user_id}:{agent_id}"
 
 
@@ -275,7 +295,19 @@ def invalidate_task_cache(task_id: int) -> None:
     )
 
 
-def invalidate_agent_cache(user_id: int, agent_id: int | None = None) -> None:
+def invalidate_agent_cache(
+    user_id: int, agent_id: int | None = None, team_id: int | None = None
+) -> None:
+    if team_id is not None:
+        # Team keys are per-member (see agent_list_key): a write by one member
+        # changes what every teammate may see (e.g. flipping visibility to
+        # admins-only), so nuke the whole team namespace rather than just the
+        # caller's variants. ponytail: prefix-nuke over-invalidates other agents'
+        # detail entries; enumerate members if write churn ever becomes hot.
+        cache_delete_prefix(f"agent:list:team:{team_id}:")
+        if agent_id is not None:
+            cache_delete_prefix(f"agent:detail:team:{team_id}:")
+        return
     cache_delete(agent_list_key(user_id))
     if agent_id is not None:
         cache_delete(agent_detail_key(user_id, agent_id))
