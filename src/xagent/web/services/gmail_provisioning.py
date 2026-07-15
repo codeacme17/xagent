@@ -29,6 +29,7 @@ from ...config import (
     get_gmail_pubsub_push_service_account,
     get_gmail_pubsub_subscription_prefix,
     get_gmail_pubsub_topic_prefix,
+    get_gmail_pubsub_transport,
     get_gmail_registration_timeout_seconds,
     get_public_api_base_url,
 )
@@ -54,12 +55,20 @@ class GmailProvisioningError(RuntimeError):
 
 
 def _default_publisher() -> Any:
+    if get_gmail_pubsub_transport() == "rest":
+        from google.pubsub_v1 import PublisherClient
+
+        return PublisherClient(transport="rest")
     from google.cloud import pubsub_v1  # type: ignore[import-untyped]
 
     return pubsub_v1.PublisherClient()
 
 
 def _default_subscriber() -> Any:
+    if get_gmail_pubsub_transport() == "rest":
+        from google.pubsub_v1 import SubscriberClient
+
+        return SubscriberClient(transport="rest")
     from google.cloud import pubsub_v1
 
     return pubsub_v1.SubscriberClient()
@@ -97,11 +106,13 @@ def _new_callback_id() -> str:
 
 def _is_already_exists(exc: Exception) -> bool:
     try:
-        from google.api_core.exceptions import AlreadyExists
+        # gRPC raises AlreadyExists; the REST transport maps HTTP 409 to its
+        # parent class Conflict, so match the whole 409 family.
+        from google.api_core.exceptions import Conflict
 
-        return isinstance(exc, AlreadyExists)
+        return isinstance(exc, Conflict)
     except ImportError:  # pragma: no cover - google libs are a core dep
-        return type(exc).__name__ == "AlreadyExists"
+        return type(exc).__name__ in ("AlreadyExists", "Conflict")
 
 
 def _is_not_found(exc: Exception) -> bool:

@@ -44,6 +44,24 @@ from .conftest import _direct_db_session, client
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gmail_push_service_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the developer .env for OIDC verification defaults.
+
+    tests/conftest.py loads the project .env with override=True; a push
+    service account configured there makes verify() demand a matching email
+    claim, flipping outcomes for every test whose fake OIDC verifier returns
+    no email claim. Tests that exercise the service-account check set the
+    variable explicitly via monkeypatch.setenv.
+
+    Set to "" rather than deleted: fixtures running later (e.g. _test_db ->
+    init_db -> migrations/env.py) call load_dotenv(override=False), which
+    would re-populate a deleted variable but leaves an empty one alone, and
+    the config getter normalizes "" to None.
+    """
+    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT", "")
+
+
 class _FakeHttpError(Exception):
     def __init__(self, status_code: int, message: str = "gmail error") -> None:
         super().__init__(message)

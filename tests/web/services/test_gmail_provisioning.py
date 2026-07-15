@@ -999,3 +999,14 @@ def test_provisioning_requires_account_email(db_session: Session) -> None:
             subscriber_factory=lambda: FakeSubscriber(),
         )
     assert db_session.query(GmailWatchState).count() == 0
+
+
+def test_is_already_exists_matches_both_transports() -> None:
+    """gRPC raises AlreadyExists; REST maps HTTP 409 to its parent Conflict."""
+    from google.api_core.exceptions import AlreadyExists, Conflict
+
+    from xagent.web.services.gmail_provisioning import _is_already_exists
+
+    assert _is_already_exists(AlreadyExists("grpc duplicate topic"))
+    assert _is_already_exists(Conflict("409 PUT .../topics/x: already exists"))
+    assert not _is_already_exists(RuntimeError("unrelated"))

@@ -103,6 +103,7 @@ GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
 GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
 GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
 GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
+GMAIL_PUBSUB_TRANSPORT = "XAGENT_GMAIL_PUBSUB_TRANSPORT"
 GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
 PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
@@ -685,6 +686,21 @@ def get_gmail_pubsub_subscription_prefix() -> str:
     """
     value = (os.getenv(GMAIL_PUBSUB_SUBSCRIPTION_PREFIX) or "").strip()
     return value or "xagent-gmail-push"
+
+
+def get_gmail_pubsub_transport() -> str:
+    """Transport used by the Gmail Pub/Sub provisioning clients.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_TRANSPORT environment variable ("grpc" or "rest")
+        2. Default "grpc"
+
+    "rest" exists for environments whose egress proxy cannot tunnel gRPC:
+    the default gRPC channel hangs indefinitely there, leaving Gmail watch
+    provisioning stuck at pending with no recorded error.
+    """
+    value = (os.getenv(GMAIL_PUBSUB_TRANSPORT) or "").strip().lower()
+    return value if value in ("grpc", "rest") else "grpc"
 
 
 def get_gmail_pubsub_push_service_account() -> str | None:
