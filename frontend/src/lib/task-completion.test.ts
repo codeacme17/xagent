@@ -65,4 +65,36 @@ describe("task-completion", () => {
     expect(payload.status).toBe("completed")
     expect(payload.success).toBe(true)
   })
+
+  it.each([null, "invalid", ["invalid"]])(
+    "rejects malformed error details: %j",
+    (errorDetails) => {
+      const payload = normalizeTaskCompletedMessage({
+        type: "task_completed",
+        success: false,
+        error_details: errorDetails,
+      })
+
+      expect(payload.errorDetails).toBeUndefined()
+    }
+  )
+
+  it("normalizes a coded failure's error_code and plain-object error_details", () => {
+    const payload = normalizeTaskCompletedMessage({
+      type: "task_completed",
+      task: { status: "failed" },
+      success: false,
+      output: "quota reason",
+      error_code: "quota_exceeded",
+      error_details: { code: "quota_exceeded", limit: 0, plan: "free" },
+    })
+
+    expect(payload.status).toBe("failed")
+    expect(payload.errorCode).toBe("quota_exceeded")
+    expect(payload.errorDetails).toEqual({
+      code: "quota_exceeded",
+      limit: 0,
+      plan: "free",
+    })
+  })
 })

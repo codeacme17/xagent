@@ -15,9 +15,22 @@ type TestWebSocketMessage = {
 }
 
 const webSocketOptions = vi.hoisted(() => ({
-  current: null as null | { onMessage?: (message: TestWebSocketMessage) => void },
+  current: null as null | {
+    onMessage?: (message: TestWebSocketMessage) => void
+    onConnect?: () => void
+  },
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
+const wsHarness = vi.hoisted(() => ({ isConnected: true }))
+const apiRequestMock = vi.hoisted(() => vi.fn())
+
+vi.mock("@/lib/api-wrapper", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api-wrapper")>()
+  return {
+    ...actual,
+    apiRequest: (...args: unknown[]) => apiRequestMock(...args),
+  }
+})
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
@@ -34,10 +47,11 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("@/hooks/use-websocket", () => ({
   useWebSocket: (options: {
     onMessage?: (message: TestWebSocketMessage) => void
+    onConnect?: () => void
   }) => {
     webSocketOptions.current = options
     return {
-      isConnected: true,
+      isConnected: wsHarness.isConnected,
       connectionError: null,
       sendChatMessage: sendChatMessageMock,
       executeTask: vi.fn(),
@@ -63,6 +77,7 @@ import {
   extractTaskControlEnvelope,
   useApp,
 } from "./app-context-chat"
+import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -82,6 +97,7 @@ function StateProbe() {
             content:
               typeof message.content === "string" ? message.content : "react-node",
             isOptimistic: message.isOptimistic,
+            isResult: message.isResult,
           }))
         )}
       </div>
@@ -198,6 +214,8 @@ describe("task control envelope parsing", () => {
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {
     webSocketOptions.current = null
+    wsHarness.isConnected = true
+    apiRequestMock.mockReset()
     sendChatMessageMock.mockReset()
     sendChatMessageMock.mockResolvedValue({
       client_message_id: "turn-optimistic",
@@ -416,6 +434,124 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("does not append an acknowledged optimistic message after switching tasks", async () => {
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({
+              client_message_id: "turn-switch",
+              turn_id: "turn-switch",
+            })
+        })
+    )
+
+    let send: (() => Promise<void>) | undefined
+    let switchTask: (() => void) | undefined
+    function SwitchingTaskProbe() {
+      const { sendMessage, setTaskId } = useApp()
+      send = () =>
+        sendMessage("Message for task one", {
+          clientMessageId: "turn-switch",
+        })
+      switchTask = () => setTaskId(2, { navigate: false })
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SwitchingTaskProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    act(() => {
+      switchTask?.()
+    })
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    ) as Array<{ content: string }>
+    expect(messages).toEqual([])
+  })
+
+  it("shows the sender's message live when a new task's run dies before tracing", async () => {
+    // A run refused at the quota gate returns before agent tracing starts, so
+    // the live user_message trace event is never emitted. The sender's bubble
+    // must come from the optimistic copy added once delivery is acknowledged —
+    // without it the message only appears after a reload replays the transcript.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        task_id: 7,
+        title: "hello quota",
+        description: "hello quota",
+        status: "pending",
+      }),
+    })
+
+    let send: ((message: string) => Promise<void>) | undefined
+    function CreateTaskProbe() {
+      const { sendMessage } = useApp()
+      send = (message: string) =>
+        sendMessage(message, { clientMessageId: "turn-create" })
+      return null
+    }
+
+    // The freshly created task's socket has not connected yet.
+    wsHarness.isConnected = false
+    render(
+      <AppProvider token="token">
+        <CreateTaskProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.("hello quota")
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    // The socket for task 7 connects; the queued message is delivered and acked.
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      await delivery
+    })
+
+    const messages = JSON.parse(
+      screen.getByTestId("messages").textContent || "[]"
+    ) as Array<{ role: string; content: string; isOptimistic?: boolean }>
+    expect(messages).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: "hello quota",
+        isOptimistic: true,
+      }),
+    ])
+  })
+
   it("does not crash on a trace event without data", () => {
     render(
       <AppProvider token="token">
@@ -470,6 +606,215 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
     })
+  })
+
+  it("surfaces the failure reason from a failed task_completed payload", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    // Quota-gate refusals never stream a message; the reason arrives only in the
+    // terminal event's output. It must render live, not just after a reload.
+    const quotaReason =
+      "Team quota exhausted for this billing period."
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: {
+          id: 1,
+          status: "failed",
+        },
+        success: false,
+        output: quotaReason,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("messages").textContent).toContain(quotaReason)
+    })
+    // The bubble must be flagged as the turn's result; the conversation panel
+    // filters out assistant messages without it, so an unflagged reason never
+    // renders and the UI degrades to a generic "unknown error" until reload.
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const failureBubble = messages.find((m: { content: string }) =>
+      m.content.includes(quotaReason)
+    )
+    expect(failureBubble?.isResult).toBe(true)
+    // Verbatim, no live-only prefix: reload replays the persisted transcript
+    // row with this exact text, and the two views must match.
+    expect(failureBubble?.content).toBe(quotaReason)
+  })
+
+  it("does not suppress a failure reason contained within the user's message", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        data: {
+          event_id: "user-event-with-reason",
+          event_type: "user_message",
+          data: {
+            message: "Why did this quota failure happen?",
+            turn_id: "turn-with-reason",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Why did this quota failure happen?"
+      )
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: { id: 1, status: "failed" },
+        success: false,
+        output: "quota failure",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ role: string; content: string; isResult?: boolean }>
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: "assistant",
+            content: "quota failure",
+            isResult: true,
+          }),
+        ])
+      )
+    })
+  })
+
+  it("emits a coded-error event for the app layer and still shows the reason", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    const events: TaskErrorEventDetail[] = []
+    const listener = (e: Event) => events.push((e as CustomEvent<TaskErrorEventDetail>).detail)
+    window.addEventListener(TASK_ERROR_EVENT, listener)
+
+    // Real coded-gate terminal events omit output/result; the reason rides in
+    // error_details.message.
+    const details = {
+      code: "quota_exceeded",
+      metric: "runs_per_month",
+      limit: 0,
+      message: "Team quota exhausted.",
+    }
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: { id: 1, status: "failed" },
+        success: false,
+        error_code: "quota_exceeded",
+        error_details: details,
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      // The code is handed to the app layer via the event (drives the dialog)...
+      expect(events).toHaveLength(1)
+    })
+    expect(events[0].code).toBe("quota_exceeded")
+    expect(events[0].details).toEqual(details)
+    // ...and the reason (from error_details.message) still shows live in chat,
+    // matching a page reload, instead of an empty "unknown error" turn.
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Team quota exhausted."
+    )
+    const codedMessages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    const codedBubble = codedMessages.find((m: { content: string }) =>
+      m.content.includes("Team quota exhausted.")
+    )
+    expect(codedBubble?.isResult).toBe(true)
+    expect(codedBubble?.content).toBe("Team quota exhausted.")
+
+    window.removeEventListener(TASK_ERROR_EVENT, listener)
+  })
+
+  it("tags the coded-error event with the event's own task id, not the viewed one", async () => {
+    // SeedExistingTask puts the viewer on task 1. A terminal event for a
+    // different task (99) must attribute its dialog to 99 — using the
+    // currently-viewed id would pop the dialog against the wrong task under a
+    // reconnect/task-switch race.
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const events: TaskErrorEventDetail[] = []
+    const listener = (e: Event) => events.push((e as CustomEvent<TaskErrorEventDetail>).detail)
+    window.addEventListener(TASK_ERROR_EVENT, listener)
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: { id: 99, status: "failed" },
+        success: false,
+        error_code: "quota_exceeded",
+        error_details: { code: "quota_exceeded", limit: 0 },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(events).toHaveLength(1)
+    })
+    expect(events[0].taskId).toBe(99)
+
+    window.removeEventListener(TASK_ERROR_EVENT, listener)
   })
 
   it("ignores out-of-order and semantically stale task state events", async () => {
