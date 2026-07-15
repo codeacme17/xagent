@@ -302,6 +302,7 @@ module = [
   "joblib",
   "xrouter_llm",
   "xrouter_llm.*",
+  "google.pubsub_v1",
 ]
 ignore_missing_imports = true
 
