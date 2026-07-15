@@ -21,6 +21,7 @@ from xagent.web.api.widget import widget_router
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
@@ -171,6 +172,116 @@ def _task(task_id: int) -> Task:
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("scenario", "expected_message"),
+    [
+        (
+            "no_asr",
+            "I couldn't understand that voice message because no speech "
+            "recognition model is configured. Configure an ASR model or send "
+            "the request as text.",
+        ),
+        (
+            "missing_download",
+            "I couldn't transcribe that voice message. Please try again or send "
+            "the request as text.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_telegram_voice_errors_are_reported_to_user(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_message: str,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="telegram",
+            channel_name=f"Telegram voice {scenario}",
+            config={},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        agent_manager = _FakeAgentManager()
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.get_agent_manager",
+            lambda: agent_manager,
+        )
+
+        async def _restore_telegram_task_context(
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
+            _restore_telegram_task_context,
+        )
+
+        class _FakeASR:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        asr_model = _FakeASR()
+        voice = SimpleNamespace(file_id="telegram-voice-id")
+        bot = object.__new__(TelegramBotInstance)
+        bot.channel_id = int(channel.id)
+        bot.channel_name = f"Telegram voice {scenario}"
+        bot.active_tasks = {}
+        bot.bot = object()
+        bot.user_preparing_executions = set()
+        bot.user_stop_events = {}
+        bot.user_active_executions = {}
+        bot._save_active_tasks = lambda: None
+        bot._clear_user_stop_request = lambda _user_id: None
+        bot._consume_user_stop_request = lambda _user_id: False
+        bot._resolve_voice_asr_model = (
+            (lambda _db, _user: None)
+            if scenario == "no_asr"
+            else (lambda _db, _user: asr_model)
+        )
+
+        async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
+            return "", [voice]
+
+        async def _download_and_register_files(**_kwargs: Any) -> list[dict[str, Any]]:
+            return []
+
+        bot._extract_message_content = _extract_message_content
+        bot._download_and_register_files = _download_and_register_files
+
+        answers: list[str] = []
+
+        class _TelegramMessage:
+            from_user = SimpleNamespace(id=123)
+            chat = SimpleNamespace(id=456)
+            voice = SimpleNamespace(file_id="telegram-voice-id")
+
+            async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
+                answers.append(text)
+                return SimpleNamespace(message_id=1)
+
+        await bot._process_user_messages_batch(123, [_TelegramMessage()])
+
+        assert answers == [expected_message]
+        if scenario == "missing_download":
+            assert asr_model.closed is True
+    finally:
+        db.close()
+
+
 def _context_row_count(task_id: int) -> int:
     db = _db_session()
     try:
@@ -223,6 +334,7 @@ class _FakeAgentService:
 class _FakeAgentManager:
     def __init__(self) -> None:
         self.service = _FakeAgentService()
+        self.execute_calls: list[dict[str, Any]] = []
 
     async def get_agent_for_task(
         self,
@@ -234,6 +346,7 @@ class _FakeAgentManager:
         return self.service
 
     async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+        self.execute_calls.append(_kwargs)
         return {"success": True, "output": "done"}
 
 
@@ -670,5 +783,159 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         assert task is not None
         assert task.connector_runtime_selected_refs == []
         assert _context_row_count(int(task.id)) == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="telegram",
+            channel_name="Telegram voice test",
+            config={},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        agent_manager = _FakeAgentManager()
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.get_agent_manager",
+            lambda: agent_manager,
+        )
+
+        async def _restore_telegram_task_context(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
+            _restore_telegram_task_context,
+        )
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
+            lambda **_kwargs: None,
+        )
+
+        class _FakeASR:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def transcribe(self, *, audio: str, format: str | None = None) -> str:
+                assert audio == "/workspace/input/voice.oga"
+                assert format == "ogg"
+                return "今晚有世界杯比赛吗？"
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        asr_model = _FakeASR()
+        voice = SimpleNamespace(file_id="telegram-voice-id")
+        bot = object.__new__(TelegramBotInstance)
+        bot.channel_id = int(channel.id)
+        bot.channel_name = "Telegram voice test"
+        bot.active_tasks = {}
+        bot.bot = object()
+        bot.user_preparing_executions = set()
+        bot.user_stop_events = {}
+        bot.user_active_executions = {}
+        bot._save_active_tasks = lambda: None
+        bot._clear_user_stop_request = lambda _user_id: None
+        bot._consume_user_stop_request = lambda _user_id: False
+        bot._resolve_voice_asr_model = lambda _db, _user: asr_model
+
+        async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
+            return "", [voice]
+
+        async def _download_and_register_files(**_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "file_id": "workspace-file-id",
+                    "telegram_file_id": "telegram-voice-id",
+                    "name": "voice.oga",
+                    "path": "/workspace/input/voice.oga",
+                    "type": "audio/ogg",
+                    "size": 123,
+                }
+            ]
+
+        async def _await_execution(_user_id: int, execution, *, reason: str) -> dict:
+            return await execution
+
+        bot._extract_message_content = _extract_message_content
+        bot._download_and_register_files = _download_and_register_files
+        bot._await_execution_with_stop_monitor = _await_execution
+
+        class _LoadingMessage:
+            message_id = 33
+
+            async def edit_text(self, _text: str, **_kwargs: Any) -> None:
+                pass
+
+        class _TelegramMessage:
+            from_user = SimpleNamespace(id=123)
+            chat = SimpleNamespace(id=456)
+
+            def __init__(self, voice_input: Any) -> None:
+                self.voice = voice_input
+
+            async def answer(self, _text: str, **_kwargs: Any) -> _LoadingMessage:
+                return _LoadingMessage()
+
+        await bot._process_user_messages_batch(123, [_TelegramMessage(voice)])
+
+        assert len(agent_manager.execute_calls) == 1
+        execute_call = agent_manager.execute_calls[0]
+        assert execute_call["task"].startswith("今晚有世界杯比赛吗？")
+        assert "voice.oga: file_id=workspace-file-id" in execute_call["task"]
+        assert execute_call["context"]["file_info"] == [
+            {
+                "file_id": "workspace-file-id",
+                "telegram_file_id": "telegram-voice-id",
+                "name": "voice.oga",
+                "path": "/workspace/input/voice.oga",
+                "type": "audio/ogg",
+                "size": 123,
+            }
+        ]
+        assert execute_call["context"]["uploaded_files"] == [
+            "/workspace/input/voice.oga"
+        ]
+        expected_attachments = [
+            {
+                "file_id": "workspace-file-id",
+                "name": "voice.oga",
+                "size": 123,
+                "type": "audio/ogg",
+            }
+        ]
+        assert execute_call["context"]["files"] == expected_attachments
+        assert execute_call["context"]["display_message"] == "今晚有世界杯比赛吗？"
+        assert asr_model.closed is True
+
+        task = (
+            db.query(Task)
+            .filter(Task.user_id == user.id, Task.title == "今晚有世界杯比赛吗？")
+            .one_or_none()
+        )
+        assert task is not None
+        user_message = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task.id,
+                TaskChatMessage.role == "user",
+            )
+            .one()
+        )
+        assert user_message.content == "今晚有世界杯比赛吗？"
+        assert user_message.attachments == expected_attachments
     finally:
         db.close()
