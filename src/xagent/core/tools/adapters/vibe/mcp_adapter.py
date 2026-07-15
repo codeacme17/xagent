@@ -9,13 +9,15 @@ import inspect
 import logging
 import os
 import re
-from collections.abc import Iterator
+import weakref
+from collections.abc import Coroutine, Iterator
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 import httpx
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
+from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
@@ -1096,6 +1098,154 @@ async def _load_direct_mcp_tools(
     return agent_tools
 
 
+# Hard cap on concurrent (including abandoned) initializations per server.
+# The timeout below bounds the CALLER's wait but not the underlying task:
+# a cancellation-resistant cleanup keeps its transport/socket alive after
+# the caller has moved on. Without a per-server bound, a burst of tasks
+# against one hung server accumulates abandoned loads (and CLOSE-WAIT
+# sockets) without limit — the gate slot is only released when the load
+# task actually finishes, so abandoned loads keep counting against the cap
+# and later callers fail fast instead of opening yet another transport.
+_MAX_INFLIGHT_LOADS_PER_SERVER = 4
+
+# Semaphores are bound to an event loop; key by loop (weakly, so a
+# discarded loop doesn't pin its gates) then by server name. Web and
+# Celery processes each get their own gates.
+_server_load_gates: "weakref.WeakKeyDictionary[Any, Dict[str, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+# Strong references to in-flight/abandoned load tasks. The event loop only
+# keeps weak references to tasks; if GC collected a still-pending task its
+# done-callback — which releases the gate slot — would never fire. Tasks
+# remove themselves on completion.
+_active_load_tasks: "set[asyncio.Task[Any]]" = set()
+
+
+def _get_server_load_gate(server_name: str) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gates = _server_load_gates.get(loop)
+    if gates is None:
+        gates = {}
+        _server_load_gates[loop] = gates
+    gate = gates.get(server_name)
+    if gate is None:
+        gate = asyncio.Semaphore(_MAX_INFLIGHT_LOADS_PER_SERVER)
+        gates[server_name] = gate
+    return gate
+
+
+async def _load_server_tools_bounded(
+    server_name: str,
+    load_coro: "Coroutine[Any, Any, list[AbstractBaseTool]]",
+    timeout_seconds: int,
+) -> list[AbstractBaseTool]:
+    """Run one server's tool load with a hard wall-clock bound and a
+    per-server in-flight cap.
+
+    ``asyncio.wait_for`` alone is not a hard bound: it awaits the cancelled
+    task's cleanup, and a hung streamable-HTTP server can stall inside the
+    session context manager's ``__aexit__`` just as easily as inside
+    ``initialize()`` (issue #889). ``asyncio.wait`` + fire-and-forget cancel
+    guarantees the caller resumes at the deadline even if cleanup never
+    completes; the abandoned task is logged and its eventual exception is
+    consumed by a done-callback so it never surfaces as "exception was never
+    retrieved".
+
+    The per-server gate bounds the resource side: at most
+    ``_MAX_INFLIGHT_LOADS_PER_SERVER`` load tasks (live or abandoned) exist
+    per server per event loop. Callers that cannot get a slot within their
+    timeout budget fail fast without creating a transport. The acquire and
+    the load share one deadline, so the end-to-end caller bound is
+    unchanged.
+    """
+    gate = _get_server_load_gate(server_name)
+
+    if timeout_seconds <= 0:
+        # Timeout disabled: still bound the fan-out, waiting as long as
+        # needed for a slot. Cancellation while waiting must close the
+        # never-started coroutine or it warns "was never awaited" at GC.
+        try:
+            await gate.acquire()
+        except asyncio.CancelledError:
+            load_coro.close()
+            raise
+        try:
+            return await load_coro
+        finally:
+            gate.release()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout_seconds)
+    except (asyncio.TimeoutError, TimeoutError):
+        # Never started: close the coroutine so it doesn't warn about
+        # being un-awaited, and don't touch the gate (nothing acquired).
+        load_coro.close()
+        raise TimeoutError(
+            f"MCP server {server_name}: no initialization slot freed within "
+            f"{timeout_seconds}s ({_MAX_INFLIGHT_LOADS_PER_SERVER} loads "
+            "already in flight, possibly abandoned by earlier timeouts); "
+            "skipping without opening another connection. Slots free when "
+            "those loads finish; if the server is permanently hung they "
+            "recover only on process restart"
+        ) from None
+    except asyncio.CancelledError:
+        # Caller cancelled while queued at the gate: the load never
+        # started, so just close the coroutine and let the cancel out.
+        load_coro.close()
+        raise
+
+    task = asyncio.ensure_future(load_coro)
+    # Keep a strong reference until completion, then release the slot only
+    # when the task truly finishes — an abandoned (cancellation-resistant)
+    # load keeps counting against the cap.
+    _active_load_tasks.add(task)
+
+    def _on_task_done(t: "asyncio.Task[Any]") -> None:
+        _active_load_tasks.discard(t)
+        gate.release()
+
+    task.add_done_callback(_on_task_done)
+
+    def _consume_result(t: "asyncio.Task[Any]") -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.debug(
+                "Abandoned MCP load task for server %s finished with: %s",
+                server_name,
+                exc,
+            )
+
+    remaining = max(0.0, deadline - loop.time())
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+    except asyncio.CancelledError:
+        # Caller cancelled (run cancelled, lease lost): ``asyncio.wait``
+        # does not cancel its awaited tasks, so propagate the cancel to
+        # the load task ourselves or it would run — and hold its gate
+        # slot and transport — forever. A well-behaved load unwinds and
+        # frees the slot; a cancellation-resistant cleanup keeps its slot
+        # until it truly finishes, same as the timeout path.
+        task.cancel()
+        task.add_done_callback(_consume_result)
+        raise
+
+    if task in done:
+        return task.result()
+
+    task.cancel()
+    task.add_done_callback(_consume_result)
+    raise TimeoutError(
+        f"MCP server {server_name} initialization timed out after "
+        f"{timeout_seconds}s (including cleanup); abandoning it"
+    )
+
+
 async def load_mcp_tools_as_agent_tools(
     connection_map: Dict[str, Connection],
     *,
@@ -1122,6 +1272,7 @@ async def load_mcp_tools_as_agent_tools(
         The function continues processing remaining servers instead of raising.
     """
     agent_tools: List[AbstractBaseTool] = []
+    timeout_seconds = _root_config.get_mcp_tool_init_timeout_seconds()
 
     for server_name, connection in connection_map.items():
         try:
@@ -1149,13 +1300,13 @@ async def load_mcp_tools_as_agent_tools(
                         concurrent_tools=_concurrent_tools,
                     )
 
-                server_tools = await load_sandboxed_mcp_tools(
+                load_coro = load_sandboxed_mcp_tools(
                     connection,
                     sandbox,
                     tool_builder,
                 )
             else:
-                server_tools = await _load_direct_mcp_tools(
+                load_coro = _load_direct_mcp_tools(
                     server_name,
                     connection,
                     name_prefix=name_prefix,
@@ -1163,6 +1314,9 @@ async def load_mcp_tools_as_agent_tools(
                     allow_users=allow_users,
                 )
 
+            server_tools = await _load_server_tools_bounded(
+                server_name, load_coro, timeout_seconds
+            )
             agent_tools.extend(server_tools)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")
 
