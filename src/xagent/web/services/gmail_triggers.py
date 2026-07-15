@@ -172,6 +172,18 @@ def _gmail_oauth_scopes(oauth_account: UserOAuth) -> list[str]:
     return scopes or DEFAULT_GMAIL_SCOPES
 
 
+def _credentials_expiry(value: datetime | None) -> datetime | None:
+    """google-auth requires Credentials.expiry to be a naive UTC datetime.
+
+    Timezone-aware databases (PostgreSQL) return aware datetimes for
+    UserOAuth.expires_at; passing one through makes creds.expired raise
+    "can't compare offset-naive and offset-aware datetimes".
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
     """Build an authenticated Gmail API client for a connected Gmail account."""
     client_id, client_secret = _get_google_oauth_config(db)
@@ -185,7 +197,7 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
         client_id=client_id,
         client_secret=client_secret,
         scopes=_gmail_oauth_scopes(oauth_account),
-        expiry=oauth_account.expires_at,
+        expiry=_credentials_expiry(getattr(oauth_account, "expires_at", None)),
     )
     if creds.expired and creds.refresh_token:
         try:
@@ -197,7 +209,8 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
             ) from exc
         setattr(oauth_account, "access_token", creds.token)
         if creds.expiry:
-            setattr(oauth_account, "expires_at", creds.expiry)
+            # google-auth hands back naive UTC; store it timezone-aware.
+            setattr(oauth_account, "expires_at", _coerce_utc(creds.expiry))
         db.commit()
 
     return _GmailApiService(AuthorizedSession(creds))

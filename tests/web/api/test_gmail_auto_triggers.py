@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -904,6 +904,147 @@ def test_build_gmail_service_passes_persisted_token_expiry_to_credentials(
         build_gmail_service(db, oauth)
 
         assert captured_kwargs["expiry"] == oauth.expires_at
+    finally:
+        db.close()
+
+
+def test_build_gmail_service_converts_aware_expiry_to_naive_utc_for_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timezone-aware expires_at (PostgreSQL) must reach google-auth as naive UTC."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeCredentials:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+            self.expired = False
+            self.refresh_token = kwargs.get("refresh_token")
+
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.Credentials",
+        FakeCredentials,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.AuthorizedSession",
+        lambda creds: object(),
+    )
+
+    db = _direct_db_session()
+    try:
+        provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one()
+        )
+        provider.client_id = ""
+        provider.client_secret = ""
+        user = _create_user(db, "gmail-aware-expiry-user")
+        oauth = _create_gmail_oauth(db, user)
+        db.add(provider)
+        db.commit()
+        # SQLite round-trips naive datetimes, so assign in memory to simulate
+        # the aware value PostgreSQL returns for DateTime(timezone=True).
+        oauth.expires_at = datetime(
+            2026, 6, 29, 20, tzinfo=timezone(timedelta(hours=8))
+        )
+
+        build_gmail_service(db, oauth)
+
+        expiry = captured_kwargs["expiry"]
+        assert isinstance(expiry, datetime)
+        assert expiry.tzinfo is None
+        assert expiry == datetime(2026, 6, 29, 12)
+    finally:
+        db.close()
+
+
+def test_build_gmail_service_accepts_aware_expiry_with_real_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #807: aware expiry made creds.expired raise TypeError."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.AuthorizedSession",
+        lambda creds: object(),
+    )
+
+    db = _direct_db_session()
+    try:
+        provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one()
+        )
+        provider.client_id = ""
+        provider.client_secret = ""
+        user = _create_user(db, "gmail-real-creds-user")
+        oauth = _create_gmail_oauth(db, user)
+        db.add(provider)
+        db.commit()
+        oauth.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        service = build_gmail_service(db, oauth)
+
+        assert service is not None
+    finally:
+        db.close()
+
+
+def test_build_gmail_service_persists_refreshed_expiry_as_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refreshed naive-UTC expiry from google-auth is stored UTC-normalized."""
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+    refreshed_expiry = datetime(2026, 6, 29, 13)
+
+    class FakeCredentials:
+        def __init__(self, **kwargs: object) -> None:
+            self.expired = True
+            self.refresh_token = kwargs.get("refresh_token")
+            self.token = kwargs.get("token")
+            self.expiry: datetime | None = None
+
+        def refresh(self, _request: object) -> None:
+            self.token = "refreshed-access-token"
+            self.expiry = refreshed_expiry
+
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.Credentials",
+        FakeCredentials,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.AuthorizedSession",
+        lambda creds: object(),
+    )
+
+    db = _direct_db_session()
+    try:
+        provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one()
+        )
+        provider.client_id = ""
+        provider.client_secret = ""
+        user = _create_user(db, "gmail-refresh-persist-user")
+        oauth = _create_gmail_oauth(db, user)
+        oauth.expires_at = datetime(2026, 6, 29, 12, tzinfo=timezone.utc)
+        db.add_all([provider, oauth])
+        db.commit()
+        db.refresh(oauth)
+
+        build_gmail_service(db, oauth)
+
+        assert str(oauth.access_token) == "refreshed-access-token"
+        stored = oauth.expires_at
+        assert stored is not None
+        if stored.tzinfo is None:  # SQLite drops tzinfo on the round-trip
+            stored = stored.replace(tzinfo=timezone.utc)
+        assert stored == refreshed_expiry.replace(tzinfo=timezone.utc)
     finally:
         db.close()
 
