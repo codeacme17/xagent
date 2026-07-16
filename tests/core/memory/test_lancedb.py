@@ -525,7 +525,7 @@ def test_search_returns_legacy_rows_missing_timestamp(memory_store):
 
 
 def test_search_skips_malformed_row_without_truncation(memory_store):
-    """A row whose conversion genuinely fails (unparseable timestamp) must be
+    """A row whose conversion genuinely fails (unparsable timestamp) must be
     skipped, not abort the vector branch after earlier appends — which used to
     suppress the text fallback and silently truncate the results (#847).
 
