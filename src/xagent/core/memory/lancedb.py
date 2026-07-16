@@ -507,7 +507,11 @@ class LanceDBMemoryStore(MemoryStore):
     def _apply_metadata_filters(
         self, metadata: dict[str, Any], metadata_filters: dict[str, Any]
     ) -> bool:
-        """Apply nested metadata filters."""
+        """Apply nested metadata filters. A non-dict filter value cannot match
+        anything (rather than crashing on a malformed caller-supplied
+        ``filters["metadata"]``)."""
+        if not isinstance(metadata_filters, dict):
+            return False
         for key, value in metadata_filters.items():
             if str(metadata.get(key, "")) != str(value):
                 return False

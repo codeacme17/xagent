@@ -455,6 +455,105 @@ class TestInMemoryMemoryStoreNestedMetadataFilters:
         )
         assert [n.id for n in results] == ["alice-system"]
 
+    def test_nested_metadata_filter_combines_with_flat_key(self, memory_store):
+        # Both dispatch paths (nested dict + flat "other" key) applied in one
+        # call — AND semantics across the two.
+        results = memory_store.list_all(
+            filters={"metadata": {"user_id": 1}, "source": "chat"}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+        assert (
+            memory_store.list_all(
+                filters={"metadata": {"user_id": 1}, "source": "email"}
+            )
+            == []
+        )
+
+    def test_non_dict_nested_metadata_filter_matches_nothing(self, memory_store):
+        # A malformed filters["metadata"] value must not crash — it can't
+        # match anything.
+        for bad in (None, "abc", 42):
+            assert memory_store.search("shared", k=10, filters={"metadata": bad}) == []
+            assert memory_store.list_all(filters={"metadata": bad}) == []
+
+    def test_flat_key_combines_with_scope_exclusive(self, memory_store):
+        prefix = MEMORY_DIMENSION_METADATA_PREFIX
+        memory_store.add(
+            MemoryNote(
+                id="alice-scoped",
+                content="shared note text",
+                metadata={"user_id": 1, "source": "chat", f"{prefix}tenant": "acme"},
+            )
+        )
+        # user_id excludes bob (flat), the directive excludes alice-scoped.
+        results = memory_store.list_all(
+            filters={"user_id": 1, "source": "chat", SCOPE_EXCLUSIVE_FILTER_KEY: True}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+
+class TestSearchListOnlyFilterParity:
+    """search() and list_all() share one filter dispatch: tags / keywords /
+    date_from / date_to must behave identically on both. Previously search()
+    let these keys fall through to flat metadata equality — they live on
+    note.tags/note.keywords/note.timestamp, never note.metadata, so any
+    query combining text search with one of them silently returned empty
+    (reachable via the web memory list route, which calls search() whenever
+    a text query is present)."""
+
+    @pytest.fixture(autouse=True)
+    def seed(self, memory_store):
+        now = datetime.now()
+        memory_store.add(
+            MemoryNote(
+                id="old-work",
+                content="quarterly report draft",
+                tags=["work"],
+                keywords=["report"],
+                timestamp=now - timedelta(days=2),
+            )
+        )
+        memory_store.add(
+            MemoryNote(
+                id="new-home",
+                content="grocery report list",
+                tags=["home"],
+                keywords=["groceries"],
+                timestamp=now,
+            )
+        )
+        self.now = now
+
+    def test_search_with_tags_filter(self, memory_store):
+        results = memory_store.search("report", k=10, filters={"tags": ["work"]})
+        assert [n.id for n in results] == ["old-work"]
+
+    def test_search_with_keywords_filter(self, memory_store):
+        results = memory_store.search(
+            "report", k=10, filters={"keywords": ["groceries"]}
+        )
+        assert [n.id for n in results] == ["new-home"]
+
+    def test_search_with_date_filters(self, memory_store):
+        cutoff = self.now - timedelta(days=1)
+        assert [
+            n.id
+            for n in memory_store.search("report", k=10, filters={"date_from": cutoff})
+        ] == ["new-home"]
+        assert [
+            n.id
+            for n in memory_store.search("report", k=10, filters={"date_to": cutoff})
+        ] == ["old-work"]
+
+    def test_search_and_list_all_agree(self, memory_store):
+        filters = {"tags": ["work"], "keywords": ["report"]}
+        search_ids = {
+            n.id for n in memory_store.search("report", k=10, filters=filters)
+        }
+        list_ids = {n.id for n in memory_store.list_all(filters=filters)}
+        assert search_ids == list_ids == {"old-work"}
+
 
 def test_scope_exclusive_filters_scoped_notes(memory_store):
     """#822: the `__scope_exclusive__` directive (strict dimension-less

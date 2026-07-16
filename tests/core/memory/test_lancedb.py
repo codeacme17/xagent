@@ -331,6 +331,18 @@ def test_list_all_with_nested_metadata_filter(memory_store):
     assert results[0].content == "alice note"
 
 
+def test_non_dict_nested_metadata_filter_matches_nothing(memory_store):
+    """A malformed (non-dict) filters["metadata"] value must not crash —
+    it can't match anything."""
+    assert memory_store.add(
+        MemoryNote(content="hello world", metadata={"user_id": 1})
+    ).success
+
+    for bad in (None, "abc", 42):
+        assert memory_store.search("hello", k=10, filters={"metadata": bad}) == []
+        assert memory_store.list_all(filters={"metadata": bad}) == []
+
+
 def test_list_all_with_tag_filters(memory_store):
     """Test listing memories with tag filters."""
     assert memory_store.add(
