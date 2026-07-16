@@ -731,9 +731,7 @@ class LanceDBMemoryStore(MemoryStore):
             # distinct values ever cross into Python.
             flat = pc.list_flatten(arrow_table[SCOPE_DIMS_COLUMN])
             matched = flat.filter(pc.starts_with(flat, pattern=prefix))
-            return {
-                element[len(prefix) :] for element in matched.unique().to_pylist()
-            }
+            return {element[len(prefix) :] for element in matched.unique().to_pylist()}
         finally:
             _safe_close_table(table)
 
