@@ -1341,15 +1341,17 @@ async def preview_agent(
         # Generate unique task_id for each preview to avoid workspace conflicts
         preview_task_id = f"preview_{uuid.uuid4().hex[:8]}"
 
-        # Scope the preview's tools to the agent's selection, exactly like
-        # the runtime chat path does. Without a spec, WebToolConfig builds
-        # the unrestricted tool set — including every Custom API / MCP
-        # server the *user* has configured — so the preview could call
-        # APIs the agent never selected (issues #798 / #117). Like the
-        # delegated-agent path, the omitted/None (legacy "unconfigured")
-        # case keeps every built-in tool but opts out of the user-level
-        # Custom API registry: a preview must never expose APIs the agent
-        # being previewed did not select.
+        # Scope the preview's tools to the agent's selection. Without a
+        # spec, WebToolConfig builds the unrestricted tool set — including
+        # every Custom API / MCP server the *user* has configured — so the
+        # preview could call APIs the agent never selected (issues #798 /
+        # #117). Explicit categories mirror the runtime chat path; the
+        # omitted/None (legacy "unconfigured") case follows the
+        # delegated-agent path instead — every built-in tool, but no
+        # user-level Custom API registry — which is stricter than the
+        # direct-chat runtime (that path intentionally keeps legacy full
+        # access): a preview must never expose APIs the agent being
+        # previewed did not select.
         from ...core.tools.adapters.vibe.selection_spec import (
             ToolSelectionSpec,
             should_load_mcp_server_configs,
