@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
+from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.service import AgentService
 
 
@@ -933,6 +934,30 @@ def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> 
     )
 
     assert result["output"] == "answer from context"
+
+
+def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="interrupted",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = adapter._normalize_result(
+        result={
+            "status": "interrupted",
+            "success": False,
+            "error": "ReActPattern interrupted.",
+        },
+        execution_type="agent_react",
+        execution_id="interrupted-exec",
+    )
+
+    assert result["output"] == INTERRUPTED_USER_MESSAGE
+    assert result["error"] == "ReActPattern interrupted."
 
 
 @pytest.mark.asyncio

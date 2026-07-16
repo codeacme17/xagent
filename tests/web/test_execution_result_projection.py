@@ -1,3 +1,4 @@
+from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.web.models.task import TaskStatus
 from xagent.web.services.execution_result_projection import (
     EMPTY_CHANNEL_OUTPUT_FALLBACK,
@@ -64,8 +65,14 @@ def test_project_execution_result_falls_back_for_empty_output():
 
 def test_project_execution_result_maps_interrupted_to_paused():
     projection = project_execution_result_for_channel(
-        {"status": "interrupted", "success": False, "output": "Paused."}
+        {
+            "status": "interrupted",
+            "success": False,
+            "output": "ReActPattern interrupted.",
+        }
     )
 
     assert projection.task_status == TaskStatus.PAUSED
-    assert projection.visible_text == "Paused."
+    assert projection.visible_text == INTERRUPTED_USER_MESSAGE
+    assert projection.transcript_content == ""
+    assert projection.interactions == []
