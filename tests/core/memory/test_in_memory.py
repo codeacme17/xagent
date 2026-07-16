@@ -426,6 +426,21 @@ class TestInMemoryMemoryStoreNestedMetadataFilters:
         results = memory_store.list_all(filters={"metadata": {"user_id": "1"}})
         assert [n.id for n in results] == ["alice"]
 
+    def test_list_all_enforces_flat_metadata_filter(self, memory_store):
+        # Flat metadata keys (outside the known category/date/tags/keywords
+        # set) were previously ignored by list_all() — the same fail-open
+        # shape as the nested case.
+        results = memory_store.list_all(filters={"source": "chat", "user_id": 1})
+        assert [n.id for n in results] == ["alice"]
+
+        assert memory_store.list_all(filters={"source": "email"}) == []
+
+    def test_search_flat_metadata_filter_string_coerced(self, memory_store):
+        # Flat keys use the same string-coerced equality as LanceDB: a string
+        # filter value matches an int metadata value.
+        results = memory_store.search("shared", k=10, filters={"user_id": "2"})
+        assert [n.id for n in results] == ["bob"]
+
     def test_nested_metadata_filter_combines_with_category(self, memory_store):
         memory_store.add(
             MemoryNote(

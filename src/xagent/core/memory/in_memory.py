@@ -25,10 +25,10 @@ class InMemoryMemoryStore(MemoryStore):
     def _matches_metadata_filters(
         metadata: dict[str, Any], metadata_filters: dict[str, Any]
     ) -> bool:
-        """Nested ``filters["metadata"]`` equality, matching the string-coerced
-        semantics of ``LanceDBMemoryStore._apply_metadata_filters`` so
-        ``UserIsolatedMemoryStore`` isolation behaves the same on both stores
-        (#842)."""
+        """Metadata equality for both the nested ``filters["metadata"]`` dict
+        and flat metadata keys, matching the string-coerced semantics of
+        ``LanceDBMemoryStore`` so ``UserIsolatedMemoryStore`` isolation and
+        ad-hoc filters behave the same on both stores (#842)."""
         return all(
             str(metadata.get(key, "")) == str(value)
             for key, value in metadata_filters.items()
@@ -93,14 +93,15 @@ class InMemoryMemoryStore(MemoryStore):
                     ):
                         match = False
 
-                    # Other metadata filters
+                    # Other flat metadata filters (string-coerced, like
+                    # LanceDBMemoryStore)
                     other_filters = {
                         k: v
                         for k, v in filters.items()
                         if k not in ("category", "metadata", SCOPE_EXCLUSIVE_FILTER_KEY)
                     }
-                    if other_filters and not all(
-                        note.metadata.get(k) == v for k, v in other_filters.items()
+                    if other_filters and not self._matches_metadata_filters(
+                        note.metadata, other_filters
                     ):
                         match = False
 
@@ -155,6 +156,29 @@ class InMemoryMemoryStore(MemoryStore):
                         keyword in note.keywords for keyword in required_keywords
                     ):
                         match = False
+
+                # Other flat metadata filters — same string-coerced equality
+                # as search() and LanceDBMemoryStore.list_all (previously
+                # ignored entirely, the same fail-open shape as the nested
+                # metadata case above)
+                other_filters = {
+                    k: v
+                    for k, v in filters.items()
+                    if k
+                    not in (
+                        "category",
+                        "metadata",
+                        "date_from",
+                        "date_to",
+                        "tags",
+                        "keywords",
+                        SCOPE_EXCLUSIVE_FILTER_KEY,
+                    )
+                }
+                if other_filters and not self._matches_metadata_filters(
+                    note.metadata, other_filters
+                ):
+                    match = False
 
                 if match:
                     filtered_results.append(note)
