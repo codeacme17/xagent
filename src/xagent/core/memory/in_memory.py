@@ -21,6 +21,19 @@ class InMemoryMemoryStore(MemoryStore):
             encode_scope_dims(note.metadata)
         )
 
+    @staticmethod
+    def _matches_metadata_filters(
+        metadata: dict[str, Any], metadata_filters: dict[str, Any]
+    ) -> bool:
+        """Nested ``filters["metadata"]`` equality, matching the string-coerced
+        semantics of ``LanceDBMemoryStore._apply_metadata_filters`` so
+        ``UserIsolatedMemoryStore`` isolation behaves the same on both stores
+        (#842)."""
+        return all(
+            str(metadata.get(key, "")) == str(value)
+            for key, value in metadata_filters.items()
+        )
+
     def add(self, note: MemoryNote) -> MemoryResponse:
         note_id = note.id or str(uuid.uuid4())
         note.id = note_id
@@ -73,11 +86,18 @@ class InMemoryMemoryStore(MemoryStore):
                     if "category" in filters and note.category != filters["category"]:
                         match = False
 
+                    # Nested metadata filters (the shape UserIsolatedMemoryStore
+                    # emits for user_id/scope isolation)
+                    if "metadata" in filters and not self._matches_metadata_filters(
+                        note.metadata, filters["metadata"]
+                    ):
+                        match = False
+
                     # Other metadata filters
                     other_filters = {
                         k: v
                         for k, v in filters.items()
-                        if k not in ("category", SCOPE_EXCLUSIVE_FILTER_KEY)
+                        if k not in ("category", "metadata", SCOPE_EXCLUSIVE_FILTER_KEY)
                     }
                     if other_filters and not all(
                         note.metadata.get(k) == v for k, v in other_filters.items()
@@ -106,6 +126,14 @@ class InMemoryMemoryStore(MemoryStore):
 
                 # Category filter
                 if "category" in filters and note.category != filters["category"]:
+                    match = False
+
+                # Nested metadata filters (the shape UserIsolatedMemoryStore
+                # emits for user_id/scope isolation — previously ignored here,
+                # which made user_id isolation fail-open, #842)
+                if "metadata" in filters and not self._matches_metadata_filters(
+                    note.metadata, filters["metadata"]
+                ):
                     match = False
 
                 # Date range filters

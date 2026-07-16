@@ -361,6 +361,86 @@ def test_clear(memory_store):
     assert len(results) == 0
 
 
+class TestInMemoryMemoryStoreNestedMetadataFilters:
+    """#842: nested ``filters["metadata"]`` dicts (the shape
+    ``UserIsolatedMemoryStore._add_user_filter`` emits) must be interpreted
+    with the same string-coerced equality semantics as
+    ``LanceDBMemoryStore._apply_metadata_filters`` — previously search()
+    never matched them and list_all() silently ignored them (fail-open)."""
+
+    @pytest.fixture(autouse=True)
+    def seed(self, memory_store):
+        memory_store.add(
+            MemoryNote(
+                id="alice",
+                content="shared note text",
+                metadata={"user_id": 1, "source": "chat"},
+            )
+        )
+        memory_store.add(
+            MemoryNote(
+                id="bob",
+                content="shared note text",
+                metadata={"user_id": 2, "source": "chat"},
+            )
+        )
+
+    def test_search_matches_nested_metadata_filter(self, memory_store):
+        results = memory_store.search(
+            "shared", k=10, filters={"metadata": {"user_id": 1}}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+    def test_search_nested_metadata_filter_no_match(self, memory_store):
+        results = memory_store.search(
+            "shared", k=10, filters={"metadata": {"user_id": 3}}
+        )
+        assert results == []
+
+    def test_list_all_enforces_nested_metadata_filter(self, memory_store):
+        results = memory_store.list_all(filters={"metadata": {"user_id": 2}})
+        assert [n.id for n in results] == ["bob"]
+
+    def test_list_all_nested_metadata_filter_no_match_is_empty(self, memory_store):
+        # Previously fail-open: an unmatched nested filter returned every note.
+        results = memory_store.list_all(filters={"metadata": {"user_id": 3}})
+        assert results == []
+
+    def test_nested_metadata_filter_multiple_keys(self, memory_store):
+        assert [
+            n.id
+            for n in memory_store.list_all(
+                filters={"metadata": {"user_id": 1, "source": "chat"}}
+            )
+        ] == ["alice"]
+        assert (
+            memory_store.list_all(
+                filters={"metadata": {"user_id": 1, "source": "email"}}
+            )
+            == []
+        )
+
+    def test_nested_metadata_filter_string_coerced_equality(self, memory_store):
+        # LanceDB compares str(metadata value) == str(filter value); the
+        # in-memory store must match a string filter against an int value.
+        results = memory_store.list_all(filters={"metadata": {"user_id": "1"}})
+        assert [n.id for n in results] == ["alice"]
+
+    def test_nested_metadata_filter_combines_with_category(self, memory_store):
+        memory_store.add(
+            MemoryNote(
+                id="alice-system",
+                content="shared note text",
+                category="system",
+                metadata={"user_id": 1},
+            )
+        )
+        results = memory_store.list_all(
+            filters={"category": "system", "metadata": {"user_id": 1}}
+        )
+        assert [n.id for n in results] == ["alice-system"]
+
+
 def test_scope_exclusive_filters_scoped_notes(memory_store):
     """#822: the `__scope_exclusive__` directive (strict dimension-less
     isolation) excludes any scope-stamped note on the real InMemoryMemoryStore,
