@@ -15,6 +15,7 @@ const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const setTaskIdMock = vi.hoisted(() => vi.fn())
 const paramsMock = vi.hoisted(() => ({ id: "42" as string | string[] | undefined }))
 const translateMock = vi.hoisted(
   () => (key: string, vars?: Record<string, string | number>) => {
@@ -55,9 +56,10 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     sendMessage: vi.fn(),
-    setTaskId: vi.fn(),
+    setTaskId: setTaskIdMock,
     closeFilePreview: vi.fn(),
     dispatch: vi.fn(),
+    state: { currentTask: null },
   }),
 }))
 
@@ -211,6 +213,7 @@ describe("workforce route entry points", () => {
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()
     routerPushMock.mockReset()
+    setTaskIdMock.mockReset()
     paramsMock.id = "42"
   })
 
@@ -248,7 +251,7 @@ describe("workforce route entry points", () => {
     )
   })
 
-  it("keeps list run actions disabled for non-active workforces", async () => {
+  it("keeps list run actions disabled for draft workforces", async () => {
     listWorkforcesMock.mockResolvedValueOnce({
       ...listResponse,
       items: [
@@ -269,7 +272,7 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
   })
 
-  it("runs a workforce and redirects to the created task", async () => {
+  it("runs an active workforce and opens the created task", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
     runWorkforceMock.mockResolvedValueOnce({
       workforce_run_id: 5,
@@ -287,33 +290,48 @@ describe("workforce route entry points", () => {
 
     // Wait for the submit button to become enabled after state update
     await waitFor(() => {
-      const submitBtn = container.querySelector(".rounded-2xl button:not([disabled])")
+      const submitBtn = container.querySelector("textarea + button:not([disabled])")
       expect(submitBtn).not.toBeNull()
     })
 
-    const submitBtn = container.querySelector(".rounded-2xl button:not([disabled])")
+    const submitBtn = container.querySelector("textarea + button:not([disabled])")
     fireEvent.click(submitBtn!)
 
     await waitFor(() => {
       expect(runWorkforceMock).toHaveBeenCalledWith("42", {
+        files: [],
+        is_visible: false,
         message: "Draft launch plan",
       })
     })
-    expect(routerPushMock).toHaveBeenCalledWith("/task/99")
+    expect(setTaskIdMock).toHaveBeenCalledWith(99, { navigate: false })
+    expect(screen.getByTestId("task-conversation-panel")).toBeInTheDocument()
   })
 
-  it("shows a run disabled reason for non-active workforces", async () => {
+  it("tests a draft workforce from the editor preview", async () => {
     getWorkforceMock.mockResolvedValueOnce({
       ...workforceDetail,
       status: "draft",
     })
+    runWorkforceMock.mockResolvedValueOnce({
+      workforce_run_id: 6,
+      task_id: 100,
+      status: "running",
+      redirect_url: "/task/100",
+    })
 
-    render(<WorkforceRunPage />)
+    render(<WorkforceDetailPage />)
 
-    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
-    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
-    expect(screen.queryByText("workforces.actions.runWorkforce")).not.toBeInTheDocument()
-    expect(runWorkforceMock).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledWith("42", {
+        files: [],
+        is_preview: true,
+        is_visible: false,
+        message: "test message",
+      })
+    })
   })
 
   it("keeps the current manager visible when it is hidden from agent options", async () => {
