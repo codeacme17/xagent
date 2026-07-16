@@ -73,6 +73,13 @@ class InMemoryMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
+        # Flat metadata filters outside the known keys (string-coerced, like
+        # LanceDBMemoryStore) — note-independent, so computed once.
+        other_filters = {
+            key: value
+            for key, value in (filters or {}).items()
+            if key not in ("category", "metadata", SCOPE_EXCLUSIVE_FILTER_KEY)
+        }
         results = []
         for note in self._store.values():
             if query.lower() in note.content.lower():
@@ -93,13 +100,6 @@ class InMemoryMemoryStore(MemoryStore):
                     ):
                         match = False
 
-                    # Other flat metadata filters (string-coerced, like
-                    # LanceDBMemoryStore)
-                    other_filters = {
-                        k: v
-                        for k, v in filters.items()
-                        if k not in ("category", "metadata", SCOPE_EXCLUSIVE_FILTER_KEY)
-                    }
                     if other_filters and not self._matches_metadata_filters(
                         note.metadata, other_filters
                     ):
@@ -118,6 +118,24 @@ class InMemoryMemoryStore(MemoryStore):
         results = list(self._store.values())
 
         if filters:
+            # Flat metadata filters outside the known keys — same string-coerced
+            # equality as search() and LanceDBMemoryStore.list_all (previously
+            # ignored entirely, the same fail-open shape as the nested metadata
+            # case). Note-independent, so computed once.
+            other_filters = {
+                key: value
+                for key, value in filters.items()
+                if key
+                not in (
+                    "category",
+                    "metadata",
+                    "date_from",
+                    "date_to",
+                    "tags",
+                    "keywords",
+                    SCOPE_EXCLUSIVE_FILTER_KEY,
+                )
+            }
             filtered_results = []
             for note in results:
                 match = True
@@ -157,24 +175,6 @@ class InMemoryMemoryStore(MemoryStore):
                     ):
                         match = False
 
-                # Other flat metadata filters — same string-coerced equality
-                # as search() and LanceDBMemoryStore.list_all (previously
-                # ignored entirely, the same fail-open shape as the nested
-                # metadata case above)
-                other_filters = {
-                    k: v
-                    for k, v in filters.items()
-                    if k
-                    not in (
-                        "category",
-                        "metadata",
-                        "date_from",
-                        "date_to",
-                        "tags",
-                        "keywords",
-                        SCOPE_EXCLUSIVE_FILTER_KEY,
-                    )
-                }
                 if other_filters and not self._matches_metadata_filters(
                     note.metadata, other_filters
                 ):
