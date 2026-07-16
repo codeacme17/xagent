@@ -21,6 +21,9 @@ from ...config import get_uploads_dir
 from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
+    MCPConfigLoadError,
+    MCPFailurePolicy,
+    MCPToolLoadSummary,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -48,7 +51,26 @@ OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
 OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
 OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
+UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+# This web-runtime allowlist is intentionally narrower than the adapter-layer
+# public summary allowlist. It accepts only credential/config resolution reasons
+# produced at this boundary; adapter/list-tools phases are sanitized separately
+# after loading and must not be admitted here by sharing one broad constant.
+MCP_UNAVAILABLE_REASONS = frozenset(
+    {
+        "authorization_required",
+        "catalog_app_not_found",
+        "config_load_failed",
+        "insufficient_scope",
+        "invalid_launch_config",
+        "oauth_token_refresh_failed",
+        "oauth_token_required",
+        OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+        "runtime_connection_failed",
+        "token_refresh_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +116,12 @@ class ResolvedToken:
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
     generation: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class _LegacyOAuthTokenResolution:
+    access_token: str | None
+    refresh_failed: bool = False
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -348,14 +376,16 @@ async def refresh_oauth_token_if_needed(
                         oauth_account.expires_at = datetime.now(
                             timezone.utc
                         ) + timedelta(seconds=int(data["expires_in"]))
-                    db.commit()
+                    db.flush([oauth_account])
                     logger.info(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
                     return True
             else:
                 logger.error(
-                    f"Failed to refresh {provider_name} token: {response.text}"
+                    "Failed to refresh %s token (status %s)",
+                    provider_name,
+                    response.status_code,
                 )
             return False
 
@@ -391,17 +421,23 @@ async def refresh_oauth_token_if_needed(
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]
                     )
-                db.commit()
+                db.flush([oauth_account])
                 logger.info(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
                 return True
         else:
-            logger.error(f"Failed to refresh {provider_name} token: {response.text}")
+            logger.error(
+                "Failed to refresh %s token (status %s)",
+                provider_name,
+                response.status_code,
+            )
 
     except Exception as e:
         logger.error(
-            f"Exception refreshing token for {provider_name}: {e}", exc_info=True
+            "Exception refreshing token for %s with %s",
+            provider_name,
+            type(e).__name__,
         )
 
     return False
@@ -444,6 +480,9 @@ class WebToolConfig(BaseToolConfig):
         mcp_auth_context: Optional[Dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
+        mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+        mcp_load_summary_tracer: Optional[Any] = None,
+        mcp_load_summary_trace_task_id: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -451,6 +490,9 @@ class WebToolConfig(BaseToolConfig):
         # reads ``config.get_tool_selection_spec()``. ``None`` defaults
         # to the ``_SpecAll`` ALL-mode (build every default tool).
         self._tool_selection_spec = tool_selection_spec
+        self._mcp_failure_policy = mcp_failure_policy
+        self._mcp_load_summary_tracer = mcp_load_summary_tracer
+        self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -681,8 +723,13 @@ class WebToolConfig(BaseToolConfig):
         if not self._include_mcp_tools:
             return []
 
-        if self._cached_mcp_configs is not None and self._mcp_config_cache_is_valid():
-            return self._cached_mcp_configs
+        if self._cached_mcp_configs is not None:
+            if self._mcp_config_cache_is_valid():
+                return self._cached_mcp_configs
+            # Once rejected, an executable config cache must not become valid
+            # again merely because a refresh updated generation/expiry metadata
+            # before failing.
+            self._cached_mcp_configs = None
 
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
@@ -959,6 +1006,36 @@ class WebToolConfig(BaseToolConfig):
         backward-compat).
         """
         return self._tool_selection_spec
+
+    def get_mcp_failure_policy(self) -> MCPFailurePolicy:
+        return self._mcp_failure_policy
+
+    async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+        """Persist one fixed-schema MCP setup audit event when configured."""
+        if self._mcp_load_summary_tracer is None:
+            return
+
+        from ...core.agent.trace import SYSTEM_INFO
+
+        await self._mcp_load_summary_tracer.trace_event(
+            SYSTEM_INFO,
+            task_id=self._mcp_load_summary_trace_task_id,
+            data={
+                "__audit_only__": True,
+                "event_type": "mcp_load_summary",
+                "requested_servers": list(summary.requested_servers),
+                "loaded_servers": list(summary.loaded_servers),
+                "failures": [
+                    {
+                        "server_name": failure.server_name,
+                        "reason": failure.reason,
+                    }
+                    for failure in summary.failures
+                ],
+                "successful_tool_count": summary.successful_tool_count,
+            },
+            require_persisted=False,
+        )
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         """Get explicitly allowed published agent IDs. None means use defaults."""
@@ -1627,32 +1704,43 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "name", "<unknown>"),
             error.exception_type,
         )
-        return self._build_unavailable_oauth_mcp_config(
+        return self._build_unavailable_mcp_config(
             server=server,
+            reason=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+            message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
             diagnostic=diagnostic,
             failure_code=error.failure_code,
         )
 
-    def _build_unavailable_oauth_mcp_config(
+    def _build_unavailable_mcp_config(
         self,
         *,
         server: Any,
-        diagnostic: Dict[str, Any],
-        failure_code: str | None,
+        reason: str,
+        message: str = UNAVAILABLE_MCP_MESSAGE,
+        diagnostic: Mapping[str, Any] | None = None,
+        failure_code: object = None,
     ) -> Dict[str, Any]:
+        safe_reason = (
+            reason
+            if type(reason) is str and reason in MCP_UNAVAILABLE_REASONS
+            else "runtime_connection_failed"
+        )
         inner_config: Dict[str, Any] = {
             "unavailable": True,
-            "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
-            "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+            "reason": safe_reason,
+            "message": message,
             "server_id": getattr(server, "id", None),
-            "diagnostic": diagnostic,
         }
-        if failure_code is not None:
-            inner_config["failure_code"] = failure_code
+        if diagnostic is not None:
+            inner_config["diagnostic"] = dict(diagnostic)
+        normalized_failure_code = normalize_tool_failure_code(failure_code)
+        if normalized_failure_code is not None:
+            inner_config["failure_code"] = normalized_failure_code
         return {
-            "name": server.name,
+            "name": getattr(server, "name", ""),
             "transport": "unavailable",
-            "description": server.description,
+            "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": str(self._user_id),
             "allow_users": [str(self._user_id)],
@@ -1710,375 +1798,494 @@ class WebToolConfig(BaseToolConfig):
             },
         }
 
+    def _new_legacy_oauth_session(self) -> Any:
+        """Open the transaction owner for legacy OAuth token maintenance."""
+        if self._db_factory is not None:
+            return self._db_factory()
+        if self._live_db is not None:
+            from sqlalchemy.orm import Session
+
+            return Session(bind=self._live_db.get_bind().engine, autoflush=False)
+        return self.get_session_factory()()
+
+    async def _resolve_legacy_oauth_access_token(
+        self,
+        *,
+        provider_name: object,
+        app_id: object,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve and persist one legacy OAuth account in an isolated transaction."""
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = self._new_legacy_oauth_session()
+        try:
+            if app_id:
+                providers_to_check = [provider_name, app_id]
+                oauth_account = (
+                    oauth_db.query(UserOAuth)
+                    .filter(
+                        UserOAuth.user_id == self._user_id,
+                        UserOAuth.provider.in_(providers_to_check),
+                    )
+                    .first()
+                )
+                logger.info(
+                    "OAUTH CONFIG: Checked providers %s for user %s. Found: %s",
+                    providers_to_check,
+                    self._user_id,
+                    oauth_account is not None,
+                )
+            else:
+                oauth_account = (
+                    oauth_db.query(UserOAuth)
+                    .filter(
+                        UserOAuth.user_id == self._user_id,
+                        UserOAuth.provider == provider_name,
+                    )
+                    .first()
+                )
+                logger.info(
+                    "OAUTH CONFIG: Checked provider '%s' for user %s. Found: %s",
+                    provider_name,
+                    self._user_id,
+                    oauth_account is not None,
+                )
+
+            if not oauth_account or not oauth_account.access_token:
+                return _LegacyOAuthTokenResolution(access_token=None)
+
+            logger.info(
+                "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
+                provider_name,
+                oauth_account.refresh_token is not None,
+                oauth_account.expires_at,
+            )
+            account_id = int(oauth_account.id)
+            is_valid = await refresh_oauth_token_if_needed(
+                oauth_db,
+                oauth_account,
+                str(provider_name) if provider_name else "",
+            )
+            if not is_valid:
+                logger.warning(
+                    "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
+                    "Deleting OAuth record to prompt user for reconnection.",
+                    provider_name,
+                )
+                # A failed flush leaves the transaction unusable. Roll it back,
+                # reload the account, then persist the disconnection atomically.
+                oauth_db.rollback()
+                oauth_account = oauth_db.get(UserOAuth, account_id)
+                if oauth_account is not None:
+                    oauth_db.delete(oauth_account)
+                    oauth_db.commit()
+                return _LegacyOAuthTokenResolution(
+                    access_token=None,
+                    refresh_failed=True,
+                )
+
+            access_token = str(oauth_account.access_token)
+            oauth_db.commit()
+            return _LegacyOAuthTokenResolution(access_token=access_token)
+        except Exception:
+            oauth_db.rollback()
+            raise
+        finally:
+            oauth_db.close()
+
+    async def _build_mcp_server_config(
+        self,
+        *,
+        server: Any,
+        user_env_by_id: Mapping[int, Any],
+        shared_env_by_id: Mapping[int, Any],
+        env_source_by_id: Mapping[int, Any],
+    ) -> Dict[str, Any]:
+        """Build one MCP server config, preserving explicit unavailable outcomes."""
+        # Build config dict from server model
+        runtime_bindings = getattr(server, "runtime_bindings", None)
+        allow_delegated_authorization = bool(
+            getattr(server, "allow_delegated_authorization", False)
+        )
+        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
+        config: Dict[str, Any] = {
+            "id": int(server.id),
+            "name": server.name,
+            "transport": server.transport,
+            "description": server.description,
+            "runtime_input_schema": getattr(server, "runtime_input_schema", None),
+            "runtime_bindings": runtime_bindings,
+            "allow_delegated_authorization": allow_delegated_authorization,
+        }
+        if runtime_values:
+            context_values = runtime_values.get("context")
+            config["connector_runtime"] = {
+                "context": context_values if isinstance(context_values, dict) else {},
+                "secrets": {},
+                "auth_selector": {},
+            }
+
+        # Add transport-specific configuration
+        transport_config: Dict[str, Any] = {}
+
+        # Handle OAuth credentials
+        if server.transport == "oauth":
+            # Find corresponding OAuth account
+            # The provider might be linkedin, google, etc. based on the app config
+            from ...web.mcp_apps import get_app_for_mcp_server
+
+            app_info = get_app_for_mcp_server(self.db, server)
+            if app_info is None:
+                logger.warning(
+                    "OAuth MCP server '%s' has no matching catalog app",
+                    getattr(server, "name", "<unknown>"),
+                )
+                return self._build_unavailable_mcp_config(
+                    server=server,
+                    reason="catalog_app_not_found",
+                )
+            provider_name = (
+                app_info.get("provider") if app_info else server.name.lower()
+            )
+
+            # Some oauth records might be saved with the app_id as provider instead of the general provider_name
+            # For example, "google-drive" instead of "google"
+            app_id = app_info.get("id") if app_info else None
+
+            hook_token: _ResolvedHookToken | None = None
+            if app_info:
+                configured_resource = _oauth_token_configured_resource(app_info)
+                providers_to_resolve = _oauth_token_provider_candidates(app_info)
+                try:
+                    hook_token = await self._resolve_oauth_token_from_hook(
+                        providers=providers_to_resolve,
+                        resource=configured_resource,
+                    )
+                except _OAuthTokenResolverFailed as error:
+                    return self._resolver_failure_config(
+                        server=server,
+                        error=error,
+                    )
+
+            if app_info and hook_token is not None:
+                self._mark_hook_token_cache_metadata(hook_token)
+                try:
+                    transport_config = self._build_oauth_mcp_stdio_transport_config(
+                        server=server,
+                        app_info=app_info,
+                        access_token=hook_token.access_token,
+                    )
+                except _OAuthLaunchConfigInvalid as error:
+                    logger.warning(
+                        "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
+                        getattr(server, "name", "<unknown>"),
+                        error.field,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="invalid_launch_config",
+                    )
+                config["transport"] = "stdio"
+                logger.info(
+                    "OAuth token resolver supplied token for MCP server '%s' via provider '%s'",
+                    getattr(server, "name", "<unknown>"),
+                    hook_token.provider,
+                )
+            else:
+                legacy_token = await self._resolve_legacy_oauth_access_token(
+                    provider_name=provider_name,
+                    app_id=app_id,
+                )
+                if legacy_token.refresh_failed:
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_refresh_failed",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
+                    )
+                if legacy_token.access_token is None:
+                    logger.info(
+                        f"OAUTH CONFIG: No valid token found for '{provider_name}'."
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
+                    )
+                logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)
+                try:
+                    transport_config = self._build_oauth_mcp_stdio_transport_config(
+                        server=server,
+                        app_info=app_info,
+                        access_token=legacy_token.access_token,
+                    )
+                except _OAuthLaunchConfigInvalid as error:
+                    logger.warning(
+                        "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
+                        getattr(server, "name", "<unknown>"),
+                        error.field,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="invalid_launch_config",
+                    )
+                config["transport"] = "stdio"
+
+        if server.transport == "stdio":
+            if server.command:
+                transport_config["command"] = server.command
+            if server.args:
+                transport_config["args"] = server.args
+            # Decrypt global env and merge per-user override (user wins).
+            from ...core.utils.encryption import decrypt_env_dict
+            from ..services.mcp_runtime import resolve_stdio_env
+
+            merged_env = resolve_stdio_env(
+                env_source_by_id.get(server.id),
+                decrypt_env_dict(getattr(server, "env", None)),
+                shared_env_by_id.get(server.id),
+                user_env_by_id.get(server.id),
+            )
+            if merged_env:
+                transport_config["env"] = merged_env
+            if server.cwd:
+                transport_config["cwd"] = server.cwd
+
+        elif server.transport in ["sse", "websocket", "streamable_http"]:
+            from ...web.mcp_apps import get_app_for_mcp_server
+            from ...web.services.mcp_runtime import (
+                build_mcp_runtime_connection,
+                connection_to_transport_config,
+                effective_mcp_oauth_resource,
+            )
+
+            auth_context = self._mcp_auth_context_for_server(
+                server_id=int(server.id),
+                runtime_values=runtime_values,
+            )
+            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            remote_providers_to_resolve: list[str] = []
+            remote_configured_resource: str | None = None
+            remote_hook_token: _ResolvedHookToken | None = None
+            if resolver is not None:
+                app_info = get_app_for_mcp_server(self.db, server)
+                remote_providers_to_resolve = (
+                    _oauth_token_provider_candidates(app_info)
+                    if app_info
+                    else [str(server.name)]
+                )
+                remote_configured_resource = effective_mcp_oauth_resource(
+                    server,
+                    mcp_auth_context=auth_context,
+                )
+                if remote_providers_to_resolve:
+                    try:
+                        remote_hook_token = await self._resolve_oauth_token_from_hook(
+                            providers=remote_providers_to_resolve,
+                            resource=remote_configured_resource,
+                            resolver=resolver,
+                        )
+                    except _OAuthTokenResolverFailed as error:
+                        return self._resolver_failure_config(
+                            server=server,
+                            error=error,
+                        )
+
+            if remote_hook_token is not None and resolver is not None:
+                self._mark_hook_token_cache_metadata(remote_hook_token)
+                resolver_connection = self._build_resolver_owned_mcp_connection(
+                    resolver=resolver,
+                    registration_generation=registration_generation,
+                    resolved=remote_hook_token,
+                    providers=remote_providers_to_resolve,
+                    user_id=int(self._user_id),
+                    scope=self.get_execution_scope(),
+                    resource=remote_configured_resource,
+                    non_auth_connection=self._non_auth_mcp_connection(
+                        server=server,
+                        runtime_values=runtime_values,
+                        runtime_bindings=runtime_bindings,
+                    ),
+                )
+                transport_config.update(
+                    connection_to_transport_config(resolver_connection)
+                )
+            else:
+                delegated_connection = self._delegated_mcp_connection(
+                    server=server,
+                    runtime_values=runtime_values,
+                    runtime_bindings=runtime_bindings,
+                    allow_delegated_authorization=allow_delegated_authorization,
+                )
+                if delegated_connection:
+                    delegated_connection["_connector_runtime_refresh"] = partial(
+                        self._refresh_delegated_mcp_connection,
+                        server=server,
+                        runtime_bindings=runtime_bindings,
+                        allow_delegated_authorization=allow_delegated_authorization,
+                    )
+                    transport_config.update(
+                        connection_to_transport_config(delegated_connection)
+                    )
+                else:
+                    try:
+                        runtime_build = await build_mcp_runtime_connection(
+                            self.db,
+                            server,
+                            user_id=self._user_id,
+                            mcp_auth_context=auth_context,
+                        )
+                    except ConnectorRuntimeError:
+                        raise
+                    except Exception as error:
+                        logger.warning(
+                            "MCP runtime connection failed for server '%s' with %s",
+                            getattr(server, "name", "<unknown>"),
+                            type(error).__name__,
+                        )
+                        return self._build_unavailable_mcp_config(
+                            server=server,
+                            reason="runtime_connection_failed",
+                        )
+                    if runtime_build.connection is None:
+                        if runtime_build.diagnostic is not None:
+                            self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
+                        diagnostic = runtime_build.diagnostic
+                        diagnostic_code = (
+                            diagnostic.get("code")
+                            if isinstance(diagnostic, Mapping)
+                            else None
+                        )
+                        reason = (
+                            diagnostic_code
+                            if isinstance(diagnostic_code, str)
+                            else "runtime_connection_failed"
+                        )
+                        return self._build_unavailable_mcp_config(
+                            server=server,
+                            reason=reason,
+                            message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                            diagnostic=diagnostic,
+                            failure_code="oauth_token_required",
+                        )
+                    transport_config.update(
+                        connection_to_transport_config(runtime_build.connection)
+                    )
+
+        transport_config["concurrency_safe"] = bool(
+            getattr(server, "concurrency_safe", False)
+        )
+        transport_config["concurrent_tools"] = list(
+            getattr(server, "concurrent_tools", None) or []
+        )
+
+        # Add Docker-specific config if managed internally
+        if server.managed == "internal":
+            if server.docker_url:
+                transport_config["docker_url"] = server.docker_url
+            if server.docker_image:
+                transport_config["docker_image"] = server.docker_image
+            if server.docker_environment:
+                transport_config["docker_environment"] = server.docker_environment
+            if server.docker_working_dir:
+                transport_config["docker_working_dir"] = server.docker_working_dir
+            if server.volumes:
+                transport_config["volumes"] = server.volumes
+            if server.bind_ports:
+                transport_config["bind_ports"] = server.bind_ports
+            if server.restart_policy:
+                transport_config["restart_policy"] = server.restart_policy
+            if server.auto_start is not None:
+                transport_config["auto_start"] = server.auto_start
+
+        config["config"] = transport_config
+
+        # Add user context for MCP tool isolation
+        config["user_id"] = str(self._user_id)
+        config["allow_users"] = [str(self._user_id)]  # Only allow current user
+
+        logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
+        return config
+
+    async def _load_mcp_server_config(
+        self,
+        *,
+        server: Any,
+        user_env_by_id: Mapping[int, Any],
+        shared_env_by_id: Mapping[int, Any],
+        env_source_by_id: Mapping[int, Any],
+    ) -> Dict[str, Any]:
+        """Isolate unexpected failures while loading one MCP server config."""
+        try:
+            return await self._build_mcp_server_config(
+                server=server,
+                user_env_by_id=user_env_by_id,
+                shared_env_by_id=shared_env_by_id,
+                env_source_by_id=env_source_by_id,
+            )
+        except ConnectorRuntimeError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Failed to load MCP server config for '%s' with %s",
+                getattr(server, "name", "<unknown>"),
+                type(error).__name__,
+            )
+            return self._build_unavailable_mcp_config(
+                server=server,
+                reason="config_load_failed",
+            )
+
     async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database with user context."""
-        logger = logging.getLogger(__name__)
-        configs = []
         self._mcp_oauth_diagnostics = []
         self._reset_mcp_config_load_cache_state()
 
         try:
             from ...web.models.mcp import MCPServer, UserMCPServer
-
-            # Query active MCP servers for this user
-            servers = (
-                self.db.query(MCPServer)
-                .join(UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id)
-                .filter(UserMCPServer.user_id == self._user_id, UserMCPServer.is_active)
-                .all()
-            )
-
-            logger.info(
-                f"Found {len(servers)} active MCP servers for user {self._user_id}"
-            )
-
-            # Per-user env overrides (decrypted), merged over each server's global
-            # env at runtime. Prefetched once to avoid an N+1 per-server lookup.
             from ..services.mcp_runtime import (
                 load_shared_env_overrides,
                 load_user_env_overrides,
                 load_user_env_sources,
             )
 
+            servers = (
+                self.db.query(MCPServer)
+                .join(UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id)
+                .filter(UserMCPServer.user_id == self._user_id, UserMCPServer.is_active)
+                .all()
+            )
+            logger.info(
+                "Found %s active MCP servers for user %s",
+                len(servers),
+                self._user_id,
+            )
+
+            # Prefetch shared runtime state once before entering the isolated
+            # per-server formatter.
             user_env_by_id = load_user_env_overrides(self.db, self._user_id)
             shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
             env_source_by_id = load_user_env_sources(self.db, self._user_id)
-
-            for server in servers:
-                # Build config dict from server model
-                runtime_bindings = getattr(server, "runtime_bindings", None)
-                allow_delegated_authorization = bool(
-                    getattr(server, "allow_delegated_authorization", False)
-                )
-                runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
-                config: Dict[str, Any] = {
-                    "id": int(server.id),
-                    "name": server.name,
-                    "transport": server.transport,
-                    "description": server.description,
-                    "runtime_input_schema": getattr(
-                        server, "runtime_input_schema", None
-                    ),
-                    "runtime_bindings": runtime_bindings,
-                    "allow_delegated_authorization": allow_delegated_authorization,
-                }
-                if runtime_values:
-                    context_values = runtime_values.get("context")
-                    config["connector_runtime"] = {
-                        "context": context_values
-                        if isinstance(context_values, dict)
-                        else {},
-                        "secrets": {},
-                        "auth_selector": {},
-                    }
-
-                # Add transport-specific configuration
-                transport_config: Dict[str, Any] = {}
-
-                # Handle OAuth credentials
-                if server.transport == "oauth":
-                    # Find corresponding OAuth account
-                    # The provider might be linkedin, google, etc. based on the app config
-                    from ...web.mcp_apps import get_app_by_name
-                    from ...web.models.user_oauth import UserOAuth
-
-                    app_info = get_app_by_name(self.db, str(server.name))
-                    provider_name = (
-                        app_info.get("provider") if app_info else server.name.lower()
-                    )
-
-                    # Some oauth records might be saved with the app_id as provider instead of the general provider_name
-                    # For example, "google-drive" instead of "google"
-                    app_id = app_info.get("id") if app_info else None
-
-                    hook_token: _ResolvedHookToken | None = None
-                    if app_info:
-                        configured_resource = _oauth_token_configured_resource(app_info)
-                        providers_to_resolve = _oauth_token_provider_candidates(
-                            app_info
-                        )
-                        try:
-                            hook_token = await self._resolve_oauth_token_from_hook(
-                                providers=providers_to_resolve,
-                                resource=configured_resource,
-                            )
-                        except _OAuthTokenResolverFailed as error:
-                            configs.append(
-                                self._resolver_failure_config(
-                                    server=server,
-                                    error=error,
-                                )
-                            )
-                            continue
-
-                    if app_info and hook_token is not None:
-                        self._mark_hook_token_cache_metadata(hook_token)
-                        try:
-                            transport_config = (
-                                self._build_oauth_mcp_stdio_transport_config(
-                                    server=server,
-                                    app_info=app_info,
-                                    access_token=hook_token.access_token,
-                                )
-                            )
-                        except _OAuthLaunchConfigInvalid as error:
-                            logger.warning(
-                                "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
-                                getattr(server, "name", "<unknown>"),
-                                error.field,
-                            )
-                            continue
-                        config["transport"] = "stdio"
-                        logger.info(
-                            "OAuth token resolver supplied token for MCP server '%s' via provider '%s'",
-                            getattr(server, "name", "<unknown>"),
-                            hook_token.provider,
-                        )
-                    else:
-                        if app_id:
-                            providers_to_check = [provider_name, app_id]
-                            oauth_account = (
-                                self.db.query(UserOAuth)
-                                .filter(
-                                    UserOAuth.user_id == self._user_id,
-                                    UserOAuth.provider.in_(providers_to_check),
-                                )
-                                .first()
-                            )
-                            logger.info(
-                                f"OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
-                            )
-                        else:
-                            oauth_account = (
-                                self.db.query(UserOAuth)
-                                .filter(
-                                    UserOAuth.user_id == self._user_id,
-                                    UserOAuth.provider == provider_name,
-                                )
-                                .first()
-                            )
-                            logger.info(
-                                f"OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
-                            )
-
-                        if oauth_account and oauth_account.access_token:
-                            logger.info(
-                                f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
-                            )
-                            # Check and refresh token if needed before using it
-                            is_valid = await refresh_oauth_token_if_needed(
-                                self.db,
-                                oauth_account,
-                                str(provider_name) if provider_name else "",
-                            )
-
-                            if not is_valid:
-                                logger.warning(
-                                    f"OAUTH CONFIG: Token for '{provider_name}' is invalid and could not be refreshed. "
-                                    "Deleting OAuth record to prompt user for reconnection."
-                                )
-                                # Delete the invalid oauth record so UI shows it as disconnected
-                                self.db.delete(oauth_account)
-                                self.db.commit()
-                                continue
-
-                            if is_valid and app_info:
-                                app_id = app_info.get("id")
-                                logger.info(
-                                    f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
-                                )
-                                try:
-                                    transport_config = (
-                                        self._build_oauth_mcp_stdio_transport_config(
-                                            server=server,
-                                            app_info=app_info,
-                                            access_token=oauth_account.access_token,
-                                        )
-                                    )
-                                except _OAuthLaunchConfigInvalid as error:
-                                    logger.warning(
-                                        "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
-                                        getattr(server, "name", "<unknown>"),
-                                        error.field,
-                                    )
-                                    continue
-                                config["transport"] = "stdio"
-
-                        else:
-                            logger.info(
-                                f"OAUTH CONFIG: No valid token found for '{provider_name}'."
-                            )
-
-                if server.transport == "stdio":
-                    if server.command:
-                        transport_config["command"] = server.command
-                    if server.args:
-                        transport_config["args"] = server.args
-                    # Decrypt global env and merge per-user override (user wins).
-                    from ...core.utils.encryption import decrypt_env_dict
-                    from ..services.mcp_runtime import resolve_stdio_env
-
-                    merged_env = resolve_stdio_env(
-                        env_source_by_id.get(server.id),
-                        decrypt_env_dict(getattr(server, "env", None)),
-                        shared_env_by_id.get(server.id),
-                        user_env_by_id.get(server.id),
-                    )
-                    if merged_env:
-                        transport_config["env"] = merged_env
-                    if server.cwd:
-                        transport_config["cwd"] = server.cwd
-
-                elif server.transport in ["sse", "websocket", "streamable_http"]:
-                    from ...web.mcp_apps import get_app_by_name
-                    from ...web.services.mcp_runtime import (
-                        build_mcp_runtime_connection,
-                        connection_to_transport_config,
-                        effective_mcp_oauth_resource,
-                    )
-
-                    auth_context = self._mcp_auth_context_for_server(
-                        server_id=int(server.id),
-                        runtime_values=runtime_values,
-                    )
-                    resolver, registration_generation = _get_oauth_token_resolver_hook()
-                    remote_providers_to_resolve: list[str] = []
-                    remote_configured_resource: str | None = None
-                    remote_hook_token: _ResolvedHookToken | None = None
-                    if resolver is not None:
-                        app_info = get_app_by_name(self.db, str(server.name))
-                        remote_providers_to_resolve = (
-                            _oauth_token_provider_candidates(app_info)
-                            if app_info
-                            else [str(server.name)]
-                        )
-                        remote_configured_resource = effective_mcp_oauth_resource(
-                            server,
-                            mcp_auth_context=auth_context,
-                        )
-                        if remote_providers_to_resolve:
-                            try:
-                                remote_hook_token = (
-                                    await self._resolve_oauth_token_from_hook(
-                                        providers=remote_providers_to_resolve,
-                                        resource=remote_configured_resource,
-                                        resolver=resolver,
-                                    )
-                                )
-                            except _OAuthTokenResolverFailed as error:
-                                configs.append(
-                                    self._resolver_failure_config(
-                                        server=server,
-                                        error=error,
-                                    )
-                                )
-                                continue
-
-                    if remote_hook_token is not None and resolver is not None:
-                        self._mark_hook_token_cache_metadata(remote_hook_token)
-                        resolver_connection = self._build_resolver_owned_mcp_connection(
-                            resolver=resolver,
-                            registration_generation=registration_generation,
-                            resolved=remote_hook_token,
-                            providers=remote_providers_to_resolve,
-                            user_id=int(self._user_id),
-                            scope=self.get_execution_scope(),
-                            resource=remote_configured_resource,
-                            non_auth_connection=self._non_auth_mcp_connection(
-                                server=server,
-                                runtime_values=runtime_values,
-                                runtime_bindings=runtime_bindings,
-                            ),
-                        )
-                        transport_config.update(
-                            connection_to_transport_config(resolver_connection)
-                        )
-                    else:
-                        delegated_connection = self._delegated_mcp_connection(
-                            server=server,
-                            runtime_values=runtime_values,
-                            runtime_bindings=runtime_bindings,
-                            allow_delegated_authorization=allow_delegated_authorization,
-                        )
-                        if delegated_connection:
-                            delegated_connection["_connector_runtime_refresh"] = (
-                                partial(
-                                    self._refresh_delegated_mcp_connection,
-                                    server=server,
-                                    runtime_bindings=runtime_bindings,
-                                    allow_delegated_authorization=allow_delegated_authorization,
-                                )
-                            )
-                            transport_config.update(
-                                connection_to_transport_config(delegated_connection)
-                            )
-                        else:
-                            runtime_build = await build_mcp_runtime_connection(
-                                self.db,
-                                server,
-                                user_id=self._user_id,
-                                mcp_auth_context=auth_context,
-                            )
-                            if runtime_build.connection is None:
-                                if runtime_build.diagnostic is not None:
-                                    self._mcp_oauth_diagnostics.append(
-                                        runtime_build.diagnostic
-                                    )
-                                continue
-                            transport_config.update(
-                                connection_to_transport_config(runtime_build.connection)
-                            )
-
-                transport_config["concurrency_safe"] = bool(
-                    getattr(server, "concurrency_safe", False)
-                )
-                transport_config["concurrent_tools"] = list(
-                    getattr(server, "concurrent_tools", None) or []
-                )
-
-                # Add Docker-specific config if managed internally
-                if server.managed == "internal":
-                    if server.docker_url:
-                        transport_config["docker_url"] = server.docker_url
-                    if server.docker_image:
-                        transport_config["docker_image"] = server.docker_image
-                    if server.docker_environment:
-                        transport_config["docker_environment"] = (
-                            server.docker_environment
-                        )
-                    if server.docker_working_dir:
-                        transport_config["docker_working_dir"] = (
-                            server.docker_working_dir
-                        )
-                    if server.volumes:
-                        transport_config["volumes"] = server.volumes
-                    if server.bind_ports:
-                        transport_config["bind_ports"] = server.bind_ports
-                    if server.restart_policy:
-                        transport_config["restart_policy"] = server.restart_policy
-                    if server.auto_start is not None:
-                        transport_config["auto_start"] = server.auto_start
-
-                config["config"] = transport_config
-
-                # Add user context for MCP tool isolation
-                config["user_id"] = str(self._user_id)
-                config["allow_users"] = [str(self._user_id)]  # Only allow current user
-
-                configs.append(config)
-                logger.debug(
-                    f"Loaded MCP server config: {server.name} ({server.transport})"
-                )
-
         except ConnectorRuntimeError:
             raise
-        except Exception as e:
-            # Preserve the legacy partial-return behavior for unrelated load
-            # errors. Resolver and OAuth launch-config failures are handled
-            # per server above so later servers can still load.
-            logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
+        except Exception as error:
+            logger.warning(
+                "Failed to scan MCP server configs with %s",
+                type(error).__name__,
+            )
+            raise MCPConfigLoadError() from error
 
-        logger.info(f"Loaded {len(configs)} MCP server configurations")
+        configs = [
+            await self._load_mcp_server_config(
+                server=server,
+                user_env_by_id=user_env_by_id,
+                shared_env_by_id=shared_env_by_id,
+                env_source_by_id=env_source_by_id,
+            )
+            for server in servers
+        ]
+        logger.info("Loaded %s MCP server configurations", len(configs))
         return configs
 
     def get_custom_api_configs(self) -> List[Dict[str, Any]]:

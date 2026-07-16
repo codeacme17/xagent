@@ -5,6 +5,11 @@ from typing import Any
 import pytest
 
 from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.config import (
+    MCPToolLoadSummary,
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
@@ -116,6 +121,44 @@ async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
 
 
 @pytest.mark.asyncio
+async def test_agent_service_rebuild_reuses_mcp_summary_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SummaryObservingConfig(RefreshingToolConfig):
+        def __init__(self) -> None:
+            super().__init__()
+            self.summaries: list[MCPToolLoadSummary] = []
+
+        async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+            self.summaries.append(summary)
+
+    tool_config = SummaryObservingConfig()
+    observed_config_ids: list[int] = []
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        observed_config_ids.append(id(config))
+        await config.emit_mcp_load_summary(MCPToolLoadSummary())
+        return [NamedTool("allowed")]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="mcp-summary-observer-refresh-test",
+        id="mcp-summary-observer-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+    await service._ensure_tools_initialized()
+
+    assert observed_config_ids == [id(tool_config), id(tool_config)]
+    assert tool_config.summaries == [MCPToolLoadSummary(), MCPToolLoadSummary()]
+
+
+@pytest.mark.asyncio
 async def test_agent_service_refreshes_when_allowed_tools_changes_from_all_to_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,3 +260,33 @@ async def test_agent_service_preserves_connector_runtime_initialization_errors(
 
     assert exc_info.value is runtime_error
     assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_agent_service_preserves_required_mcp_initialization_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_config = AllowedToolsConfig()
+    required_error = RequiredMCPUnavailableError(
+        [MCPUnavailableSummary.from_values("Gmail", "oauth_token_required")]
+    )
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        raise required_error
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="required-mcp-error-test",
+        id="required-mcp-error-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await service._ensure_tools_initialized()
+
+    assert exc_info.value is required_error

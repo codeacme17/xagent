@@ -14,8 +14,10 @@ from sqlalchemy.orm import sessionmaker
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+from xagent.core.utils.encryption import encrypt_value
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
@@ -103,7 +105,7 @@ def _add_oauth_server(
     user: User,
     *,
     name: str = "Google Drive",
-    app_id: str | None = "google-drive",
+    app_id: str | None = "resolver-google-drive",
     provider: str | None = "google",
     launch_config: object | None = None,
     register_app: bool = True,
@@ -265,6 +267,86 @@ def _assert_same_oauth_config_except_token(
     assert hook_env == user_env
 
 
+def _assert_unavailable_mcp_config(
+    config: dict,
+    server: MCPServer,
+    *,
+    reason: str,
+    oauth_token_required: bool = False,
+) -> None:
+    assert config["name"] == server.name
+    assert config["transport"] == "unavailable"
+    assert config["description"] == server.description
+    assert config["config"]["unavailable"] is True
+    assert config["config"]["reason"] == reason
+    assert config["config"]["server_id"] == server.id
+    if oauth_token_required:
+        assert config["config"]["failure_code"] == "oauth_token_required"
+    else:
+        assert "failure_code" not in config["config"]
+    expected_user_id = str(server.user_mcpservers[0].user_id)
+    assert config["user_id"] == expected_user_id
+    assert config["allow_users"] == [expected_user_id]
+    assert "runtime_input_schema" not in config
+    assert "runtime_bindings" not in config
+    assert "allow_delegated_authorization" not in config
+    assert "connector_runtime" not in config
+
+
+@pytest.mark.asyncio
+async def test_builtin_oauth_server_uses_stable_app_id_and_canonical_runtime_config(
+    db_session,
+):
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Renamed Gmail Server",
+        app_id="custom-same-name",
+        provider="wrong-provider",
+        launch_config={
+            "command": "uv",
+            "args": ["run", "wrong-server.py"],
+            "env_mapping": {"WRONG_TOKEN": "access_token"},
+        },
+    )
+    server.auth = {"app_id": "gmail"}
+    db.add(
+        PublicMCPApp(
+            app_id="gmail",
+            name="Stale Gmail Catalog Name",
+            transport="oauth",
+            provider_name="wrong-provider",
+            oauth_scopes=["wrong-scope"],
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "env_mapping": {"WRONG_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "stdio"
+    assert configs[0]["config"]["command"] == "python"
+    assert configs[0]["config"]["args"] == [
+        "-m",
+        "xagent.web.tools.mcp.gmail",
+    ]
+    assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == "hook-token"
+    assert "WRONG_TOKEN" not in configs[0]["config"]["env"]
+
+
 @pytest.mark.asyncio
 async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
     db_session,
@@ -275,7 +357,7 @@ async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
         seen.append(request.provider)
-        if request.provider == "google-drive":
+        if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -286,7 +368,7 @@ async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert seen == ["google", "google-drive"]
+    assert seen == ["google", "resolver-google-drive"]
     assert len(configs) == 1
     assert configs[0]["transport"] == "stdio"
     assert _access_token_env(configs[0]) == "hook-token"
@@ -346,7 +428,7 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
         seen.append((request.provider, request.resource, request.scope))
-        if request.provider == "google-drive":
+        if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -361,7 +443,7 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
 
     assert seen == [
         ("google", resource, scope),
-        ("google-drive", resource, scope),
+        ("resolver-google-drive", resource, scope),
     ]
     assert _access_token_env(configs[0]) == "hook-token"
 
@@ -554,7 +636,7 @@ async def test_launch_config_env_mapping_none_matches_user_oauth_shape(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_launch_config_missing_command_skips_only_that_server_for_hook(
+async def test_launch_config_missing_command_retains_unavailable_server_for_hook(
     db_session,
     caplog,
 ):
@@ -563,7 +645,7 @@ async def test_launch_config_missing_command_skips_only_that_server_for_hook(
     _add_stdio_server(db, user, name="before")
     launch_config = _launch_config()
     launch_config.pop("command")
-    _add_oauth_server(db, user, launch_config=launch_config)
+    oauth_server = _add_oauth_server(db, user, launch_config=launch_config)
     _add_stdio_server(db, user, name="after")
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
@@ -576,12 +658,20 @@ async def test_launch_config_missing_command_skips_only_that_server_for_hook(
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert [config["name"] for config in configs] == ["before", "after"]
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    _assert_unavailable_mcp_config(
+        configs[1], oauth_server, reason="invalid_launch_config"
+    )
+    assert "hook-token" not in repr(configs[1])
     assert "launch_config.command is invalid" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_launch_config_missing_command_skips_only_that_server_for_user_oauth(
+async def test_launch_config_missing_command_retains_unavailable_server_for_user_oauth(
     db_session,
     caplog,
 ):
@@ -590,25 +680,33 @@ async def test_launch_config_missing_command_skips_only_that_server_for_user_oau
     _add_stdio_server(db, user, name="before")
     launch_config = _launch_config()
     launch_config.pop("command")
-    _add_oauth_server(db, user, launch_config=launch_config)
+    oauth_server = _add_oauth_server(db, user, launch_config=launch_config)
     _add_user_oauth(db, user, provider="google", access_token="user-token")
     _add_stdio_server(db, user, name="after")
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert [config["name"] for config in configs] == ["before", "after"]
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    _assert_unavailable_mcp_config(
+        configs[1], oauth_server, reason="invalid_launch_config"
+    )
+    assert "user-token" not in repr(configs[1])
     assert "launch_config.command is invalid" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_launch_config_non_mapping_skips_only_that_server_for_hook(
+async def test_launch_config_non_mapping_retains_unavailable_server_for_hook(
     db_session,
     caplog,
 ):
     db, user = db_session
     caplog.set_level(logging.WARNING)
     _add_stdio_server(db, user, name="before")
-    _add_oauth_server(db, user, launch_config="not-a-mapping")
+    oauth_server = _add_oauth_server(db, user, launch_config="not-a-mapping")
     _add_stdio_server(db, user, name="after")
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
@@ -621,32 +719,48 @@ async def test_launch_config_non_mapping_skips_only_that_server_for_hook(
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert [config["name"] for config in configs] == ["before", "after"]
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    _assert_unavailable_mcp_config(
+        configs[1], oauth_server, reason="invalid_launch_config"
+    )
+    assert "hook-token" not in repr(configs[1])
     assert "launch_config.type is invalid" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_launch_config_non_mapping_skips_only_that_server_for_user_oauth(
+async def test_launch_config_non_mapping_retains_unavailable_server_for_user_oauth(
     db_session,
     caplog,
 ):
     db, user = db_session
     caplog.set_level(logging.WARNING)
     _add_stdio_server(db, user, name="before")
-    _add_oauth_server(db, user, launch_config=["not", "a", "mapping"])
+    oauth_server = _add_oauth_server(db, user, launch_config=["not", "a", "mapping"])
     _add_user_oauth(db, user, provider="google", access_token="user-token")
     _add_stdio_server(db, user, name="after")
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert [config["name"] for config in configs] == ["before", "after"]
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    _assert_unavailable_mcp_config(
+        configs[1], oauth_server, reason="invalid_launch_config"
+    )
+    assert "user-token" not in repr(configs[1])
     assert "launch_config.type is invalid" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_hook_is_not_asked_without_app_info(db_session):
+async def test_missing_catalog_app_retains_unavailable_oauth_server(db_session):
     db, user = db_session
-    _add_oauth_server(db, user, name="Unregistered OAuth", register_app=False)
+    server = _add_oauth_server(db, user, name="Unregistered OAuth", register_app=False)
     seen: list[str] = []
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
@@ -659,8 +773,269 @@ async def test_hook_is_not_asked_without_app_info(db_session):
 
     assert seen == []
     assert len(configs) == 1
-    assert configs[0]["name"] == "Unregistered OAuth"
-    assert configs[0]["transport"] == "oauth"
+    _assert_unavailable_mcp_config(configs[0], server, reason="catalog_app_not_found")
+
+
+@pytest.mark.asyncio
+async def test_invalid_stable_app_id_does_not_fall_back_to_catalog_name(db_session):
+    db, user = db_session
+    server = _add_oauth_server(db, user, launch_config=_launch_config())
+    server.auth = {"app_id": "missing-stable-app"}
+    db.commit()
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    _assert_unavailable_mcp_config(configs[0], server, reason="catalog_app_not_found")
+
+
+@pytest.mark.asyncio
+async def test_missing_user_oauth_token_retains_unavailable_server_and_later_servers(
+    db_session,
+):
+    db, user = db_session
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_stdio_server(db, user, name="after")
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive", "after"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_required",
+        oauth_token_required=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_server_config_failure_retains_failure_and_later_server(
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    db, user = db_session
+    failed_server = _add_stdio_server(db, user, name="before")
+    failed_server.env = {"FAIL": "encrypted-secret"}
+    _add_stdio_server(db, user, name="after")
+    db.commit()
+
+    def fail_first_server(env):
+        if env == {"FAIL": "encrypted-secret"}:
+            raise RuntimeError("decrypt-secret")
+        return {}
+
+    monkeypatch.setattr(
+        "xagent.core.utils.encryption.decrypt_env_dict",
+        fail_first_server,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        failed_server,
+        reason="config_load_failed",
+    )
+    assert configs[1]["config"]["command"] == "echo"
+    public_output = repr(configs[0]) + caplog.text
+    assert "encrypted-secret" not in public_output
+    assert "decrypt-secret" not in public_output
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invalid_record(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-secret-token"
+    )
+    account_id = oauth_account.id
+    _add_stdio_server(db, user, name="after")
+    pending_app = PublicMCPApp(
+        app_id="pending-unrelated-app",
+        name="Pending unrelated app",
+        transport="stdio",
+    )
+    db.add(pending_app)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive", "after"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    assert "expired-secret-token" not in repr(configs[0])
+    assert pending_app in db.new
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is None
+        assert (
+            verification_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == pending_app.app_id)
+            .first()
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_does_not_commit_unrelated_caller_changes(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    _add_oauth_server(
+        db,
+        user,
+        name="Meta Connector",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="meta", access_token="expired-access-secret"
+    )
+    account_id = oauth_account.id
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+    pending_app = PublicMCPApp(
+        app_id="pending-refresh-app",
+        name="Pending refresh app",
+        transport="stdio",
+    )
+    db.add(pending_app)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class SuccessfulAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(
+                200,
+                json={"access_token": "refreshed-token", "expires_in": 3600},
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        SuccessfulAsyncClient,
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert _access_token_env(configs[0], "META_ACCESS_TOKEN") == "refreshed-token"
+    assert pending_app in db.new
+    with isolated_session_factory() as verification_db:
+        refreshed_account = verification_db.get(UserOAuth, account_id)
+        assert refreshed_account is not None
+        assert refreshed_account.access_token == "refreshed-token"
+        assert (
+            verification_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == pending_app.app_id)
+            .first()
+            is None
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["response", "exception"])
+async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
+    db_session,
+    monkeypatch,
+    caplog,
+    failure_kind,
+):
+    db, user = db_session
+    response_secret = "response-body-secret-token"
+    exception_secret = "transport-exception-secret-token"
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-access-secret"
+    )
+    oauth_account.refresh_token = "refresh-secret-value"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    class FailingAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            if failure_kind == "exception":
+                raise RuntimeError(exception_secret)
+            return httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": response_secret,
+                    "access_token": "leaked-response-access-token",
+                },
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        FailingAsyncClient,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        is_valid = await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+
+    assert is_valid is False
+    assert response_secret not in caplog.text
+    assert exception_secret not in caplog.text
+    assert "leaked-response-access-token" not in caplog.text
+    assert "client-secret-value" not in caplog.text
+    assert "refresh-secret-value" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -730,7 +1105,7 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
             "resource": None,
             "scope": "",
             "issuer": None,
-            "providers": ["google", "google-drive"],
+            "providers": ["google", "resolver-google-drive"],
             "exception_type": "RuntimeError",
         }
     ]
@@ -1057,7 +1432,7 @@ async def test_invalid_launch_config_with_uncacheable_hook_token_is_not_cached(
     db_session,
 ):
     db, user = db_session
-    _add_oauth_server(db, user, launch_config="not-a-mapping")
+    server = _add_oauth_server(db, user, launch_config="not-a-mapping")
     calls = 0
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
@@ -1074,7 +1449,8 @@ async def test_invalid_launch_config_with_uncacheable_hook_token_is_not_cached(
     db.commit()
     second = await cfg.get_mcp_server_configs()
 
-    assert first == []
+    _assert_unavailable_mcp_config(first[0], server, reason="invalid_launch_config")
+    assert "hook-token-1" not in repr(first[0])
     assert calls == 2
     assert _access_token_env(second[0]) == "hook-token-2"
 
@@ -1264,7 +1640,9 @@ async def test_remote_without_hook_skips_resolver_candidate_work(
     def unexpected_resolver_work(*args, **kwargs):
         pytest.fail("resolver-specific work ran without a registered hook")
 
-    monkeypatch.setattr("xagent.web.mcp_apps.get_app_by_name", unexpected_resolver_work)
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.get_app_for_mcp_server", unexpected_resolver_work
+    )
     monkeypatch.setattr(
         "xagent.web.services.mcp_runtime.effective_mcp_oauth_resource",
         unexpected_resolver_work,
@@ -1483,7 +1861,7 @@ async def test_remote_hook_decline_preserves_delegated_runtime_path(db_session):
 @pytest.mark.asyncio
 async def test_remote_hook_decline_preserves_standard_oauth_path(db_session):
     db, user = db_session
-    _add_remote_server(
+    server = _add_remote_server(
         db,
         user,
         auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
@@ -1500,8 +1878,53 @@ async def test_remote_hook_decline_preserves_standard_oauth_path(db_session):
     configs = await cfg.get_mcp_server_configs()
 
     assert seen == ["records", "remote-records"]
-    assert configs == []
+    _assert_unavailable_mcp_config(
+        configs[0],
+        server,
+        reason="authorization_required",
+        oauth_token_required=True,
+    )
     assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "authorization_required"
+
+
+@pytest.mark.asyncio
+async def test_remote_runtime_connection_exception_retains_safe_unavailable_config(
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    db, user = db_session
+    _add_stdio_server(db, user, name="before")
+    remote_server = _add_remote_server(
+        db,
+        user,
+        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+        headers={"Authorization": "Bearer static-secret"},
+    )
+    _add_stdio_server(db, user, name="after")
+
+    async def fail_runtime_connection(*args, **kwargs):
+        raise RuntimeError("runtime-connection-secret")
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        fail_runtime_connection,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Remote Records",
+        "after",
+    ]
+    _assert_unavailable_mcp_config(
+        configs[1], remote_server, reason="runtime_connection_failed"
+    )
+    public_output = repr(configs[1]) + caplog.text
+    assert "runtime-connection-secret" not in public_output
+    assert "static-secret" not in public_output
 
 
 @pytest.mark.asyncio

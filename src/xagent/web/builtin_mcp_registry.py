@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from copy import deepcopy
 from typing import Any
 
 import sqlalchemy as sa
@@ -109,8 +112,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["openid", "profile", "email", "w_member_social"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.linkedin"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.linkedin"],
                 "env_mapping": {"LINKEDIN_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -125,8 +128,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.gmail"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -141,13 +144,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": [
-                    "run",
-                    "python",
-                    "-m",
-                    "xagent.web.tools.mcp.google_drive",
-                ],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_drive"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -162,8 +160,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.calendar"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.calendar"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -185,8 +183,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.teams"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -206,8 +204,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.outlook"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -222,8 +220,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["Files.ReadWrite"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -242,8 +240,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.facebook"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -263,8 +261,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -287,6 +285,99 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+_BUILTIN_EXECUTION_FIELD_NAMES = (
+    "name",
+    "transport",
+    "provider_name",
+    "oauth_scopes",
+    "launch_config",
+)
+
+
+def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
+    for row in get_builtin_public_mcp_app_rows():
+        if row["app_id"] == app_id:
+            return deepcopy(row)
+    return None
+
+
+def is_builtin_public_mcp_app(app_id: str) -> bool:
+    return any(row["app_id"] == app_id for row in get_builtin_public_mcp_app_rows())
+
+
+def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None:
+        return None
+    return deepcopy(
+        {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
+    )
+
+
+def _safe_configuration_hash(values: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        values,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(serialized).hexdigest()}"
+
+
+def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
+    """Return safe summaries for persisted built-in catalog drift.
+
+    Missing rows are intentionally outside this drift-only check; supported
+    admin writes cannot delete built-ins, and this validator never recreates
+    data. Only rows selected by exact built-in ``app_id`` are compared, so
+    custom applications remain database-owned.
+    """
+
+    canonical_rows = get_builtin_public_mcp_app_rows()
+    canonical_by_app_id = {row["app_id"]: row for row in canonical_rows}
+    selected_columns = [
+        PUBLIC_MCP_APPS_TABLE.c.app_id,
+        *(PUBLIC_MCP_APPS_TABLE.c[field] for field in _BUILTIN_EXECUTION_FIELD_NAMES),
+    ]
+    persisted_rows = bind.execute(
+        sa.select(*selected_columns).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id.in_(tuple(canonical_by_app_id))
+        )
+    ).mappings()
+    persisted_by_app_id = {row["app_id"]: row for row in persisted_rows}
+
+    mismatches: list[dict[str, Any]] = []
+    for app_id, canonical_row in canonical_by_app_id.items():
+        persisted_row = persisted_by_app_id.get(app_id)
+        if persisted_row is None:
+            continue
+
+        mismatched_fields = [
+            field_name
+            for field_name in _BUILTIN_EXECUTION_FIELD_NAMES
+            if persisted_row[field_name] != canonical_row[field_name]
+        ]
+        if not mismatched_fields:
+            continue
+
+        canonical_values = {
+            field_name: canonical_row[field_name] for field_name in mismatched_fields
+        }
+        persisted_values = {
+            field_name: persisted_row[field_name] for field_name in mismatched_fields
+        }
+        mismatches.append(
+            {
+                "app_id": app_id,
+                "mismatched_fields": mismatched_fields,
+                "canonical_hash": _safe_configuration_hash(canonical_values),
+                "persisted_hash": _safe_configuration_hash(persisted_values),
+            }
+        )
+
+    return mismatches
 
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:

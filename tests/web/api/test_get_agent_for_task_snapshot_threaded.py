@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
@@ -45,12 +46,13 @@ def _make_user() -> User:
     return User(id=1, username="snap-int-user", password_hash="hash", is_admin=False)
 
 
-def _build_snapshot() -> TaskSetupSnapshot:
+def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
             id=42,
             user_id=1,
             status=TaskStatus.PENDING,
+            source=source,
             agent_id=None,
             agent_config=None,
             model_name=None,
@@ -78,9 +80,11 @@ async def test_snapshot_runs_off_loop_thread() -> None:
     loop_thread_id = threading.get_ident()
     loader_thread_id: dict[str, int] = {}
 
+    loaded_snapshot = _build_snapshot(source="trigger")
+
     def fake_loader(task_id: int, user_id: int | None) -> TaskSetupSnapshot:
         loader_thread_id["id"] = threading.get_ident()
-        return _build_snapshot()
+        return loaded_snapshot
 
     manager = AgentServiceManager()
     user = _make_user()
@@ -130,6 +134,7 @@ async def test_snapshot_runs_off_loop_thread() -> None:
         "fails when the ``to_thread`` wrapper is removed or the "
         "loader is being called inline."
     )
+    assert loaded_snapshot.task.source == "trigger"
 
 
 @pytest.mark.asyncio
@@ -281,6 +286,47 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "expected_policy"),
+    [
+        ("trigger", MCPFailurePolicy.STRICT),
+        ("internal", MCPFailurePolicy.BEST_EFFORT),
+        (None, MCPFailurePolicy.BEST_EFFORT),
+    ],
+)
+async def test_snapshot_source_controls_mcp_failure_policy(
+    source: str | None,
+    expected_policy: MCPFailurePolicy,
+) -> None:
+    snapshot = _build_snapshot(source=source)
+    manager = AgentServiceManager()
+    user = _make_user()
+    db = MagicMock()
+    task_row = MagicMock(status=TaskStatus.PENDING)
+    db.query.return_value.filter.return_value.first.return_value = task_row
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+
+    tracer = MagicMock()
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=tracer),
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService"),
+    ):
+        await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert create_tools.await_args.kwargs["mcp_failure_policy"] is expected_policy
+    assert create_tools.await_args.kwargs["mcp_load_summary_tracer"] is tracer
+    assert create_tools.await_args.kwargs["mcp_load_summary_trace_task_id"] == "42"
+
+
+@pytest.mark.asyncio
 async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -> None:
     """Snapshot path must share the same fail-fast failure policy as
     the reconstruct path.
@@ -310,6 +356,7 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
             id=42,
             user_id=1,
             status=TaskStatus.PENDING,
+            source="trigger",
             agent_id=7,
             agent_config=None,
             model_name=None,

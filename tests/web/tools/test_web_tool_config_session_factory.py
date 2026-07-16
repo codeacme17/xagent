@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
@@ -75,6 +76,15 @@ class _TrackingSession:
         self.closed = True
 
 
+class _FailingQuerySession:
+    def __init__(self):
+        self.query_calls = 0
+
+    def query(self, *args, **kwargs):
+        self.query_calls += 1
+        raise RuntimeError("database-secret")
+
+
 def test_get_session_factory_prefers_injected_factory():
     factory = _factory()
     cfg = WebToolConfig(db=None, request=None, db_factory=factory)
@@ -99,6 +109,23 @@ def test_live_db_path_unchanged():
     cfg.close()  # must not raise; caller owns the request session
 
 
+def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():
+    engine = create_engine("sqlite://")
+    connection = engine.connect()
+    caller_db = Session(bind=connection)
+    cfg = WebToolConfig(db=caller_db, request=None, user_id=1)
+
+    oauth_db = cfg._new_legacy_oauth_session()
+    try:
+        assert caller_db.get_bind() is connection
+        assert oauth_db.get_bind() is engine
+    finally:
+        oauth_db.close()
+        caller_db.close()
+        connection.close()
+        engine.dispose()
+
+
 def test_custom_api_loader_uses_factory_session():
     # Factory-only (nested child) config: the loader must mint/reuse the lazy
     # factory session via get_db(), not read the None live ``self.db`` and
@@ -114,6 +141,41 @@ def test_mcp_loader_uses_factory_session():
     cfg = WebToolConfig(db=None, request=None, db_factory=lambda: sess, user_id=1)
     asyncio.run(cfg._load_mcp_server_configs())
     assert sess.query_calls >= 1
+
+
+def test_mcp_config_scan_failure_raises_safe_typed_error():
+    cfg = WebToolConfig(
+        db=_FailingQuerySession(),
+        request=None,
+        user_id=1,
+        include_mcp_tools=True,
+    )
+
+    with pytest.raises(MCPConfigLoadError) as exc_info:
+        asyncio.run(cfg._load_mcp_server_configs())
+
+    assert exc_info.value.summaries[0].server_name == "MCP server"
+    assert exc_info.value.summaries[0].reason == "config_load_failed"
+    assert "database-secret" not in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_failed_mcp_config_refresh_never_reuses_stale_cache():
+    session = _FailingQuerySession()
+    cfg = WebToolConfig(
+        db=session,
+        request=None,
+        user_id=1,
+        include_mcp_tools=True,
+    )
+    cfg._cached_mcp_configs = [{"name": "stale", "config": {"token": "secret"}}]
+    cfg._mcp_hook_generation_at_load = -1
+
+    for _ in range(2):
+        with pytest.raises(MCPConfigLoadError):
+            asyncio.run(cfg.get_mcp_server_configs())
+
+    assert session.query_calls == 2
 
 
 def test_connector_runtime_turn_switch_invalidates_runtime_caches():

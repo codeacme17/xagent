@@ -8,7 +8,10 @@ import pytest
 
 from xagent.config import MCP_TOOL_INIT_TIMEOUT_SECONDS
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
+from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
     _load_server_tools_bounded,
     load_mcp_tools_as_agent_tools,
 )
@@ -25,12 +28,16 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
     async def fake_load_direct(server_name, connection, **kwargs):
         if server_name == "stalled":
             await asyncio.Event().wait()  # never completes
-        return [healthy_tool]
+        return MCPLoadResult(
+            tools=(healthy_tool,),
+            loaded_servers=(server_name,),
+            failures=(),
+        )
 
     monkeypatch.setattr(mcp_adapter_module, "_load_direct_mcp_tools", fake_load_direct)
 
     started = time.monotonic()
-    tools = await load_mcp_tools_as_agent_tools(
+    result = await load_mcp_tools_as_agent_tools(
         {
             "stalled": {"transport": "streamable_http", "url": "http://x"},
             "healthy": {"transport": "streamable_http", "url": "http://y"},
@@ -38,7 +45,12 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
     )
     elapsed = time.monotonic() - started
 
-    assert tools == [healthy_tool]
+    assert result.tools == (healthy_tool,)
+    assert result.loaded_servers == ("healthy",)
+    assert len(result.failures) == 1
+    assert result.failures[0].server_name == "stalled"
+    assert result.failures[0].phase is MCPFailurePhase.INITIALIZE
+    assert result.failures[0].error_type == "TimeoutError"
     # 1s timeout for the stalled server plus fast healthy load; the old
     # behavior blocked forever.
     assert elapsed < 5
@@ -250,6 +262,9 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
 
         def release_db_connection(self):
             calls.append("release_db")
+
+        def get_mcp_failure_policy(self):
+            return MCPFailurePolicy.BEST_EFFORT
 
         def get_sandbox(self):
             return None

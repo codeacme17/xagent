@@ -10,7 +10,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
+    MCPServerLoadFailure,
+)
 from xagent.core.tools.core.mcp.manager.db import DatabaseMCPServerManager, MCPServer
 from xagent.core.utils.encryption import encrypt_value
 from xagent.core.workspace import TaskWorkspace
@@ -411,7 +420,11 @@ class TestToolFactoryMCPIntegration:
         """Test successful MCP tools creation."""
         # Setup mock
         mock_tools = [MagicMock(), MagicMock()]
-        mock_load_mcp.return_value = mock_tools
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=tuple(mock_tools),
+            loaded_servers=(sample_stdio_config["name"],),
+            failures=(),
+        )
 
         # Add MCP server to database
         manager = DatabaseMCPServerManager(test_db)
@@ -431,32 +444,47 @@ class TestToolFactoryMCPIntegration:
         assert sample_stdio_config["name"] in connections_arg
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
-    async def test_create_mcp_tools_skips_mcp_oauth_but_loads_other_servers(
+    async def test_create_mcp_tools_exposes_unavailable_oauth_and_loads_other_servers(
         self, mock_load_mcp, test_db, sample_stdio_config
     ):
         mock_tools = [MagicMock()]
-        mock_load_mcp.return_value = mock_tools
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=tuple(mock_tools),
+            loaded_servers=(sample_stdio_config["name"],),
+            failures=(),
+        )
         manager = DatabaseMCPServerManager(test_db)
         manager.add_server(manager.create_config(**sample_stdio_config))
         manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+        oauth_server = (
+            test_db.query(MCPServer).filter_by(name="test_mcp_oauth_server").one()
+        )
 
         tools = await ToolFactory.create_mcp_tools(test_db)
 
-        assert tools == mock_tools
+        assert [tool.name for tool in tools[:-1]] == [
+            f"mcp_test_mcp_oauth_server_{oauth_server.id}_unavailable"
+        ]
+        assert tools[-1] is mock_tools[0]
         connections_arg = mock_load_mcp.call_args[0][0]
         assert sample_stdio_config["name"] in connections_arg
         assert "test_mcp_oauth_server" not in connections_arg
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
-    async def test_create_mcp_tools_all_mcp_oauth_returns_empty_without_loading(
+    async def test_create_mcp_tools_all_mcp_oauth_returns_unavailable_without_loading(
         self, mock_load_mcp, test_db
     ):
         manager = DatabaseMCPServerManager(test_db)
         manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+        oauth_server = (
+            test_db.query(MCPServer).filter_by(name="test_mcp_oauth_server").one()
+        )
 
         tools = await ToolFactory.create_mcp_tools(test_db)
 
-        assert tools == []
+        assert [tool.name for tool in tools] == [
+            f"mcp_test_mcp_oauth_server_{oauth_server.id}_unavailable"
+        ]
         mock_load_mcp.assert_not_called()
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
@@ -464,7 +492,11 @@ class TestToolFactoryMCPIntegration:
         self, mock_load_mcp, test_db
     ):
         mock_tools = [MagicMock()]
-        mock_load_mcp.return_value = mock_tools
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=tuple(mock_tools),
+            loaded_servers=("test_mcp_oauth_server",),
+            failures=(),
+        )
         manager = DatabaseMCPServerManager(test_db)
         manager.add_server(manager.create_config(**self._mcp_oauth_config()))
         server = test_db.query(MCPServer).filter_by(name="test_mcp_oauth_server").one()
@@ -510,6 +542,91 @@ class TestToolFactoryMCPIntegration:
         }
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_exposes_structured_runtime_failure(
+        self, mock_load_mcp, test_db, sample_stdio_config
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=sample_stdio_config["name"],
+                    phase=MCPFailurePhase.SESSION_START,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+        tools = await ToolFactory.create_mcp_tools(test_db)
+
+        assert [tool.name for tool in tools] == [
+            f"mcp_test_stdio_server_{server.id}_unavailable"
+        ]
+        result = tools[0].run_json_sync({})
+        assert result["reason"] == "session_start"
+        assert result["error"] == "MCP server could not be started."
+        assert "BearerSecretError" not in repr(result)
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_enforces_strict_failure_policy(
+        self, mock_load_mcp, test_db, sample_stdio_config
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=sample_stdio_config["name"],
+                    phase=MCPFailurePhase.SESSION_START,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await ToolFactory.create_mcp_tools(
+                test_db,
+                mcp_failure_policy=MCPFailurePolicy.STRICT,
+            )
+
+        assert exc_info.value.summaries[0].server_name == sample_stdio_config["name"]
+        assert exc_info.value.summaries[0].reason == "session_start"
+        assert "BearerSecretError" not in str(exc_info.value)
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_scopes_loader_failure_to_requested_user(
+        self, mock_load_mcp, test_db, sample_stdio_config, monkeypatch
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
+        test_db.add(
+            UserMCPServer(
+                user_id=1,
+                mcpserver_id=server.id,
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        test_db.commit()
+        mock_load_mcp.side_effect = RuntimeError("loader failed")
+
+        tools = await ToolFactory.create_mcp_tools(test_db, user_id=1)
+
+        monkeypatch.setenv("XAGENT_USER_ID", "2")
+        result = tools[0].run_json_sync({})
+        assert "Access denied" in result["content"][0]["text"]
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):
         """Test MCP tools creation with no connections."""
         tools = await ToolFactory.create_mcp_tools(test_db)
@@ -529,11 +646,16 @@ class TestToolFactoryMCPIntegration:
         manager = DatabaseMCPServerManager(test_db)
         config = manager.create_config(**sample_stdio_config)
         manager.add_server(config)
+        server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
 
         # Create MCP tools (should handle error gracefully)
-        tools = await ToolFactory.create_mcp_tools(test_db, user_id=1)
+        tools = await ToolFactory.create_mcp_tools(test_db)
 
-        assert tools == []
+        assert [tool.name for tool in tools] == [
+            f"mcp_test_stdio_server_{server.id}_unavailable"
+        ]
 
     def test_create_mcp_tools_sync_wrapper(self, test_db, sample_stdio_config):
         """Test synchronous wrapper for MCP tools creation."""

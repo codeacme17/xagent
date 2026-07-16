@@ -12,6 +12,7 @@ import json
 import logging
 import secrets
 import shlex
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -192,6 +193,45 @@ class MCPConnectionTestResponse(BaseModel):
     success: bool
     message: str
     details: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class _MCPToolLoadAPIProjection:
+    """Public-safe API projection that preserves usable partial load results."""
+
+    tools: tuple[Any, ...]
+    failure_message: str
+    failures: tuple[dict[str, Any], ...]
+
+
+def _project_mcp_tool_load_result(load_result: Any) -> _MCPToolLoadAPIProjection:
+    """Project one structured load without collapsing partial success."""
+    from ...core.tools.adapters.vibe.mcp_adapter import (
+        MCPFailurePhase,
+        MCPServerLoadFailure,
+        mcp_load_failure_message,
+    )
+
+    failures = [
+        failure
+        for failure in getattr(load_result, "failures", ())
+        if isinstance(failure, MCPServerLoadFailure)
+    ]
+    failure_message = mcp_load_failure_message(
+        failures[0].phase if failures else MCPFailurePhase.NO_TOOLS_RETURNED
+    )
+    return _MCPToolLoadAPIProjection(
+        tools=tuple(getattr(load_result, "tools", ())),
+        failure_message=failure_message,
+        failures=tuple(
+            {
+                "server_name": failure.server_name,
+                "phase": failure.phase.value,
+                "attempts": failure.attempts,
+            }
+            for failure in failures
+        ),
+    )
 
 
 class MCPOAuthDiscoverRequest(BaseModel):
@@ -2852,36 +2892,44 @@ async def test_mcp_connection(
 
         try:
             connections_dict: Dict[str, Any] = {"test": connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix="test_"
             )
 
-            if tools:
+            projection = _project_mcp_tool_load_result(load_result)
+            details: dict[str, Any] = {"tool_count": len(projection.tools)}
+            if projection.failures:
+                details["failures"] = list(projection.failures)
+            if projection.tools:
                 return MCPConnectionTestResponse(
                     success=True,
-                    message=f"Successfully connected to {test_data.name}. Loaded {len(tools)} tools.",
-                    details={"tool_count": len(tools)},
+                    message=f"Successfully connected to {test_data.name}. Loaded {len(projection.tools)} tools.",
+                    details=details,
                 )
-            else:
-                return MCPConnectionTestResponse(
-                    success=True,
-                    message=f"Connected to {test_data.name}, but no tools were loaded.",
-                    details={"tool_count": 0},
-                )
-
-        except Exception as conn_error:
             return MCPConnectionTestResponse(
                 success=False,
-                message=f"Failed to connect to {test_data.name}: {str(conn_error)}",
-                details={"error": str(conn_error)},
+                message=projection.failure_message,
+                details=details,
+            )
+
+        except Exception as conn_error:
+            logger.warning(
+                "MCP connection test failed for '%s' (%s)",
+                test_data.name,
+                type(conn_error).__name__,
+            )
+            return MCPConnectionTestResponse(
+                success=False,
+                message=f"Failed to connect to {test_data.name}.",
+                details={"error": "mcp_connection_test_failed"},
             )
 
     except Exception as e:
-        logger.error(f"Failed to test MCP connection: {e}")
+        logger.error("Failed to test MCP connection (%s)", type(e).__name__)
         return MCPConnectionTestResponse(
             success=False,
-            message=f"Connection test failed: {str(e)}",
-            details={"error": str(e)},
+            message="Connection test failed.",
+            details={"error": "mcp_connection_test_failed"},
         )
 
 
@@ -3037,17 +3085,28 @@ async def get_mcp_server_tools(
 
         server_name = server.name
         tools: List[Any] = []
+        load_failures: tuple[dict[str, Any], ...] = ()
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix=f"server_{server_id}_"
             )
+            projection = _project_mcp_tool_load_result(load_result)
+            if not projection.tools:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail={
+                        "code": "mcp_tools_unavailable",
+                        "message": projection.failure_message,
+                        "failures": list(projection.failures),
+                    },
+                )
+            tools = list(projection.tools)
+            load_failures = projection.failures
 
-        tools_list: List[Any] = tools if isinstance(tools, list) else []
-
-        return {
+        response = {
             "server_name": server.name,
-            "tool_count": len(tools_list),
+            "tool_count": len(tools),
             "tools": [
                 {
                     "name": getattr(tool, "name", str(tool)),
@@ -3055,14 +3114,17 @@ async def get_mcp_server_tools(
                         tool, "description", "No description available"
                     ),
                 }
-                for tool in tools_list
+                for tool in tools
             ],
         }
+        if load_failures:
+            response["failures"] = list(load_failures)
+        return response
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get MCP server tools: {e}")
+        logger.error("Failed to get MCP server tools (%s)", type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get MCP server tools",
