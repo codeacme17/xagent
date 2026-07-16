@@ -448,16 +448,24 @@ class LanceDBMemoryStore(MemoryStore):
         except (json.JSONDecodeError, TypeError):
             metadata = {}
 
-        return MemoryNote(
-            id=data.get("id"),
-            content=metadata.pop("content", data.get("text", "")),
-            keywords=metadata.pop("keywords", []),
-            tags=metadata.pop("tags", []),
-            category=metadata.pop("category", "general"),
-            timestamp=metadata.pop("timestamp", None),
-            mime_type=metadata.pop("mime_type", "text/plain"),
-            metadata=metadata,
-        )
+        note_kwargs: dict[str, Any] = {
+            "id": data.get("id"),
+            "content": metadata.pop("content", data.get("text", "")),
+            "keywords": metadata.pop("keywords", []),
+            "tags": metadata.pop("tags", []),
+            "category": metadata.pop("category", "general"),
+            "mime_type": metadata.pop("mime_type", "text/plain"),
+            "metadata": metadata,
+        }
+        # #847: legacy rows may lack `timestamp`. MemoryNote.timestamp is a
+        # non-optional datetime with a default_factory, and pydantic only
+        # applies the factory when the field is omitted — an explicit None
+        # raises ValidationError.
+        timestamp = metadata.pop("timestamp", None)
+        if timestamp is not None:
+            note_kwargs["timestamp"] = timestamp
+
+        return MemoryNote(**note_kwargs)
 
     def _apply_filters(self, note: MemoryNote, filters: dict[str, Any]) -> bool:
         """Apply filters to a MemoryNote for vector search results.
@@ -734,7 +742,20 @@ class LanceDBMemoryStore(MemoryStore):
                                     "text": row.get("text", ""),
                                     "metadata": row.get("metadata", "{}"),
                                 }
-                                note = self._dict_to_memory_note(note_data)
+                                # #847: a malformed row must not abort the whole
+                                # vector branch — escaping to the outer except
+                                # after earlier appends would skip the text
+                                # fallback and silently truncate the results.
+                                try:
+                                    note = self._dict_to_memory_note(note_data)
+                                except Exception as row_error:
+                                    logger.warning(
+                                        "Skipping malformed memory row %r in "
+                                        "vector search results: %s",
+                                        note_data["id"],
+                                        row_error,
+                                    )
+                                    continue
 
                                 # user_id + scope dimensions were already applied
                                 # as a `where` prefilter; only residual filters
@@ -803,7 +824,18 @@ class LanceDBMemoryStore(MemoryStore):
                             "text": text,
                             "metadata": metadata,
                         }
-                        note = self._dict_to_memory_note(note_data)
+                        # #847: here a malformed row would escape to the outer
+                        # except and turn the whole query into an empty result.
+                        try:
+                            note = self._dict_to_memory_note(note_data)
+                        except Exception as row_error:
+                            logger.warning(
+                                "Skipping malformed memory row %r in text "
+                                "search results: %s",
+                                note_data["id"],
+                                row_error,
+                            )
+                            continue
                         results.append(note)
 
                         if len(results) >= k:

@@ -1,10 +1,11 @@
+import json
 import shutil
 import tempfile
 
 import pytest
 
 from xagent.core.memory.core import MemoryNote
-from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.lancedb import LanceDBMemoryStore, _safe_close_table
 
 
 @pytest.fixture
@@ -467,6 +468,142 @@ def test_invalid_memory_id(memory_store):
     response = memory_store.delete("non-existent-id")
     # This might succeed or fail depending on implementation
     # The important thing is that it doesn't crash
+
+
+# --- #847: search() must not silently truncate on a mid-loop row failure ---
+
+
+def _insert_raw_row(store, collection_name, record):
+    """Insert a row directly into the LanceDB table, bypassing add()."""
+    conn = store._vector_store.get_raw_connection()
+    table = conn.open_table(collection_name)
+    try:
+        table.add([record])
+    finally:
+        _safe_close_table(table)
+
+
+def test_dict_to_memory_note_missing_timestamp(memory_store):
+    """A legacy row whose metadata lacks `timestamp` must convert using the
+    model default instead of raising ValidationError (#847 root cause)."""
+    note = memory_store._dict_to_memory_note(
+        {
+            "id": "legacy-1",
+            "text": "legacy content",
+            "metadata": json.dumps({"content": "legacy content"}),
+        }
+    )
+    assert note.content == "legacy content"
+    assert note.timestamp is not None
+    assert "timestamp" not in note.metadata
+
+
+def test_search_returns_legacy_rows_missing_timestamp(memory_store):
+    """A vector search whose top-k contains a timestamp-less legacy row must
+    return all matching rows, including the legacy one (#847)."""
+    for i in range(3):
+        assert memory_store.add(MemoryNote(content=f"well-formed note {i}")).success
+
+    _insert_raw_row(
+        memory_store,
+        "test_memories",
+        {
+            "id": "legacy-no-ts",
+            "vector": [0.1] * 64,
+            "text": "legacy note without timestamp",
+            "metadata": json.dumps({"content": "legacy note without timestamp"}),
+            "user_id": None,
+            "scope_dims": [],
+        },
+    )
+
+    results = memory_store.search("note", k=10)
+    ids = {r.id for r in results}
+    contents = {r.content for r in results}
+    assert {f"well-formed note {i}" for i in range(3)} <= contents
+    assert "legacy-no-ts" in ids
+
+
+def test_search_skips_malformed_row_without_truncation(memory_store):
+    """A row whose conversion genuinely fails (unparseable timestamp) must be
+    skipped, not abort the vector branch after earlier appends — which used to
+    suppress the text fallback and silently truncate the results (#847).
+
+    The malformed row is seeded BETWEEN well-formed rows so that, pre-fix, the
+    mid-loop escape would drop the rows inserted after it."""
+    for i in range(2):
+        assert memory_store.add(MemoryNote(content=f"well-formed note {i}")).success
+
+    _insert_raw_row(
+        memory_store,
+        "test_memories",
+        {
+            "id": "malformed-ts",
+            "vector": [0.1] * 64,
+            "text": "malformed note",
+            "metadata": json.dumps(
+                {"content": "malformed note", "timestamp": "not-a-datetime"}
+            ),
+            "user_id": None,
+            "scope_dims": [],
+        },
+    )
+
+    for i in range(2, 4):
+        assert memory_store.add(MemoryNote(content=f"well-formed note {i}")).success
+
+    results = memory_store.search("note", k=10)
+    contents = {r.content for r in results}
+    assert {f"well-formed note {i}" for i in range(4)} <= contents
+    assert all(r.id != "malformed-ts" for r in results)
+
+
+def test_text_fallback_skips_malformed_row(temp_db_dir):
+    """The text-search fallback must also skip a malformed row instead of
+    escaping to the outer except and returning an empty result set (#847)."""
+    from xagent.core.model.embedding import BaseEmbedding
+
+    class FailingEmbedding(BaseEmbedding):
+        def __init__(self):
+            self._dimension = 64
+
+        def encode(self, text, dimension=None, instruct=None):
+            raise Exception("Embedding failed")
+
+        def get_dimension(self):
+            return self._dimension
+
+        @property
+        def abilities(self):
+            return ["embed"]
+
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="test_text_fallback_847",
+        embedding_model=FailingEmbedding(),
+    )
+
+    for i in range(3):
+        assert store.add(MemoryNote(content=f"well-formed note {i}")).success
+
+    _insert_raw_row(
+        store,
+        "test_text_fallback_847",
+        {
+            "id": "malformed-ts",
+            "text": "malformed note",
+            "metadata": json.dumps(
+                {"content": "malformed note", "timestamp": "not-a-datetime"}
+            ),
+            "user_id": None,
+            "scope_dims": [],
+        },
+    )
+
+    results = store.search("note", k=10)
+    contents = {r.content for r in results}
+    assert {f"well-formed note {i}" for i in range(3)} <= contents
+    assert all(r.id != "malformed-ts" for r in results)
 
 
 if __name__ == "__main__":
