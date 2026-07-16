@@ -107,10 +107,12 @@ def _new_callback_id() -> str:
 def _is_already_exists(exc: Exception) -> bool:
     try:
         # gRPC raises AlreadyExists; the REST transport maps HTTP 409 to its
-        # parent class Conflict, so match the whole 409 family.
-        from google.api_core.exceptions import Conflict
+        # parent class Conflict. Match exactly those two — Aborted is also a
+        # Conflict subclass but signals a transient concurrency error, not
+        # "already exists", and must propagate.
+        from google.api_core.exceptions import AlreadyExists, Conflict
 
-        return isinstance(exc, Conflict)
+        return isinstance(exc, AlreadyExists) or type(exc) is Conflict
     except ImportError:  # pragma: no cover - google libs are a core dep
         return type(exc).__name__ in ("AlreadyExists", "Conflict")
 

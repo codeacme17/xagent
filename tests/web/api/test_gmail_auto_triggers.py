@@ -29,6 +29,7 @@ from xagent.web.services.gmail_provisioning import gmail_topic_path
 from xagent.web.services.gmail_triggers import (
     GmailPubsubNotification,
     GmailWatchConfigurationError,
+    _credentials_expiry,
     _get_google_oauth_config,
     build_gmail_service,
     collect_gmail_pubsub_events,
@@ -926,56 +927,18 @@ def test_build_gmail_service_passes_persisted_token_expiry_to_credentials(
         db.close()
 
 
-def test_build_gmail_service_converts_aware_expiry_to_naive_utc_for_credentials(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_credentials_expiry_converts_aware_expiry_to_naive_utc() -> None:
     """Timezone-aware expires_at (PostgreSQL) must reach google-auth as naive UTC."""
-    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-client-id")
-    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
-    captured_kwargs: dict[str, object] = {}
+    aware = datetime(2026, 6, 29, 20, tzinfo=timezone(timedelta(hours=8)))
 
-    class FakeCredentials:
-        def __init__(self, **kwargs: object) -> None:
-            captured_kwargs.update(kwargs)
-            self.expired = False
-            self.refresh_token = kwargs.get("refresh_token")
+    converted = _credentials_expiry(aware)
 
-    monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.Credentials",
-        FakeCredentials,
-    )
-    monkeypatch.setattr(
-        "xagent.web.services.gmail_triggers.AuthorizedSession",
-        lambda creds: object(),
-    )
-
-    db = _direct_db_session()
-    try:
-        provider = (
-            db.query(OAuthProvider)
-            .filter(OAuthProvider.provider_name == "google")
-            .one()
-        )
-        provider.client_id = ""
-        provider.client_secret = ""
-        user = _create_user(db, "gmail-aware-expiry-user")
-        oauth = _create_gmail_oauth(db, user)
-        db.add(provider)
-        db.commit()
-        # SQLite round-trips naive datetimes, so assign in memory to simulate
-        # the aware value PostgreSQL returns for DateTime(timezone=True).
-        oauth.expires_at = datetime(
-            2026, 6, 29, 20, tzinfo=timezone(timedelta(hours=8))
-        )
-
-        build_gmail_service(db, oauth)
-
-        expiry = captured_kwargs["expiry"]
-        assert isinstance(expiry, datetime)
-        assert expiry.tzinfo is None
-        assert expiry == datetime(2026, 6, 29, 12)
-    finally:
-        db.close()
+    assert converted is not None
+    assert converted.tzinfo is None
+    assert converted == datetime(2026, 6, 29, 12)
+    # Naive values (SQLite) and None pass through untouched.
+    assert _credentials_expiry(datetime(2026, 6, 29, 12)) == datetime(2026, 6, 29, 12)
+    assert _credentials_expiry(None) is None
 
 
 def test_build_gmail_service_accepts_aware_expiry_with_real_credentials(

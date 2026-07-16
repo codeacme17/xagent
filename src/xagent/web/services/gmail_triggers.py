@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import quote
 
 from google.auth.exceptions import RefreshError
@@ -197,7 +197,9 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
         client_id=client_id,
         client_secret=client_secret,
         scopes=_gmail_oauth_scopes(oauth_account),
-        expiry=_credentials_expiry(getattr(oauth_account, "expires_at", None)),
+        # cast: legacy Column[...] typing on UserOAuth; runtime value is the
+        # datetime (or None) loaded from the row.
+        expiry=_credentials_expiry(cast("datetime | None", oauth_account.expires_at)),
     )
     if creds.expired and creds.refresh_token:
         try:
