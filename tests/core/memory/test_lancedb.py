@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 import tempfile
 
@@ -524,10 +525,11 @@ def test_search_returns_legacy_rows_missing_timestamp(memory_store):
     assert "legacy-no-ts" in ids
 
 
-def test_search_skips_malformed_row_without_truncation(memory_store):
+def test_search_skips_malformed_row_without_truncation(memory_store, caplog):
     """A row whose conversion genuinely fails (unparsable timestamp) must be
-    skipped, not abort the vector branch after earlier appends — which used to
-    suppress the text fallback and silently truncate the results (#847).
+    skipped *and logged*, not abort the vector branch after earlier appends —
+    which used to suppress the text fallback and silently truncate the
+    results (#847).
 
     The malformed row is seeded BETWEEN well-formed rows so that, pre-fix, the
     mid-loop escape would drop the rows inserted after it."""
@@ -552,15 +554,23 @@ def test_search_skips_malformed_row_without_truncation(memory_store):
     for i in range(2, 4):
         assert memory_store.add(MemoryNote(content=f"well-formed note {i}")).success
 
-    results = memory_store.search("note", k=10)
+    with caplog.at_level(logging.WARNING, logger="xagent.core.memory.lancedb"):
+        results = memory_store.search("note", k=10)
+
     contents = {r.content for r in results}
     assert {f"well-formed note {i}" for i in range(4)} <= contents
     assert all(r.id != "malformed-ts" for r in results)
+    assert any(
+        "Skipping malformed memory row" in record.getMessage()
+        and "malformed-ts" in record.getMessage()
+        for record in caplog.records
+    )
 
 
-def test_text_fallback_skips_malformed_row(temp_db_dir):
-    """The text-search fallback must also skip a malformed row instead of
-    escaping to the outer except and returning an empty result set (#847)."""
+def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
+    """The text-search fallback must also skip (and log) a malformed row
+    instead of escaping to the outer except and returning an empty result
+    set (#847)."""
     from xagent.core.model.embedding import BaseEmbedding
 
     class FailingEmbedding(BaseEmbedding):
@@ -600,10 +610,18 @@ def test_text_fallback_skips_malformed_row(temp_db_dir):
         },
     )
 
-    results = store.search("note", k=10)
+    with caplog.at_level(logging.WARNING, logger="xagent.core.memory.lancedb"):
+        results = store.search("note", k=10)
+
     contents = {r.content for r in results}
     assert {f"well-formed note {i}" for i in range(3)} <= contents
     assert all(r.id != "malformed-ts" for r in results)
+    assert any(
+        "Skipping malformed memory row" in record.getMessage()
+        and "malformed-ts" in record.getMessage()
+        and "text search" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 if __name__ == "__main__":
