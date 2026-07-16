@@ -234,6 +234,25 @@ class UserIsolatedMemoryStore(MemoryStore):
 
         return self._base_store.delete(note_id)
 
+    def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
+        """Bulk-delete notes stamped with dimension ``dim_key=value``.
+
+        Maintenance operation (reaping memories of a dead principal, e.g. a
+        revoked client application), delegated straight to the base store: it
+        is not gated by the per-user context, because the dimension predicate
+        itself bounds the deletion to notes explicitly stamped with that
+        dimension — dimension-less (creator-direct) notes are never touched.
+        """
+        return self._base_store.delete_by_scope_dimension(dim_key, value)
+
+    def list_scope_dimension_values(self, dim_key: str) -> set[str]:
+        """Distinct stamped values for one scope dimension, store-wide.
+
+        Reconciliation primitive for the same maintenance flows as
+        ``delete_by_scope_dimension`` — delegated ungated for the same reason.
+        """
+        return self._base_store.list_scope_dimension_values(dim_key)
+
     def search(
         self,
         query: str,

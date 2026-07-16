@@ -1,0 +1,144 @@
+"""Tests for MemoryStore.delete_by_scope_dimension.
+
+Bulk-reaping every note stamped with one execution-scope dimension
+(``key=value``) — the primitive a control plane needs to clean up memories
+whose dimension no longer maps to a live principal (e.g. a revoked client
+application, xagent-saas#91). Covers the LanceDB predicate-pushdown override,
+the base class's generic list-and-delete fallback (via InMemoryMemoryStore),
+and the UserIsolatedMemoryStore delegation.
+"""
+
+from __future__ import annotations
+
+import shutil
+import tempfile
+
+import pytest
+
+from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
+from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
+
+from .conftest import ConstantEmbedding
+
+P = MEMORY_DIMENSION_METADATA_PREFIX
+
+
+@pytest.fixture
+def temp_db_dir():
+    temp_dir = tempfile.mkdtemp()
+    yield temp_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def lancedb_store(temp_db_dir):
+    return LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="test_memories",
+        embedding_model=ConstantEmbedding(64),
+    )
+
+
+def _note(content, **dims):
+    return MemoryNote(
+        content=content,
+        metadata={f"{P}{key}": str(value) for key, value in dims.items()},
+    )
+
+
+def _seed(store):
+    """Notes for CA 42 (two end users), CA 4 (the prefix of 42), and a
+    dimension-less creator-direct note. Returns their ids."""
+    ids = {}
+    ids["ca42_a"] = store.add(
+        _note("ca42 user a", client_application_id=42, end_user_id=7)
+    ).memory_id
+    ids["ca42_b"] = store.add(
+        _note("ca42 user b", client_application_id=42, end_user_id=8)
+    ).memory_id
+    ids["ca4"] = store.add(
+        _note("ca4 user", client_application_id=4, end_user_id=9)
+    ).memory_id
+    ids["plain"] = store.add(MemoryNote(content="creator-direct note")).memory_id
+    return ids
+
+
+def _assert_reap_semantics(store):
+    """The contract shared by every implementation: exact-match bulk delete,
+    no prefix collisions, dimension-less notes untouched, idempotent."""
+    ids = _seed(store)
+
+    # int value must match the string-stamped dimension (control planes pass
+    # integer surrogate keys; stamps are strings).
+    response = store.delete_by_scope_dimension("client_application_id", 42)
+    assert response.success
+    assert response.metadata["deleted_count"] == 2
+
+    assert not store.get(ids["ca42_a"]).success
+    assert not store.get(ids["ca42_b"]).success
+    # "client_application_id=4" is a prefix of "...=42" — must survive.
+    assert store.get(ids["ca4"]).success
+    assert store.get(ids["plain"]).success
+
+    # Idempotent: nothing left to reap.
+    again = store.delete_by_scope_dimension("client_application_id", 42)
+    assert again.success
+    assert again.metadata["deleted_count"] == 0
+
+
+def test_lancedb_pushdown_reap(lancedb_store):
+    _assert_reap_semantics(lancedb_store)
+
+
+def test_lancedb_reap_before_any_write(lancedb_store):
+    """Empty store (no note ever written) — reap is a successful no-op."""
+    response = lancedb_store.delete_by_scope_dimension("client_application_id", 42)
+    assert response.success
+    assert response.metadata["deleted_count"] == 0
+
+
+def test_base_default_reap_via_in_memory():
+    _assert_reap_semantics(InMemoryMemoryStore())
+
+
+def _assert_enumeration_semantics(store):
+    """list_scope_dimension_values: distinct stamped values for one dimension,
+    other dimensions and dimension-less notes invisible."""
+    _seed(store)
+    assert store.list_scope_dimension_values("client_application_id") == {"42", "4"}
+    assert store.list_scope_dimension_values("end_user_id") == {"7", "8", "9"}
+    assert store.list_scope_dimension_values("no_such_dimension") == set()
+
+
+def test_lancedb_list_scope_dimension_values(lancedb_store):
+    _assert_enumeration_semantics(lancedb_store)
+
+
+def test_lancedb_list_values_before_any_write(lancedb_store):
+    assert lancedb_store.list_scope_dimension_values("client_application_id") == set()
+
+
+def test_base_default_list_values_via_in_memory():
+    _assert_enumeration_semantics(InMemoryMemoryStore())
+
+
+def test_user_isolated_store_delegates_ungated():
+    """The wrapper reaps regardless of the current user context: the dimension
+    predicate itself bounds the deletion, and a maintenance job runs with no
+    (or an unrelated) user bound."""
+    base = InMemoryMemoryStore()
+    store = UserIsolatedMemoryStore(base)
+
+    note = _note("ca42 note", client_application_id=42, end_user_id=7)
+    note.metadata["user_id"] = 1
+    note_id = base.add(note).memory_id
+
+    with UserContext(99):  # some other principal entirely
+        response = store.delete_by_scope_dimension("client_application_id", 42)
+
+    assert response.success
+    assert response.metadata["deleted_count"] == 1
+    assert not base.get(note_id).success

@@ -30,6 +30,7 @@ from .scope_columns import (
     coerce_user_id,
     derive_scope_columns,
     encode_scope_dims,
+    scope_dim_where_term,
 )
 
 logger = logging.getLogger(__name__)
@@ -669,6 +670,64 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to delete memory: {str(e)}",
                 memory_id=note_id,
             )
+
+    def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
+        """Bulk-delete every note stamped with dimension ``dim_key=value``.
+
+        Pushes a single ``array_contains(scope_dims, 'key=value')`` predicate
+        into LanceDB instead of the base class's list-and-delete walk, so the
+        whole matching set goes in one table operation. Exact per-element
+        equality (see scope_columns), so similar values never collide.
+        """
+        where = scope_dim_where_term(dim_key, value)
+        table = None
+        try:
+            # The table always exists after construction (the vector store
+            # creates it in __init__), so open directly like get()/search().
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            count = table.count_rows(where)
+            if count:
+                table.delete(where)
+            return MemoryResponse(success=True, metadata={"deleted_count": count})
+        except Exception as e:
+            logger.error(f"Failed to delete memories by scope dimension {dim_key}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to delete memories by scope dimension: {str(e)}",
+                metadata={"deleted_count": 0},
+            )
+        finally:
+            _safe_close_table(table)
+
+    def list_scope_dimension_values(self, dim_key: str) -> set[str]:
+        """Distinct stamped values for one scope dimension, store-wide.
+
+        Projects only the ``scope_dims`` column (no vectors, no metadata JSON)
+        so the scan stays cheap on large tables. Raises on backend failure —
+        see the base class contract.
+        """
+        prefix = f"{dim_key}="
+        table = None
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            total = table.count_rows()
+            if not total:
+                return set()
+            df = table.search().select([SCOPE_DIMS_COLUMN]).limit(total).to_pandas()
+            values: set[str] = set()
+            for dims in df[SCOPE_DIMS_COLUMN]:
+                if dims is None:
+                    continue
+                for element in dims:
+                    if element.startswith(prefix):
+                        values.add(element[len(prefix) :])
+            return values
+        finally:
+            _safe_close_table(table)
 
     def search(
         self,
