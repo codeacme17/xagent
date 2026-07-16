@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
+import pyarrow.compute as pc  # type: ignore
 
 from ...providers.vector_store.lancedb import (
     LanceDBConnectionManager,
@@ -717,15 +718,17 @@ class LanceDBMemoryStore(MemoryStore):
             total = table.count_rows()
             if not total:
                 return set()
-            df = table.search().select([SCOPE_DIMS_COLUMN]).limit(total).to_pandas()
-            values: set[str] = set()
-            for dims in df[SCOPE_DIMS_COLUMN]:
-                if dims is None:
-                    continue
-                for element in dims:
-                    if element.startswith(prefix):
-                        values.add(element[len(prefix) :])
-            return values
+            arrow_table = (
+                table.search().select([SCOPE_DIMS_COLUMN]).limit(total).to_arrow()
+            )
+            # Filter in Arrow: flatten the list<string> column (null rows drop
+            # out), keep only this dimension's elements, then dedupe — only the
+            # distinct values ever cross into Python.
+            flat = pc.list_flatten(arrow_table[SCOPE_DIMS_COLUMN])
+            matched = flat.filter(pc.starts_with(flat, pattern=prefix))
+            return {
+                element[len(prefix) :] for element in matched.unique().to_pylist()
+            }
         finally:
             _safe_close_table(table)
 
