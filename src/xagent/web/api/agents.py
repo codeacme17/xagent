@@ -1248,8 +1248,12 @@ class AgentPreviewRequest(BaseModel):
         default_factory=list, description="Knowledge base names"
     )
     skills: List[str] = Field(default_factory=list, description="Skill names")
-    tool_categories: List[str] = Field(
-        default_factory=list, description="Tool category names"
+    # ``None`` (field omitted) keeps the legacy "unconfigured" semantics
+    # (full default tool set); ``[]`` means the caller explicitly selected
+    # zero tools. This mirrors how ``Agent.tool_categories`` is read at
+    # runtime, so a preview behaves like the saved agent would.
+    tool_categories: Optional[List[str]] = Field(
+        None, description="Tool category names"
     )
     message: str = Field(..., description="User message to preview")
 
@@ -1337,6 +1341,27 @@ async def preview_agent(
         # Generate unique task_id for each preview to avoid workspace conflicts
         preview_task_id = f"preview_{uuid.uuid4().hex[:8]}"
 
+        # Scope the preview's tools to the agent's selection. Without a
+        # spec, WebToolConfig builds the unrestricted tool set — including
+        # every Custom API / MCP server the *user* has configured — so the
+        # preview could call APIs the agent never selected (issues #798 /
+        # #117). Explicit categories mirror the runtime chat path; the
+        # omitted/None (legacy "unconfigured") case follows the
+        # delegated-agent path instead — every built-in tool, but no
+        # user-level Custom API registry — which is stricter than the
+        # direct-chat runtime (that path intentionally keeps legacy full
+        # access): a preview must never expose APIs the agent being
+        # previewed did not select.
+        from ...core.tools.adapters.vibe.selection_spec import (
+            ToolSelectionSpec,
+            should_load_mcp_server_configs,
+        )
+
+        tool_selection_spec = ToolSelectionSpec.from_raw(
+            tool_categories=request.tool_categories,
+            exclude_custom_api_when_unconfigured=True,
+        )
+
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
@@ -1347,6 +1372,8 @@ async def preview_agent(
             if request.knowledge_bases is not None
             else None,
             allowed_skills=request.skills if request.skills is not None else None,
+            tool_selection_spec=tool_selection_spec,
+            include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
             task_id=preview_task_id,
             workspace_base_dir=str(get_uploads_dir() / "preview"),
         )
