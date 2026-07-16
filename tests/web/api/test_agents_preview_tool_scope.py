@@ -34,17 +34,15 @@ async def _run_preview(tool_categories):
     model_record.model_id = "test-model"
     db.query.return_value.filter.return_value.first.return_value = model_record
 
-    request_kwargs = dict(
+    request = AgentPreviewRequest(
         instructions="preview instructions",
         execution_mode="balanced",
         models={"general": 1},
         knowledge_bases=[],
         skills=[],
+        tool_categories=tool_categories,
         message="hello",
     )
-    if tool_categories is not ...:
-        request_kwargs["tool_categories"] = tool_categories
-    request = AgentPreviewRequest(**request_kwargs)
 
     with (
         patch("xagent.web.api.agents.UserAwareModelStorage") as mock_storage_class,
@@ -104,12 +102,14 @@ async def test_preview_empty_categories_yield_zero_tools():
 
 
 @pytest.mark.asyncio
-async def test_preview_omitted_categories_keep_legacy_all_mode():
-    """Field omitted (None) keeps legacy unconfigured semantics, matching
-    how a saved agent with NULL tool_categories behaves at runtime."""
-    tool_config = await _run_preview(...)
+async def test_preview_omitted_categories_keep_builtins_but_not_custom_apis():
+    """Field omitted (None, legacy "unconfigured") keeps the full built-in
+    tool set, but must NOT bulk-load the user-level Custom API registry —
+    the same opt-out the delegated-agent path applies (#798 / #117)."""
+    tool_config = await _run_preview(None)
 
     spec = tool_config.get_tool_selection_spec()
     assert spec.is_all()
+    assert spec.includes_custom_api() is False
     # Legacy ALL mode does not pay MCP server init on the preview path.
     assert tool_config._include_mcp_tools is False

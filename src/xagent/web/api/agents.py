@@ -1345,7 +1345,11 @@ async def preview_agent(
         # the runtime chat path does. Without a spec, WebToolConfig builds
         # the unrestricted tool set — including every Custom API / MCP
         # server the *user* has configured — so the preview could call
-        # APIs the agent never selected (issues #798 / #117).
+        # APIs the agent never selected (issues #798 / #117). Like the
+        # delegated-agent path, the omitted/None (legacy "unconfigured")
+        # case keeps every built-in tool but opts out of the user-level
+        # Custom API registry: a preview must never expose APIs the agent
+        # being previewed did not select.
         from ...core.tools.adapters.vibe.selection_spec import (
             ToolSelectionSpec,
             should_load_mcp_server_configs,
@@ -1353,6 +1357,7 @@ async def preview_agent(
 
         tool_selection_spec = ToolSelectionSpec.from_raw(
             tool_categories=request.tool_categories,
+            exclude_custom_api_when_unconfigured=True,
         )
 
         tool_config = WebToolConfig(
