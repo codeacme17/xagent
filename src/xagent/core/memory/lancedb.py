@@ -679,6 +679,11 @@ class LanceDBMemoryStore(MemoryStore):
         into LanceDB instead of the base class's list-and-delete walk, so the
         whole matching set goes in one table operation. Exact per-element
         equality (see scope_columns), so similar values never collide.
+
+        ``deleted_count`` is best-effort under concurrent writers: LanceDB's
+        ``delete()`` reports only the new table version, not a row count, so
+        the count comes from a ``count_rows`` on the same predicate just
+        before the delete. The operation itself stays idempotent either way.
         """
         where = scope_dim_where_term(dim_key, value)
         table = None
