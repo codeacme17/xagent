@@ -999,3 +999,44 @@ def test_provisioning_requires_account_email(db_session: Session) -> None:
             subscriber_factory=lambda: FakeSubscriber(),
         )
     assert db_session.query(GmailWatchState).count() == 0
+
+
+def test_default_clients_select_rest_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """XAGENT_GMAIL_PUBSUB_TRANSPORT=rest must pick the GAPIC REST clients."""
+    import google.pubsub_v1
+
+    from xagent.web.services import gmail_provisioning
+
+    captured: list[tuple[str, object]] = []
+
+    class FakePublisher:
+        def __init__(self, transport: str | None = None) -> None:
+            captured.append(("publisher", transport))
+
+    class FakeSubscriber:
+        def __init__(self, transport: str | None = None) -> None:
+            captured.append(("subscriber", transport))
+
+    monkeypatch.setattr(google.pubsub_v1, "PublisherClient", FakePublisher)
+    monkeypatch.setattr(google.pubsub_v1, "SubscriberClient", FakeSubscriber)
+    monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "rest")
+
+    assert isinstance(gmail_provisioning._default_publisher(), FakePublisher)
+    assert isinstance(gmail_provisioning._default_subscriber(), FakeSubscriber)
+    assert captured == [("publisher", "rest"), ("subscriber", "rest")]
+
+
+def test_is_already_exists_matches_both_transports() -> None:
+    """gRPC raises AlreadyExists; REST maps HTTP 409 to its parent Conflict."""
+    from google.api_core.exceptions import Aborted, AlreadyExists, Conflict
+
+    from xagent.web.services.gmail_provisioning import _is_already_exists
+
+    assert _is_already_exists(AlreadyExists("grpc duplicate topic"))
+    assert _is_already_exists(Conflict("409 PUT .../topics/x: already exists"))
+    assert not _is_already_exists(RuntimeError("unrelated"))
+    # Aborted is also a Conflict subclass but signals a transient concurrency
+    # error, not "already exists" — it must propagate, not be swallowed.
+    assert not _is_already_exists(Aborted("transaction aborted"))

@@ -1541,6 +1541,16 @@ class TestGmailPubSubProvisioningConfig:
         monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "not-a-number")
         assert get_gmail_registration_timeout_seconds() == 10
 
+    def test_pubsub_transport_defaults_to_grpc(self, monkeypatch):
+        from xagent.config import get_gmail_pubsub_transport
+
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", raising=False)
+        assert get_gmail_pubsub_transport() == "grpc"
+        monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", " REST ")
+        assert get_gmail_pubsub_transport() == "rest"
+        monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "carrier-pigeon")
+        assert get_gmail_pubsub_transport() == "grpc"
+
 
 class TestTrustedProxyHopsConfig:
     """Config for proxy-aware remote IP derivation."""
