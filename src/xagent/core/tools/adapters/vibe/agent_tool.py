@@ -1794,7 +1794,12 @@ class AgentTool(AbstractBaseTool):
 
             # Delegated-agent tool selection goes through the shared
             # ``ToolSelectionSpec.from_raw`` normalizer.
-            # ``None`` → _SpecAll (unconfigured legacy agent, all tools).
+            # ``None`` → _SpecAll (unconfigured legacy agent, all built-in
+            #            tools) — but WITHOUT the user-level Custom API
+            #            registry: a delegated agent may only call Custom
+            #            APIs it explicitly selected via an ``mcp:<server>``
+            #            connector, never inherit every API the *user* has
+            #            configured (issue #798).
             # ``[]``  → _SpecNone (agent explicitly saved with zero tools).
             # Non-empty list → _SpecByCategories (scoped to declared tools).
             from .selection_spec import (
@@ -1804,6 +1809,7 @@ class AgentTool(AbstractBaseTool):
 
             tool_selection_spec = ToolSelectionSpec.from_raw(
                 tool_categories=agent_tool_categories,
+                exclude_custom_api_when_unconfigured=True,
             )
 
             parent_db_task_id = _coerce_db_task_id(self._parent_task_id)

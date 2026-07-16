@@ -2410,6 +2410,11 @@ class TestCreateAndCallAgent:
                 assert spec.is_none()
                 assert spec.includes_mcp() is False
             assert tool_config._include_mcp_tools is False
+            # Issue #798: whatever the categories shape, a delegated agent
+            # must never bulk-load the user-level Custom API registry.
+            # Custom APIs only load through an explicit mcp:<server>
+            # connector selection (none in this parametrization).
+            assert spec.includes_custom_api() is False
         finally:
             db.close()
             try:

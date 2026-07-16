@@ -211,6 +211,7 @@ class ToolSelectionSpec(ABC):
         name_allowlist: Optional[Set[str]] = None,
         explicit_none: bool = False,
         extras_only_when_unconfigured: bool = False,
+        exclude_custom_api_when_unconfigured: bool = False,
     ) -> "ToolSelectionSpec":
         """Build a spec from raw ORM / dict / SDK fields.
 
@@ -232,6 +233,14 @@ class ToolSelectionSpec(ABC):
             filters to the worker tool names (or ``_SpecNone`` when there
             is no ``published_agent_ids``). Lets an unconfigured manager
             delegate only to its workers without inheriting the full set.
+          - ``exclude_custom_api_when_unconfigured=True`` with
+            ``tool_categories=None`` → ``_SpecAll`` that still builds every
+            default tool but does NOT run the Custom API creator. Delegated
+            workforce workers use this: an unconfigured (legacy) worker
+            keeps built-in tools, but must not bulk-inherit every user-level
+            Custom API it never selected (issue #798). No effect in
+            BY_CATEGORIES / NONE modes, which already scope Custom APIs to
+            explicit ``mcp:<server>`` connectors.
           - Otherwise → ``_SpecByCategories`` after dropping non-assignable
             entries such as ``"other"``; if nothing assignable remains, NONE.
 
@@ -271,7 +280,9 @@ class ToolSelectionSpec(ABC):
             # selected zero tools — return NONE so no tools are injected.
             if tool_categories is not None:
                 return _SpecNone()
-            return _SpecAll()
+            return _SpecAll(
+                include_custom_api=not exclude_custom_api_when_unconfigured,
+            )
 
         # ``tool_categories`` mixes two orthogonal shapes:
         #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``);
@@ -393,6 +404,12 @@ class _SpecAll(ToolSelectionSpec):
     categories: Optional[frozenset[str]] = None
     mcp_servers: Optional[frozenset[str]] = None
     published_agent_ids: Optional[frozenset[int]] = None
+    # Whether the Custom API creator may run in ALL mode. Defaults to
+    # True (legacy unconfigured agents keep their Custom API access);
+    # ``from_raw(exclude_custom_api_when_unconfigured=True)`` sets it to
+    # False so delegated workforce workers never bulk-load user-level
+    # Custom APIs they did not select (issue #798).
+    include_custom_api: bool = True
 
     def is_all(self) -> bool:
         return True
@@ -414,7 +431,7 @@ class _SpecAll(ToolSelectionSpec):
         return True
 
     def includes_custom_api(self) -> bool:
-        return True
+        return self.include_custom_api
 
     def includes_published_agent(self) -> bool:
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:

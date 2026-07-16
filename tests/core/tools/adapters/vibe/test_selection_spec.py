@@ -1317,6 +1317,49 @@ def test_by_categories_includes_custom_api_when_mcp_server_scoped():
     assert spec.includes_custom_api() is True
 
 
+def test_from_raw_unconfigured_keeps_custom_api_by_default():
+    """Legacy parity: a plain unconfigured spec (direct chat / no agent)
+    still admits the Custom API creator unless the caller opts out."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=None)
+    assert spec.is_all()
+    assert spec.includes_custom_api() is True
+
+
+def test_from_raw_unconfigured_can_exclude_custom_api():
+    """Issue #798: a delegated workforce worker with NULL tool_categories
+    must keep the legacy ALL-mode built-in tool set but NOT bulk-inherit
+    every user-level Custom API it never selected."""
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        exclude_custom_api_when_unconfigured=True,
+    )
+    assert spec.is_all()
+    assert spec.includes_custom_api() is False
+    # Everything else keeps ALL-mode semantics: no name-level filter,
+    # ordinary categories still admitted.
+    assert spec.compute_allowed_names([]) is None
+    assert spec.includes_category("basic") is True
+
+
+def test_exclude_custom_api_flag_is_noop_when_configured():
+    """The opt-out only targets the unconfigured (NULL) legacy shape.
+    Configured agents already scope Custom APIs to explicit
+    ``mcp:<server>`` connectors; explicit ``[]`` stays NONE."""
+    scoped = ToolSelectionSpec.from_raw(
+        tool_categories=["mcp:onedrive"],
+        exclude_custom_api_when_unconfigured=True,
+    )
+    assert scoped.is_by_categories()
+    assert scoped.includes_custom_api() is True
+
+    zero = ToolSelectionSpec.from_raw(
+        tool_categories=[],
+        exclude_custom_api_when_unconfigured=True,
+    )
+    assert zero.is_none()
+    assert zero.includes_custom_api() is False
+
+
 # ----- compute_allowed_names mode dispatch -------------------------------
 
 

@@ -48,6 +48,24 @@ async def test_create_db_custom_api_tools_other_category_does_not_load_configs()
 
 
 @pytest.mark.asyncio
+async def test_create_db_custom_api_tools_unconfigured_delegated_spec_skips_db():
+    """Issue #798: a delegated workforce worker with NULL tool_categories
+    builds an ALL-mode spec that opts out of the Custom API creator, so
+    the user-level Custom API registry is never enumerated."""
+    config = MagicMock()
+    config.get_tool_selection_spec.return_value = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        exclude_custom_api_when_unconfigured=True,
+    )
+    config.get_user_id.return_value = 1
+
+    tools = await create_db_custom_api_tools(config)
+
+    assert tools == []
+    config.get_custom_api_configs.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_create_db_custom_api_tools_with_configs():
     config = MagicMock(spec=BaseToolConfig)
     config.get_user_id.return_value = 1
