@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
@@ -79,6 +80,11 @@ interface Model {
   model_name: string
   model_provider: string
   category: string
+  base_url?: string
+  is_default?: boolean
+  is_small_fast?: boolean
+  is_visual?: boolean
+  is_compact?: boolean
 }
 
 interface UserDefaultModel {
@@ -718,11 +724,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     description: skill.description || skill.when_to_use || undefined,
   }))
 
+  const modelHost = (model: Model): string => {
+    const host = hostnameFromUrl(model.base_url)
+    return host ? `${host} (${model.model_provider})` : model.model_provider
+  }
+
   const modelOptions = [
     { value: "", label: "--" },
     ...(Array.isArray(models) ? models : []).map((model) => ({
       value: model.id.toString(),
       label: model.model_name,
+      host: modelHost(model),
+      description: model.model_id,
+      isBuiltin: isBuiltinModel(model),
+      isDefault: model.is_default,
+      isSmallFast: model.is_small_fast,
+      isVisual: model.is_visual,
+      isCompact: model.is_compact,
     }))
   ]
 

@@ -15,6 +15,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import {
   DefaultModelType,
   getProviderModels,
+  hostnameFromUrl,
   isBuiltinModel,
   ProviderModel,
   removeUserDefaultModel,
@@ -39,7 +40,8 @@ import {
   Check,
   Video,
   Volume2,
-  Music
+  Music,
+  Globe
 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -253,6 +255,11 @@ export function ModelManagementDialog({
       return provider.categoryBaseUrls[category]
     }
     return provider.defaultBaseUrl || ""
+  }
+
+  const getProviderHost = (model: Model) => {
+    const url = model.base_url || getDefaultBaseUrlForProvider(model.model_provider, model.category)
+    return hostnameFromUrl(url)
   }
 
   // Determine initial form data based on editing model or prefill provider
@@ -756,6 +763,7 @@ export function ModelManagementDialog({
                   {managingProviderModels.map(model => {
                     const defaultTypes = getModelDefaultTypes(model.id)
                     const audioTypeLabels = getAudioTypeLabels(model)
+                    const host = getProviderHost(model)
                     return (
                       <div key={model.model_id} className="flex items-center justify-between p-4">
                         <div>
@@ -793,6 +801,14 @@ export function ModelManagementDialog({
                               </Badge>
                             )}
                           </div>
+                          {host && (
+                            <div className="mt-1">
+                              <Badge variant="outline" className="font-normal text-muted-foreground">
+                                <Globe />
+                                {host}
+                              </Badge>
+                            </div>
+                          )}
                         </div>
                         <div className="flex items-center gap-1">
                           {!model.is_owner && getDefaultOptionsForModel(model.category, model.abilities).length > 0 && (

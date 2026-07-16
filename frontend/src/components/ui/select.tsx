@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from "react"
 import { cn } from "@/lib/utils"
-import { ChevronDown, Check } from "lucide-react"
+import { ChevronDown, Check, Globe } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 
 export interface SelectOption {
@@ -14,6 +14,7 @@ export interface SelectOption {
   isVisual?: boolean
   isCompact?: boolean
   isBuiltin?: boolean
+  host?: string
   actionIcon?: React.ReactNode
   onAction?: (e: React.MouseEvent) => void
 }
@@ -110,25 +111,33 @@ export function Select({
       >
         <div className="flex items-center gap-2 flex-1 min-w-0">
           {selectedOption ? (
-            <div className="flex items-center gap-2 min-w-0 flex-1">
-              <span className="font-medium truncate">{selectedOption.label}</span>
-              {(selectedOption.isBuiltin || selectedOption.isDefault || selectedOption.isSmallFast || selectedOption.isVisual || selectedOption.isCompact) && (
-                <div className="flex gap-1 flex-shrink-0">
-                  {selectedOption.isBuiltin && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600">{t('models.defaults.builtin')}</span>
-                  )}
-                  {selectedOption.isDefault && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">Default</span>
-                  )}
-                  {selectedOption.isSmallFast && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">Fast</span>
-                  )}
-                  {selectedOption.isVisual && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500">Visual</span>
-                  )}
-                  {selectedOption.isCompact && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/10 text-green-500">Long Context</span>
-                  )}
+            <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-medium truncate">{selectedOption.label}</span>
+                {(selectedOption.isBuiltin || selectedOption.isDefault || selectedOption.isSmallFast || selectedOption.isVisual || selectedOption.isCompact) && (
+                  <div className="flex gap-1 flex-shrink-0">
+                    {selectedOption.isBuiltin && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600">{t('models.defaults.builtin')}</span>
+                    )}
+                    {selectedOption.isDefault && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">Default</span>
+                    )}
+                    {selectedOption.isSmallFast && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">Fast</span>
+                    )}
+                    {selectedOption.isVisual && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500">Visual</span>
+                    )}
+                    {selectedOption.isCompact && (
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/10 text-green-500">Long Context</span>
+                    )}
+                  </div>
+                )}
+              </div>
+              {selectedOption.host && (
+                <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <Globe className="h-3 w-3 flex-shrink-0" />
+                  <span className="truncate">{selectedOption.host}</span>
                 </div>
               )}
             </div>
@@ -196,6 +205,12 @@ export function Select({
                       <Check className="h-4 w-4 text-primary flex-shrink-0" />
                     )}
                   </div>
+                  {option.host && (
+                    <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
+                      <Globe className="h-3 w-3 flex-shrink-0" />
+                      <span className="truncate">{option.host}</span>
+                    </div>
+                  )}
                   {option.description && (
                     <div className="text-xs text-muted-foreground mt-1 truncate">{option.description}</div>
                   )}

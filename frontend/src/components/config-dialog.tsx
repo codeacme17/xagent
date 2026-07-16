@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { Settings, X, Loader2, ArrowRight } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { isBuiltinModel } from "@/lib/models"
+import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
 import { Select } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
@@ -63,12 +63,12 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
   })
   const { t } = useI18n()
 
-  // Platform (built-in) models show a locale-aware badge next to the name
-  // (isBuiltinModel); their seeded "Built-in" placeholder is then kept out of
-  // the option detail line, while a real description (if one is ever added)
-  // still shows since the badge already conveys built-in.
-  const modelDesc = (m: Model): string | undefined =>
-    isBuiltinModel(m) && m.description?.toLowerCase() === "built-in" ? undefined : m.description
+  // Provider host line shown under the model name: "hostname (provider)",
+  // falling back to just the provider when there's no base_url.
+  const modelHost = (m: Model): string => {
+    const host = hostnameFromUrl(m.base_url)
+    return host ? `${host} (${m.model_provider})` : m.model_provider
+  }
 
   // Fetch models when dialog opens
   useEffect(() => {
@@ -224,7 +224,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                     options={models.map(m => ({
                       value: m.model_id,
                       label: m.model_name,
-                      description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider}) [${m.model_id}]`,
+                      host: modelHost(m),
+                      description: m.model_id,
                       isBuiltin: isBuiltinModel(m),
                       isDefault: m.is_default,
                       isSmallFast: m.is_small_fast,
@@ -250,7 +251,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider}) [${m.model_id}]${m.is_small_fast ? t('agent.configDialog.modelSelect.smallFast.options.tagFast') : ''}`,
+                        host: modelHost(m),
+                        description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
@@ -277,7 +279,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider})[${m.model_id}]${m.is_visual ? t('agent.configDialog.modelSelect.visual.options.tagVisual') : ''}`,
+                        host: modelHost(m),
+                        description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,
@@ -304,7 +307,8 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        description: `${m.model_name}${modelDesc(m) ? ' - ' + modelDesc(m) : ''} (${m.model_provider})[${m.model_id}]${m.is_compact ? t('agent.configDialog.modelSelect.compact.options.tagCompact') : ''}`,
+                        host: modelHost(m),
+                        description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
                         isSmallFast: m.is_small_fast,

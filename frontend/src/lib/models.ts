@@ -47,6 +47,20 @@ export interface Model {
 export const isBuiltinModel = (model: { model_id?: string | null }): boolean =>
   Boolean(model.model_id?.startsWith("platform/"));
 
+// Host (including port) extracted from a base URL, for disambiguating
+// same-named models across endpoints. Uses `.host` so non-standard ports
+// (xinference :9997, Ollama :11434) survive. Returns "" for empty or
+// non-absolute URLs so callers fall back to a provider-only label instead
+// of rendering a garbled raw string.
+export const hostnameFromUrl = (url?: string | null): string => {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+};
+
 export interface UserDefaultModel {
   id: number;
   user_id: number;
