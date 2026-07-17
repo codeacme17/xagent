@@ -364,9 +364,10 @@ def test_clear(memory_store):
 class TestInMemoryMemoryStoreNestedMetadataFilters:
     """#842: nested ``filters["metadata"]`` dicts (the shape
     ``UserIsolatedMemoryStore._add_user_filter`` emits) must be interpreted
-    with the same string-coerced equality semantics as
-    ``LanceDBMemoryStore._apply_metadata_filters`` — previously search()
-    never matched them and list_all() silently ignored them (fail-open)."""
+    with the same string-coerced equality semantics as the LanceDB store
+    (now the shared ``MemoryStore._matches_metadata_filters``, #916) —
+    previously search() never matched them and list_all() silently ignored
+    them (fail-open)."""
 
     @pytest.fixture(autouse=True)
     def seed(self, memory_store):
@@ -614,11 +615,60 @@ class TestSearchListOnlyFilterParity:
             n.id for n in memory_store.list_all(filters={"keywords": "groceries"})
         ] == ["new-home"]
 
+    def test_explicit_none_date_bounds_mean_no_bound(self, memory_store):
+        # #916: an explicit None date_from/date_to means "no bound" — same as
+        # an absent key — instead of raising TypeError inside the date
+        # comparison (this store has no outer exception guard, so the
+        # TypeError used to propagate uncaught).
+        for filters in (
+            {"date_from": None},
+            {"date_to": None},
+            {"date_from": None, "date_to": None},
+        ):
+            assert {
+                n.id for n in memory_store.search("report", k=10, filters=filters)
+            } == {"old-work", "new-home"}
+            assert {n.id for n in memory_store.list_all(filters=filters)} == {
+                "old-work",
+                "new-home",
+            }
+
+    def test_none_date_bound_combines_with_real_bound(self, memory_store):
+        # A None bound on one side must not disable the real bound on the
+        # other side.
+        cutoff = self.now - timedelta(days=1)
+        assert [
+            n.id
+            for n in memory_store.search(
+                "report", k=10, filters={"date_from": cutoff, "date_to": None}
+            )
+        ] == ["new-home"]
+
+    def test_category_filter_is_string_coerced(self, memory_store):
+        # #916: the deliberate cross-store decision — category comparison is
+        # string-coerced on both stores, consistent with the metadata-equality
+        # policy of the shared dispatch (previously this store compared
+        # exactly while LanceDB coerced).
+        memory_store.add(
+            MemoryNote(
+                id="cat-42",
+                content="numeric category report",
+                category="42",
+            )
+        )
+        assert [
+            n.id for n in memory_store.search("report", k=10, filters={"category": 42})
+        ] == ["cat-42"]
+        assert [n.id for n in memory_store.list_all(filters={"category": 42})] == [
+            "cat-42"
+        ]
+
 
 def test_scope_exclusive_filters_scoped_notes(memory_store):
     """#822: the `__scope_exclusive__` directive (strict dimension-less
     isolation) excludes any scope-stamped note on the real InMemoryMemoryStore,
-    via `_is_scope_excluded`, on both search() and list_all()."""
+    via the shared `_matches_filters` dispatch, on both search() and
+    list_all()."""
     prefix = MEMORY_DIMENSION_METADATA_PREFIX
     memory_store.add(MemoryNote(id="u", content="hello unscoped", metadata={}))
     memory_store.add(
