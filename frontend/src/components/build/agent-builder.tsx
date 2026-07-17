@@ -51,6 +51,12 @@ import { TaskConversationPanel } from "@/components/task/task-conversation-panel
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentFlowView } from "./agent-flow-view"
 import { AgentTrigger, AgentTriggerType, listAgentTriggers } from "@/lib/agent-triggers-api"
+import {
+  sanitizeUnsharedConnectors,
+  sanitizeUnsharedKnowledgeBases,
+  type UnsharedConnector,
+  type UnsharedKnowledgeBase,
+} from "@/lib/team-sharing-sanitizers"
 
 interface KnowledgeBase {
   name: string
@@ -142,6 +148,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [executionMode, setExecutionMode] = useState("balanced") // "flash", "balanced", "think"
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([])
   const [visibility, setVisibility] = useState<"team" | "admins">("team")
+  // Agent ownership: personal (team_id NULL) is the default; "team" reveals the
+  // visibility sub-option and drives promote/demote calls on save.
+  const [ownership, setOwnership] = useState<"personal" | "team">("personal")
   const [modelConfig, setModelConfig] = useState<AgentModelConfig>({
     general: null,
     small_fast: null,
@@ -186,6 +195,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Create Success Dialog State
   const [showSuccessDialog, setShowSuccessDialog] = useState(false)
   const [createdAgent, setCreatedAgent] = useState<any>(null)
+  // Connectors referenced by an agent that isn't yet team-shared. Populated from
+  // a 422 promote-team response so the user can share them and retry.
+  const [unsharedConnectors, setUnsharedConnectors] = useState<UnsharedConnector[]>([])
+  const [unsharedKnowledgeBases, setUnsharedKnowledgeBases] = useState<
+    UnsharedKnowledgeBase[]
+  >([])
+  const [isSharingConnectors, setIsSharingConnectors] = useState(false)
+  const hasUnresolvedConnectors = unsharedConnectors.some((c) => c.reason === "unresolved")
   const [templateRequirements, setTemplateRequirements] = useState<TemplateRequirements | null>(null)
 
   // Data State
@@ -577,6 +594,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setExecutionMode(agent.execution_mode || "balanced")
           setSuggestedPrompts(agent.suggested_prompts || [])
           setVisibility(agent.visibility === "admins" ? "admins" : "team")
+          setOwnership(agent.team_id == null ? "personal" : "team")
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
 
@@ -956,6 +974,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if ((instructions || "") !== (originalData.instructions || "")) return true
     if (executionMode !== (originalData.execution_mode || "graph")) return true
 
+    // Compare ownership / visibility
+    const originalOwnership = originalData.team_id == null ? "personal" : "team"
+    if (ownership !== originalOwnership) return true
+    if (ownership === "team" && visibility !== (originalData.visibility === "admins" ? "admins" : "team")) return true
+
     // Compare logo
     if (logoFile) return true
 
@@ -983,7 +1006,108 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
-  }, [name, description, instructions, executionMode, logoFile, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  // After a successful save, align server-side ownership with the chosen control:
+  // promote a personal agent to team (with visibility) or demote a team agent back
+  // to personal. Returns the ownership fields to fold into originalData, or null if
+  // a promote was blocked by unshared connectors (dialog opened for the retry).
+  const reconcileOwnership = async (
+    agentId: string,
+    savedTeamId: unknown,
+  ): Promise<{ team_id: number | null; visibility: string } | null> => {
+    const wasTeam = savedTeamId != null
+
+    if (ownership === "team" && !wasTeam) {
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/promote-team`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visibility }),
+      })
+      if (res.status === 422) {
+        const body = await res.json().catch(() => ({}))
+        const connectors = sanitizeUnsharedConnectors(body?.detail?.unshared_connectors)
+        const knowledgeBases = sanitizeUnsharedKnowledgeBases(
+          body?.detail?.unshared_knowledge_bases,
+        )
+        if (connectors.length > 0 || knowledgeBases.length > 0) {
+          setUnsharedConnectors(connectors)
+          setUnsharedKnowledgeBases(knowledgeBases)
+          return null
+        }
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      const agent = await res.json().catch(() => ({}))
+      toast.success(t("builds.configForm.promoteTeam.success"))
+      return { team_id: agent?.team_id ?? null, visibility: agent?.visibility ?? visibility }
+    }
+
+    if (ownership === "personal" && wasTeam) {
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/demote-personal`, {
+        method: "POST",
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      return { team_id: null, visibility: "team" }
+    }
+
+    // No ownership change; keep saved values.
+    return { team_id: (savedTeamId as number | null) ?? null, visibility }
+  }
+
+  // Share every listed connector, then retry the promote-team flow.
+  const handleShareConnectorsAndContinue = async () => {
+    if (!localAgentId) return
+    setIsSharingConnectors(true)
+    try {
+      for (const c of unsharedConnectors) {
+        if (c.reason === "unresolved" || c.id == null) continue
+        const res = await apiRequest(
+          `${getApiUrl()}/api/connectors/${c.type}/${c.id}/share`,
+          { method: "POST" },
+        )
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+        }
+      }
+      for (const kb of unsharedKnowledgeBases) {
+        const res = await apiRequest(
+          `${getApiUrl()}/api/knowledge-bases/${encodeURIComponent(kb.name)}/promote-team`,
+          { method: "POST" },
+        )
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+        }
+      }
+      setUnsharedConnectors([])
+      setUnsharedKnowledgeBases([])
+      const result = await reconcileOwnership(localAgentId, null)
+      if (result) {
+        setOriginalData((current: any) => ({ ...current, ...result }))
+        setShowSuccessDialog(true)
+      }
+    } catch (error) {
+      console.error("Failed to share connectors:", error)
+      toast.error(error instanceof Error ? error.message : t("builds.editor.error.unknown"))
+    } finally {
+      setIsSharingConnectors(false)
+    }
+  }
+
+  const handleCancelShareConnectors = () => {
+    // User declined to share: stay personal.
+    setUnsharedConnectors([])
+    setUnsharedKnowledgeBases([])
+    setOwnership("personal")
+  }
 
   const handleCreate = async () => {
     // Validation
@@ -1040,11 +1164,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           instructions: instructions.trim() || undefined,
           execution_mode: executionMode,
           suggested_prompts: suggestedPrompts.filter(p => p.trim()),
-          visibility,
           models: modelConfig,
           knowledge_bases: selectedKbs,
           skills: selectedSkills,
           tool_categories: finalToolCategories,
+          // Only meaningful for team agents; sending it for a personal agent
+          // could trip the team-admin visibility guard on an ordinary save.
+          // Ownership transitions go through promote-team/demote-personal.
+          ...(ownership === "team" ? { visibility } : {}),
           logo_base64,
         }),
       })
@@ -1062,6 +1189,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setInstructions(trimmedInstr)
           setSuggestedPrompts(trimmedPrompts)
 
+          // Reconcile team/personal ownership (may open the share-connectors dialog).
+          const ownershipResult = localAgentId
+            ? await reconcileOwnership(localAgentId, originalData?.team_id)
+            : { team_id: originalData?.team_id ?? null, visibility }
+
           // Update original data to reflect saved state
           setOriginalData({
             ...originalData,
@@ -1074,14 +1206,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             knowledge_bases: selectedKbs,
             skills: selectedSkills,
             tool_categories: finalToolCategories,
+            ...(ownershipResult ?? {}),
           })
           setLogoFile(null)
           // Optional: Reload agent to get updated logo URL if needed, but avoiding it keeps it fast
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
-          setOriginalData(newAgent)
-          setShowSuccessDialog(true)
+          // Newly created agents are always personal; promote if the user chose Team.
+          const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
+          setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
+          // Only confirm success once ownership resolved. If a promote was blocked
+          // (the share-connectors dialog opened, ownershipResult is null), don't
+          // stack a "created" dialog on top of it.
+          if (ownershipResult) {
+            setShowSuccessDialog(true)
+          }
           setLocalAgentId(newAgent.id.toString())
 
           // Silently update URL to include ID so refreshing works
@@ -2147,27 +2287,44 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         </div>
 
-        {/* Visibility (SaaS team context only) */}
+        {/* Ownership + team visibility (SaaS team context only) */}
         {inTeam && (
           <div className="space-y-2">
-            <Label>{t("builds.configForm.visibility.label")}</Label>
+            <Label>{t("builds.configForm.ownership.label")}</Label>
             <div className="text-xs text-muted-foreground mb-2">
-              {t("builds.configForm.visibility.desc")}
+              {t("builds.configForm.ownership.hint")}
             </div>
-            <SelectRadix value={visibility} onValueChange={(v) => setVisibility(v as "team" | "admins")}>
+            <SelectRadix value={ownership} onValueChange={(v) => setOwnership(v as "personal" | "team")}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="team">{t("builds.configForm.visibility.team")}</SelectItem>
-                <SelectItem value="admins" disabled={!canSetAdminsOnly}>
-                  {t("builds.configForm.visibility.admins")}
-                </SelectItem>
+                <SelectItem value="personal">{t("builds.configForm.ownership.personal")}</SelectItem>
+                <SelectItem value="team">{t("builds.configForm.ownership.team")}</SelectItem>
               </SelectContent>
             </SelectRadix>
-            {!canSetAdminsOnly && (
-              <div className="text-xs text-muted-foreground">
-                {t("builds.configForm.visibility.adminsHint")}
+
+            {ownership === "team" && (
+              <div className="space-y-2 pt-2">
+                <Label>{t("builds.configForm.visibility.label")}</Label>
+                <div className="text-xs text-muted-foreground mb-2">
+                  {t("builds.configForm.visibility.desc")}
+                </div>
+                <SelectRadix value={visibility} onValueChange={(v) => setVisibility(v as "team" | "admins")}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="team">{t("builds.configForm.visibility.team")}</SelectItem>
+                    {/* Admins-only is an admin-controlled setting; non-admins
+                        never see the option (the backend also gates it). */}
+                    {canSetAdminsOnly && (
+                      <SelectItem value="admins">
+                        {t("builds.configForm.visibility.admins")}
+                      </SelectItem>
+                    )}
+                  </SelectContent>
+                </SelectRadix>
               </div>
             )}
           </div>
@@ -2323,6 +2480,49 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               <Button onClick={handleDialogPublish}>
                 {t("builds.editor.header.publish")}
               </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Share-connectors-first prompt (promote-team 422) */}
+      <Dialog
+        open={unsharedConnectors.length > 0 || unsharedKnowledgeBases.length > 0}
+        onOpenChange={(open) => { if (!open) handleCancelShareConnectors() }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("builds.configForm.connectorNotShared.title")}</DialogTitle>
+            <DialogDescription>
+              {t(
+                hasUnresolvedConnectors
+                  ? "builds.configForm.connectorNotShared.unresolvedDesc"
+                  : "builds.configForm.connectorNotShared.desc",
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="list-disc pl-5 text-sm space-y-1">
+            {unsharedConnectors.map((c) => (
+              <li key={`${c.type}:${c.id ?? c.name}`}>
+                {c.name}
+                {c.reason === "unresolved" && ` — ${t("builds.configForm.connectorNotShared.unresolved")}`}
+              </li>
+            ))}
+            {unsharedKnowledgeBases.map((kb) => (
+              <li key={`kb:${kb.name}`}>{kb.name}</li>
+            ))}
+          </ul>
+          <DialogFooter className="gap-2 sm:justify-end">
+            <div className="flex w-full sm:w-auto gap-2 justify-end">
+              <Button variant="outline" onClick={handleCancelShareConnectors} disabled={isSharingConnectors}>
+                {t("builds.configForm.connectorNotShared.cancel")}
+              </Button>
+              {!hasUnresolvedConnectors && (
+                <Button onClick={handleShareConnectorsAndContinue} disabled={isSharingConnectors}>
+                  {isSharingConnectors && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                  {t("builds.configForm.connectorNotShared.shareAndContinue")}
+                </Button>
+              )}
             </div>
           </DialogFooter>
         </DialogContent>

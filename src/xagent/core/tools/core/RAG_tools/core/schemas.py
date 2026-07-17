@@ -1305,6 +1305,14 @@ class CollectionInfo(BaseModel):
 
     # Basic identifier
     name: str = Field(..., description="Collection identifier")
+    ownership: Literal["personal", "team"] = Field(
+        default="personal", description="Logical owner scope exposed by the web API"
+    )
+    storage_user_id: Optional[int] = Field(
+        default=None, description="Physical tenant id backing a team collection"
+    )
+    can_edit: bool = Field(default=True)
+    can_delete: bool = Field(default=True)
 
     # 🎯 Core binding: Embedding configuration (lazy initialization)
     embedding_model_id: Optional[str] = Field(
@@ -1459,7 +1467,16 @@ class CollectionInfo(BaseModel):
         """
         import json
 
-        data = self.model_dump(exclude={"document_metadata", "rerank_model_id"})
+        data = self.model_dump(
+            exclude={
+                "document_metadata",
+                "rerank_model_id",
+                "ownership",
+                "storage_user_id",
+                "can_edit",
+                "can_delete",
+            }
+        )
 
         # Serialize complex types to JSON strings for LanceDB
         data["extra_metadata"] = json.dumps(data["extra_metadata"])

@@ -8,6 +8,7 @@ from ..models.task import Task
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.user_admin_scope import hidden_user_ids
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
 
@@ -37,6 +38,12 @@ async def get_users(
 
     # Build query
     query = db.query(User)
+
+    # Hide app-managed service users (e.g. SaaS team storage principals) that
+    # own data but are not real accounts.
+    hidden = hidden_user_ids(db)
+    if hidden:
+        query = query.filter(User.id.notin_(hidden))
 
     # Apply search filter
     if search:
@@ -71,6 +78,12 @@ async def delete_user(
     # Cannot delete yourself
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
+
+    # App-managed service users (e.g. SaaS team storage principals) are hidden
+    # from the directory and must not be deletable — doing so would orphan the
+    # data they back.
+    if user_id in set(hidden_user_ids(db)):
+        raise HTTPException(status_code=404, detail="User not found")
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:

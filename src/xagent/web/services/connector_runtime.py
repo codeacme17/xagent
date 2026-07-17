@@ -563,28 +563,38 @@ def _optional_mapping(value: Any) -> dict[str, Any]:
 def _load_visible_runtime_connectors(
     db: Session, *, user_id: int
 ) -> dict[ConnectorRef, Any]:
+    from .connector_team_scope import visible_team_connector_ids
+
     visible: dict[ConnectorRef, Any] = {}
-    mcp_rows = (
+    team_ids = visible_team_connector_ids(db, int(user_id))
+
+    own_mcp = (
         db.query(MCPServer)
         .join(UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id)
         .filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
         .all()
     )
-    for server in mcp_rows:
-        visible[
-            ConnectorRef(cast(ConnectorType, CONNECTOR_TYPE_MCP), int(server.id))
-        ] = server
+    mcp_by_id = {int(s.id): s for s in own_mcp}
+    missing = [sid for sid in team_ids["mcp"] if sid not in mcp_by_id]
+    if missing:
+        for server in db.query(MCPServer).filter(MCPServer.id.in_(missing)).all():
+            mcp_by_id[int(server.id)] = server
+    for sid, server in mcp_by_id.items():
+        visible[ConnectorRef(cast(ConnectorType, CONNECTOR_TYPE_MCP), sid)] = server
 
-    custom_api_rows = (
+    own_api = (
         db.query(CustomApi)
         .join(UserCustomApi, CustomApi.id == UserCustomApi.custom_api_id)
         .filter(UserCustomApi.user_id == user_id, UserCustomApi.is_active)
         .all()
     )
-    for api in custom_api_rows:
-        visible[
-            ConnectorRef(cast(ConnectorType, CONNECTOR_TYPE_CUSTOM_API), int(api.id))
-        ] = api
+    api_by_id = {int(a.id): a for a in own_api}
+    missing = [aid for aid in team_ids["custom_api"] if aid not in api_by_id]
+    if missing:
+        for api in db.query(CustomApi).filter(CustomApi.id.in_(missing)).all():
+            api_by_id[int(api.id)] = api
+    for aid, api in api_by_id.items():
+        visible[ConnectorRef(cast(ConnectorType, CONNECTOR_TYPE_CUSTOM_API), aid)] = api
     return visible
 
 

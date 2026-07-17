@@ -16,6 +16,8 @@ from .agent_team_scope import (
     get_agent_team_scope,
     owned_agent_clause,
     team_id_of,
+    validate_team_agent_connectors,
+    validate_team_agent_knowledge_bases,
 )
 from .hot_path_cache import (
     agent_detail_key,
@@ -53,6 +55,29 @@ _UNRESOLVED = object()
 
 
 _VALID_VISIBILITIES = {"team", "admins"}
+
+
+class UnsharedConnectorsError(Exception):
+    """A team agent selects connectors not shared with or resolvable by its team.
+
+    Carries the offending connectors so the API layer can surface them
+    (mapped to HTTP 422) and the frontend can prompt the user to share or
+    correct the references.
+    """
+
+    def __init__(self, connectors: list) -> None:
+        self.connectors = connectors
+        super().__init__(
+            "agent selects connectors not shared with or resolvable by the team"
+        )
+
+
+class UnsharedKnowledgeBasesError(Exception):
+    """A team agent selects knowledge bases not owned by its team."""
+
+    def __init__(self, knowledge_bases: list) -> None:
+        self.knowledge_bases = knowledge_bases
+        super().__init__("agent selects knowledge bases not shared with the team")
 
 
 def _assert_can_set_visibility(
@@ -101,6 +126,7 @@ class AgentStore:
         return {
             "id": agent.id,
             "user_id": agent.user_id,
+            "team_id": agent.team_id,
             "name": agent.name,
             "description": agent.description,
             "instructions": agent.instructions,
@@ -129,6 +155,7 @@ class AgentStore:
     def agent_to_list_item_dict(self, agent: Agent) -> dict[str, Any]:
         return {
             "id": agent.id,
+            "team_id": agent.team_id,
             "name": agent.name,
             "description": agent.description,
             "logo_url": agent.logo_url,
@@ -287,7 +314,7 @@ class AgentStore:
         )
         self.db.commit()
         self.db.refresh(agent)
-        # add_agent already stamped agent.team_id from the resolved scope.
+        # Agents are created personal (team_id NULL); promotion is explicit.
         invalidate_agent_cache(
             user_id, int(agent.id), cast("int | None", agent.team_id)
         )
@@ -320,12 +347,16 @@ class AgentStore:
             published_at = datetime.now(timezone.utc)
         # Widget-enabled agents always carry an embed credential; agents
         # created disabled get one when the widget is first enabled.
-        team_scope = get_agent_team_scope(self.db, user_id)
-        _assert_can_set_visibility(team_scope, visibility)
+        if visibility is not None and visibility not in _VALID_VISIBILITIES:
+            raise ValueError(f"Unsupported agent visibility: {visibility}")
         widget_key = new_widget_key() if widget_enabled else None
+        # Agents are created personal (team_id NULL). Team ownership is granted
+        # only by an explicit promote (see ``promote_agent_to_team``); a create
+        # never stamps the caller's team. ``visibility`` is stored but only
+        # takes effect once the agent is a team agent.
         agent = Agent(
             user_id=user_id,
-            team_id=team_id_of(team_scope),
+            team_id=None,
             name=name,
             description=description,
             instructions=instructions,
@@ -373,6 +404,28 @@ class AgentStore:
                 cast("str | None", agent.visibility),
             )
 
+        # A team agent (team_id set) may only select connectors already shared
+        # with its team. Re-validate when its connector selection changes.
+        if agent.team_id is not None and "tool_categories" in updates:
+            unshared = validate_team_agent_connectors(
+                self.db,
+                user_id,
+                int(agent.team_id),
+                clean_tool_categories(updates.get("tool_categories")),
+            )
+            if unshared:
+                raise UnsharedConnectorsError(unshared)
+
+        if agent.team_id is not None and "knowledge_bases" in updates:
+            unshared_kbs = validate_team_agent_knowledge_bases(
+                self.db,
+                user_id,
+                int(agent.team_id),
+                ensure_list(updates.get("knowledge_bases")) or [],
+            )
+            if unshared_kbs:
+                raise UnsharedKnowledgeBasesError(unshared_kbs)
+
         unknown_fields = set(updates) - _AGENT_UPDATE_FIELDS
         if unknown_fields:
             raise ValueError(
@@ -384,6 +437,80 @@ class AgentStore:
                 value = clean_tool_categories(value)
             setattr(agent, field, value)
 
+        self.db.commit()
+        self.db.refresh(agent)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
+        return agent
+
+    def promote_agent_to_team(
+        self,
+        user_id: int,
+        agent_id: int,
+        scope: Any,
+        *,
+        visibility: str = "team",
+    ) -> Agent | None:
+        """Make a personal agent team-owned, gated on shared connectors.
+
+        Validates that every connector the agent selects is already shared
+        with ``scope.team_id`` (raising :class:`UnsharedConnectorsError` with
+        the offenders otherwise), then stamps ``team_id`` + ``visibility``.
+        """
+        team_scope = get_agent_team_scope(self.db, user_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
+        if agent is None:
+            return None
+        _assert_can_set_visibility(
+            scope, visibility, cast("str | None", agent.visibility)
+        )
+        if (
+            agent.team_id is not None
+            and int(agent.team_id) == int(scope.team_id)
+            and str(agent.visibility) == visibility
+        ):
+            return agent
+        unshared = validate_team_agent_connectors(
+            self.db,
+            user_id,
+            int(scope.team_id),
+            clean_tool_categories(agent.tool_categories),
+        )
+        if unshared:
+            raise UnsharedConnectorsError(unshared)
+        unshared_kbs = validate_team_agent_knowledge_bases(
+            self.db,
+            user_id,
+            int(scope.team_id),
+            ensure_list(agent.knowledge_bases) or [],
+        )
+        if unshared_kbs:
+            raise UnsharedKnowledgeBasesError(unshared_kbs)
+        agent.team_id = scope.team_id
+        agent.visibility = visibility  # type: ignore[assignment]
+        self.db.commit()
+        self.db.refresh(agent)
+        invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))
+        return agent
+
+    def demote_agent_to_personal(self, user_id: int, agent_id: int) -> Agent | None:
+        """Revert a team agent to personal (team_id NULL)."""
+        team_scope = get_agent_team_scope(self.db, user_id)
+        agent = self.get_owned_agent(user_id, agent_id, team_scope)
+        if agent is None:
+            return None
+        if (
+            team_scope is not None
+            and agent.team_id is not None
+            and not team_scope.is_team_admin
+            and int(agent.user_id) != int(user_id)
+        ):
+            raise PermissionError(
+                "Only a team admin or the agent creator can make it personal"
+            )
+        agent.team_id = None  # type: ignore[assignment]
+        # Reset to the default so a restrictive value (e.g. "admins") cannot
+        # survive on a personal agent, where the visibility control is hidden.
+        agent.visibility = "team"  # type: ignore[assignment]
         self.db.commit()
         self.db.refresh(agent)
         invalidate_agent_cache(user_id, agent_id, team_id_of(team_scope))

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from .RAG_tools.core.schemas import ListCollectionsResult
 from .RAG_tools.management.collections import list_collections
 from .RAG_tools.pipelines.document_search import run_document_search
 
@@ -19,6 +20,45 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
     from .RAG_tools.kb import get_kb_coordinator
 
     return get_kb_coordinator().tool_compatibility
+
+
+async def _list_visible_collections(
+    user_id: Optional[int], is_admin: bool
+) -> ListCollectionsResult:
+    """Union personal collections with application-provided team overlays."""
+    result = await list_collections(user_id=user_id, is_admin=is_admin)
+    if user_id is None or is_admin:
+        return result
+
+    from ....web.services.knowledge_base_team_scope import (
+        visible_team_knowledge_bases,
+    )
+
+    collections_by_name = {
+        collection.name: collection for collection in result.collections
+    }
+    refs_by_owner: dict[int, list] = {}
+    for ref in visible_team_knowledge_bases(None, int(user_id)):
+        refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
+    for storage_user_id, refs in refs_by_owner.items():
+        owner_result = await list_collections(user_id=storage_user_id, is_admin=False)
+        owner_collections = {
+            collection.name: collection for collection in owner_result.collections
+        }
+        for ref in refs:
+            collection = owner_collections.get(ref.name)
+            if collection is None:
+                continue
+            collections_by_name[ref.name] = collection.model_copy(
+                update={
+                    "ownership": "team",
+                    "storage_user_id": ref.storage_user_id,
+                    "can_edit": ref.can_edit,
+                    "can_delete": ref.can_delete,
+                }
+            )
+    merged = list(collections_by_name.values())
+    return result.model_copy(update={"collections": merged, "total_count": len(merged)})
 
 
 class ListKnowledgeBasesArgs(BaseModel):
@@ -116,7 +156,7 @@ async def _list_knowledge_bases_impl(
         RuntimeError: If listing knowledge bases fails
     """
     try:
-        result = await list_collections(user_id=user_id, is_admin=is_admin)
+        result = await _list_visible_collections(user_id=user_id, is_admin=is_admin)
 
         kb_list = []
         for collection in result.collections:
@@ -168,7 +208,7 @@ async def _find_missing_knowledge_bases_impl(
     if not requested:
         return []
 
-    result = await list_collections(user_id=user_id, is_admin=is_admin)
+    result = await _list_visible_collections(user_id=user_id, is_admin=is_admin)
     available = {collection.name for collection in result.collections}
     return [name for name in requested if name not in available]
 
@@ -206,7 +246,9 @@ async def _search_knowledge_base_impl(
     """
     try:
         # List all collections
-        collections_result = await list_collections(user_id=user_id, is_admin=is_admin)
+        collections_result = await _list_visible_collections(
+            user_id=user_id, is_admin=is_admin
+        )
 
         if not collections_result.collections:
             return KnowledgeSearchResult(
@@ -321,6 +363,7 @@ async def _search_knowledge_base_impl(
             effective_rerank = tool_args.rerank_model_id or collection_rerank
             if effective_rerank:
                 search_config["rerank_model_id"] = effective_rerank
+            storage_user_id = getattr(collection_info, "storage_user_id", None)
 
             try:
                 logger.info(
@@ -331,8 +374,10 @@ async def _search_knowledge_base_impl(
                     collection=collection_name,
                     query_text=tool_args.query,
                     config=search_config,
-                    user_id=user_id,
-                    is_admin=is_admin,
+                    user_id=storage_user_id if storage_user_id is not None else user_id,
+                    is_admin=False
+                    if getattr(collection_info, "ownership", "personal") == "team"
+                    else is_admin,
                 )
 
                 if result.status not in {"success", "partial_success"}:

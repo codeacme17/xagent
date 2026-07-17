@@ -32,4 +32,8 @@ export interface AppIntegration {
   user_env_configured?: boolean
   // Key-based apps: the user's current env-source pick, if any.
   env_source?: "own" | "shared" | "platform" | null
+  // Team-sharing status (from POST /api/connectors/status), merged in after list load.
+  shared?: boolean
+  is_owner?: boolean
+  needs_config?: boolean
 }

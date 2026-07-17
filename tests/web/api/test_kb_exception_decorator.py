@@ -247,6 +247,105 @@ async def test_delete_collection_api_failed_no_metadata_cleanup() -> None:
         )
 
     mock_metadata_store.delete_collection.assert_not_awaited()
+    mock_db.rollback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_hook_failure_prevents_physical_delete() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.kb import delete_collection_api
+    from xagent.web.models.user import User
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+    mock_db = MagicMock()
+
+    with (
+        patch(
+            "xagent.web.api.kb.notify_knowledge_base_deleted",
+            side_effect=RuntimeError("hook failed"),
+        ),
+        patch("xagent.web.api.kb._perform_kb_collection_delete") as physical_delete,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_collection_api(
+                collection_name="team-kb", _user=mock_user, db=mock_db
+            )
+
+    assert exc_info.value.status_code == 500
+    physical_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_continues_after_hook_failure_without_double_counting() -> (
+    None
+):
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.kb import (
+        BatchDeleteCollectionsRequest,
+        batch_delete_collections_api,
+    )
+    from xagent.web.models.user import User
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+    mock_db = MagicMock()
+    success = MagicMock(status="success")
+
+    with (
+        patch(
+            "xagent.web.api.kb.notify_knowledge_base_deleted",
+            side_effect=[RuntimeError("hook failed"), None],
+        ),
+        patch(
+            "xagent.web.api.kb._perform_kb_collection_delete",
+            return_value=success,
+        ) as physical_delete,
+    ):
+        result = await batch_delete_collections_api(
+            body=BatchDeleteCollectionsRequest(collection_names=["first", "second"]),
+            _user=mock_user,
+            db=mock_db,
+        )
+
+    assert result.deleted == ["second"]
+    assert [item.name for item in result.failed] == ["first"]
+    physical_delete.assert_called_once()
+    assert physical_delete.call_args.args[0] == "second"
+
+
+def test_effective_kb_user_enforces_hook_permissions() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.kb import _effective_knowledge_base_user
+    from xagent.web.models.user import User
+    from xagent.web.services.knowledge_base_team_scope import KnowledgeBaseAccess
+
+    actor = MagicMock(spec=User)
+    actor.id = 1
+    db = MagicMock()
+
+    with patch(
+        "xagent.web.api.kb.resolve_knowledge_base_access",
+        return_value=KnowledgeBaseAccess(
+            name="team-kb",
+            storage_user_id=2,
+            team_owned=True,
+            can_edit=False,
+            can_delete=False,
+        ),
+    ):
+        with pytest.raises(HTTPException) as edit_exc:
+            _effective_knowledge_base_user(db, actor, "team-kb", action="edit")
+        with pytest.raises(HTTPException) as delete_exc:
+            _effective_knowledge_base_user(db, actor, "team-kb", action="delete")
+
+    assert edit_exc.value.status_code == 403
+    assert delete_exc.value.status_code == 403
 
 
 @pytest.mark.asyncio

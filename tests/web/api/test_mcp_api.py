@@ -626,7 +626,7 @@ class TestMCPApiFunctions:
             _merge_masked_env({"NEW": "********"}, {"OLD": "secret"})
 
     def test_check_mcp_permission(self):
-        """Owner gates edit; owner-or-can_delete gates delete; admin bypasses."""
+        """Owner gates edit; owner/can_delete gates delete; admin bypasses."""
         owner = MagicMock(is_owner=True, can_delete=True)
         guest = MagicMock(is_owner=False, can_delete=False)
         assert _check_mcp_permission(owner, is_admin=False, require="edit") is True

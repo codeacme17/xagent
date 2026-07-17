@@ -1635,6 +1635,12 @@ def test_trigger_runtime_visibility_uses_trigger_task_owner() -> None:
     )
     try:
         agent_id = _create_agent(admin_headers)
+        promoted = client.post(
+            f"/api/agents/{agent_id}/promote-team",
+            headers=admin_headers,
+            json={"visibility": "team"},
+        )
+        assert promoted.status_code == 200, promoted.text
         server_id = _install_runtime_mcp_connector(
             agent_id,
             connector_user_id=trigger_owner_id,

@@ -21,7 +21,8 @@ import {
   UploadCloud,
   Globe,
   Search,
-  Plug
+  Plug,
+  Users,
 } from "lucide-react"
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet"
 import { KnowledgeBaseDetailContent } from "@/components/kb/knowledge-base-detail"
@@ -38,6 +39,9 @@ interface Collection {
   embeddings: number
   document_names: string[]
   owners?: number[]
+  ownership?: "personal" | "team"
+  can_edit?: boolean
+  can_delete?: boolean
 }
 
 interface AdminUser {
@@ -51,7 +55,7 @@ interface AdminUserListResponse {
 }
 
 export function KnowledgeBasePage() {
-  const { user } = useAuth()
+  const { user, inTeam } = useAuth()
   const { t } = useI18n()
   const [collections, setCollections] = useState<Collection[]>([])
   const [loading, setLoading] = useState(true)
@@ -66,6 +70,7 @@ export function KnowledgeBasePage() {
   const [adminUsersLoadFailed, setAdminUsersLoadFailed] = useState(false)
   const [isManageMode, setIsManageMode] = useState(false)
   const [selectedNames, setSelectedNames] = useState<Set<string>>(new Set())
+  const [ownershipChanging, setOwnershipChanging] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     fetchCollections()
@@ -166,6 +171,35 @@ export function KnowledgeBasePage() {
     setIsDrawerOpen(true)
   }
 
+  const handleOwnershipChange = async (collection: Collection) => {
+    const action = collection.ownership === "team" ? "demote-personal" : "promote-team"
+    setOwnershipChanging((prev) => new Set(prev).add(collection.name))
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/knowledge-bases/${encodeURIComponent(collection.name)}/${action}`,
+        { method: "POST" },
+      )
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(typeof body.detail === "string" ? body.detail : t("kb.ownership.failed"))
+      }
+      toast.success(
+        collection.ownership === "team"
+          ? t("kb.ownership.personalSuccess")
+          : t("kb.ownership.teamSuccess"),
+      )
+      await fetchCollections()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("kb.ownership.failed"))
+    } finally {
+      setOwnershipChanging((prev) => {
+        const next = new Set(prev)
+        next.delete(collection.name)
+        return next
+      })
+    }
+  }
+
   const handleDrawerOpenChange = (open: boolean) => {
     setIsDrawerOpen(open)
 
@@ -240,7 +274,9 @@ export function KnowledgeBasePage() {
     })
   }
 
-  const visibleNames = filteredCollections.map((c) => c.name)
+  const visibleNames = filteredCollections
+    .filter((collection) => collection.can_delete !== false)
+    .map((collection) => collection.name)
   const visibleSelectedCount = visibleNames.reduce(
     (count, name) => count + (selectedNames.has(name) ? 1 : 0),
     0
@@ -444,6 +480,7 @@ export function KnowledgeBasePage() {
                                 type="checkbox"
                                 checked={selectedNames.has(collection.name)}
                                 onChange={() => toggleSelect(collection.name)}
+                                disabled={collection.can_delete === false}
                                 className="h-4 w-4 rounded border-input mt-1"
                               />
                             </div>
@@ -466,10 +503,35 @@ export function KnowledgeBasePage() {
                               <Badge variant="outline" className="text-green-600 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-900 whitespace-nowrap">
                                 {t("kb.card.status.active")}
                               </Badge>
+                              {inTeam && (
+                                <Badge variant="secondary" className="whitespace-nowrap">
+                                  {collection.ownership === "team"
+                                    ? t("kb.ownership.team")
+                                    : t("kb.ownership.personal")}
+                                </Badge>
+                              )}
+                              {inTeam && (collection.ownership !== "team" || collection.can_delete) && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  disabled={ownershipChanging.has(collection.name)}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    void handleOwnershipChange(collection)
+                                  }}
+                                  title={collection.ownership === "team"
+                                    ? t("kb.ownership.makePersonal")
+                                    : t("kb.ownership.makeTeam")}
+                                >
+                                  <Users className="h-4 w-4" />
+                                </Button>
+                              )}
                               <Button
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 text-destructive hover:text-destructive"
+                                disabled={collection.can_delete === false}
                                 onClick={(e) => {
                                   e.stopPropagation()
                                   setCollectionToDelete(collection.name)
@@ -547,7 +609,9 @@ export function KnowledgeBasePage() {
                   {selectedCollection ? t("kb.detail.viewingDetails", { name: selectedCollection }) : ""}
                 </SheetDescription>
               </div>
-              {selectedCollection && (
+              {selectedCollection && collections.find(
+                (collection) => collection.name === selectedCollection,
+              )?.can_delete !== false && (
                 <Button
                   variant="outline"
                   size="sm"

@@ -38,6 +38,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useEffect } from "react"
+import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
@@ -53,6 +54,20 @@ import {
 
 // Matches the backend mask; a masked value submitted unchanged keeps the stored secret.
 const MASKED_SECRET_VALUE = "********"
+
+// A connector's (type, numeric id) for the /api/connectors sharing endpoints.
+// Only connected connectors carry a numeric server_id; catalog entries without
+// one can't be shared/statused, so return null.
+const connectorRef = (app: unknown) =>
+  app !== null &&
+  typeof app === "object" &&
+  Number.isInteger((app as { server_id?: unknown }).server_id)
+    ? {
+        type:
+          (app as { transport?: unknown }).transport === "custom_api" ? "custom_api" : "mcp",
+        id: (app as { server_id: number }).server_id,
+      }
+    : null
 
 export type { AppIntegration } from "./types"
 import type { AppIntegration } from "./types"
@@ -85,7 +100,7 @@ export function ConnectMcpDialog({
   onSuccess
 }: ConnectMcpDialogProps) {
   const { t } = useI18n()
-  const { token } = useAuth()
+  const { token, inTeam } = useAuth()
   const { apps: officialApps } = useMcpApps()
   const [searchQuery, setSearchQuery] = useState("")
   const [debouncedSearch, setDebouncedSearch] = useState("")
@@ -101,6 +116,8 @@ export function ConnectMcpDialog({
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
   const [keyEnvSource, setKeyEnvSource] = useState<"own" | "shared" | "platform">("own")
   const [isConnectingKey, setIsConnectingKey] = useState(false)
+  // Ownership choice at connect/create; "team" triggers a share call after success.
+  const [shareChoice, setShareChoice] = useState<"private" | "team">("private")
   const [localSelectedServers, setLocalSelectedServers] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState("library")
   const [editingCustomServerId, setEditingCustomServerId] = useState<number | null>(null)
@@ -137,13 +154,65 @@ export function ConnectMcpDialog({
 
       const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?${params.toString()}`)
       if (response.ok) {
-        const data = await response.json()
-        setApps(data || [])
+        const data = sanitizeAppIntegrations(await response.json())
+        setApps(data)
+        void loadSharingStatus(data)
       }
     } catch (error) {
       console.error("Failed to load apps:", error)
     } finally {
       setIsLoadingApps(false)
+    }
+  }
+
+  // Batch-fetch team-sharing status for connected connectors and merge it into
+  // the apps list so cards/settings can show Shared/Private/Needs-config.
+  const loadSharingStatus = async (list: AppIntegration[]) => {
+    // /api/connectors/status is an overlay-only route; standalone has no team
+    // sharing, so skip it entirely when the user is not in a team.
+    if (!inTeam) return
+    const refs = list.map(connectorRef).filter((r): r is { type: string; id: number } => r !== null)
+    if (refs.length === 0) return
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/connectors/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refs }),
+      })
+      if (!response.ok) return
+      const status: Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }> =
+        await response.json()
+      setApps((prev) =>
+        prev.map((app) => {
+          const ref = connectorRef(app)
+          const s = ref ? status[`${ref.type}:${ref.id}`] : undefined
+          return s ? { ...app, shared: s.shared, is_owner: s.is_owner, needs_config: s.needs_config } : app
+        }),
+      )
+    } catch (error) {
+      console.error("Failed to load connector sharing status:", error)
+    }
+  }
+
+  // Share a just-connected/created connector with the team. Returns false (and
+  // toasts) when the caller isn't the owner/admin (403), so callers don't fail
+  // silently — the connector simply stays private.
+  const shareConnector = async (ref: { type: string; id: number }): Promise<boolean> => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/connectors/${ref.type}/${ref.id}/share`, {
+        method: "POST",
+      })
+      if (response.ok) return true
+      toast.error(
+        response.status === 403
+          ? t("tools.mcp.sharing.onlyOwnerOrAdmin")
+          : t("tools.mcp.alerts.saveFailed"),
+      )
+      return false
+    } catch (error) {
+      console.error("Failed to share connector:", error)
+      toast.error(t("tools.mcp.alerts.saveFailed"))
+      return false
     }
   }
 
@@ -163,6 +232,7 @@ export function ConnectMcpDialog({
       setCustomApiEditBaseline(null)
       setMcpEditBaseline(null)
       setRuntimeValidationError(null)
+      setShareChoice("private")
     } else {
       connectorEditRequestRef.current += 1
     }
@@ -333,6 +403,17 @@ export function ConnectMcpDialog({
   const handleSaveResponse = async (response: any) => {
     if (response.ok) {
       toast.success(t('tools.mcp.buttons.save'))
+      // Newly created self-owned connector + "Share with team" chosen: share it.
+      // Skip on edit (the connector already exists and keeps its sharing state).
+      if (!editingCustomServerId && shareChoice === "team") {
+        try {
+          const created = await response.json()
+          const type = mcpFormData.transport === "custom_api" ? "custom_api" : "mcp"
+          if (Number.isInteger(created?.id)) await shareConnector({ type, id: created.id })
+        } catch (error) {
+          console.error("Failed to read created connector for sharing:", error)
+        }
+      }
       if (onSuccess) onSuccess()
       loadApps()
 
@@ -386,6 +467,7 @@ export function ConnectMcpDialog({
         || (app.platform_env_available ? "platform" : null)
         || "own"
     setKeyEnvSource(defaultSource)
+    setShareChoice("private")
     setConnectingKeyApp(app)
   }
 
@@ -405,6 +487,16 @@ export function ConnectMcpDialog({
       })
       if (response.ok) {
         toast.success(t('tools.mcp.buttons.save'))
+        // "Share with team" chosen: catalog connect users are usually not the
+        // owner, so shareConnector toasts a clear 403 message and stays private.
+        if (shareChoice === "team") {
+          try {
+            const connected = await response.json()
+            if (Number.isInteger(connected?.id)) await shareConnector({ type: "mcp", id: connected.id })
+          } catch (error) {
+            console.error("Failed to read connected app for sharing:", error)
+          }
+        }
         if (autoSelect && onConnectSelected) {
           setLocalSelectedServers(prev => prev.includes(connectingKeyApp.name) ? prev : [...prev, connectingKeyApp.name])
         }
@@ -505,6 +597,28 @@ export function ConnectMcpDialog({
       setSelectedApp(app);
     }
   }
+
+  // Ownership radio shared by the three connect/create flows (key connect,
+  // custom MCP, custom API). Hidden on edit — sharing is managed in settings.
+  const ownershipRadio = editingCustomServerId || !inTeam ? null : (
+    <div className="space-y-1.5">
+      <Label>{t('tools.mcp.dialog.ownership.label')}</Label>
+      <RadioGroup value={shareChoice} onValueChange={(v) => setShareChoice(v as "private" | "team")}>
+        <div className="flex items-center space-x-2">
+          <RadioGroupItem value="private" id="ownership-private" />
+          <Label htmlFor="ownership-private" className="font-normal cursor-pointer">
+            {t('tools.mcp.dialog.ownership.private')}
+          </Label>
+        </div>
+        <div className="flex items-center space-x-2">
+          <RadioGroupItem value="team" id="ownership-team" />
+          <Label htmlFor="ownership-team" className="font-normal cursor-pointer">
+            {t('tools.mcp.dialog.ownership.team')}
+          </Label>
+        </div>
+      </RadioGroup>
+    </div>
+  )
 
   const selectedRemoteCount = localSelectedServers.filter(name =>
     officialApps.some(app => app.name.toLowerCase() === name.toLowerCase() || app.id.toLowerCase() === name.toLowerCase())
@@ -811,6 +925,20 @@ export function ConnectMcpDialog({
                                   {app.is_local ? <Home className="h-3 w-3 mr-1.5 text-slate-400" /> : <Globe className="h-3 w-3 mr-1.5 text-slate-400" />}
                                   {app.is_local ? t('tools.mcp.dialog.local') : t('tools.mcp.dialog.remote')}
                                 </Badge>
+                                {inTeam && isGloballyConnected && connectorRef(app) && (
+                                  <Badge variant="secondary" className={`font-medium px-2 py-0.5 rounded-md border shadow-none ${app.shared ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
+                                    {!app.shared
+                                      ? t('tools.mcp.sharing.private')
+                                      : app.is_owner
+                                        ? t('tools.mcp.sharing.shared')
+                                        : t('tools.mcp.sharing.teamTool')}
+                                  </Badge>
+                                )}
+                                {app.needs_config && (
+                                  <Badge variant="secondary" className="font-medium px-2 py-0.5 rounded-md border border-amber-200 bg-amber-50 text-amber-700 shadow-none">
+                                    {t('tools.mcp.sharing.needsConfig')}
+                                  </Badge>
+                                )}
                               </div>
                               <div className="flex items-center gap-2">
                                 {isLoading ? (
@@ -858,6 +986,7 @@ export function ConnectMcpDialog({
                     editingCustomServerId ? customApiEditBaseline?.env ?? {} : {}
                   }
                 />
+                {ownershipRadio}
               </div>
 
               <div className="flex justify-end gap-3 mt-8 pt-4 border-t">
@@ -897,6 +1026,7 @@ export function ConnectMcpDialog({
                     onOAuthStatusChange={loadApps}
                     onRuntimeValidationErrorChange={setRuntimeValidationError}
                   />
+                  {ownershipRadio}
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
                   <Button variant="outline" onClick={() => onOpenChange(false)}>
@@ -1050,6 +1180,7 @@ export function ConnectMcpDialog({
               <p className="text-xs text-slate-500">{t('tools.mcp.dialog.apiKeyOptionalHint')}</p>
             </>
           )}
+          {ownershipRadio}
         </div>
         <div className="flex justify-end gap-2">
           <Button variant="outline" onClick={() => setConnectingKeyApp(null)} disabled={isConnectingKey}>

@@ -26,11 +26,59 @@ class AgentTeamScope:
 
 _agent_team_scope_hook = None  # (db, user_id) -> AgentTeamScope | None
 
+# (db, user_id, team_id, tool_categories) -> list of unshared connector dicts.
+_team_agent_connector_validator = None
+
+# (db, user_id, team_id, knowledge_bases) -> list of unshared KB dicts.
+_team_agent_knowledge_base_validator = None
+
+
+def set_agent_team_hooks(
+    *,
+    scope: Any = None,
+    connector_validator: Any = None,
+    knowledge_base_validator: Any = None,
+) -> None:
+    """Install or clear the complete application-owned agent team hook set."""
+    global _agent_team_scope_hook
+    global _team_agent_connector_validator, _team_agent_knowledge_base_validator
+    _agent_team_scope_hook = scope
+    _team_agent_connector_validator = connector_validator
+    _team_agent_knowledge_base_validator = knowledge_base_validator
+
 
 def set_agent_team_scope_hook(hook: Any) -> None:
     """Install (or clear, with ``None``) the user-id -> AgentTeamScope resolver."""
     global _agent_team_scope_hook
     _agent_team_scope_hook = hook
+
+
+def validate_team_agent_connectors(
+    db: Session, user_id: int, team_id: int, tool_categories: Any
+) -> list:
+    """Return the agent's selected connectors that are not shared with the team.
+
+    Empty list when no validator is installed (standalone) or nothing is
+    unshared. Each item is a ``{"type", "id", "name"}`` dict.
+    """
+    if _team_agent_connector_validator is None:
+        return []
+    return cast(
+        list,
+        _team_agent_connector_validator(db, user_id, team_id, tool_categories),
+    )
+
+
+def validate_team_agent_knowledge_bases(
+    db: Session, user_id: int, team_id: int, knowledge_bases: Any
+) -> list:
+    """Return selected knowledge bases not owned by the agent's team."""
+    if _team_agent_knowledge_base_validator is None:
+        return []
+    return cast(
+        list,
+        _team_agent_knowledge_base_validator(db, user_id, team_id, knowledge_bases),
+    )
 
 
 def get_agent_team_scope(

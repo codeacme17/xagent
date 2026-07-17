@@ -134,6 +134,7 @@ function ToolsPageContent() {
   const searchParams = useSearchParams()
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
+  const [connectorStatus, setConnectorStatus] = useState<Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }>>({})
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
@@ -177,7 +178,7 @@ function ToolsPageContent() {
   const [runtimeValidationError, setRuntimeValidationError] = useState<RuntimeConfigErrorKey | null>(null)
 
   const { t, tDynamic } = useI18n()
-  const { user } = useAuth()
+  const { user, inTeam } = useAuth()
   const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
@@ -249,9 +250,39 @@ function ToolsPageContent() {
       if (response.ok) {
         const servers = await response.json()
         setMcpServers(servers)
+        void loadConnectorStatus(servers)
       }
     } catch (error) {
       console.error("Failed to load MCP servers:", error)
+    }
+  }
+
+  const loadConnectorStatus = async (servers: MCPServer[]) => {
+    // Team ownership status is an overlay-only concept; standalone has no
+    // /api/connectors/status route, so skip the call entirely when not in a team.
+    if (!inTeam) {
+      setConnectorStatus({})
+      return
+    }
+    try {
+      const refs = servers.map((s) => ({
+        type: s.transport === "custom_api" ? "custom_api" : "mcp",
+        id: s.id,
+      }))
+      if (refs.length === 0) {
+        setConnectorStatus({})
+        return
+      }
+      const response = await apiRequest(`${getApiUrl()}/api/connectors/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refs }),
+      })
+      if (response.ok) {
+        setConnectorStatus(await response.json())
+      }
+    } catch (error) {
+      console.error("Failed to load connector status:", error)
     }
   }
 
@@ -887,18 +918,40 @@ function ToolsPageContent() {
 
   const MCPServerCard = ({ server }: { server: MCPServer }) => {
     const icon = getToolIcon(server.name, 'mcp', 'mcp')
+    const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+    const status = connectorStatus[`${connType}:${server.id}`]
+    const isTeam = !!status?.shared
+    const isOwner = status?.is_owner === true
+    const isNonOwnedTeamTool = isTeam && !isOwner
+    const ownershipLabel = !isTeam
+      ? t('tools.mcp.sharing.private')
+      : isOwner
+        ? t('tools.mcp.sharing.shared')
+        : t('tools.mcp.sharing.teamTool')
     return (
       <div
-        className="flex min-w-0 cursor-pointer flex-col overflow-hidden rounded-[14px] border border-border bg-card p-5 transition-all hover:border-primary/40 hover:shadow-sm"
-        onClick={() => handleEditMcpServer(server)}
+        className={`flex min-w-0 flex-col overflow-hidden rounded-[14px] border border-border bg-card p-5 transition-all hover:border-primary/40 hover:shadow-sm${isNonOwnedTeamTool ? '' : ' cursor-pointer'}`}
+        onClick={isNonOwnedTeamTool ? undefined : () => handleEditMcpServer(server)}
       >
         <div className="mb-3 flex items-start justify-between">
           <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-muted/50">
             {icon}
           </div>
-          <span className="rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]">
-            {t('tools.mcp.badge')}
-          </span>
+          <div className="flex flex-wrap justify-end gap-1">
+            <span className="rounded-full bg-[rgba(28,202,91,0.12)] px-2 py-0.5 text-[10px] font-semibold text-[rgb(21,157,71)]">
+              {t('tools.mcp.badge')}
+            </span>
+            {inTeam && (
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${isTeam ? 'bg-blue-100 text-blue-700' : 'bg-muted text-muted-foreground'}`}>
+                {ownershipLabel}
+              </span>
+            )}
+            {status?.needs_config && (
+              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                {t('tools.mcp.sharing.needsConfig')}
+              </span>
+            )}
+          </div>
         </div>
         <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">
           {server.transport}

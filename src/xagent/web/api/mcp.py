@@ -1330,7 +1330,9 @@ def _merge_masked_env(new_env: dict, old_env: dict) -> dict:
 
 
 def _check_mcp_permission(
-    user_mcp: UserMCPServer, is_admin: bool, require: str = "edit"
+    user_mcp: "UserMCPServer | _TeamOwnedUserMCP",
+    is_admin: bool,
+    require: str = "edit",
 ) -> bool:
     """Whether the user may mutate shared MCP config.
 
@@ -1401,9 +1403,37 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
     return _auth_metadata_tampered(incoming.get("auth"), current.get("auth"))
 
 
+class _TeamOwnedUserMCP:
+    """Stand-in for a missing UserMCPServer row: a team connector the user does
+    not personally own. Exposes the attributes the response builders read with
+    not-owned defaults (usable, but not editable/deletable)."""
+
+    is_owner = False
+    can_edit = False
+    can_delete = False
+    is_active = True
+    is_default = False
+    env = None
+    env_source = None
+
+    def __init__(self, user_id: int) -> None:
+        self.user_id = int(user_id)
+
+
+class _TeamOwnedUserApi:
+    """Stand-in for a missing UserCustomApi row (team-owned, not user-owned)."""
+
+    can_edit = False
+    is_active = True
+    is_default = False
+
+    def __init__(self, user_id: int) -> None:
+        self.user_id = int(user_id)
+
+
 def _db_server_to_response(
     server: MCPServer,
-    user_mcp: UserMCPServer,
+    user_mcp: UserMCPServer | _TeamOwnedUserMCP,
     manager: DatabaseMCPServerManager,
     connected_account: Optional[str] = None,
     app_id: Optional[str] = None,
@@ -1453,7 +1483,7 @@ def _db_server_to_response(
 
 def _custom_api_to_mcp_response(
     api: CustomApi,
-    user_api: UserCustomApi,
+    user_api: UserCustomApi | _TeamOwnedUserApi,
 ) -> MCPServerResponse:
     """Project a Custom API into the aggregate connector response contract."""
     masked_env: dict[str, Any] = _mask_env(api.env) if isinstance(api.env, dict) else {}
@@ -2048,6 +2078,43 @@ def get_mcp_servers(
         for user_api, api in user_custom_apis:
             responses.append(_custom_api_to_mcp_response(api, user_api))
 
+        # Append team-owned connectors the user has no personal row for, so a
+        # team member sees the team's shared connectors in their own list.
+        from ..services.connector_team_scope import visible_team_connector_ids
+
+        team_ids = visible_team_connector_ids(db, effective_user_id)
+
+        own_mcp_ids = {int(server.id) for _um, server in user_mcps}
+        missing_mcp = [sid for sid in team_ids["mcp"] if sid not in own_mcp_ids]
+        if missing_mcp:
+            for server in (
+                db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
+            ):
+                app_id, provider, connected_account = _enrich_oauth_server_info(
+                    db, server, oauth_emails
+                )
+                responses.append(
+                    _db_server_to_response(
+                        server,
+                        _TeamOwnedUserMCP(effective_user_id),
+                        manager,
+                        connected_account,
+                        app_id,
+                        provider,
+                        is_admin=is_admin,
+                    )
+                )
+
+        own_api_ids = {int(api.id) for _ua, api in user_custom_apis}
+        missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
+        if missing_api:
+            for api in db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all():
+                responses.append(
+                    _custom_api_to_mcp_response(
+                        api, _TeamOwnedUserApi(effective_user_id)
+                    )
+                )
+
         return responses
 
     except HTTPException:
@@ -2459,6 +2526,7 @@ def create_mcp_server(
             env=encrypted_user_env,
         )
         db.add(user_mcp)
+
         db.commit()
         db.refresh(user_mcp)
 
@@ -2504,6 +2572,7 @@ def update_mcp_server(
             )
 
         user_mcp, server = result
+        old_name = str(server.name)
         can_edit_global = _check_mcp_permission(
             user_mcp, getattr(current_user, "is_admin", False), require="edit"
         )
@@ -2628,6 +2697,12 @@ def update_mcp_server(
         if server_data.is_active is not None:
             user_mcp.is_active = server_data.is_active
 
+        from ..services.connector_team_scope import rename_team_connector
+
+        rename_team_connector(
+            db, int(user_id), "mcp", int(server_id), old_name, str(server.name)
+        )
+
         db.commit()
         db.refresh(server)
         db.refresh(user_mcp)
@@ -2713,6 +2788,20 @@ def delete_mcp_server(
 
         server_name = server.name
 
+        from ..services.connector_team_scope import delete_team_connector
+
+        team_delete = delete_team_connector(db, int(user_id), "mcp", int(server_id))
+        if team_delete.blocked_reason:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=team_delete.blocked_reason,
+            )
+        if team_delete.team_owned and not team_delete.authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only a team admin can delete a team MCP server",
+            )
+
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
             from ..mcp_apps import get_app_by_name
@@ -2745,6 +2834,11 @@ def delete_mcp_server(
 
         # Only remove from manager and delete if no other users
         if not other_users:
+            if team_delete.team_owned and not team_delete.delete_definition:
+                logger.info(
+                    f"Kept shared MCP server '{server_name}' after team disconnect"
+                )
+                return
             if _catalog_server_has_platform_key(db, server):
                 # Keep the shared catalog row: it holds the admin's platform
                 # fallback key and is reused by future connects. Deleting it would
@@ -3328,8 +3422,7 @@ async def connect_mcp_oauth(
                 detail={
                     "code": "unsupported_auth_server",
                     "message": (
-                        "Unsupported token endpoint auth method: "
-                        f"{token_endpoint_auth_method}"
+                        f"Unsupported token endpoint auth method: {token_endpoint_auth_method}"
                     ),
                 },
             )

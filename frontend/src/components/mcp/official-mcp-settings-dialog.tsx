@@ -2,7 +2,7 @@ import React from "react"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
-import { Settings, Unlink, Plus } from "lucide-react"
+import { Settings, Unlink, Plus, Users, UserMinus } from "lucide-react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
@@ -35,7 +35,7 @@ export function OfficialMcpSettingsDialog({
   onConfigure,
   onManageKey
 }: OfficialMcpSettingsDialogProps) {
-  const { token } = useAuth()
+  const { token, inTeam } = useAuth()
   const { t } = useI18n()
 
   const handleConnectApp = (appToConnect: AppIntegration) => {
@@ -87,6 +87,34 @@ export function OfficialMcpSettingsDialog({
         window.removeEventListener('message', handleMessage);
       }
     }, 500);
+  }
+
+  // Toggle team-sharing for the connector. On unshare 403 (still referenced by
+  // a team agent) show the reason. server_id is the numeric connector id.
+  const handleToggleShare = async (appToShare: AppIntegration, share: boolean) => {
+    if (!Number.isInteger(appToShare.server_id)) return
+    const type = appToShare.transport === "custom_api" ? "custom_api" : "mcp"
+    const action = share ? "share" : "unshare"
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/connectors/${type}/${appToShare.server_id}/${action}`,
+        { method: "POST" },
+      )
+      if (response.ok) {
+        toast.success(share ? t('tools.mcp.sharing.shared') : t('tools.mcp.sharing.private'))
+        if (onSuccess) onSuccess()
+        onOpenChange(false)
+      } else if (!share && response.status === 403) {
+        toast.error(t('tools.mcp.sharing.stillUsedByAgent'))
+      } else if (share && response.status === 403) {
+        toast.error(t('tools.mcp.sharing.onlyOwnerOrAdmin'))
+      } else {
+        toast.error(t('tools.mcp.alerts.saveFailed'))
+      }
+    } catch (error) {
+      console.error("Failed to toggle connector sharing:", error)
+      toast.error(t('tools.mcp.alerts.saveFailed'))
+    }
   }
 
   const handleDisconnectApp = async (appToDisconnect: any) => {
@@ -160,6 +188,17 @@ export function OfficialMcpSettingsDialog({
             </div>
           )}
 
+          {inTeam && isGloballyConnected && Number.isInteger(app.server_id) && (
+            <div className={`mb-4 inline-flex items-center px-3 py-1 rounded-full text-sm font-medium border ${app.shared ? 'bg-blue-50 border-blue-100 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+              {!app.shared
+                ? t('tools.mcp.sharing.private')
+                : app.is_owner
+                  ? t('tools.mcp.sharing.shared')
+                  : t('tools.mcp.sharing.teamTool')}
+              {app.needs_config && ` · ${t('tools.mcp.sharing.needsConfig')}`}
+            </div>
+          )}
+
           <p className="text-slate-500 mb-8 max-w-sm leading-relaxed">
             {app.description}
           </p>
@@ -178,32 +217,55 @@ export function OfficialMcpSettingsDialog({
               <>
                 {(() => {
                   const isKeyBased = app.auth_type === "api_key"
+                  // Team tool the viewer doesn't own: they can use it, but the backend
+                  // rejects edit/delete/unshare (403), so don't render those buttons.
+                  const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
                   return (
                     <>
-                      <Button
-                        className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
-                        onClick={() => {
-                          // Key-based apps: users only manage their own key, never the
-                          // shared server config. Route to the key dialog, not the form.
-                          if (isKeyBased && onManageKey) {
-                            onManageKey(app);
-                          } else if (app.is_custom && onConfigure) {
-                            onConfigure(app);
-                          } else {
-                            handleConnectApp(app);
-                          }
-                        }}
-                      >
-                        <Settings className="h-4 w-4 mr-2" />
-                        {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
-                        onClick={() => handleDisconnectApp(app)}
-                      >
-                        <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
-                      </Button>
+                      {!isNonOwnedTeamTool && (
+                        <Button
+                          className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
+                          onClick={() => {
+                            // Key-based apps: users only manage their own key, never the
+                            // shared server config. Route to the key dialog, not the form.
+                            if (isKeyBased && onManageKey) {
+                              onManageKey(app);
+                            } else if (app.is_custom && onConfigure) {
+                              onConfigure(app);
+                            } else {
+                              handleConnectApp(app);
+                            }
+                          }}
+                        >
+                          <Settings className="h-4 w-4 mr-2" />
+                          {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+                        </Button>
+                      )}
+                      {/* "Make team" / "Make personal": only the owner (or a team admin,
+                          enforced server-side) can change ownership. Hidden on non-owned
+                          team tools. */}
+                      {inTeam && Number.isInteger(app.server_id) && !isNonOwnedTeamTool && (
+                        <Button
+                          variant="outline"
+                          className="w-full max-w-[200px] rounded-full h-11 font-medium"
+                          onClick={() => handleToggleShare(app, !app.shared)}
+                        >
+                          {app.shared ? (
+                            <><UserMinus className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.unshare')}</>
+                          ) : (
+                            <><Users className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.share')}</>
+                          )}
+                        </Button>
+                      )}
+                      {!isNonOwnedTeamTool && (
+                        <Button
+                          variant="outline"
+                          className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+                          onClick={() => handleDisconnectApp(app)}
+                        >
+                          <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
+                        </Button>
+                      )}
                     </>
                   )
                 })()}

@@ -32,6 +32,21 @@ def _make_user(db, email):
     return user
 
 
+def _create_team_agent(db, user_id, **kwargs):
+    """Create an agent and promote it to team ownership.
+
+    Agents are personal on create (team_id NULL) now; team co-management only
+    applies once the owner explicitly promotes. Tests exercising team-shared
+    behaviour create through this helper.
+    """
+    store = AgentStore(db)
+    agent = store.create_agent(user_id=int(user_id), **kwargs)
+    store.promote_agent_to_team(
+        int(user_id), int(agent.id), ats.get_agent_team_scope(db, int(user_id))
+    )
+    return agent
+
+
 def test_agent_model_has_team_id_column():
     # team_id is a nullable scoping column owned by the SaaS overlay.
     col = Agent.__table__.columns["team_id"]
@@ -139,8 +154,8 @@ def two_users_one_team(db):
 def test_member_can_read_and_manage_teammates_agent(db, two_users_one_team):
     a, b = two_users_one_team
     store = AgentStore(db)
-    created = store.create_agent(
-        user_id=int(a.id), name="Shared", description=None, instructions=None
+    created = _create_team_agent(
+        db, a.id, name="Shared", description=None, instructions=None
     )
     # B sees it in the list...
     b_list = store.list_agent_items(int(b.id))
@@ -153,20 +168,15 @@ def test_member_can_read_and_manage_teammates_agent(db, two_users_one_team):
 
 def test_name_uniqueness_is_per_team(db, two_users_one_team):
     a, b = two_users_one_team
-    store = AgentStore(db)
-    store.create_agent(
-        user_id=int(a.id), name="Dup", description=None, instructions=None
-    )
-    assert store.agent_name_exists(int(b.id), "Dup") is True
+    _create_team_agent(db, a.id, name="Dup", description=None, instructions=None)
+    assert AgentStore(db).agent_name_exists(int(b.id), "Dup") is True
 
 
 def test_teammate_agent_is_owner_access(db, two_users_one_team):
     from xagent.web.services.agent_access import list_accessible_agents
 
     a, b = two_users_one_team
-    AgentStore(db).create_agent(
-        user_id=int(a.id), name="Shared2", description=None, instructions=None
-    )
+    _create_team_agent(db, a.id, name="Shared2", description=None, instructions=None)
     items = list_accessible_agents(db, b)
     match = [i for i in items if i.agent.name == "Shared2"]
     assert match and match[0].access == "owner"
@@ -180,8 +190,8 @@ def test_member_can_manage_teammates_agent_api_key(db, two_users_one_team):
     from xagent.web.services.api_keys import AgentApiKeyService
 
     a, b = two_users_one_team
-    agent = AgentStore(db).create_agent(
-        user_id=int(a.id), name="KeyShared", description=None, instructions=None
+    agent = _create_team_agent(
+        db, a.id, name="KeyShared", description=None, instructions=None
     )
     svc = AgentApiKeyService(db)
     # B (teammate) can create and then list a key on A's agent.
@@ -195,8 +205,8 @@ def test_member_can_manage_teammates_agent_trigger(db, two_users_one_team):
     from xagent.web.services.triggers import get_owned_agent
 
     a, b = two_users_one_team
-    agent = AgentStore(db).create_agent(
-        user_id=int(a.id), name="TrigShared", description=None, instructions=None
+    agent = _create_team_agent(
+        db, a.id, name="TrigShared", description=None, instructions=None
     )
     # B (teammate) resolves A's agent as owned -- the gate every trigger
     # endpoint routes through.
@@ -213,8 +223,8 @@ def test_member_can_read_and_edit_teammates_trigger(db, two_users_one_team):
     )
 
     a, b = two_users_one_team
-    agent = AgentStore(db).create_agent(
-        user_id=int(a.id), name="TrigCoManage", description=None, instructions=None
+    agent = _create_team_agent(
+        db, a.id, name="TrigCoManage", description=None, instructions=None
     )
     trigger, _ = create_agent_trigger(
         db,
@@ -247,9 +257,7 @@ def test_workforce_names_agent_name_exists_is_per_team(db, two_users_one_team):
     from xagent.web.services.workforce_names import agent_name_exists
 
     a, b = two_users_one_team
-    AgentStore(db).create_agent(
-        user_id=int(a.id), name="WFDup", description=None, instructions=None
-    )
+    _create_team_agent(db, a.id, name="WFDup", description=None, instructions=None)
     # B's name-existence check sees A's team-visible agent.
     assert agent_name_exists(db, user_id=int(b.id), name="WFDup") is True
 

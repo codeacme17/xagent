@@ -1,5 +1,5 @@
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +19,7 @@ from xagent.web.api.custom_api import (
 )
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.user import User
+from xagent.web.services.connector_team_scope import ConnectorDeleteDecision
 
 
 def test_custom_api_models_env_validation():
@@ -453,3 +454,30 @@ async def test_delete_custom_api():
 
     db.delete.assert_called_once_with(mock_api)
     db.commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_team_custom_api_flushes_only_current_user_link():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+    mock_api = CustomApi(id=10)
+    mock_user_api = UserCustomApi(
+        user_id=1, custom_api_id=10, can_delete=True, custom_api=mock_api
+    )
+    db.query().filter().first.side_effect = [mock_user_api, None]
+
+    decision = ConnectorDeleteDecision(
+        team_owned=True,
+        authorized=True,
+        delete_definition=True,
+    )
+    with patch(
+        "xagent.web.services.connector_team_scope.delete_team_connector",
+        return_value=decision,
+    ):
+        await delete_custom_api(10, current_user=user, db=db)
+
+    db.flush.assert_called_once_with([mock_user_api])
+    assert db.no_autoflush.__enter__.called
+    assert db.delete.call_args_list == [call(mock_user_api), call(mock_api)]
+    db.commit.assert_called_once()

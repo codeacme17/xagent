@@ -251,6 +251,7 @@ async def create_custom_api(
     )
 
     db.add(user_api)
+
     db.commit()
     db.refresh(new_api)
     db.refresh(user_api)
@@ -315,6 +316,7 @@ async def update_custom_api(
         )
 
     api = user_api.custom_api
+    old_name = str(api.name)
 
     # Check name uniqueness if name is changed
     if api_data.name and api_data.name != api.name:
@@ -386,6 +388,17 @@ async def update_custom_api(
     if "allow_delegated_authorization" in fields_set:
         api.allow_delegated_authorization = allow_delegated_authorization
 
+    from ..services.connector_team_scope import rename_team_connector
+
+    rename_team_connector(
+        db,
+        int(current_user.id),
+        "custom_api",
+        int(api_id),
+        old_name,
+        str(api.name),
+    )
+
     # Update UserCustomApi link
     if api_data.is_active is not None:
         user_api.is_active = api_data.is_active  # type: ignore[assignment]
@@ -425,7 +438,36 @@ async def delete_custom_api(
             detail="You do not have permission to delete this Custom API",
         )
 
-    db.delete(user_api.custom_api)  # Will cascade to UserCustomApi
+    api = user_api.custom_api
+
+    from ..services.connector_team_scope import delete_team_connector
+
+    team_delete = delete_team_connector(
+        db, int(current_user.id), "custom_api", int(api_id)
+    )
+    if team_delete.blocked_reason:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=team_delete.blocked_reason,
+        )
+    if team_delete.team_owned and not team_delete.authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a team admin can delete a team Custom API",
+        )
+    if team_delete.team_owned:
+        db.delete(user_api)
+        db.flush([user_api])
+        with db.no_autoflush:
+            remaining = (
+                db.query(UserCustomApi)
+                .filter(UserCustomApi.custom_api_id == api_id)
+                .first()
+            )
+        if remaining is None and team_delete.delete_definition:
+            db.delete(api)
+    else:
+        db.delete(api)  # Will cascade to UserCustomApi
     db.commit()
 
     return None
