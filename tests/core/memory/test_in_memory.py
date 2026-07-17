@@ -562,6 +562,18 @@ class TestSearchListOnlyFilterParity:
             assert memory_store.search("report", k=10, filters={key: 5}) == []
             assert memory_store.list_all(filters={key: 5}) == []
 
+    def test_empty_tags_keywords_match_everything(self, memory_store):
+        # An empty list means "no tags/keywords required" — vacuously matches
+        # every note, distinct from the malformed no-match case above.
+        for key in ("tags", "keywords"):
+            assert {
+                n.id for n in memory_store.search("report", k=10, filters={key: []})
+            } == {"old-work", "new-home"}
+            assert {n.id for n in memory_store.list_all(filters={key: []})} == {
+                "old-work",
+                "new-home",
+            }
+
     def test_string_tags_keywords_treated_as_single_item(self, memory_store):
         # A bare string is one required item, not a per-character iteration.
         assert [

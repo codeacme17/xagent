@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Collection, List, Optional
 
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
@@ -53,16 +53,16 @@ class InMemoryMemoryStore(MemoryStore):
         )
 
     @staticmethod
-    def _required_items(value: Any) -> Optional[list[Any]]:
+    def _required_items(value: Any) -> Optional[Collection[Any]]:
         """Normalize a ``tags``/``keywords`` filter value: a plain string is a
         single required item (not iterated per character), an iterable is many,
         and anything else can't match (rather than raising ``TypeError`` on
         malformed caller-supplied filters — the same no-match policy as
         ``_matches_metadata_filters``)."""
         if isinstance(value, str):
-            return [value]
+            return (value,)
         if isinstance(value, (list, tuple, set, frozenset)):
-            return list(value)
+            return value
         return None
 
     @classmethod
