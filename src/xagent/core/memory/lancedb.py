@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, Collection, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -467,49 +467,111 @@ class LanceDBMemoryStore(MemoryStore):
 
         return MemoryNote(**note_kwargs)
 
-    def _apply_filters(self, note: MemoryNote, filters: dict[str, Any]) -> bool:
-        """Apply filters to a MemoryNote for vector search results.
+    # Filter keys with dedicated handling in _matches_filters; anything else
+    # is treated as a flat metadata-equality filter. Mirrors
+    # InMemoryMemoryStore._KNOWN_FILTER_KEYS so the two stores cannot drift
+    # apart on filter semantics (#909).
+    _KNOWN_FILTER_KEYS = frozenset(
+        {
+            "category",
+            "metadata",
+            "date_from",
+            "date_to",
+            "tags",
+            "keywords",
+            SCOPE_EXCLUSIVE_FILTER_KEY,
+        }
+    )
 
-        Unlike ``_apply_text_search_filters``, this never checks
-        ``SCOPE_EXCLUSIVE_FILTER_KEY``: on the vector path that directive is
-        already turned into an ``array_length`` ``where`` term and popped out of
-        the residual filters by ``build_scope_where`` before it reaches here, so
-        it can only appear among these residual filters on the text fallback.
-        """
-        for key, value in filters.items():
-            # Special handling for category - check note.category first
-            if key == "category":
-                if str(note.category) != str(value):
-                    return False
-            elif key == "metadata":
-                # Handle nested metadata filters
-                if not self._apply_metadata_filters(note.metadata, value):
-                    return False
-            else:
-                # For other fields, check metadata
-                if str(note.metadata.get(key, "")) != str(value):
-                    return False
-        return True
+    @staticmethod
+    def _required_items(value: Any) -> Optional[Collection[Any]]:
+        """Normalize a ``tags``/``keywords`` filter value: a plain string is a
+        single required item (not iterated per character), an iterable is many,
+        and anything else can't match (rather than raising ``TypeError`` on
+        malformed caller-supplied filters — the same no-match policy as
+        ``_apply_metadata_filters``)."""
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return value
+        return None
 
-    def _apply_text_search_filters(
-        self, metadata_dict: dict[str, Any], filters: dict[str, Any]
+    @classmethod
+    def _flat_other_filters(cls, filters: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Filter keys without dedicated handling, applied as flat metadata
+        equality. Note-independent — compute once per call, not per note."""
+        return {
+            key: value
+            for key, value in (filters or {}).items()
+            if key not in cls._KNOWN_FILTER_KEYS
+        }
+
+    def _matches_filters(
+        self,
+        note: MemoryNote,
+        filters: dict[str, Any],
+        other_filters: dict[str, Any],
     ) -> bool:
-        """Apply filters to metadata dict for text search results."""
-        for key, value in filters.items():
-            if key == SCOPE_EXCLUSIVE_FILTER_KEY:
-                # #822: the text-fallback form of the strict dimension-less
-                # exclusion the vector path pushes into `where`. Only notes
-                # carrying no scope dimensions pass.
-                if value and encode_scope_dims(metadata_dict):
-                    return False
-            elif key == "metadata":
-                # Handle nested metadata filters
-                if not self._apply_metadata_filters(metadata_dict, value):
-                    return False
-            else:
-                # Direct field comparison
-                if str(metadata_dict.get(key, "")) != str(value):
-                    return False
+        """Single filter dispatch shared by the vector path, the text fallback,
+        and (via search) ``list_all()``, so they cannot drift apart on filter
+        semantics (#909 — previously ``tags``/``keywords``/``date_from``/
+        ``date_to`` fell through to flat metadata equality on both search paths
+        and never matched, while ``list_all()`` handled them correctly).
+
+        On the vector path ``filters`` is the residual dict left by
+        ``build_scope_where``: ``SCOPE_EXCLUSIVE_FILTER_KEY`` and the
+        user_id/scope-dimension entries of the nested ``metadata`` filter were
+        already pushed into the ``where`` prefilter, so those checks simply do
+        not trigger there. The text fallback passes the full filters and relies
+        on the checks here.
+
+        ``other_filters`` is ``_flat_other_filters(filters)``, precomputed by
+        the caller so the per-note check does not rebuild it.
+        """
+        # #822: strict dimension-less exclusion — only notes carrying no scope
+        # dimensions pass. Scope-dimension stamps live in note.metadata (they
+        # are not popped by _dict_to_memory_note).
+        if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
+            return False
+
+        if "category" in filters and str(note.category) != str(filters["category"]):
+            return False
+
+        # Nested metadata filters (the shape UserIsolatedMemoryStore emits
+        # for user_id/scope isolation)
+        if "metadata" in filters and not self._apply_metadata_filters(
+            note.metadata, filters["metadata"]
+        ):
+            return False
+
+        # Date range filters
+        if "date_from" in filters and note.timestamp < filters["date_from"]:
+            return False
+        if "date_to" in filters and note.timestamp > filters["date_to"]:
+            return False
+
+        # Tag filter (all required tags present)
+        if "tags" in filters:
+            required_tags = self._required_items(filters["tags"])
+            if required_tags is None or not all(
+                tag in note.tags for tag in required_tags
+            ):
+                return False
+
+        # Keyword filter (all required keywords present)
+        if "keywords" in filters:
+            required_keywords = self._required_items(filters["keywords"])
+            if required_keywords is None or not all(
+                keyword in note.keywords for keyword in required_keywords
+            ):
+                return False
+
+        # Other flat metadata filters (string-coerced equality)
+        if other_filters and not self._apply_metadata_filters(
+            note.metadata, other_filters
+        ):
+            return False
+
         return True
 
     def _apply_metadata_filters(
@@ -699,8 +761,10 @@ class LanceDBMemoryStore(MemoryStore):
 
             # #822: push user_id + scope-dimension filters into a `where`
             # prefilter so the ANN returns k already-scoped neighbours; the rest
-            # (category, arbitrary metadata keys) stays a Python post-filter.
+            # (category, tags/keywords/dates, arbitrary metadata keys) stays a
+            # Python post-filter.
             where_sql, residual_filters = build_scope_where(filters)
+            residual_other_filters = self._flat_other_filters(residual_filters)
 
             # Try vector search first
             try:
@@ -763,13 +827,12 @@ class LanceDBMemoryStore(MemoryStore):
 
                                 # user_id + scope dimensions were already applied
                                 # as a `where` prefilter; only residual filters
-                                # (category, arbitrary metadata keys) remain.
-                                if residual_filters:
-                                    filter_match = self._apply_filters(
-                                        note, residual_filters
-                                    )
-                                    if not filter_match:
-                                        continue
+                                # (category, tags/keywords/dates, arbitrary
+                                # metadata keys) remain.
+                                if residual_filters and not self._matches_filters(
+                                    note, residual_filters, residual_other_filters
+                                ):
+                                    continue
 
                                 results.append(note)
                         except Exception as vector_error:
@@ -802,48 +865,46 @@ class LanceDBMemoryStore(MemoryStore):
             if not results:
                 # Text search
                 df = table.search().to_pandas()
+                other_filters = self._flat_other_filters(filters)
 
                 # Filter by query text and apply filters
                 for _, row in df.iterrows():
                     text = row.get("text", "")
-                    metadata = row.get("metadata", "{}")
-
-                    try:
-                        metadata_dict = json.loads(metadata)
-                    except (json.JSONDecodeError, TypeError):
-                        metadata_dict = {}
-
-                    # Apply metadata filters if specified
-                    if filters:
-                        filter_match = self._apply_text_search_filters(
-                            metadata_dict, filters
-                        )
-                        if not filter_match:
-                            continue
 
                     # Simple text matching
-                    if not query or query.lower() in text.lower():
-                        note_data = {
-                            "id": row.get("id", ""),
-                            "text": text,
-                            "metadata": metadata,
-                        }
-                        # #847: here a malformed row would escape to the outer
-                        # except and turn the whole query into an empty result.
-                        try:
-                            note = self._dict_to_memory_note(note_data)
-                        except Exception as row_error:
-                            logger.warning(
-                                "Skipping malformed memory row %r in text "
-                                "search results: %s",
-                                note_data["id"],
-                                row_error,
-                            )
-                            continue
-                        results.append(note)
+                    if query and query.lower() not in text.lower():
+                        continue
 
-                        if len(results) >= k:
-                            break
+                    note_data = {
+                        "id": row.get("id", ""),
+                        "text": text,
+                        "metadata": row.get("metadata", "{}"),
+                    }
+                    # #847: here a malformed row would escape to the outer
+                    # except and turn the whole query into an empty result.
+                    try:
+                        note = self._dict_to_memory_note(note_data)
+                    except Exception as row_error:
+                        logger.warning(
+                            "Skipping malformed memory row %r in text "
+                            "search results: %s",
+                            note_data["id"],
+                            row_error,
+                        )
+                        continue
+
+                    # Unlike the vector path, nothing was pushed into `where`
+                    # here, so the full filters apply (including the
+                    # scope-exclusive directive and nested metadata isolation).
+                    if filters and not self._matches_filters(
+                        note, filters, other_filters
+                    ):
+                        continue
+
+                    results.append(note)
+
+                    if len(results) >= k:
+                        break
 
             return results[:k]
 
@@ -860,51 +921,17 @@ class LanceDBMemoryStore(MemoryStore):
         except Exception as e:
             logger.error(f"Failed to clear memory store: {e}")
 
-    # Filters that search() does not understand and must be applied here.
-    # Everything else (category, nested `metadata`, direct-field equality) is
-    # delegated to search()'s proven filter path so list_all cannot diverge.
-    _LIST_ONLY_FILTERS = frozenset({"date_from", "date_to", "tags", "keywords"})
-
-    def _matches_list_only_filters(
-        self, note: MemoryNote, filters: dict[str, Any]
-    ) -> bool:
-        """Apply the date-range/tags/keywords filters search() does not handle."""
-        if "date_from" in filters and note.timestamp < filters["date_from"]:
-            return False
-        if "date_to" in filters and note.timestamp > filters["date_to"]:
-            return False
-        if "tags" in filters and not all(tag in note.tags for tag in filters["tags"]):
-            return False
-        if "keywords" in filters and not all(
-            keyword in note.keywords for keyword in filters["keywords"]
-        ):
-            return False
-        return True
-
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
         """List all memory notes with optional filtering.
 
-        Delegates category / nested-``metadata`` / direct-field filters to
-        search() (its filter logic is the single source of truth, including the
-        nested ``{"metadata": {...}}`` shape the user-isolation layer relies on),
-        and applies the date-range/tags/keywords filters here. Results are sorted
+        Delegates all filtering to search(): its ``_matches_filters`` dispatch
+        is the single source of truth (category, nested ``{"metadata": {...}}``
+        isolation filters, tags/keywords/date ranges, flat metadata equality),
+        so list_all and search cannot diverge (#909). Results are sorted
         newest-first to match InMemoryStore.list_all.
         """
         try:
-            filters = filters or {}
-            # Let search() handle everything it understands...
-            search_filters = {
-                k: v for k, v in filters.items() if k not in self._LIST_ONLY_FILTERS
-            }
-            notes = self.search(query="", k=10000, filters=search_filters or None)
-            # ...then apply the list-only filters it does not.
-            list_only = {
-                k: v for k, v in filters.items() if k in self._LIST_ONLY_FILTERS
-            }
-            if list_only:
-                notes = [
-                    n for n in notes if self._matches_list_only_filters(n, list_only)
-                ]
+            notes = self.search(query="", k=10000, filters=filters or None)
             # Mirror InMemoryStore: newest first.
             notes.sort(key=lambda n: n.timestamp, reverse=True)
             return notes
