@@ -499,6 +499,34 @@ def test_dict_to_memory_note_missing_timestamp(memory_store):
     assert "timestamp" not in note.metadata
 
 
+def test_get_returns_legacy_row_missing_timestamp(memory_store):
+    """get() uses the same converter, so a timestamp-less legacy row must load
+    with the default timestamp instead of surfacing a generic failure (#847)."""
+    # Settle the table schema (vector column dimension) with a regular add
+    # before bypassing it with a raw legacy row.
+    assert memory_store.add(MemoryNote(content="schema-settling note")).success
+
+    _insert_raw_row(
+        memory_store,
+        "test_memories",
+        {
+            "id": "legacy-get-no-ts",
+            "vector": [0.1] * 64,
+            "text": "legacy get target",
+            "metadata": json.dumps({"content": "legacy get target"}),
+            "user_id": None,
+            "scope_dims": [],
+        },
+    )
+
+    response = memory_store.get("legacy-get-no-ts")
+    assert response.success
+    note = response.content
+    assert isinstance(note, MemoryNote)
+    assert note.content == "legacy get target"
+    assert note.timestamp is not None
+
+
 def test_search_returns_legacy_rows_missing_timestamp(memory_store):
     """A vector search whose top-k contains a timestamp-less legacy row must
     return all matching rows, including the legacy one (#847)."""
@@ -531,8 +559,12 @@ def test_search_skips_malformed_row_without_truncation(memory_store, caplog):
     which used to suppress the text fallback and silently truncate the
     results (#847).
 
-    The malformed row is seeded BETWEEN well-formed rows so that, pre-fix, the
-    mid-loop escape would drop the rows inserted after it."""
+    The malformed row is seeded between well-formed rows so that, pre-fix, the
+    mid-loop escape would drop whichever rows the scan happened to visit after
+    it (LanceDB does not guarantee tied-distance iteration order, so exactly
+    which rows those are is an implementation detail). The assertions below
+    are order-independent — set membership plus log presence — so the test
+    stays valid regardless of how tied rows are iterated."""
     for i in range(2):
         assert memory_store.add(MemoryNote(content=f"well-formed note {i}")).success
 
