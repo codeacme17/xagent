@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, List, Optional
 
 from .core import MemoryNote, MemoryResponse
+
+
+def comparable_timestamp(value: Any) -> Any:
+    """Normalize a datetime for cross-comparison in date-range filters.
+
+    Stored note timestamps default to naive local time
+    (``MemoryNote.timestamp``'s ``datetime.now`` factory), while caller-supplied
+    ``date_from``/``date_to`` filter values may be timezone-aware (FastAPI
+    parses ISO date query params with an offset into aware datetimes).
+    Comparing the two directly raises ``TypeError``, which the stores' outer
+    exception handlers would swallow into a silently empty result. Aware
+    datetimes are therefore converted to naive local time before comparison;
+    naive datetimes and non-datetime values pass through unchanged.
+
+    Shared by every ``MemoryStore`` implementation's filter dispatch so the
+    stores cannot drift apart on this policy.
+    """
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
 
 
 class MemoryStore(ABC):

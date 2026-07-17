@@ -15,7 +15,7 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from .base import MemoryStore
+from .base import MemoryStore, comparable_timestamp
 from .core import MemoryNote, MemoryResponse
 from .schema_migration import (
     MemoryMismatchKind,
@@ -544,11 +544,18 @@ class LanceDBMemoryStore(MemoryStore):
         ):
             return False
 
-        # Date range filters
-        if "date_from" in filters and note.timestamp < filters["date_from"]:
-            return False
-        if "date_to" in filters and note.timestamp > filters["date_to"]:
-            return False
+        # Date range filters (both sides tz-normalized so an aware filter
+        # against the naive default timestamps cannot raise TypeError)
+        if "date_from" in filters or "date_to" in filters:
+            note_ts = comparable_timestamp(note.timestamp)
+            if "date_from" in filters and note_ts < comparable_timestamp(
+                filters["date_from"]
+            ):
+                return False
+            if "date_to" in filters and note_ts > comparable_timestamp(
+                filters["date_to"]
+            ):
+                return False
 
         # Tag filter (all required tags present)
         if "tags" in filters:
