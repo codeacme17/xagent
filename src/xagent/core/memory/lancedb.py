@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
+import pyarrow.compute as pc  # type: ignore
 
 from ...providers.vector_store.lancedb import (
     LanceDBConnectionManager,
@@ -30,6 +31,7 @@ from .scope_columns import (
     coerce_user_id,
     derive_scope_columns,
     encode_scope_dims,
+    scope_dim_where_term,
 )
 
 logger = logging.getLogger(__name__)
@@ -681,6 +683,66 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to delete memory: {str(e)}",
                 memory_id=note_id,
             )
+
+    def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
+        """Bulk-delete every note stamped with dimension ``dim_key=value``.
+
+        Pushes a single ``array_contains(scope_dims, 'key=value')`` predicate
+        into LanceDB instead of the base class's list-and-delete walk, so the
+        whole matching set goes in one table operation. Exact per-element
+        equality (see scope_columns), so similar values never collide.
+
+        ``deleted_count`` is best-effort under concurrent writers: LanceDB's
+        ``delete()`` reports only the new table version, not a row count, so
+        the count comes from a ``count_rows`` on the same predicate just
+        before the delete. The operation itself stays idempotent either way.
+        """
+        where = scope_dim_where_term(dim_key, value)
+        table = None
+        try:
+            # The table always exists after construction (the vector store
+            # creates it in __init__), so open directly like get()/search().
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            count = table.count_rows(where)
+            if count:
+                table.delete(where)
+            return MemoryResponse(success=True, metadata={"deleted_count": count})
+        except Exception as e:
+            logger.error(f"Failed to delete memories by scope dimension {dim_key}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to delete memories by scope dimension: {str(e)}",
+                metadata={"deleted_count": 0},
+            )
+        finally:
+            _safe_close_table(table)
+
+    def list_scope_dimension_values(self, dim_key: str) -> set[str]:
+        """Distinct stamped values for one scope dimension, store-wide.
+
+        Projects only the ``scope_dims`` column (no vectors, no metadata JSON)
+        so the scan stays cheap on large tables. Raises on backend failure —
+        see the base class contract.
+        """
+        prefix = f"{dim_key}="
+        table = None
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            arrow_table = (
+                table.search().select([SCOPE_DIMS_COLUMN]).limit(None).to_arrow()
+            )
+            # Filter in Arrow: flatten the list<string> column (null rows drop
+            # out), keep only this dimension's elements, then dedupe — only the
+            # distinct values ever cross into Python.
+            flat = pc.list_flatten(arrow_table[SCOPE_DIMS_COLUMN])
+            matched = flat.filter(pc.starts_with(flat, pattern=prefix))
+            return {element[len(prefix) :] for element in matched.unique().to_pylist()}
+        finally:
+            _safe_close_table(table)
 
     def search(
         self,
