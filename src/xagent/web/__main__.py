@@ -92,6 +92,7 @@ Examples:
     python -m xagent.web --reload --debug    # Development mode + debug mode
     python -m xagent.web --host 0.0.0.0      # Listen on all interfaces
     python -m xagent.web --debug             # Enable verbose logging (LLM responses, etc.)
+    python -m xagent.web migrate --help      # Import agents from OpenClaw or Hermes
         """,
     )
 
@@ -119,7 +120,16 @@ Examples:
 
 
 def main() -> None:
-    """Main function"""
+    """Main function.
+
+    ``xagent migrate ...`` dispatches to the migration CLI; every other
+    invocation starts the web service (the historical behavior).
+    """
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        from ..migration.cli import main as migrate_main
+
+        raise SystemExit(migrate_main(sys.argv[2:]))
+
     args = parse_args()
 
     # Configure logging BEFORE importing app
