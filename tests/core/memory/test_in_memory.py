@@ -1,6 +1,6 @@
 """Test cases for InMemory memory store implementation."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -545,6 +545,37 @@ class TestSearchListOnlyFilterParity:
             n.id
             for n in memory_store.search("report", k=10, filters={"date_to": cutoff})
         ] == ["old-work"]
+
+    def test_timezone_aware_date_filters(self, memory_store):
+        # A tz-aware filter (FastAPI parses ISO date query params with an
+        # offset into aware datetimes) must compare against the naive stored
+        # timestamps instead of raising TypeError.
+        cutoff_utc = (self.now - timedelta(days=1)).astimezone(timezone.utc)
+        assert [
+            n.id
+            for n in memory_store.search(
+                "report", k=10, filters={"date_from": cutoff_utc}
+            )
+        ] == ["new-home"]
+        assert [
+            n.id for n in memory_store.list_all(filters={"date_from": cutoff_utc})
+        ] == ["new-home"]
+
+    def test_timezone_aware_stored_timestamp_with_naive_filter(self, memory_store):
+        # The other direction: an aware stored timestamp must compare against
+        # a naive filter value.
+        memory_store.add(
+            MemoryNote(
+                id="aware-note",
+                content="weekly report summary",
+                tags=["work"],
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+        results = memory_store.search(
+            "report", k=10, filters={"date_from": self.now - timedelta(days=1)}
+        )
+        assert {n.id for n in results} == {"new-home", "aware-note"}
 
     def test_search_and_list_all_agree(self, memory_store):
         filters = {"tags": ["work"], "keywords": ["report"]}

@@ -2,11 +2,30 @@ import json
 import logging
 import shutil
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore, _safe_close_table
+from xagent.core.model.embedding import BaseEmbedding
+
+
+class FailingEmbedding(BaseEmbedding):
+    """Embedding model that always fails, forcing the text-search fallback."""
+
+    def __init__(self):
+        self._dimension = 64
+
+    def encode(self, text, dimension=None, instruct=None):
+        raise Exception("Embedding failed")
+
+    def get_dimension(self):
+        return self._dimension
+
+    @property
+    def abilities(self):
+        return ["embed"]
 
 
 @pytest.fixture
@@ -21,7 +40,6 @@ def temp_db_dir():
 @pytest.fixture
 def mock_embedding_model():
     """Create a mock embedding model for testing."""
-    from xagent.core.model.embedding import BaseEmbedding
 
     class MockEmbedding(BaseEmbedding):
         def __init__(self):
@@ -396,22 +414,6 @@ def test_embedding_fallback(memory_store):
     # Create a memory store with failing embedding model
     temp_dir = tempfile.mkdtemp()
     try:
-        from xagent.core.model.embedding import BaseEmbedding
-
-        class FailingEmbedding(BaseEmbedding):
-            def __init__(self):
-                self._dimension = 64
-
-            def encode(self, text, dimension=None, instruct=None):
-                raise Exception("Embedding failed")
-
-            def get_dimension(self):
-                return self._dimension
-
-            @property
-            def abilities(self):
-                return ["embed"]
-
         failing_model = FailingEmbedding()
 
         fallback_store = LanceDBMemoryStore(
@@ -615,22 +617,6 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
     """The text-search fallback must also skip (and log) a malformed row
     instead of escaping to the outer except and returning an empty result
     set (#847)."""
-    from xagent.core.model.embedding import BaseEmbedding
-
-    class FailingEmbedding(BaseEmbedding):
-        def __init__(self):
-            self._dimension = 64
-
-        def encode(self, text, dimension=None, instruct=None):
-            raise Exception("Embedding failed")
-
-        def get_dimension(self):
-            return self._dimension
-
-        @property
-        def abilities(self):
-            return ["embed"]
-
     store = LanceDBMemoryStore(
         db_dir=temp_db_dir,
         collection_name="test_text_fallback_847",
@@ -666,6 +652,173 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
         and "text search" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.fixture
+def failing_embedding_store(temp_db_dir):
+    """A store whose embedding model always fails, forcing the text fallback."""
+    return LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="test_memories_text_fallback",
+        embedding_model=FailingEmbedding(),
+    )
+
+
+@pytest.fixture(params=["vector", "text_fallback"])
+def parity_store(request, temp_db_dir, mock_embedding_model, failing_embedding_store):
+    """Run the filter-parity suite on both search paths.
+
+    ``vector``: mock embeddings (identical vectors, distance 0), so every note
+    is an accepted ANN neighbour and filters are exercised as the residual
+    Python post-filter of the vector path. ``text_fallback``: the embedding
+    model always fails, so filters are exercised on the text-search fallback.
+    """
+    if request.param == "vector":
+        return LanceDBMemoryStore(
+            db_dir=temp_db_dir,
+            collection_name="test_memories_parity",
+            embedding_model=mock_embedding_model,
+        )
+    return failing_embedding_store
+
+
+class TestSearchListOnlyFilterParity:
+    """#909: search() and list_all() share one filter dispatch — tags /
+    keywords / date_from / date_to must behave identically on both, on both
+    the vector path and the text fallback. Previously search() let these keys
+    fall through to flat metadata equality — they live on note.tags /
+    note.keywords / note.timestamp, never note.metadata, so any query
+    combining text search with one of them silently returned empty (reachable
+    via the web memory list route, which calls search() whenever a text query
+    is present), while list_all() handled them correctly."""
+
+    @pytest.fixture(autouse=True)
+    def seed(self, parity_store):
+        now = datetime.now()
+        assert parity_store.add(
+            MemoryNote(
+                id="old-work",
+                content="quarterly report draft",
+                tags=["work"],
+                keywords=["report"],
+                timestamp=now - timedelta(days=2),
+            )
+        ).success
+        assert parity_store.add(
+            MemoryNote(
+                id="new-home",
+                content="grocery report list",
+                tags=["home"],
+                keywords=["groceries"],
+                timestamp=now,
+            )
+        ).success
+        self.now = now
+
+    def test_search_with_tags_filter(self, parity_store):
+        results = parity_store.search("report", k=10, filters={"tags": ["work"]})
+        assert [n.id for n in results] == ["old-work"]
+
+    def test_search_with_keywords_filter(self, parity_store):
+        results = parity_store.search(
+            "report", k=10, filters={"keywords": ["groceries"]}
+        )
+        assert [n.id for n in results] == ["new-home"]
+
+    def test_search_with_date_filters(self, parity_store):
+        cutoff = self.now - timedelta(days=1)
+        assert [
+            n.id
+            for n in parity_store.search("report", k=10, filters={"date_from": cutoff})
+        ] == ["new-home"]
+        assert [
+            n.id
+            for n in parity_store.search("report", k=10, filters={"date_to": cutoff})
+        ] == ["old-work"]
+
+    def test_timezone_aware_date_filters(self, parity_store):
+        # A tz-aware filter (FastAPI parses ISO date query params with an
+        # offset into aware datetimes) must compare against the naive stored
+        # timestamps instead of raising TypeError — which the outer exception
+        # handlers would swallow into a silently empty result.
+        cutoff_utc = (self.now - timedelta(days=1)).astimezone(timezone.utc)
+        assert [
+            n.id
+            for n in parity_store.search(
+                "report", k=10, filters={"date_from": cutoff_utc}
+            )
+        ] == ["new-home"]
+        assert [
+            n.id
+            for n in parity_store.search(
+                "report", k=10, filters={"date_to": cutoff_utc}
+            )
+        ] == ["old-work"]
+        assert [
+            n.id for n in parity_store.list_all(filters={"date_from": cutoff_utc})
+        ] == ["new-home"]
+
+    def test_timezone_aware_stored_timestamp_with_naive_filter(self, parity_store):
+        # The other direction: an aware stored timestamp must compare against
+        # a naive filter value.
+        assert parity_store.add(
+            MemoryNote(
+                id="aware-note",
+                content="weekly report summary",
+                tags=["work"],
+                timestamp=datetime.now(timezone.utc),
+            )
+        ).success
+        results = parity_store.search(
+            "report", k=10, filters={"date_from": self.now - timedelta(days=1)}
+        )
+        assert {n.id for n in results} == {"new-home", "aware-note"}
+
+    def test_search_combines_text_query_with_tag_filter(self, parity_store):
+        # The production shape (web memory list route): a text query PLUS a
+        # tag filter. Pre-#909 this returned [] on the LanceDB store.
+        assert parity_store.search("quarterly", k=10) != []
+        results = parity_store.search("quarterly", k=10, filters={"tags": ["work"]})
+        assert [n.id for n in results] == ["old-work"]
+
+    def test_search_and_list_all_agree(self, parity_store):
+        filters = {"tags": ["work"], "keywords": ["report"]}
+        search_ids = {
+            n.id for n in parity_store.search("report", k=10, filters=filters)
+        }
+        list_ids = {n.id for n in parity_store.list_all(filters=filters)}
+        assert search_ids == list_ids == {"old-work"}
+
+    def test_string_tags_keywords_are_single_items(self, parity_store):
+        # A bare string is one required tag/keyword, not iterated per
+        # character (per-char iteration would require single-letter tags and
+        # never match "work" against tags=["work"]).
+        assert [
+            n.id for n in parity_store.search("report", k=10, filters={"tags": "work"})
+        ] == ["old-work"]
+        assert [n.id for n in parity_store.list_all(filters={"tags": "work"})] == [
+            "old-work"
+        ]
+
+    def test_non_iterable_tags_keywords_match_nothing(self, parity_store):
+        # Malformed (non-iterable) tags/keywords values can't match anything —
+        # same no-match policy as a non-dict filters["metadata"], no TypeError
+        # on either method.
+        for key in ("tags", "keywords"):
+            assert parity_store.search("report", k=10, filters={key: 5}) == []
+            assert parity_store.list_all(filters={key: 5}) == []
+
+    def test_empty_tags_keywords_match_everything(self, parity_store):
+        # An empty list means "no tags/keywords required" — vacuously matches
+        # every note, distinct from the malformed no-match case above.
+        for key in ("tags", "keywords"):
+            assert {
+                n.id for n in parity_store.search("report", k=10, filters={key: []})
+            } == {"old-work", "new-home"}
+            assert {n.id for n in parity_store.list_all(filters={key: []})} == {
+                "old-work",
+                "new-home",
+            }
 
 
 if __name__ == "__main__":
