@@ -9,9 +9,16 @@
 #
 # Options (environment variables):
 #   XAGENT_VERSION   pin a specific version, e.g. XAGENT_VERSION=0.6.0
+#   XAGENT_SKIP_BROWSER_INSTALL=1
+#                    skip the Playwright Chromium browser download
+#   XAGENT_SKIP_ROUTER_INSTALL=1
+#                    skip the OpenRouter "auto" model routing runtime
 #
 # Prefer not to pipe curl into sh? The equivalent manual install is:
-#   uv tool install xagent-ai        # or, in a venv: pip install xagent-ai
+#   uv tool install 'xagent-ai[browser,router]'
+#   "$(uv tool dir)/xagent-ai/bin/python" -m playwright install chromium
+#   # Or, in a virtualenv: pip install 'xagent-ai[browser,router]'
+#   # followed by: python -m playwright install chromium
 set -eu
 
 # The user's PATH before this script mutates it (below, when bootstrapping uv).
@@ -27,6 +34,12 @@ warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$1" >&2; }
 err() {
   printf '\033[1;31merror:\033[0m %s\n' "$1" >&2
   exit 1
+}
+is_truthy() {
+  case "${1:-}" in
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # uv supports Linux and macOS. Windows users should use pip in a venv.
@@ -49,16 +62,39 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 command -v uv >/dev/null 2>&1 || err "uv not found on PATH after install; open a new shell and re-run."
 
-spec="$APP"
+extras="browser,router"
+if is_truthy "${XAGENT_SKIP_ROUTER_INSTALL:-}"; then
+  extras="browser"
+  warn "Skipping OpenRouter auto-routing runtime (XAGENT_SKIP_ROUTER_INSTALL is set)."
+fi
+
+spec="${APP}[$extras]"
 if [ -n "${XAGENT_VERSION:-}" ]; then
   # Strip a leading 'v' (e.g. v0.6.0 -> 0.6.0) so a git-tag-style value works.
   version="${XAGENT_VERSION#v}"
   [ -n "$version" ] || err "XAGENT_VERSION='$XAGENT_VERSION' is not a valid version."
-  spec="$APP==$version"
+  spec="${spec}==$version"
 fi
 
 info "Installing $spec ..."
 uv tool install --upgrade "$spec"
+
+if is_truthy "${XAGENT_SKIP_BROWSER_INSTALL:-}"; then
+  warn "Skipping Playwright Chromium installation (XAGENT_SKIP_BROWSER_INSTALL is set)."
+else
+  tool_python="$(uv tool dir)/$APP/bin/python"
+  [ -x "$tool_python" ] || err "Xagent tool Python not found at '$tool_python'."
+  info "Installing Playwright Chromium browser..."
+  # xagent is already installed and usable at this point; the browser binary is
+  # an optional enhancement for browser-enabled tasks. Don't let a transient
+  # download failure abort the whole install (and swallow the "Next steps"
+  # message) — warn and continue so the user can retry manually.
+  if ! "$tool_python" -m playwright install chromium; then
+    warn "Playwright Chromium download failed. Xagent is installed, but browser-enabled tasks need it."
+    warn "Retry with: \"$tool_python\" -m playwright install chromium"
+    warn "Or skip it on re-run with XAGENT_SKIP_BROWSER_INSTALL=1."
+  fi
+fi
 
 printf '\n'
 info "Installed. Next steps:"
