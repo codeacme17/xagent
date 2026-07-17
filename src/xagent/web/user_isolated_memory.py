@@ -242,6 +242,11 @@ class UserIsolatedMemoryStore(MemoryStore):
         is not gated by the per-user context, because the dimension predicate
         itself bounds the deletion to notes explicitly stamped with that
         dimension — dimension-less (creator-direct) notes are never touched.
+
+        Trusted-caller-only: because it bypasses per-user isolation, this must
+        only be reachable from control-plane maintenance jobs — never wire it
+        to a per-user/per-request route, or one tenant could delete another
+        tenant's notes.
         """
         return self._base_store.delete_by_scope_dimension(dim_key, value)
 
@@ -249,7 +254,8 @@ class UserIsolatedMemoryStore(MemoryStore):
         """Distinct stamped values for one scope dimension, store-wide.
 
         Reconciliation primitive for the same maintenance flows as
-        ``delete_by_scope_dimension`` — delegated ungated for the same reason.
+        ``delete_by_scope_dimension`` — delegated ungated, and trusted-caller-
+        only, for the same reasons: it enumerates values across every user.
         """
         return self._base_store.list_scope_dimension_values(dim_key)
 

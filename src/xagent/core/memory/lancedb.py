@@ -720,12 +720,11 @@ class LanceDBMemoryStore(MemoryStore):
             table = self._vector_store.get_raw_connection().open_table(
                 self._collection_name
             )
-            total = table.count_rows()
-            if not total:
-                return set()
             arrow_table = (
-                table.search().select([SCOPE_DIMS_COLUMN]).limit(total).to_arrow()
+                table.search().select([SCOPE_DIMS_COLUMN]).limit(None).to_arrow()
             )
+            if arrow_table.num_rows == 0:
+                return set()
             # Filter in Arrow: flatten the list<string> column (null rows drop
             # out), keep only this dimension's elements, then dedupe — only the
             # distinct values ever cross into Python.

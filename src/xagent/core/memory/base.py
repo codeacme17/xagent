@@ -130,11 +130,21 @@ class MemoryStore(ABC):
         ``client_application_id=4`` — and notes carrying no scope dimensions are
         never candidates. Idempotent: re-running deletes nothing further.
 
+        ``value`` is matched by its ``str()`` form, which must render exactly
+        the string stamped at write time (write-time values are validated
+        non-empty strings). A non-canonical representation — a float, a bool,
+        leading zeros, alternate UUID casing — silently matches nothing
+        (``success=True``, ``deleted_count=0``).
+
         This default walks ``list_all()`` and deletes note-by-note; backends
         with a native bulk predicate delete should override it.
 
         Returns:
             MemoryResponse: ``success`` plus ``metadata["deleted_count"]``.
+            On failure, ``deleted_count`` is backend-specific: this fallback
+            deletes note-by-note and may report a nonzero partial count, while
+            bulk-predicate overrides (e.g. LanceDB) are all-or-nothing and
+            report 0.
         """
         element = scope_dim_element(dim_key, value)
         deleted = 0

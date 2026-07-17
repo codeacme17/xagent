@@ -16,7 +16,7 @@ import tempfile
 import pytest
 
 from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
-from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
@@ -123,6 +123,56 @@ def test_lancedb_list_values_before_any_write(lancedb_store):
 
 def test_base_default_list_values_via_in_memory():
     _assert_enumeration_semantics(InMemoryMemoryStore())
+
+
+def test_base_default_reap_reports_partial_failure():
+    """Base fallback: one per-note delete failing yields success=False while
+    deleted_count still reports the notes that did go (best-effort)."""
+    store = InMemoryMemoryStore()
+    ids = [
+        store.add(_note(f"ca42 note {i}", client_application_id=42)).memory_id
+        for i in range(3)
+    ]
+    stuck_id = ids[1]
+    real_delete = store.delete
+
+    def flaky_delete(note_id):
+        if note_id == stuck_id:
+            return MemoryResponse(success=False, error="simulated backend failure")
+        return real_delete(note_id)
+
+    store.delete = flaky_delete
+
+    response = store.delete_by_scope_dimension("client_application_id", 42)
+    assert not response.success
+    assert response.metadata["deleted_count"] == 2
+    assert "1" in response.error
+
+
+def test_lancedb_reap_failure_on_backend_error(lancedb_store, monkeypatch):
+    """LanceDB override: a backend error during the bulk delete surfaces as
+    success=False with deleted_count=0 (all-or-nothing), not an exception."""
+    _seed(lancedb_store)
+
+    class ExplodingTable:
+        def count_rows(self, *args, **kwargs):
+            return 2
+
+        def delete(self, *args, **kwargs):
+            raise RuntimeError("simulated backend failure")
+
+    class StubConnection:
+        def open_table(self, name):
+            return ExplodingTable()
+
+    monkeypatch.setattr(
+        lancedb_store._vector_store, "get_raw_connection", lambda: StubConnection()
+    )
+
+    response = lancedb_store.delete_by_scope_dimension("client_application_id", 42)
+    assert not response.success
+    assert response.metadata["deleted_count"] == 0
+    assert "simulated backend failure" in response.error
 
 
 def test_user_isolated_store_delegates_ungated():
