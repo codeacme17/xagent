@@ -8,6 +8,24 @@ import pytest
 
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore, _safe_close_table
+from xagent.core.model.embedding import BaseEmbedding
+
+
+class FailingEmbedding(BaseEmbedding):
+    """Embedding model that always fails, forcing the text-search fallback."""
+
+    def __init__(self):
+        self._dimension = 64
+
+    def encode(self, text, dimension=None, instruct=None):
+        raise Exception("Embedding failed")
+
+    def get_dimension(self):
+        return self._dimension
+
+    @property
+    def abilities(self):
+        return ["embed"]
 
 
 @pytest.fixture
@@ -22,7 +40,6 @@ def temp_db_dir():
 @pytest.fixture
 def mock_embedding_model():
     """Create a mock embedding model for testing."""
-    from xagent.core.model.embedding import BaseEmbedding
 
     class MockEmbedding(BaseEmbedding):
         def __init__(self):
@@ -397,22 +414,6 @@ def test_embedding_fallback(memory_store):
     # Create a memory store with failing embedding model
     temp_dir = tempfile.mkdtemp()
     try:
-        from xagent.core.model.embedding import BaseEmbedding
-
-        class FailingEmbedding(BaseEmbedding):
-            def __init__(self):
-                self._dimension = 64
-
-            def encode(self, text, dimension=None, instruct=None):
-                raise Exception("Embedding failed")
-
-            def get_dimension(self):
-                return self._dimension
-
-            @property
-            def abilities(self):
-                return ["embed"]
-
         failing_model = FailingEmbedding()
 
         fallback_store = LanceDBMemoryStore(
@@ -616,22 +617,6 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
     """The text-search fallback must also skip (and log) a malformed row
     instead of escaping to the outer except and returning an empty result
     set (#847)."""
-    from xagent.core.model.embedding import BaseEmbedding
-
-    class FailingEmbedding(BaseEmbedding):
-        def __init__(self):
-            self._dimension = 64
-
-        def encode(self, text, dimension=None, instruct=None):
-            raise Exception("Embedding failed")
-
-        def get_dimension(self):
-            return self._dimension
-
-        @property
-        def abilities(self):
-            return ["embed"]
-
     store = LanceDBMemoryStore(
         db_dir=temp_db_dir,
         collection_name="test_text_fallback_847",
@@ -672,22 +657,6 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
 @pytest.fixture
 def failing_embedding_store(temp_db_dir):
     """A store whose embedding model always fails, forcing the text fallback."""
-    from xagent.core.model.embedding import BaseEmbedding
-
-    class FailingEmbedding(BaseEmbedding):
-        def __init__(self):
-            self._dimension = 64
-
-        def encode(self, text, dimension=None, instruct=None):
-            raise Exception("Embedding failed")
-
-        def get_dimension(self):
-            return self._dimension
-
-        @property
-        def abilities(self):
-            return ["embed"]
-
     return LanceDBMemoryStore(
         db_dir=temp_db_dir,
         collection_name="test_memories_text_fallback",
