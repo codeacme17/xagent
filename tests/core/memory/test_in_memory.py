@@ -361,6 +361,229 @@ def test_clear(memory_store):
     assert len(results) == 0
 
 
+class TestInMemoryMemoryStoreNestedMetadataFilters:
+    """#842: nested ``filters["metadata"]`` dicts (the shape
+    ``UserIsolatedMemoryStore._add_user_filter`` emits) must be interpreted
+    with the same string-coerced equality semantics as
+    ``LanceDBMemoryStore._apply_metadata_filters`` — previously search()
+    never matched them and list_all() silently ignored them (fail-open)."""
+
+    @pytest.fixture(autouse=True)
+    def seed(self, memory_store):
+        memory_store.add(
+            MemoryNote(
+                id="alice",
+                content="shared note text",
+                metadata={"user_id": 1, "source": "chat"},
+            )
+        )
+        memory_store.add(
+            MemoryNote(
+                id="bob",
+                content="shared note text",
+                metadata={"user_id": 2, "source": "chat"},
+            )
+        )
+
+    def test_search_matches_nested_metadata_filter(self, memory_store):
+        results = memory_store.search(
+            "shared", k=10, filters={"metadata": {"user_id": 1}}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+    def test_search_nested_metadata_filter_no_match(self, memory_store):
+        results = memory_store.search(
+            "shared", k=10, filters={"metadata": {"user_id": 3}}
+        )
+        assert results == []
+
+    def test_list_all_enforces_nested_metadata_filter(self, memory_store):
+        results = memory_store.list_all(filters={"metadata": {"user_id": 2}})
+        assert [n.id for n in results] == ["bob"]
+
+    def test_list_all_nested_metadata_filter_no_match_is_empty(self, memory_store):
+        # Previously fail-open: an unmatched nested filter returned every note.
+        results = memory_store.list_all(filters={"metadata": {"user_id": 3}})
+        assert results == []
+
+    def test_nested_metadata_filter_multiple_keys(self, memory_store):
+        assert [
+            n.id
+            for n in memory_store.list_all(
+                filters={"metadata": {"user_id": 1, "source": "chat"}}
+            )
+        ] == ["alice"]
+        assert (
+            memory_store.list_all(
+                filters={"metadata": {"user_id": 1, "source": "email"}}
+            )
+            == []
+        )
+
+    def test_nested_metadata_filter_string_coerced_equality(self, memory_store):
+        # LanceDB compares str(metadata value) == str(filter value); the
+        # in-memory store must match a string filter against an int value.
+        results = memory_store.list_all(filters={"metadata": {"user_id": "1"}})
+        assert [n.id for n in results] == ["alice"]
+
+    def test_list_all_enforces_flat_metadata_filter(self, memory_store):
+        # Flat metadata keys (outside the known category/date/tags/keywords
+        # set) were previously ignored by list_all() — the same fail-open
+        # shape as the nested case.
+        results = memory_store.list_all(filters={"source": "chat", "user_id": 1})
+        assert [n.id for n in results] == ["alice"]
+
+        assert memory_store.list_all(filters={"source": "email"}) == []
+
+    def test_search_flat_metadata_filter_string_coerced(self, memory_store):
+        # Flat keys use the same string-coerced equality as LanceDB: a string
+        # filter value matches an int metadata value.
+        results = memory_store.search("shared", k=10, filters={"user_id": "2"})
+        assert [n.id for n in results] == ["bob"]
+
+    def test_nested_metadata_filter_combines_with_category(self, memory_store):
+        memory_store.add(
+            MemoryNote(
+                id="alice-system",
+                content="shared note text",
+                category="system",
+                metadata={"user_id": 1},
+            )
+        )
+        results = memory_store.list_all(
+            filters={"category": "system", "metadata": {"user_id": 1}}
+        )
+        assert [n.id for n in results] == ["alice-system"]
+
+    def test_nested_metadata_filter_combines_with_flat_key(self, memory_store):
+        # Both dispatch paths (nested dict + flat "other" key) applied in one
+        # call — AND semantics across the two.
+        results = memory_store.list_all(
+            filters={"metadata": {"user_id": 1}, "source": "chat"}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+        assert (
+            memory_store.list_all(
+                filters={"metadata": {"user_id": 1}, "source": "email"}
+            )
+            == []
+        )
+
+    def test_non_dict_nested_metadata_filter_matches_nothing(self, memory_store):
+        # A malformed filters["metadata"] value must not crash — it can't
+        # match anything.
+        for bad in (None, "abc", 42):
+            assert memory_store.search("shared", k=10, filters={"metadata": bad}) == []
+            assert memory_store.list_all(filters={"metadata": bad}) == []
+
+    def test_flat_key_combines_with_scope_exclusive(self, memory_store):
+        prefix = MEMORY_DIMENSION_METADATA_PREFIX
+        memory_store.add(
+            MemoryNote(
+                id="alice-scoped",
+                content="shared note text",
+                metadata={"user_id": 1, "source": "chat", f"{prefix}tenant": "acme"},
+            )
+        )
+        # user_id excludes bob (flat), the directive excludes alice-scoped.
+        results = memory_store.list_all(
+            filters={"user_id": 1, "source": "chat", SCOPE_EXCLUSIVE_FILTER_KEY: True}
+        )
+        assert [n.id for n in results] == ["alice"]
+
+
+class TestSearchListOnlyFilterParity:
+    """search() and list_all() share one filter dispatch: tags / keywords /
+    date_from / date_to must behave identically on both. Previously search()
+    let these keys fall through to flat metadata equality — they live on
+    note.tags/note.keywords/note.timestamp, never note.metadata, so any
+    query combining text search with one of them silently returned empty
+    (reachable via the web memory list route, which calls search() whenever
+    a text query is present)."""
+
+    @pytest.fixture(autouse=True)
+    def seed(self, memory_store):
+        now = datetime.now()
+        memory_store.add(
+            MemoryNote(
+                id="old-work",
+                content="quarterly report draft",
+                tags=["work"],
+                keywords=["report"],
+                timestamp=now - timedelta(days=2),
+            )
+        )
+        memory_store.add(
+            MemoryNote(
+                id="new-home",
+                content="grocery report list",
+                tags=["home"],
+                keywords=["groceries"],
+                timestamp=now,
+            )
+        )
+        self.now = now
+
+    def test_search_with_tags_filter(self, memory_store):
+        results = memory_store.search("report", k=10, filters={"tags": ["work"]})
+        assert [n.id for n in results] == ["old-work"]
+
+    def test_search_with_keywords_filter(self, memory_store):
+        results = memory_store.search(
+            "report", k=10, filters={"keywords": ["groceries"]}
+        )
+        assert [n.id for n in results] == ["new-home"]
+
+    def test_search_with_date_filters(self, memory_store):
+        cutoff = self.now - timedelta(days=1)
+        assert [
+            n.id
+            for n in memory_store.search("report", k=10, filters={"date_from": cutoff})
+        ] == ["new-home"]
+        assert [
+            n.id
+            for n in memory_store.search("report", k=10, filters={"date_to": cutoff})
+        ] == ["old-work"]
+
+    def test_search_and_list_all_agree(self, memory_store):
+        filters = {"tags": ["work"], "keywords": ["report"]}
+        search_ids = {
+            n.id for n in memory_store.search("report", k=10, filters=filters)
+        }
+        list_ids = {n.id for n in memory_store.list_all(filters=filters)}
+        assert search_ids == list_ids == {"old-work"}
+
+    def test_non_iterable_tags_keywords_match_nothing(self, memory_store):
+        # Malformed (non-iterable) tags/keywords values can't match anything —
+        # same no-match policy as a non-dict filters["metadata"], no TypeError
+        # on either method.
+        for key in ("tags", "keywords"):
+            assert memory_store.search("report", k=10, filters={key: 5}) == []
+            assert memory_store.list_all(filters={key: 5}) == []
+
+    def test_empty_tags_keywords_match_everything(self, memory_store):
+        # An empty list means "no tags/keywords required" — vacuously matches
+        # every note, distinct from the malformed no-match case above.
+        for key in ("tags", "keywords"):
+            assert {
+                n.id for n in memory_store.search("report", k=10, filters={key: []})
+            } == {"old-work", "new-home"}
+            assert {n.id for n in memory_store.list_all(filters={key: []})} == {
+                "old-work",
+                "new-home",
+            }
+
+    def test_string_tags_keywords_treated_as_single_item(self, memory_store):
+        # A bare string is one required item, not a per-character iteration.
+        assert [
+            n.id for n in memory_store.search("report", k=10, filters={"tags": "work"})
+        ] == ["old-work"]
+        assert [
+            n.id for n in memory_store.list_all(filters={"keywords": "groceries"})
+        ] == ["new-home"]
+
+
 def test_scope_exclusive_filters_scoped_notes(memory_store):
     """#822: the `__scope_exclusive__` directive (strict dimension-less
     isolation) excludes any scope-stamped note on the real InMemoryMemoryStore,
