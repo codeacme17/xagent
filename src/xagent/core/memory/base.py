@@ -137,7 +137,10 @@ class MemoryStore(ABC):
         (``success=True``, ``deleted_count=0``).
 
         This default walks ``list_all()`` and deletes note-by-note; backends
-        with a native bulk predicate delete should override it.
+        with a native bulk predicate delete should override it. It assumes
+        ``list_all()`` returns the complete store — a backend whose
+        ``list_all()`` is bounded or paginated must override this method
+        directly.
 
         Returns:
             MemoryResponse: ``success`` plus ``metadata["deleted_count"]``.
@@ -173,8 +176,10 @@ class MemoryStore(ABC):
         query on the database side can recover. Values are returned in their
         stamped string form.
 
-        This default walks ``list_all()``; backends able to project the
-        dimension column should override it. Raises on backend failure rather
+        This default walks ``list_all()``, and assumes it returns the complete
+        store — a backend whose ``list_all()`` is bounded or paginated must
+        override this method directly, as should backends able to project the
+        dimension column. Raises on backend failure rather
         than returning a partial set, so a reconciler never mistakes an error
         for "no values".
         """

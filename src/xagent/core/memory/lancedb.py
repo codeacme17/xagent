@@ -723,8 +723,6 @@ class LanceDBMemoryStore(MemoryStore):
             arrow_table = (
                 table.search().select([SCOPE_DIMS_COLUMN]).limit(None).to_arrow()
             )
-            if arrow_table.num_rows == 0:
-                return set()
             # Filter in Arrow: flatten the list<string> column (null rows drop
             # out), keep only this dimension's elements, then dedupe — only the
             # distinct values ever cross into Python.

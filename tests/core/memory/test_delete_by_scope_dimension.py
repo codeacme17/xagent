@@ -125,6 +125,35 @@ def test_base_default_list_values_via_in_memory():
     _assert_enumeration_semantics(InMemoryMemoryStore())
 
 
+def _assert_special_character_values(store):
+    """Values containing ``=`` and a single quote survive both the SQL-literal
+    escaping on the delete pushdown and the fixed-length prefix strip on
+    enumeration."""
+    kept = store.add(_note("equals value", session_ref="a=b")).memory_id
+    quoted = store.add(_note("quoted value", session_ref="o'brien")).memory_id
+
+    assert store.list_scope_dimension_values("session_ref") == {"a=b", "o'brien"}
+
+    response = store.delete_by_scope_dimension("session_ref", "o'brien")
+    assert response.success
+    assert response.metadata["deleted_count"] == 1
+    assert not store.get(quoted).success
+    assert store.get(kept).success
+
+    response = store.delete_by_scope_dimension("session_ref", "a=b")
+    assert response.success
+    assert response.metadata["deleted_count"] == 1
+    assert store.list_scope_dimension_values("session_ref") == set()
+
+
+def test_lancedb_special_character_values(lancedb_store):
+    _assert_special_character_values(lancedb_store)
+
+
+def test_base_default_special_character_values():
+    _assert_special_character_values(InMemoryMemoryStore())
+
+
 def test_base_default_reap_reports_partial_failure():
     """Base fallback: one per-note delete failing yields success=False while
     deleted_count still reports the notes that did go (best-effort)."""
