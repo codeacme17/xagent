@@ -554,6 +554,23 @@ class TestSearchListOnlyFilterParity:
         list_ids = {n.id for n in memory_store.list_all(filters=filters)}
         assert search_ids == list_ids == {"old-work"}
 
+    def test_non_iterable_tags_keywords_match_nothing(self, memory_store):
+        # Malformed (non-iterable) tags/keywords values can't match anything —
+        # same no-match policy as a non-dict filters["metadata"], no TypeError
+        # on either method.
+        for key in ("tags", "keywords"):
+            assert memory_store.search("report", k=10, filters={key: 5}) == []
+            assert memory_store.list_all(filters={key: 5}) == []
+
+    def test_string_tags_keywords_treated_as_single_item(self, memory_store):
+        # A bare string is one required item, not a per-character iteration.
+        assert [
+            n.id for n in memory_store.search("report", k=10, filters={"tags": "work"})
+        ] == ["old-work"]
+        assert [
+            n.id for n in memory_store.list_all(filters={"keywords": "groceries"})
+        ] == ["new-home"]
+
 
 def test_scope_exclusive_filters_scoped_notes(memory_store):
     """#822: the `__scope_exclusive__` directive (strict dimension-less

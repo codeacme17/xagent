@@ -52,6 +52,19 @@ class InMemoryMemoryStore(MemoryStore):
             for key, value in metadata_filters.items()
         )
 
+    @staticmethod
+    def _required_items(value: Any) -> Optional[list[Any]]:
+        """Normalize a ``tags``/``keywords`` filter value: a plain string is a
+        single required item (not iterated per character), an iterable is many,
+        and anything else can't match (rather than raising ``TypeError`` on
+        malformed caller-supplied filters — the same no-match policy as
+        ``_matches_metadata_filters``)."""
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return list(value)
+        return None
+
     @classmethod
     def _flat_other_filters(cls, filters: Optional[dict[str, Any]]) -> dict[str, Any]:
         """Filter keys without dedicated handling, applied as flat metadata
@@ -96,14 +109,20 @@ class InMemoryMemoryStore(MemoryStore):
             return False
 
         # Tag filter (all required tags present)
-        if "tags" in filters and not all(tag in note.tags for tag in filters["tags"]):
-            return False
+        if "tags" in filters:
+            required_tags = cls._required_items(filters["tags"])
+            if required_tags is None or not all(
+                tag in note.tags for tag in required_tags
+            ):
+                return False
 
         # Keyword filter (all required keywords present)
-        if "keywords" in filters and not all(
-            keyword in note.keywords for keyword in filters["keywords"]
-        ):
-            return False
+        if "keywords" in filters:
+            required_keywords = cls._required_items(filters["keywords"])
+            if required_keywords is None or not all(
+                keyword in note.keywords for keyword in required_keywords
+            ):
+                return False
 
         # Other flat metadata filters (string-coerced, like LanceDBMemoryStore)
         if other_filters and not cls._matches_metadata_filters(
