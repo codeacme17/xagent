@@ -1,13 +1,15 @@
 "use client";
 
 import { useI18n } from "@/contexts/i18n-context";
-import { Loader2, Search } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { useState, useEffect, useMemo } from "react";
-import { getApiUrl, cn } from "@/lib/utils";
+import { getApiUrl } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { apiRequest } from "@/lib/api-wrapper";
+import { SearchInput } from "@/components/ui/search-input";
+import { PageHeader } from "@/components/ui/page-header";
+import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 import type { Template } from "@/types/template";
-import { FeaturedTemplateCard } from "@/components/templates/featured-template-card";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
 import type { TranslationKey } from "@/i18n/translations";
 
@@ -64,9 +66,10 @@ export default function TemplatesPage() {
     fetchTemplates();
   }, [locale]);
 
-  const categoryLabel = (category: string) => {
-    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(category)];
-    return key ? t(key) : formatFallbackLabel(category);
+  const categoryLabel = (category?: string) => {
+    const c = category || "Others";
+    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(c)];
+    return key ? t(key) : formatFallbackLabel(c);
   };
 
   const categories = useMemo(() => {
@@ -162,55 +165,33 @@ export default function TemplatesPage() {
   };
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-[48px_52px_72px]">
-      {/* Hero — bleeds to edges via negative margin */}
-      <div className="m-[-48px_-52px_36px] flex flex-col items-center gap-[14px] border-b border-border bg-background p-[48px_64px_44px] text-center">
-        <div className="flex w-full flex-col items-center gap-[14px]">
-          <div>
-            <div className="mb-1 text-[30px] font-extrabold tracking-[-0.04em] text-foreground">
-              {t("templates.title")}
-            </div>
-            <div className="text-[13px] tracking-[0.01em] text-muted-foreground">
-              {t("templates.subtitle")}
-            </div>
-          </div>
+    <div className="flex h-full flex-col overflow-y-auto bg-background">
+      <PageHeader
+        title={t("templates.title")}
+        description={t("templates.subtitle")}
+        actions={
+          <SearchInput
+            placeholder={t("templates.searchPlaceholder")}
+            value={searchQuery}
+            onChange={setSearchQuery}
+            containerClassName="flex-1 sm:w-64"
+          />
+        }
+      />
 
-          {/* Pill search bar */}
-          <div className="flex w-full max-w-[620px]">
-            <div className="flex w-full items-center gap-3 rounded-full border-[1.5px] border-border bg-background px-5 py-[13px] shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
-              <Search className="h-[18px] w-[18px] flex-shrink-0 text-muted-foreground" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={t("templates.searchPlaceholder")}
-                className="w-full border-none bg-transparent text-sm text-foreground outline-none"
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Category tabs */}
-      <div className="relative mb-5 flex flex-wrap items-center justify-center gap-1.5">
-        {categories.map((cat) => {
-          const isActive = selectedCategory === cat.id;
-          return (
-            <button
-              key={cat.id}
-              onClick={() => setSelectedCategory(cat.id)}
-              className={cn(
-                "rounded-full px-4 py-1.5 text-xs transition-all duration-150",
-                isActive
-                  ? "border-none bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] font-semibold text-white"
-                  : "border border-[rgba(60,131,246,0.16)] bg-transparent font-medium text-muted-foreground"
-              )}
-            >
-              {cat.label}
-            </button>
-          );
-        })}
-        <span className="absolute right-0 rounded-full border border-[rgba(60,131,246,0.18)] bg-[rgba(60,131,246,0.08)] px-[10px] py-[3px] text-[11px] font-semibold text-[rgb(60,131,246)]">
+      <div className="px-6 py-6 md:px-8">
+      {/* Segmented category filter */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <SegmentedTabs
+          items={categories}
+          value={selectedCategory}
+          onValueChange={setSelectedCategory}
+          listClassName="gap-0.5 rounded-[13px] bg-muted p-1"
+          triggerClassName="rounded-[10px] px-4 py-2 text-sm duration-300"
+          activeTriggerClassName="bg-background font-semibold text-foreground shadow-sm"
+          inactiveTriggerClassName="font-medium text-muted-foreground hover:text-foreground"
+        />
+        <span className="rounded-full bg-muted px-3 py-1.5 text-[13px] font-medium text-muted-foreground">
           {filteredTemplates.length === 1
             ? t("templates.countOne", { count: filteredTemplates.length })
             : t("templates.countOther", { count: filteredTemplates.length })}
@@ -226,50 +207,31 @@ export default function TemplatesPage() {
         <div className="flex flex-col gap-12">
           {/* Featured section */}
           {selectedCategory === "All" && !searchQuery && featuredTemplates.length > 0 && (
-            <div>
-              {/* Featured cards row */}
-              <div className="mb-8 flex w-full flex-wrap gap-[10px]">
-                <div className="mb-1.5 basis-full text-[10.5px] font-bold uppercase tracking-[0.08em] text-muted-foreground">
-                  {t("templates.categoryTitles.featured")}
-                </div>
-                {featuredTemplates.map((template) => (
-                  <div key={template.id} className="flex min-w-[200px] flex-1">
-                    <FeaturedTemplateCard
-                      template={template}
-                      categoryLabel={categoryLabel(template.category)}
-                      onUse={handleUseTemplate}
-                      onLike={handleLikeTemplate}
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
+            <TemplateSection
+              title={t("templates.categoryTitles.featured")}
+              count={featuredTemplates.length}
+              templates={featuredTemplates}
+              categoryLabel={categoryLabel}
+              useLabel={t("templates.useTemplate")}
+              defaultSetupTime={t("templates.defaultSetupTime")}
+              onUse={handleUseTemplate}
+              onLike={handleLikeTemplate}
+            />
           )}
 
           {/* Library sections */}
           {sections.map((section) => (
-            <div key={section.id}>
-              {/* Section title */}
-              <div className="mb-[18px] flex items-center gap-3 text-[10.5px] font-bold uppercase tracking-[0.11em] text-[rgb(60,131,246)]">
-                {section.title}
-                <span className="h-px flex-1 bg-[linear-gradient(90deg,rgba(60,131,246,0.22)_0%,transparent_100%)]" />
-              </div>
-
-              {/* 4-column grid */}
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-                {section.templates.map((template) => (
-                  <LibraryTemplateCard
-                    key={template.id}
-                    template={template}
-                    categoryLabel={categoryLabel(template.category)}
-                    useLabel={t("templates.useTemplate")}
-                    defaultSetupTime={t("templates.defaultSetupTime")}
-                    onUse={handleUseTemplate}
-                    onLike={handleLikeTemplate}
-                  />
-                ))}
-              </div>
-            </div>
+            <TemplateSection
+              key={section.id}
+              title={section.title}
+              count={section.templates.length}
+              templates={section.templates}
+              categoryLabel={categoryLabel}
+              useLabel={t("templates.useTemplate")}
+              defaultSetupTime={t("templates.defaultSetupTime")}
+              onUse={handleUseTemplate}
+              onLike={handleLikeTemplate}
+            />
           ))}
 
           {sections.length === 0 && (
@@ -279,6 +241,54 @@ export default function TemplatesPage() {
           )}
         </div>
       )}
+      </div>
     </div>
+  );
+}
+
+interface TemplateSectionProps {
+  title: string;
+  count: number;
+  templates: Template[];
+  categoryLabel: (category: string) => string;
+  useLabel: string;
+  defaultSetupTime: string;
+  onUse: (templateId: string) => void;
+  onLike: (templateId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
+}
+
+function TemplateSection({
+  title,
+  count,
+  templates,
+  categoryLabel,
+  useLabel,
+  defaultSetupTime,
+  onUse,
+  onLike,
+}: TemplateSectionProps) {
+  return (
+    <section>
+      <div className="mb-4 flex items-baseline gap-2.5">
+        <h2 className="text-[19px] font-semibold tracking-[-0.02em] text-foreground">{title}</h2>
+        <span className="text-[13px] font-medium text-muted-foreground">{count}</span>
+      </div>
+      <div
+        className="grid gap-5"
+        style={{ gridTemplateColumns: "repeat(auto-fill, minmax(min(340px, 100%), 1fr))" }}
+      >
+        {templates.map((template) => (
+          <LibraryTemplateCard
+            key={template.id}
+            template={template}
+            categoryLabel={categoryLabel(template.category)}
+            useLabel={useLabel}
+            defaultSetupTime={defaultSetupTime}
+            onUse={onUse}
+            onLike={onLike}
+          />
+        ))}
+      </div>
+    </section>
   );
 }

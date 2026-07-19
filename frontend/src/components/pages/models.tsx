@@ -3,6 +3,7 @@
 import { useState, useEffect, useMemo, ReactNode } from "react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
+import { PageHeader } from "@/components/ui/page-header"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -449,21 +450,20 @@ export function ModelsPage() {
 
   return (
     <div className="h-full overflow-auto bg-background text-foreground">
-      <div className="w-full p-4 sm:p-8 pb-20">
-        {/* Header */}
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
-          <div className="space-y-1 w-full sm:w-auto">
-            <h1 className="text-[22px] font-bold leading-tight">{t('models.header.title')}</h1>
-            <p className="text-[13px] text-muted-foreground mt-0.5">{t('models.header.description')}</p>
-          </div>
-
+      {/* Header */}
+      <PageHeader
+        title={t('models.header.title')}
+        description={t('models.header.description')}
+        actions={
           <Button onClick={handleAddModel} className="flex items-center gap-2 shrink-0">
             <Plus size={16} className="mr-1 sm:mr-2" />
             <span className="hidden sm:inline">{t('models.header.add')}</span>
             <span className="sm:hidden">{t('common.add') || t('models.header.add')}</span>
           </Button>
-        </div>
+        }
+      />
 
+      <div className="w-full px-6 py-6 md:px-8 pb-20">
         <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full mb-8">
           <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none">
             <TabsTrigger
@@ -640,7 +640,7 @@ export function ModelsPage() {
                     </p>
                   </div>
                   <div className="flex justify-end pt-4 border-t">
-                    <Button onClick={() => handleConnectProvider(provider)} className="bg-blue-600 hover:bg-blue-700 text-white rounded-full px-6">
+                    <Button onClick={() => handleConnectProvider(provider)} className="shrink-0 rounded-lg">
                       {t('models.card.actions.connect')} &rarr;
                     </Button>
                   </div>

@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 
 export interface SegmentedTabItem {
   id: string;
-  label: string;
+  label: React.ReactNode;
 }
 
 interface SegmentedTabsProps {

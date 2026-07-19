@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type KeyboardEvent, type MouseEvent } from "react";
+import { type KeyboardEvent, type MouseEvent } from "react";
 import { Clock, Heart, Play } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
@@ -16,28 +16,57 @@ interface LibraryTemplateCardProps {
   className?: string;
 }
 
+// Soft pill palette keyed by category, with dark-mode variants so pills work
+// in both themes. Unknown categories hash into the palette so colors stay
+// stable across renders. The colored dot inherits the text color via bg-current.
+const PILL_PALETTE = [
+  "bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300",
+  "bg-pink-50 text-pink-700 dark:bg-pink-950/50 dark:text-pink-300",
+  "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300",
+  "bg-indigo-50 text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300",
+  "bg-orange-50 text-orange-700 dark:bg-orange-950/50 dark:text-orange-300",
+];
+const PILL_NEUTRAL = "bg-muted text-muted-foreground";
+const PILL_KNOWN: Record<string, string> = {
+  sales: PILL_PALETTE[2],
+  marketing: PILL_PALETTE[1],
+  support: PILL_PALETTE[0],
+  research: PILL_PALETTE[3],
+  productivity: PILL_PALETTE[4],
+};
+
+function pillClasses(category?: string): string {
+  if (!category) return PILL_NEUTRAL;
+  const key = category.toLowerCase();
+  if (PILL_KNOWN[key]) return PILL_KNOWN[key];
+  if (key === "general" || key === "others") return PILL_NEUTRAL;
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  return PILL_PALETTE[hash % PILL_PALETTE.length];
+}
+
 function LibraryConnections({ template }: { template: Template }) {
   const visibleConnections = template.connections?.slice(0, 4) || [];
   const remainingCount = Math.max((template.connections?.length || 0) - visibleConnections.length, 0);
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-1.5">
       {visibleConnections.map((connection, index) => (
         <div
           key={`${connection.name}-${index}`}
-          className="flex h-6 w-6 items-center justify-center overflow-hidden rounded-md"
+          className="flex h-[26px] w-[26px] items-center justify-center overflow-hidden rounded-lg bg-muted text-muted-foreground"
         >
           {connection.logo ? (
             <img src={connection.logo} alt={connection.name} className="h-4 w-4 object-contain" />
           ) : (
-            <span className="text-[8px] font-bold text-white">
+            <span className="text-[11px] font-bold">
               {(connection.name || "").substring(0, 1).toUpperCase()}
             </span>
           )}
         </div>
       ))}
       {remainingCount > 0 ? (
-        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-[#EEF2FF] text-[9px] font-semibold text-[#64748B]">
+        <div className="flex h-[26px] w-[26px] items-center justify-center rounded-lg bg-muted text-[10px] font-semibold text-muted-foreground">
           +{remainingCount}
         </div>
       ) : null}
@@ -54,7 +83,6 @@ export function LibraryTemplateCard({
   onLike,
   className,
 }: LibraryTemplateCardProps) {
-  const [isUseButtonHovered, setIsUseButtonHovered] = useState(false);
   const handleActivate = () => onUse(template.id);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -68,10 +96,8 @@ export function LibraryTemplateCard({
     }
   };
 
-  const items =
-    template.features && template.features.length > 0
-      ? template.features.slice(0, 3)
-      : [template.description];
+  const bullets = template.features && template.features.length > 0 ? template.features.slice(0, 3) : [];
+  const pill = pillClasses(template.category);
 
   return (
     <div
@@ -80,93 +106,84 @@ export function LibraryTemplateCard({
       onClick={handleActivate}
       onKeyDown={handleKeyDown}
       className={cn(
-        "group relative flex cursor-pointer flex-col overflow-hidden rounded-[14px] border border-[rgba(60,131,246,0.22)] bg-[hsl(217_85%_56%/0.03)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_10px_32px_rgba(0,0,0,0.11),0_2px_8px_rgba(0,0,0,0.06)]",
+        "group flex h-full cursor-pointer flex-col rounded-[18px] border border-border bg-card p-5 shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-transparent hover:shadow-[0_16px_40px_rgba(0,0,0,0.11)]",
         className
       )}
     >
-      {/* 3px blue top strip — always blue regardless of category */}
-      <div className="h-[3px] flex-shrink-0 bg-[rgb(60,131,246)]" />
-
-      <div className="flex flex-1 flex-col p-[18px_20px_16px]">
-        {/* Category + setup time */}
-        <div className="mb-[10px] flex items-center justify-between">
-          <span className="text-[10px] font-bold uppercase tracking-[0.08em] text-[rgb(60,131,246)]">
-            {categoryLabel || template.category}
+      {/* Category pill + setup time */}
+      <div className="mb-3.5 flex items-center justify-between gap-2">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full px-[9px] py-1 text-[11.5px] font-semibold",
+            pill
+          )}
+        >
+          <span className="h-[5px] w-[5px] rounded-full bg-current" />
+          {categoryLabel || template.category}
+        </span>
+        {template.setup_time || defaultSetupTime ? (
+          <span className="flex items-center gap-1 whitespace-nowrap text-[11.5px] font-medium text-muted-foreground">
+            <Clock className="h-3 w-3 flex-shrink-0" />
+            {template.setup_time || defaultSetupTime}
           </span>
-          <div className="flex items-center gap-[3px] whitespace-nowrap text-[10.5px] text-muted-foreground">
-            <Clock className="h-[11px] w-[11px] flex-shrink-0" />
-            <span>{template.setup_time || defaultSetupTime}</span>
-          </div>
-        </div>
+        ) : null}
+      </div>
 
-        <h3 className="mb-[10px] text-[14px] font-bold leading-[1.3] tracking-[-0.02em] text-foreground">
-          {template.name}
-        </h3>
+      <h3 className="mb-2 line-clamp-2 text-[16.5px] font-semibold leading-[1.25] tracking-[-0.015em] text-foreground">
+        {template.name}
+      </h3>
 
-        {/* Bullet list */}
-        <ul className="mb-[14px] flex flex-1 flex-col gap-[5px] p-0">
-          {items.map((item, index) => (
+      {bullets.length > 0 ? (
+        <ul className="flex flex-1 flex-col gap-2 p-0">
+          {bullets.map((item, index) => (
             <li
               key={`${template.id}-${index}`}
-              className="relative line-clamp-2 pl-3 text-[12px] leading-[1.45] text-muted-foreground"
+              className="flex gap-2 text-[13.5px] leading-[1.45] text-foreground/80"
             >
-              <span className="absolute left-0 font-bold leading-[1.3] text-[rgb(47,121,238)]">›</span>
-              {item}
+              <span className="flex-none text-muted-foreground/60">›</span>
+              <span className="line-clamp-2">{item}</span>
             </li>
           ))}
         </ul>
+      ) : (
+        <p className="flex-1 text-[13.5px] leading-[1.5] text-muted-foreground">{template.description}</p>
+      )}
 
-        {/* Footer */}
-        <div className="mt-auto border-t border-[rgba(60,131,246,0.08)] pt-[10px]">
-          <div className="flex items-center justify-between gap-2">
-            <LibraryConnections template={template} />
-            <div className="flex flex-shrink-0 items-center gap-[10px]">
-              <div className="flex items-center gap-1 text-[rgba(60,131,246,0.55)]">
-                <Play className="h-[10px] w-[10px] flex-shrink-0 fill-current" />
-                <span className="text-[11px] font-bold text-muted-foreground">{template.used_count ?? 0}</span>
-              </div>
-              <button
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onLike?.(template.id, event);
-                }}
-                className={cn(
-                  "flex items-center gap-1 border-none bg-transparent p-0",
-                  onLike ? "cursor-pointer" : "cursor-default",
-                  template.is_liked ? "text-pink-500" : "text-[rgba(60,131,246,0.55)]"
-                )}
-              >
-                <Heart
-                  className={cn(
-                    "h-[11px] w-[11px] fill-current",
-                    template.is_liked ? "text-rose-500" : "text-rose-400/70"
-                  )}
-                />
-                <span className="text-[11px] font-bold text-muted-foreground">{template.likes ?? 0}</span>
-              </button>
-            </div>
-          </div>
-
+      {/* Footer: integrations + stats */}
+      <div className="mt-[18px] flex items-center justify-between gap-2.5">
+        <LibraryConnections template={template} />
+        <div className="flex flex-shrink-0 items-center gap-3 text-muted-foreground">
+          <span className="flex items-center gap-1">
+            <Play className="h-2.5 w-2.5 flex-shrink-0 fill-current" />
+            <span className="text-xs font-medium">{template.used_count ?? 0}</span>
+          </span>
           <button
             type="button"
-            className={cn(
-              "mt-[14px] w-full rounded-lg py-[7px] text-[11.5px] font-semibold uppercase tracking-[0.04em] transition-all duration-200",
-              isUseButtonHovered
-                ? "border border-transparent bg-[linear-gradient(135deg,rgb(48,64,207),rgb(60,131,246))] text-white"
-                : "border border-[rgba(60,131,246,0.28)] bg-transparent text-[rgb(60,131,246)]"
-            )}
             onClick={(event) => {
               event.stopPropagation();
-              handleActivate();
+              onLike?.(template.id, event);
             }}
-            onMouseEnter={() => setIsUseButtonHovered(true)}
-            onMouseLeave={() => setIsUseButtonHovered(false)}
+            className={cn(
+              "flex items-center gap-1 border-none bg-transparent p-0",
+              onLike ? "cursor-pointer" : "cursor-default"
+            )}
           >
-            {useLabel}
+            <Heart className={cn("h-3 w-3 fill-current", template.is_liked ? "text-rose-500" : "text-rose-400/70")} />
+            <span className="text-xs font-medium">{template.likes ?? 0}</span>
           </button>
         </div>
       </div>
+
+      <button
+        type="button"
+        className="mt-4 h-[38px] rounded-[10px] bg-primary/10 text-[13.5px] font-semibold text-primary transition-all duration-300 hover:bg-primary hover:text-primary-foreground active:scale-[0.98]"
+        onClick={(event) => {
+          event.stopPropagation();
+          handleActivate();
+        }}
+      >
+        {useLabel}
+      </button>
     </div>
   );
 }

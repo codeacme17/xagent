@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { SearchInput } from "@/components/ui/search-input"
+import { PageHeader } from "@/components/ui/page-header"
 import { Badge } from "@/components/ui/badge"
 import { InfoTooltip } from "@/components/ui/tooltip"
 import { getApiUrl } from "@/lib/utils"
@@ -328,13 +329,11 @@ export function MemoryPage() {
   return (
     <div className="flex h-full flex-col bg-background">
       {/* Top Header */}
-      <div className="border-b flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 p-4 sm:p-8">
-        <div>
-          <h1 className="text-[22px] font-bold leading-tight">{t("memory.header.title")}</h1>
-          <p className="text-sm sm:text-base text-muted-foreground">{t("memory.header.description")}</p>
-        </div>
-
-        <div className="flex items-center gap-3 w-full sm:w-auto">
+      <PageHeader
+        title={t("memory.header.title")}
+        description={t("memory.header.description")}
+        actions={
+          <>
           <SearchInput
             placeholder={t("memory.filters.search.placeholder")}
             className="h-9"
@@ -367,8 +366,9 @@ export function MemoryPage() {
               />
             </DialogContent>
           </Dialog>
-        </div>
-      </div>
+          </>
+        }
+      />
 
       {/* Content Area */}
       <div className="flex flex-col md:flex-row flex-1 overflow-hidden">

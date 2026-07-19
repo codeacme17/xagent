@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { SearchInput } from "@/components/ui/search-input"
+import { PageHeader } from "@/components/ui/page-header"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { getApiUrl } from "@/lib/utils"
@@ -350,21 +351,10 @@ export function KnowledgeBasePage() {
   return (
     <div className="flex flex-col h-full bg-background/50">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center w-full p-4 sm:p-8 gap-4">
-        <div className="space-y-1 w-full sm:w-auto">
-          <div className="flex items-center gap-3 mb-1 flex-wrap">
-            <h1 className="text-[22px] font-bold leading-tight">{t("kb.header.title")}</h1>
-            <Badge variant="secondary" className="hidden sm:inline-flex font-normal text-xs sm:text-sm">
-              {searchQuery
-                ? t("kb.header.matchCount", {
-                  matched: filteredCollections.length,
-                  total: collections.length,
-                })
-                : t("kb.header.totalCount", { total: collections.length })}
-            </Badge>
-          </div>
-          <p className="text-[13px] text-muted-foreground mt-0.5">{t("kb.header.description")}</p>
-          <Badge variant="secondary" className="sm:hidden inline-flex font-normal text-xs w-fit">
+      <PageHeader
+        title={t("kb.header.title")}
+        titleExtra={
+          <Badge variant="secondary" className="inline-flex font-normal text-xs sm:text-sm">
             {searchQuery
               ? t("kb.header.matchCount", {
                 matched: filteredCollections.length,
@@ -372,36 +362,38 @@ export function KnowledgeBasePage() {
               })
               : t("kb.header.totalCount", { total: collections.length })}
           </Badge>
-        </div>
-
-        <div className="flex items-center gap-3 w-full sm:w-auto">
-          <SearchInput
-            placeholder={t("kb.search.placeholder")}
-            value={searchQuery}
-            onChange={setSearchQuery}
-            containerClassName="flex-1 sm:w-64"
-          />
-          <Button
-            variant={isManageMode ? "secondary" : "outline"}
-            onClick={() => {
-              setIsManageMode((m) => !m)
-              setSelectedNames(new Set())
-            }}
-            className="flex items-center gap-1 sm:gap-2 shrink-0"
-          >
-            {isManageMode ? <X size={16} className="sm:mr-2" /> : <Settings2 size={16} className="sm:mr-2" />}
-            <span className="hidden sm:inline">{isManageMode ? t("kb.manage.exit") : t("kb.manage.enter")}</span>
-          </Button>
-          <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-1 sm:gap-2 shrink-0">
-            <Plus size={16} className="sm:mr-2" />
-            <span className="hidden sm:inline">{t("kb.header.new")}</span>
-            <span className="sm:hidden">{t("common.create") || t("kb.header.new")}</span>
-          </Button>
-        </div>
-      </div>
+        }
+        description={t("kb.header.description")}
+        actions={
+          <>
+            <SearchInput
+              placeholder={t("kb.search.placeholder")}
+              value={searchQuery}
+              onChange={setSearchQuery}
+              containerClassName="flex-1 sm:w-64"
+            />
+            <Button
+              variant={isManageMode ? "secondary" : "outline"}
+              onClick={() => {
+                setIsManageMode((m) => !m)
+                setSelectedNames(new Set())
+              }}
+              className="flex items-center gap-1 sm:gap-2 shrink-0"
+            >
+              {isManageMode ? <X size={16} className="sm:mr-2" /> : <Settings2 size={16} className="sm:mr-2" />}
+              <span className="hidden sm:inline">{isManageMode ? t("kb.manage.exit") : t("kb.manage.enter")}</span>
+            </Button>
+            <Button onClick={() => { setIsCreateDialogOpen(true) }} className="flex items-center gap-1 sm:gap-2 shrink-0">
+              <Plus size={16} className="sm:mr-2" />
+              <span className="hidden sm:inline">{t("kb.header.new")}</span>
+              <span className="sm:hidden">{t("common.create") || t("kb.header.new")}</span>
+            </Button>
+          </>
+        }
+      />
 
       {/* Collections Grid */}
-      <div className="flex-1 overflow-y-auto w-full px-8 pb-8">
+      <div className="flex-1 overflow-y-auto w-full px-6 md:px-8 pb-8">
         {collections.length === 0 ? (
           <FeatureEmptyState
             icon={Database}

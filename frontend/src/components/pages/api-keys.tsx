@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { PageHeader } from "@/components/ui/page-header"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
@@ -249,24 +250,20 @@ export function ApiKeysPage() {
 
   return (
     <div className="flex h-full flex-col bg-background overflow-auto">
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-4 sm:p-8 gap-4">
-        <div>
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight mb-1">
-            {t("apiKeysPage.title") || "API Keys"}
-          </h1>
-          <p className="text-xs sm:text-sm text-muted-foreground">
-            {t("apiKeysPage.subtitle") || "Manage API keys for programmatic access to your agents."}
-          </p>
-        </div>
-        <Button onClick={openCreateDialog}>
-          <Plus className="w-4 h-4 mr-1" />
-          {t("apiKeysPage.newKey") || "New API Key"}
-        </Button>
-      </div>
+      <PageHeader
+        title={t("apiKeysPage.title") || "API Keys"}
+        description={t("apiKeysPage.subtitle") || "Manage API keys for programmatic access to your agents."}
+        actions={
+          <Button onClick={openCreateDialog} className="shrink-0">
+            <Plus className="w-4 h-4 mr-1" />
+            {t("apiKeysPage.newKey") || "New API Key"}
+          </Button>
+        }
+      />
 
-      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 px-4 sm:px-8">
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 px-6 md:px-8 mt-6">
         <Card>
-          <CardContent className="pt-6">
+          <CardContent>
             <p className="text-xs text-muted-foreground">{t("apiKeysPage.stats.totalKeys") || "Total Keys"}</p>
             <p className="text-2xl font-bold mt-1">{stats?.total_keys ?? "—"}</p>
             <p className="text-xs text-muted-foreground mt-1">
@@ -275,7 +272,7 @@ export function ApiKeysPage() {
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="pt-6">
+          <CardContent>
             <p className="text-xs text-muted-foreground">{t("apiKeysPage.stats.activeKeys") || "Active Keys"}</p>
             <p className="text-2xl font-bold mt-1">{stats?.active_keys ?? "—"}</p>
             <p className="text-xs text-muted-foreground mt-1">
@@ -284,7 +281,7 @@ export function ApiKeysPage() {
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="pt-6">
+          <CardContent>
             <p className="text-xs text-muted-foreground">{t("apiKeysPage.stats.callsThisMonth") || "Calls This Month"}</p>
             <p className="text-2xl font-bold mt-1">{stats?.calls_this_month ?? "—"}</p>
             <p className="text-xs text-muted-foreground mt-1">
@@ -293,7 +290,7 @@ export function ApiKeysPage() {
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="pt-6">
+          <CardContent>
             <p className="text-xs text-muted-foreground">{t("apiKeysPage.stats.lastApiCall") || "Last API Call"}</p>
             <p className="text-2xl font-bold mt-1">
               {stats?.last_api_call ? new Date(stats.last_api_call).toLocaleDateString() : "—"}
@@ -307,7 +304,7 @@ export function ApiKeysPage() {
         </Card>
       </div>
 
-      <div className="px-4 sm:px-8 pb-8 mt-6">
+      <div className="px-6 md:px-8 pb-8 mt-6">
         <Card className="shadow-sm">
           <CardHeader className="pb-3 border-b flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 space-y-0">
             <h2 className="text-lg font-semibold">{t("apiKeysPage.allKeys") || "All Keys"}</h2>
