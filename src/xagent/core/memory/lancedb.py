@@ -709,8 +709,10 @@ class LanceDBMemoryStore(MemoryStore):
         arbitrary metadata keys — are applied as a Python post-filter *after*
         ANN top-k retrieval (``vector_query.limit(k)``). A note that matches
         the filters but falls outside the ANN's top-k window will therefore
-        not surface, even though it exists in the store. Only user_id and
-        scope dimensions are pushed into the ``where`` prefilter, because
+        not surface, even though it exists in the store. Only user_id, the
+        scope dimensions, and the scope-exclusive directive
+        (``SCOPE_EXCLUSIVE_FILTER_KEY``, compiled to an empty-``scope_dims``
+        clause) are pushed into the ``where`` prefilter, because
         cross-principal crowd-out is an isolation-recall problem (#822);
         pushing more filter keys into the prefilter was considered and
         deliberately deferred as a possible future recall improvement (#916).

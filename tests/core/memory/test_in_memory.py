@@ -635,7 +635,7 @@ class TestSearchListOnlyFilterParity:
 
     def test_none_date_bound_combines_with_real_bound(self, memory_store):
         # A None bound on one side must not disable the real bound on the
-        # other side.
+        # other side — both directions.
         cutoff = self.now - timedelta(days=1)
         assert [
             n.id
@@ -643,6 +643,12 @@ class TestSearchListOnlyFilterParity:
                 "report", k=10, filters={"date_from": cutoff, "date_to": None}
             )
         ] == ["new-home"]
+        assert [
+            n.id
+            for n in memory_store.search(
+                "report", k=10, filters={"date_from": None, "date_to": cutoff}
+            )
+        ] == ["old-work"]
 
     def test_category_filter_is_string_coerced(self, memory_store):
         # #916: the deliberate cross-store decision — category comparison is
