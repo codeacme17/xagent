@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Collection, List, Optional, Union
+from typing import Any, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -16,7 +16,7 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from .base import MemoryStore, comparable_timestamp
+from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
 from .schema_migration import (
     MemoryMismatchKind,
@@ -25,7 +25,6 @@ from .schema_migration import (
 )
 from .scope_columns import (
     SCOPE_DIMS_COLUMN,
-    SCOPE_EXCLUSIVE_FILTER_KEY,
     USER_ID_COLUMN,
     build_scope_where,
     coerce_user_id,
@@ -469,132 +468,15 @@ class LanceDBMemoryStore(MemoryStore):
 
         return MemoryNote(**note_kwargs)
 
-    # Filter keys with dedicated handling in _matches_filters; anything else
-    # is treated as a flat metadata-equality filter. Mirrors
-    # InMemoryMemoryStore._KNOWN_FILTER_KEYS so the two stores cannot drift
-    # apart on filter semantics (#909).
-    _KNOWN_FILTER_KEYS = frozenset(
-        {
-            "category",
-            "metadata",
-            "date_from",
-            "date_to",
-            "tags",
-            "keywords",
-            SCOPE_EXCLUSIVE_FILTER_KEY,
-        }
-    )
-
-    @staticmethod
-    def _required_items(value: Any) -> Optional[Collection[Any]]:
-        """Normalize a ``tags``/``keywords`` filter value: a plain string is a
-        single required item (not iterated per character), an iterable is many,
-        and anything else can't match (rather than raising ``TypeError`` on
-        malformed caller-supplied filters — the same no-match policy as
-        ``_apply_metadata_filters``)."""
-        if isinstance(value, str):
-            return (value,)
-        if isinstance(value, (list, tuple, set, frozenset)):
-            return value
-        return None
-
-    @classmethod
-    def _flat_other_filters(cls, filters: Optional[dict[str, Any]]) -> dict[str, Any]:
-        """Filter keys without dedicated handling, applied as flat metadata
-        equality. Note-independent — compute once per call, not per note."""
-        return {
-            key: value
-            for key, value in (filters or {}).items()
-            if key not in cls._KNOWN_FILTER_KEYS
-        }
-
-    def _matches_filters(
-        self,
-        note: MemoryNote,
-        filters: dict[str, Any],
-        other_filters: dict[str, Any],
-    ) -> bool:
-        """Single filter dispatch shared by the vector path, the text fallback,
-        and (via search) ``list_all()``, so they cannot drift apart on filter
-        semantics (#909 — previously ``tags``/``keywords``/``date_from``/
-        ``date_to`` fell through to flat metadata equality on both search paths
-        and never matched, while ``list_all()`` handled them correctly).
-
-        On the vector path ``filters`` is the residual dict left by
-        ``build_scope_where``: ``SCOPE_EXCLUSIVE_FILTER_KEY`` and the
-        user_id/scope-dimension entries of the nested ``metadata`` filter were
-        already pushed into the ``where`` prefilter, so those checks simply do
-        not trigger there. The text fallback passes the full filters and relies
-        on the checks here.
-
-        ``other_filters`` is ``_flat_other_filters(filters)``, precomputed by
-        the caller so the per-note check does not rebuild it.
-        """
-        # #822: strict dimension-less exclusion — only notes carrying no scope
-        # dimensions pass. Scope-dimension stamps live in note.metadata (they
-        # are not popped by _dict_to_memory_note).
-        if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
-            return False
-
-        if "category" in filters and str(note.category) != str(filters["category"]):
-            return False
-
-        # Nested metadata filters (the shape UserIsolatedMemoryStore emits
-        # for user_id/scope isolation)
-        if "metadata" in filters and not self._apply_metadata_filters(
-            note.metadata, filters["metadata"]
-        ):
-            return False
-
-        # Date range filters (both sides tz-normalized so an aware filter
-        # against the naive default timestamps cannot raise TypeError)
-        if "date_from" in filters or "date_to" in filters:
-            note_ts = comparable_timestamp(note.timestamp)
-            if "date_from" in filters and note_ts < comparable_timestamp(
-                filters["date_from"]
-            ):
-                return False
-            if "date_to" in filters and note_ts > comparable_timestamp(
-                filters["date_to"]
-            ):
-                return False
-
-        # Tag filter (all required tags present)
-        if "tags" in filters:
-            required_tags = self._required_items(filters["tags"])
-            if required_tags is None or not all(
-                tag in note.tags for tag in required_tags
-            ):
-                return False
-
-        # Keyword filter (all required keywords present)
-        if "keywords" in filters:
-            required_keywords = self._required_items(filters["keywords"])
-            if required_keywords is None or not all(
-                keyword in note.keywords for keyword in required_keywords
-            ):
-                return False
-
-        # Other flat metadata filters (string-coerced equality)
-        if other_filters and not self._apply_metadata_filters(
-            note.metadata, other_filters
-        ):
-            return False
-
-        return True
-
-    def _apply_metadata_filters(
-        self, metadata: dict[str, Any], metadata_filters: dict[str, Any]
-    ) -> bool:
-        """Apply nested metadata filters. A non-dict filter value cannot match
-        anything (rather than crashing on a malformed caller-supplied
-        ``filters["metadata"]``)."""
-        if not isinstance(metadata_filters, dict):
-            return False
-        for key, value in metadata_filters.items():
-            if str(metadata.get(key, "")) != str(value):
-                return False
-        return True
+    # Filter matching (_matches_filters and friends) is inherited from the
+    # MemoryStore base so stores cannot drift apart on filter semantics (#916).
+    #
+    # On the vector path the dispatch receives the residual dict left by
+    # ``build_scope_where``: ``SCOPE_EXCLUSIVE_FILTER_KEY`` and the
+    # user_id/scope-dimension entries of the nested ``metadata`` filter were
+    # already pushed into the ``where`` prefilter, so those checks simply do
+    # not trigger there. The text fallback passes the full filters and relies
+    # on all the base checks.
 
     def add(self, note: MemoryNote) -> MemoryResponse:
         """Add a memory note to the store."""
@@ -820,7 +702,23 @@ class LanceDBMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
-        """Search memory notes by query text with optional filters."""
+        """Search memory notes by query text with optional filters.
+
+        Known limitation (#916): on the vector path, residual filters —
+        ``category``, ``tags``/``keywords``, ``date_from``/``date_to``, and
+        arbitrary metadata keys — are applied as a Python post-filter *after*
+        ANN top-k retrieval (``vector_query.limit(k)``). A note that matches
+        the filters but falls outside the ANN's top-k window will therefore
+        not surface, even though it exists in the store. Only user_id, the
+        scope dimensions, and the scope-exclusive directive
+        (``SCOPE_EXCLUSIVE_FILTER_KEY``, compiled to an empty-``scope_dims``
+        clause) are pushed into the ``where`` prefilter, because
+        cross-principal crowd-out is an isolation-recall problem (#822);
+        pushing more filter keys into the prefilter was considered and
+        deliberately deferred as a possible future recall improvement (#916).
+        Callers that need filter-complete results should use ``list_all()``
+        (full scan) or pass a large ``k`` (the web route uses k=1000).
+        """
         table = None
         try:
             table = self._vector_store.get_raw_connection().open_table(

@@ -820,6 +820,60 @@ class TestSearchListOnlyFilterParity:
                 "new-home",
             }
 
+    def test_explicit_none_date_bounds_mean_no_bound(self, parity_store):
+        # #916: an explicit None date_from/date_to means "no bound" — same as
+        # an absent key — instead of raising TypeError inside the date
+        # comparison, which search()'s broad exception handler used to swallow
+        # into a silently empty result.
+        for filters in (
+            {"date_from": None},
+            {"date_to": None},
+            {"date_from": None, "date_to": None},
+        ):
+            assert {
+                n.id for n in parity_store.search("report", k=10, filters=filters)
+            } == {"old-work", "new-home"}
+            assert {n.id for n in parity_store.list_all(filters=filters)} == {
+                "old-work",
+                "new-home",
+            }
+
+    def test_none_date_bound_combines_with_real_bound(self, parity_store):
+        # A None bound on one side must not disable the real bound on the
+        # other side — both directions.
+        cutoff = self.now - timedelta(days=1)
+        assert [
+            n.id
+            for n in parity_store.search(
+                "report", k=10, filters={"date_from": cutoff, "date_to": None}
+            )
+        ] == ["new-home"]
+        assert [
+            n.id
+            for n in parity_store.search(
+                "report", k=10, filters={"date_from": None, "date_to": cutoff}
+            )
+        ] == ["old-work"]
+
+    def test_category_filter_is_string_coerced(self, parity_store):
+        # #916: the deliberate cross-store decision — category comparison is
+        # string-coerced on both stores, consistent with the metadata-equality
+        # policy of the shared dispatch (a non-str filter value still matches
+        # its string-rendered category).
+        assert parity_store.add(
+            MemoryNote(
+                id="cat-42",
+                content="numeric category report",
+                category="42",
+            )
+        ).success
+        assert [
+            n.id for n in parity_store.search("report", k=10, filters={"category": 42})
+        ] == ["cat-42"]
+        assert [n.id for n in parity_store.list_all(filters={"category": 42})] == [
+            "cat-42"
+        ]
+
 
 if __name__ == "__main__":
     # Run the tests

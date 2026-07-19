@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Collection, List, Optional
 
 from .core import MemoryNote, MemoryResponse
-from .scope_columns import encode_scope_dims, scope_dim_element
+from .scope_columns import (
+    SCOPE_EXCLUSIVE_FILTER_KEY,
+    encode_scope_dims,
+    scope_dim_element,
+)
 
 
 def comparable_timestamp(value: Any) -> Any:
@@ -138,6 +142,149 @@ class MemoryStore(ABC):
             Dict[str, Any]: Statistics including total count, counts by category, etc.
         """
         pass
+
+    # ------------------------------------------------------------------
+    # Shared filter dispatch (#916)
+    #
+    # Single implementation of filter matching used by every store's
+    # search()/list_all(), hoisted here so backends cannot drift apart on
+    # filter semantics. #906/#909/#910 unified the dispatch *within* each
+    # store; this hoists it *across* stores, mirroring what #910 did for
+    # comparable_timestamp(). Store-specific behavior belongs in overrides,
+    # not in copies.
+    # ------------------------------------------------------------------
+
+    # Filter keys with dedicated handling in _matches_filters; anything else
+    # is treated as a flat metadata-equality filter.
+    _KNOWN_FILTER_KEYS = frozenset(
+        {
+            "category",
+            "metadata",
+            "date_from",
+            "date_to",
+            "tags",
+            "keywords",
+            SCOPE_EXCLUSIVE_FILTER_KEY,
+        }
+    )
+
+    @staticmethod
+    def _matches_metadata_filters(
+        metadata: dict[str, Any], metadata_filters: dict[str, Any]
+    ) -> bool:
+        """Metadata equality for both the nested ``filters["metadata"]`` dict
+        and flat metadata keys. String-coerced on both sides so
+        ``UserIsolatedMemoryStore`` isolation and ad-hoc filters behave the
+        same on every store (#842). A non-dict filter value cannot match
+        anything (rather than crashing on a malformed caller-supplied
+        ``filters["metadata"]``)."""
+        if not isinstance(metadata_filters, dict):
+            return False
+        return all(
+            str(metadata.get(key, "")) == str(value)
+            for key, value in metadata_filters.items()
+        )
+
+    @staticmethod
+    def _required_items(value: Any) -> Optional[Collection[Any]]:
+        """Normalize a ``tags``/``keywords`` filter value: a plain string is a
+        single required item (not iterated per character), an iterable is many,
+        and anything else can't match (rather than raising ``TypeError`` on
+        malformed caller-supplied filters — the same no-match policy as
+        ``_matches_metadata_filters``)."""
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return value
+        return None
+
+    @classmethod
+    def _flat_other_filters(cls, filters: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Filter keys without dedicated handling, applied as flat metadata
+        equality. Note-independent — compute once per call, not per note."""
+        return {
+            key: value
+            for key, value in (filters or {}).items()
+            if key not in cls._KNOWN_FILTER_KEYS
+        }
+
+    @classmethod
+    def _matches_filters(
+        cls,
+        note: MemoryNote,
+        filters: dict[str, Any],
+        other_filters: dict[str, Any],
+    ) -> bool:
+        """Single filter dispatch shared by every store's ``search()`` and
+        ``list_all()``, so backends cannot drift apart on filter semantics
+        (#916; previously near-identical per-store copies).
+
+        ``category`` comparison is string-coerced on both sides — a deliberate
+        decision (#916): before the hoist the stores accidentally disagreed
+        (InMemory exact, LanceDB coerced), and coercion is consistent with the
+        string-coerced metadata-equality policy used everywhere else in this
+        dispatch.
+
+        An explicit ``None`` for ``date_from``/``date_to`` means "no bound"
+        (#916) — matching how absent keys behave — rather than raising
+        ``TypeError`` inside the date comparison.
+
+        ``other_filters`` is ``_flat_other_filters(filters)``, precomputed by
+        the caller so the per-note check does not rebuild it.
+        """
+        # #822: strict dimension-less exclusion (the ``__scope_exclusive__``
+        # directive, ``SCOPE_EXCLUSIVE_FILTER_KEY``) — a note carrying any
+        # scope dimension is excluded. Scope-dimension stamps live in
+        # note.metadata.
+        if filters.get(SCOPE_EXCLUSIVE_FILTER_KEY) and encode_scope_dims(note.metadata):
+            return False
+
+        if "category" in filters and str(note.category) != str(filters["category"]):
+            return False
+
+        # Nested metadata filters (the shape UserIsolatedMemoryStore emits
+        # for user_id/scope isolation — before #842 search() never matched
+        # them and list_all() ignored them, fail-open)
+        if "metadata" in filters and not cls._matches_metadata_filters(
+            note.metadata, filters["metadata"]
+        ):
+            return False
+
+        # Date range filters (both sides tz-normalized so an aware filter
+        # against the naive default timestamps cannot raise TypeError;
+        # explicit None = no bound)
+        date_from = filters.get("date_from")
+        date_to = filters.get("date_to")
+        if date_from is not None or date_to is not None:
+            note_ts = comparable_timestamp(note.timestamp)
+            if date_from is not None and note_ts < comparable_timestamp(date_from):
+                return False
+            if date_to is not None and note_ts > comparable_timestamp(date_to):
+                return False
+
+        # Tag filter (all required tags present)
+        if "tags" in filters:
+            required_tags = cls._required_items(filters["tags"])
+            if required_tags is None or not all(
+                tag in note.tags for tag in required_tags
+            ):
+                return False
+
+        # Keyword filter (all required keywords present)
+        if "keywords" in filters:
+            required_keywords = cls._required_items(filters["keywords"])
+            if required_keywords is None or not all(
+                keyword in note.keywords for keyword in required_keywords
+            ):
+                return False
+
+        # Other flat metadata filters (string-coerced equality)
+        if other_filters and not cls._matches_metadata_filters(
+            note.metadata, other_filters
+        ):
+            return False
+
+        return True
 
     def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
         """
