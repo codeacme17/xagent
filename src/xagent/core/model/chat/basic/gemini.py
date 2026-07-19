@@ -485,6 +485,9 @@ class GeminiLLM(BaseLLM):
                 usage_metadata = response.usage_metadata
                 input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
                 output_tokens = getattr(usage_metadata, "candidates_token_count", 0)
+                cached_tokens = (
+                    getattr(usage_metadata, "cached_content_token_count", 0) or 0
+                )
 
                 if input_tokens > 0 or output_tokens > 0:
                     add_token_usage(
@@ -493,6 +496,7 @@ class GeminiLLM(BaseLLM):
                         model=self._model_name,
                         model_id=self.model_id,
                         call_type="chat",
+                        cached_input_tokens=cached_tokens,
                     )
             else:
                 logger.warning("No usage_metadata in Gemini SDK response")
@@ -721,6 +725,10 @@ class GeminiLLM(BaseLLM):
                     output_tokens = (
                         getattr(usage_metadata, "candidates_token_count", 0) or 0
                     )
+                    raw_cached = getattr(
+                        usage_metadata, "cached_content_token_count", 0
+                    )
+                    cached_tokens = raw_cached if isinstance(raw_cached, int) else 0
 
                     if input_tokens > 0 or output_tokens > 0:
                         usage_received = True
@@ -731,15 +739,19 @@ class GeminiLLM(BaseLLM):
                             model=self._model_name,
                             model_id=self.model_id,
                             call_type="stream_chat",
+                            cached_input_tokens=cached_tokens,
                         )
 
+                        usage_payload: Dict[str, Any] = {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                        if cached_tokens:
+                            usage_payload["cached_input_tokens"] = cached_tokens
                         yield StreamChunk(
                             type=ChunkType.USAGE,
-                            usage={
-                                "prompt_tokens": input_tokens,
-                                "completion_tokens": output_tokens,
-                                "total_tokens": input_tokens + output_tokens,
-                            },
+                            usage=usage_payload,
                             raw=chunk,
                         )
 

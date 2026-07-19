@@ -477,3 +477,91 @@ class TestZhipuLLM:
         # Should raise ValueError for invalid API key
         with pytest.raises(ValueError, match="Invalid API key"):
             await ZhipuLLM.list_available_models("invalid-key")
+
+
+class TestZhipuPromptCacheUsage:
+    """prompt_tokens_details.cached_tokens is recorded as cached input tokens."""
+
+    @pytest.fixture
+    def mock_zhipu_client(self):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock()
+        return mock_client
+
+    @pytest.fixture
+    def zhipu_llm(self, mock_zhipu_client):
+        with patch(
+            "xagent.core.model.chat.basic.zhipu.ZhipuAiClient",
+            return_value=mock_zhipu_client,
+        ):
+            llm = ZhipuLLM(api_key="test_key")
+            llm._client = mock_zhipu_client
+            return llm
+
+    @pytest.mark.asyncio
+    async def test_chat_records_cached_tokens(self, zhipu_llm, mock_zhipu_client):
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = "ok"
+        mock_message.tool_calls = None
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=5,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+        )
+
+        mock_zhipu_client.chat.completions.create.return_value = mock_response
+
+        with TokenContextManager() as manager:
+            await zhipu_llm.chat([{"role": "user", "content": "hi"}])
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 100
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_usage_chunk_carries_cached_tokens(
+        self, zhipu_llm, mock_zhipu_client
+    ):
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_zhipu_client.chat.completions.create.return_value = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=100,
+                    completion_tokens=5,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+                ),
+            ),
+        ]
+
+        with TokenContextManager() as manager:
+            chunks = [
+                chunk
+                async for chunk in zhipu_llm.stream_chat(
+                    [{"role": "user", "content": "hi"}]
+                )
+            ]
+            usage = manager.get_usage()
+
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+        usage_payloads = [
+            c.usage for c in chunks if c.type == ChunkType.USAGE and c.usage
+        ]
+        assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60

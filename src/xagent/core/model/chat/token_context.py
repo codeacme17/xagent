@@ -42,11 +42,14 @@ class TokenUsage:
         call_type: str = "",
         model_id: str = "",
         cached_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> None:
         """Add input tokens from a prompt.
 
         ``cached_tokens`` is the subset of ``tokens`` served from the provider's
         prompt cache (usually billed cheaper); 0 when unknown/unsupported.
+        ``cache_write_tokens`` is the subset of ``tokens`` written to the cache
+        this call (Claude bills these at a premium); 0 when unknown.
         """
         self.input_tokens += tokens
         if model or call_type:
@@ -55,6 +58,7 @@ class TokenUsage:
                     "type": "input",
                     "tokens": tokens,
                     "cached_tokens": cached_tokens,
+                    "cache_write_tokens": cache_write_tokens,
                     "model": model,
                     "model_id": model_id,
                     "call_type": call_type,
@@ -206,6 +210,36 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def _usage_field(usage: Any, name: str) -> Any:
+    """Read a field from a provider usage payload (SDK object or plain dict)."""
+    if isinstance(usage, dict):
+        return usage.get(name)
+    return getattr(usage, name, None)
+
+
+def extract_cached_input_tokens(usage: Any) -> int:
+    """Prompt-cache-hit input tokens from an OpenAI-style usage payload.
+
+    Handles both attribute-style SDK objects and plain dicts (streaming chunks
+    often arrive as dicts). DeepSeek reports ``prompt_cache_hit_tokens``;
+    OpenAI/DashScope/Zhipu report ``prompt_tokens_details.cached_tokens``.
+    Returns 0 when unavailable.
+    """
+    if usage is None:
+        return 0
+    hit = _usage_field(usage, "prompt_cache_hit_tokens")
+    if hit is not None:
+        value = max(0, _coerce_int(hit))
+        if value:
+            return value
+        # Some proxies emit prompt_cache_hit_tokens=0 as a default while the
+        # real count sits in prompt_tokens_details; fall through to it.
+    details = _usage_field(usage, "prompt_tokens_details")
+    if details is not None:
+        return max(0, _coerce_int(_usage_field(details, "cached_tokens")))
+    return 0
+
+
 def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     """Aggregate persisted token detail entries by the actual model used.
 
@@ -245,6 +279,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
             },
         )
         # Some legacy adapters only stamped the name on one of the pair.
@@ -252,6 +288,15 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             aggregate["model_name"] = model_name
         aggregate[f"{token_type}_tokens"] += tokens
         aggregate["total_tokens"] += tokens
+        if token_type == "input":
+            # Legacy entries predate cache tracking; clamp to the entry's
+            # own input tokens so malformed data can't exceed the total.
+            cached = min(tokens, max(0, _coerce_int(detail.get("cached_tokens"))))
+            cache_write = min(
+                tokens, max(0, _coerce_int(detail.get("cache_write_tokens")))
+            )
+            aggregate["cached_input_tokens"] += cached
+            aggregate["cache_write_input_tokens"] += cache_write
 
     id_keys_by_name: Dict[str, List[tuple[str, str]]] = {}
     for key, aggregate in grouped.items():
@@ -268,6 +313,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         target["input_tokens"] += aggregate["input_tokens"]
         target["output_tokens"] += aggregate["output_tokens"]
         target["total_tokens"] += aggregate["total_tokens"]
+        target["cached_input_tokens"] += aggregate["cached_input_tokens"]
+        target["cache_write_input_tokens"] += aggregate["cache_write_input_tokens"]
         del grouped[key]
 
     sorted_groups = sorted(
@@ -284,6 +331,8 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             "model_name": item["model_name"],
             "input_tokens": item["input_tokens"],
             "output_tokens": item["output_tokens"],
+            "cached_input_tokens": item["cached_input_tokens"],
+            "cache_write_input_tokens": item["cache_write_input_tokens"],
         }
         for item in sorted_groups
     ]
@@ -296,6 +345,7 @@ def add_token_usage(
     call_type: str = "",
     model_id: str = "",
     cached_input_tokens: int = 0,
+    cache_write_input_tokens: int = 0,
 ) -> None:
     """Add token usage to the current context.
 
@@ -306,12 +356,14 @@ def add_token_usage(
         call_type: Type of call (chat, stream_chat, vision_chat, etc.)
         model_id: Unique model id (disambiguates identically-named models)
         cached_input_tokens: Subset of input_tokens served from prompt cache
+        cache_write_input_tokens: Subset of input_tokens written to the cache
     """
     # Coerce defensively: a provider/response that yields a non-int token count
     # (or a mock in tests) must never crash the LLM call over accounting.
     input_tokens = _coerce_int(input_tokens)
     output_tokens = _coerce_int(output_tokens)
     cached_input_tokens = _coerce_int(cached_input_tokens)
+    cache_write_input_tokens = _coerce_int(cache_write_input_tokens)
 
     usage = get_token_usage()
     if input_tokens or output_tokens:
@@ -319,7 +371,12 @@ def add_token_usage(
         usage.increment_llm_calls()
     if input_tokens:
         usage.add_input_tokens(
-            input_tokens, model, call_type, model_id, cached_input_tokens
+            input_tokens,
+            model,
+            call_type,
+            model_id,
+            cached_input_tokens,
+            cache_write_input_tokens,
         )
     if output_tokens:
         usage.add_output_tokens(output_tokens, model, call_type, model_id)

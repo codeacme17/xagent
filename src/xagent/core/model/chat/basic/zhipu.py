@@ -14,7 +14,7 @@ except ImportError:
 
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
-from ..token_context import add_token_usage
+from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
@@ -236,6 +236,7 @@ class ZhipuLLM(BaseLLM):
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
                 )
 
             # Extract the choice
@@ -531,6 +532,14 @@ class ZhipuLLM(BaseLLM):
                                 )
                                 or getattr(usage, "output_tokens", 0),
                             }
+                            # Preserve cache telemetry across the dict
+                            # conversion in OpenAI shape so the consumer's
+                            # extract_cached_input_tokens still sees it.
+                            cached = extract_cached_input_tokens(usage)
+                            if cached:
+                                usage_dict["prompt_tokens_details"] = {
+                                    "cached_tokens": cached
+                                }
                             chunk_dict["usage"] = usage_dict
 
                         # Put chunk in queue using the event loop from main thread
@@ -684,6 +693,8 @@ class ZhipuLLM(BaseLLM):
                     input_tokens = usage.get("prompt_tokens", 0)
                     output_tokens = usage.get("completion_tokens", 0)
 
+                    cached_tokens = extract_cached_input_tokens(usage)
+
                     # Record token usage
                     add_token_usage(
                         input_tokens=input_tokens,
@@ -691,6 +702,7 @@ class ZhipuLLM(BaseLLM):
                         model=self._model_name,
                         model_id=self.model_id,
                         call_type="stream_chat",
+                        cached_input_tokens=cached_tokens,
                     )
 
                     # Yield usage chunk
@@ -699,6 +711,8 @@ class ZhipuLLM(BaseLLM):
                         "output_tokens": output_tokens,
                         "total_tokens": input_tokens + output_tokens,
                     }
+                    if cached_tokens:
+                        usage_dict["cached_input_tokens"] = cached_tokens
                     yield StreamChunk(
                         type=ChunkType.USAGE,
                         usage=usage_dict,
@@ -862,6 +876,7 @@ class ZhipuLLM(BaseLLM):
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="vision_chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
                 )
 
             # Extract the choice
