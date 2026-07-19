@@ -14,7 +14,6 @@ from ...context.enrichment import (
     SELECTED_SKILL_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
-    enrich_context_with_skill,
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
@@ -469,24 +468,6 @@ class AutoPattern(AgentPattern):
                 runtime=runtime,
                 similarity_threshold=memory_similarity_threshold,
             )
-            try:
-                await enrich_context_with_skill(
-                    context=context,
-                    task=task_text,
-                    llm=llm,
-                    skill_manager=skill_manager,
-                    runtime=runtime,
-                    allowed_skills=allowed_skills,
-                )
-            except LLMCallInterrupted:
-                interrupted = await self._interrupt_if_requested(
-                    runtime=runtime,
-                    context=context,
-                    label="auto_during_enrichment",
-                )
-                if interrupted is not None:
-                    return interrupted
-                raise
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -504,6 +485,7 @@ class AutoPattern(AgentPattern):
                     llm=llm,
                     compact_llm=compact_llm,
                     runtime=runtime,
+                    memory_tools_available=memory_store is not None,
                 )
                 self.decision = decision_result.decision
                 final_answer_stream = decision_result.final_answer_stream
@@ -752,6 +734,7 @@ class AutoPattern(AgentPattern):
         llm: Any,
         compact_llm: Any | None,
         runtime: PatternRuntime,
+        memory_tools_available: bool = False,
     ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
@@ -778,6 +761,7 @@ class AutoPattern(AgentPattern):
         decision_prompt = self._decision_prompt(
             tools,
             current_request=current_request,
+            memory_tools_available=memory_tools_available,
         )
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
@@ -922,7 +906,21 @@ class AutoPattern(AgentPattern):
         tools: list[Any],
         *,
         current_request: str = "",
+        memory_tools_available: bool = False,
     ) -> str:
+        memory_rule = (
+            "If the latest user message asks to remember, store, forget, or "
+            "update personal information or preferences for future tasks, "
+            "choose react so the memory tools can persist the change; never "
+            "claim via final_answer that something was remembered, because "
+            "final_answer cannot store anything. Likewise, if the user asks "
+            "what they previously told you or what you remember about them "
+            "and the retrieved context does not already contain the answer, "
+            "choose react and look it up with the search_memory tool before "
+            "concluding that nothing was recorded. "
+            if memory_tools_available
+            else ""
+        )
         tool_count = len(tools)
         tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
@@ -963,6 +961,7 @@ class AutoPattern(AgentPattern):
             "tool, to pause for user input, or to wait for a user choice, choose "
             "react; do not choose final_answer merely to restate or paraphrase the "
             "requested tool action. "
+            f"{memory_rule}"
             "A final answer means the latest user request is already complete and "
             "no tool or other work will happen after this routing decision. If the "
             "user-facing answer would describe a future tool action, ask the user "

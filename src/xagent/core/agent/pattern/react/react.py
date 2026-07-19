@@ -41,10 +41,10 @@ from typing import Any, cast
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ...context.enrichment import (
     enrich_context_with_memory,
-    enrich_context_with_skill,
-    generate_and_store_react_memory,
     latest_user_text,
 )
+from ...context.memory_tool import build_memory_tools
+from ...context.skill_tool import build_load_skill_tool
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
@@ -270,25 +270,28 @@ class ReActPattern(AgentPattern):
         try:
             task_text = self._task_text(context)
             self._memory_store = kwargs.get("memory_store")
-            await enrich_context_with_memory(
-                context=context,
-                query=task_text,
-                category="react_memory",
-                memory_store=self._memory_store,
-                runtime=runtime,
-                similarity_threshold=kwargs.get("memory_similarity_threshold"),
-            )
-            await enrich_context_with_skill(
-                context=context,
-                task=task_text,
-                llm=active_llm,
-                skill_manager=kwargs.get("skill_manager"),
-                runtime=runtime,
-                allowed_skills=kwargs.get("allowed_skills"),
-            )
+            # DAG steps skip the automatic retrieval: the root run already
+            # retrieved for the whole task, and steps can search_memory on
+            # demand.
+            if not context.metadata.get("dag_step_id"):
+                await enrich_context_with_memory(
+                    context=context,
+                    query=task_text,
+                    category="react_memory",
+                    memory_store=self._memory_store,
+                    runtime=runtime,
+                    similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                )
             result = await self._run_tool_calling_loop(
                 context=context,
-                tools=tools,
+                tools=await self._with_context_tools(
+                    tools=tools,
+                    context=context,
+                    task_text=task_text,
+                    runtime=runtime,
+                    skill_manager=kwargs.get("skill_manager"),
+                    allowed_skills=kwargs.get("allowed_skills"),
+                ),
                 llm=active_llm,
                 compact_llm=compact_llm,
                 runtime=runtime,
@@ -308,6 +311,41 @@ class ReActPattern(AgentPattern):
 
         await runtime.on_pattern_end(context=context, pattern=self, result=result)
         return result
+
+    async def _with_context_tools(
+        self,
+        *,
+        tools: list[Any],
+        context: Any,
+        task_text: str,
+        runtime: PatternRuntime,
+        skill_manager: Any | None,
+        allowed_skills: list[str] | None,
+    ) -> list[Any]:
+        """Expose the memory tool set and ``load_skill`` for this run.
+
+        Skipped when ``finalize_after_tool_result`` is set (single_call mode):
+        that mode forces a final answer after the first successful tool call,
+        so the only tool round must go to the actual task.
+        """
+        if self.finalize_after_tool_result:
+            return tools
+        extra_tools: list[Any] = build_memory_tools(
+            memory_store=self._memory_store,
+            task=task_text,
+            runtime=runtime,
+            context=context,
+        )
+        skill_tool = await build_load_skill_tool(
+            skill_manager=skill_manager,
+            context=context,
+            allowed_skills=allowed_skills,
+        )
+        if skill_tool is not None:
+            extra_tools.append(skill_tool)
+        if not extra_tools:
+            return tools
+        return [*tools, *extra_tools]
 
     async def _run_tool_calling_loop(
         self,
@@ -553,7 +591,6 @@ class ReActPattern(AgentPattern):
             if normalized.get("done", True):
                 return await self._finalize_success(
                     context=context,
-                    llm=llm,
                     runtime=runtime,
                     response=assistant_content or normalized.get("raw"),
                 )
@@ -1334,7 +1371,6 @@ class ReActPattern(AgentPattern):
                 context.add_assistant_message(answer)
             return await self._finalize_success(
                 context=context,
-                llm=llm,
                 runtime=runtime,
                 response=answer,
             )
@@ -2043,7 +2079,6 @@ class ReActPattern(AgentPattern):
         self,
         *,
         context: Any,
-        llm: Any,
         runtime: PatternRuntime,
         response: Any,
     ) -> dict[str, Any]:
@@ -2057,15 +2092,6 @@ class ReActPattern(AgentPattern):
             output=response,
             metadata={"response": response, "status": self.status},
         ).to_dict()
-        await generate_and_store_react_memory(
-            context=context,
-            task=self._task_text(context),
-            result=result,
-            iterations=self.current_iteration + 1,
-            llm=llm,
-            memory_store=getattr(self, "_memory_store", None),
-            runtime=runtime,
-        )
         return result
 
     def _ensure_pending_tool_call_envelope(self, context: Any) -> None:

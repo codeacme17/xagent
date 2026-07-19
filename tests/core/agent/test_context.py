@@ -17,11 +17,7 @@ from xagent.core.agent.context.enrichment import (
     SKILL_CONTEXT_METADATA_KEY,
     _current_user_id,
     _lookup_relevant_memories_with_context,
-    _parse_json_object,
-    _skill_selection_attempt_key,
     enrich_context_with_memory,
-    enrich_context_with_skill,
-    generate_and_store_react_memory,
 )
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -29,7 +25,6 @@ from xagent.core.agent.language import (
     output_language_policy,
     response_language_rules,
 )
-from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -371,168 +366,6 @@ async def test_enrich_context_with_memory_caches_and_builds_context(
     assert ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] == (
         "Memory: Prefer concise answers."
     )
-
-
-class FakeSkillManager:
-    def __init__(self, selected: dict[str, str] | None) -> None:
-        self.selected = selected
-        self.calls: list[dict[str, object]] = []
-
-    async def select_skill(self, **kwargs: object) -> dict[str, str] | None:
-        self.calls.append(kwargs)
-        return self.selected
-
-
-@pytest.mark.asyncio
-async def test_enrich_context_with_skill_records_selected_skill() -> None:
-    skill = {
-        "name": "writer",
-        "description": "Writes concise copy",
-        "when_to_use": "Writing",
-        "content": "Use short sentences.",
-    }
-    manager = FakeSkillManager(skill)
-    ctx = ExecutionContext(execution_id="exec-skill")
-
-    selected = await enrich_context_with_skill(
-        context=ctx,
-        task="Write release notes",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-
-    assert selected == skill
-    assert ctx.metadata[enrichment_module.SELECTED_SKILL_METADATA_KEY]["name"] == (
-        "writer"
-    )
-    assert "Use short sentences." in ctx.metadata[SKILL_CONTEXT_METADATA_KEY]
-
-
-@pytest.mark.asyncio
-async def test_enrich_context_with_skill_caches_no_skill() -> None:
-    manager = FakeSkillManager(None)
-    ctx = ExecutionContext(execution_id="exec-skill")
-
-    first = await enrich_context_with_skill(
-        context=ctx,
-        task="No matching skill",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-    second = await enrich_context_with_skill(
-        context=ctx,
-        task="No matching skill",
-        llm=object(),
-        skill_manager=manager,
-        allowed_skills=["writer"],
-    )
-
-    assert first is None
-    assert second is None
-    assert len(manager.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_store_and_skip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored: list[dict[str, object]] = []
-
-    async def fake_generate(**_: object) -> dict[str, object]:
-        return {
-            "should_store": True,
-            "reason": "useful",
-            "core_insight": "core",
-            "tool_usage_insights": "tools",
-            "reasoning_strategy": "strategy",
-        }
-
-    def fake_store_react_task_memory(**kwargs: object) -> str:
-        stored.append(kwargs)
-        return "memory-1"
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-    monkeypatch.setattr(
-        enrichment_module,
-        "store_react_task_memory",
-        fake_store_react_task_memory,
-    )
-    ctx = ExecutionContext(execution_id="exec-memory")
-    ctx.add_user_message("Do work")
-
-    await generate_and_store_react_memory(
-        context=ctx,
-        task="Do work",
-        result={"success": True, "output": "Done"},
-        iterations=2,
-        llm=object(),
-        memory_store=object(),
-    )
-
-    assert stored[0]["task"] == "Do work"
-    assert stored[0]["tool_usage_insights"] == "tools"
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_parse_failure_skips_store(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stored: list[dict[str, object]] = []
-
-    async def fake_generate(**_: object) -> None:
-        return None
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-    monkeypatch.setattr(
-        enrichment_module,
-        "store_react_task_memory",
-        lambda **kwargs: stored.append(kwargs),
-    )
-
-    await generate_and_store_react_memory(
-        context=ExecutionContext(execution_id="exec-memory"),
-        task="Do work",
-        result={"success": True, "output": "Done"},
-        iterations=2,
-        llm=object(),
-        memory_store=object(),
-    )
-
-    assert stored == []
-
-
-@pytest.mark.asyncio
-async def test_generate_and_store_react_memory_propagates_interrupt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_generate(**_: object) -> None:
-        raise LLMCallInterrupted("paused")
-
-    monkeypatch.setattr(
-        enrichment_module,
-        "_generate_react_memory_insights",
-        fake_generate,
-    )
-
-    with pytest.raises(LLMCallInterrupted, match="paused"):
-        await generate_and_store_react_memory(
-            context=ExecutionContext(execution_id="exec-memory"),
-            task="Do work",
-            result={"success": True, "output": "Done"},
-            iterations=2,
-            llm=object(),
-            memory_store=object(),
-        )
 
 
 def test_add_messages() -> None:
@@ -1094,29 +927,6 @@ def test_serialization_roundtrip() -> None:
     assert restored.compact_config.max_messages == ctx.compact_config.max_messages
 
 
-def test_parse_json_object_extracts_fenced_json_with_preamble() -> None:
-    content = """Here is the analysis:
-
-```json
-{"should_store": false, "reason": "routine"}
-```
-"""
-
-    parsed = _parse_json_object(content)
-
-    assert parsed == {"should_store": False, "reason": "routine"}
-
-
-def test_skill_selection_attempt_key_hashes_task_payload() -> None:
-    task = "x" * 1000
-
-    key = _skill_selection_attempt_key(task, ["b", "a"])
-
-    assert len(key) == 64
-    assert task not in key
-    assert key == _skill_selection_attempt_key(task, ["a", "b"])
-
-
 def test_context_manager_lifecycle() -> None:
     manager = ContextManager()
     ctx = manager.create_context(
@@ -1283,3 +1093,19 @@ def test_custom_component_roundtrip_without_context_schema_change() -> None:
         "library_dirs": ["/tmp/skills"],
         "active": ["writer"],
     }
+
+
+def test_system_context_renders_memory_persistence_guidance() -> None:
+    from xagent.core.agent.context.memory_tool import MEMORY_TOOLS_METADATA_KEY
+
+    context = ExecutionContext(system_prompt="Base prompt.")
+    context.add_user_message("hello")
+
+    without_flag = context.get_messages_for_llm()[0]["content"]
+    assert "Memory persistence:" not in without_flag
+
+    context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
+    with_flag = context.get_messages_for_llm()[0]["content"]
+    assert "Memory persistence:" in with_flag
+    assert "store_memory" in with_flag
+    assert "update_memory" in with_flag
