@@ -397,6 +397,7 @@ def test_create_list_get_and_cross_user_access_control() -> None:
     assert workforce["status"] == "draft"
     assert workforce["manager"]["name"] == "Support Workforce Manager"
     assert workforce["workers"][0]["agent"]["name"] == "Support Workforce Worker 1"
+    assert "manager_instructions" not in workforce
 
     list_response = client.get("/api/workforces", headers=headers)
     assert list_response.status_code == 200
@@ -424,6 +425,32 @@ def test_create_list_get_and_cross_user_access_control() -> None:
     other_list_payload = other_list_response.json()
     assert other_list_payload["total"] == 1
     assert other_list_payload["items"][0]["id"] == other_workforce["id"]
+
+
+def test_manager_instructions_is_ignored_on_create_and_update() -> None:
+    headers = _admin_headers()
+    # _create_workforce still submits a legacy "manager_instructions" key;
+    # older frontends may do the same during rollout and must not get a 422.
+    workforce = _create_workforce(headers)
+    assert "manager_instructions" not in workforce
+
+    update_response = client.patch(
+        f"/api/workforces/{workforce['id']}",
+        headers=headers,
+        json={"description": "Updated", "manager_instructions": "Legacy value"},
+    )
+    assert update_response.status_code == 200, update_response.text
+    payload = update_response.json()
+    assert payload["description"] == "Updated"
+    assert "manager_instructions" not in payload
+
+    db = _direct_db_session()
+    try:
+        row = db.get(Workforce, workforce["id"])
+        assert row is not None
+        assert row.manager_instructions is None
+    finally:
+        db.close()
 
 
 def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> None:
@@ -646,6 +673,15 @@ def test_from_prompt_creates_draft_workforce() -> None:
     assert payload["id"]
     assert payload["status"] == "draft"
     assert payload["manager"]["status"] == "published"
+    assert "manager_instructions" not in payload
+
+    db = _direct_db_session()
+    try:
+        row = db.get(Workforce, payload["id"])
+        assert row is not None
+        assert row.manager_instructions is None
+    finally:
+        db.close()
 
 
 def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) -> None:

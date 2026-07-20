@@ -130,12 +130,6 @@ def build_manager_system_prompt(snapshot: dict[str, Any]) -> str:
     for worker in workers:
         alias = worker.get("alias") or worker["name"]
         lines.append(f"- {alias}: {worker['assignment_instructions']}")
-
-    manager_instructions = snapshot.get("manager", {}).get("workforce_instructions")
-    if manager_instructions:
-        lines.extend(
-            ["", "Workforce-specific manager instructions:", manager_instructions]
-        )
     return "\n".join(lines)
 
 
@@ -243,7 +237,6 @@ def build_workforce_snapshot(
             "name": manager_agent.name,
             "description": manager_agent.description,
             "instructions": manager_agent.instructions,
-            "workforce_instructions": workforce.manager_instructions,
             "execution_mode": manager_agent.execution_mode,
             "models": manager_agent.models or {},
         },

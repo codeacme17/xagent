@@ -151,6 +151,14 @@ def test_build_workforce_snapshot_for_active_workforce(db_session: Session) -> N
     assert snapshot["workforce"]["status"] == "active"
     assert snapshot["manager"]["agent_id"] == manager.id
     assert "Workforce Manager" in snapshot["manager"]["runtime_prompt"]
+    # Workforce-level manager instructions are removed (#800): even legacy
+    # rows with a stored value must not leak into the snapshot or prompt.
+    assert "workforce_instructions" not in snapshot["manager"]
+    assert "Prefer concise synthesis." not in snapshot["manager"]["runtime_prompt"]
+    assert (
+        "Workforce-specific manager instructions"
+        not in snapshot["manager"]["runtime_prompt"]
+    )
     assert snapshot["workers"] == [
         {
             "member_id": worker.id,
