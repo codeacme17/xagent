@@ -59,7 +59,6 @@ export interface WorkforceDetail {
   description: string | null
   status: WorkforceStatus
   manager: WorkforceAgentSummary
-  manager_instructions: string | null
   workers: WorkforceWorker[]
   canvas_layout: Record<string, unknown> | null
   scope_type: string
@@ -114,7 +113,6 @@ export interface WorkforceCreatePayload {
   name: string
   description?: string
   manager_agent_id: number
-  manager_instructions?: string
   canvas_layout?: Record<string, unknown> | null
   workers?: WorkforceWorkerPayload[]
 }
@@ -127,7 +125,6 @@ export interface WorkforceUpdatePayload {
   name?: string
   description?: string | null
   manager_agent_id?: number
-  manager_instructions?: string | null
   canvas_layout?: Record<string, unknown> | null
 }
 

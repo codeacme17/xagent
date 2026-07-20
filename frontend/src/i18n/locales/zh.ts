@@ -3718,7 +3718,6 @@ const zh = {
       name: "名称",
       description: "描述",
       manager: "Manager",
-      managerInstructions: "Manager 指令",
       workers: "Workers",
       publishedAgent: "已发布 Agent",
       alias: "别名",
@@ -3730,7 +3729,6 @@ const zh = {
       requireApproval: "运行前需要审批",
       requireApprovalHint: "Workforce 负责人在委派此 Agent 前会征求您的确认",
       workforceName: "Workforce 名称",
-      workforceInstructions: "Workforce 指令",
       agentManager: "Agent Manager",
     },
     list: {
@@ -3822,12 +3820,9 @@ const zh = {
       placeholders: {
         name: "营销发布 Workforce",
         description: "协调调研、内容和发布任务。",
-        managerInstructions: "协调 workers，处理冲突结果，并返回统一答案。"
       },
       fields: {
         workforceName: "Workforce 名称",
-        workforceInstructions: "Workforce 指令",
-        workforceInstructionsHint: "描述 Workforce Lead 应如何编排工作，以及成功的输出是什么样子的。",
         agentManager: "Agent Manager",
         agentManagerHint: "这是你的 Workforce 汇报的 Agent，它理解你的指令并协调所有子 Agent 完成工作。",
       },
@@ -3874,7 +3869,6 @@ const zh = {
     review: {
       potentialRisks: "潜在风险",
       untitled: "未命名 Workforce",
-      noManagerInstructions: "没有 manager 指令",
       canvasPreview: "画布预览",
       workforceLead: "Workforce Lead",
       subAgentsDelegation: "Sub-agents 与委派",

@@ -55,7 +55,6 @@ describe("workforces-api", () => {
     await createWorkforce({
       name: "Launch",
       manager_agent_id: 7,
-      manager_instructions: "Coordinate workers",
       workers: [
         {
           source_type: "existing",
@@ -72,7 +71,6 @@ describe("workforces-api", () => {
     expect(JSON.parse(String(options.body))).toEqual({
       name: "Launch",
       manager_agent_id: 7,
-      manager_instructions: "Coordinate workers",
       workers: [
         {
           source_type: "existing",
@@ -83,6 +81,9 @@ describe("workforces-api", () => {
       ],
     })
     expect(JSON.parse(String(options.body))).not.toHaveProperty("status")
+    expect(JSON.parse(String(options.body))).not.toHaveProperty(
+      "manager_instructions",
+    )
   })
 
   it("loads workforce-selectable agents from the workforce options endpoint", async () => {
