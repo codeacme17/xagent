@@ -323,7 +323,10 @@ function WorkforceRunPageInner() {
   }, [])
 
   const openRun = useCallback((run: WorkforceRunHistoryItem) => {
-    if (!run.task_id) return
+    if (!run.task_id) {
+      toast.error(t("workforces.runs.taskDeleted"))
+      return
+    }
     setHistoryOpen(false)
     if (previewTaskIdRef.current === run.task_id) return
     previewTaskIdRef.current = run.task_id
@@ -340,10 +343,30 @@ function WorkforceRunPageInner() {
       updatedAt: run.completed_at ?? run.created_at ?? new Date().toISOString(),
     }
     dispatch({ type: "SET_CURRENT_TASK", payload: taskPayload })
-  }, [closeFilePreview, setTaskId, dispatch])
+  }, [closeFilePreview, setTaskId, dispatch, t])
 
   useEffect(() => {
-    if (!id || !runParam || openedRunParamRef.current === runParam) return
+    if (!id) return
+    if (!runParam) {
+      // Navigating back to the plain run page (e.g. browser back clearing
+      // ?run=) should return to the fresh "start a new run" state instead of
+      // staying stuck in the previously opened conversation.
+      if (openedRunParamRef.current !== null) {
+        openedRunParamRef.current = null
+        previewTaskIdRef.current = null
+        setTaskStarted(false)
+        closeFilePreview()
+        dispatch({ type: "CLEAR_MESSAGES" })
+        dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+        dispatch({ type: "SET_STEPS", payload: [] })
+        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+        dispatch({ type: "SET_CURRENT_TASK", payload: null })
+        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        setTaskId(null, { navigate: false })
+      }
+      return
+    }
+    if (openedRunParamRef.current === runParam) return
     openedRunParamRef.current = runParam
     void (async () => {
       try {
@@ -353,7 +376,7 @@ function WorkforceRunPageInner() {
         toast.error(err instanceof Error ? err.message : t("workforces.runs.loadError"))
       }
     })()
-  }, [id, runParam, openRun, t])
+  }, [id, runParam, openRun, t, closeFilePreview, dispatch, setTaskId])
 
   const handleSend = useCallback(async (
     content: string,
