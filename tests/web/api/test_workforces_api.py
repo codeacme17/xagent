@@ -680,6 +680,9 @@ def test_from_prompt_creates_draft_workforce() -> None:
         row = db.get(Workforce, payload["id"])
         assert row is not None
         assert row.manager_instructions is None
+        manager_agent = db.get(Agent, payload["manager"]["id"])
+        assert manager_agent is not None
+        assert manager_agent.instructions
     finally:
         db.close()
 
