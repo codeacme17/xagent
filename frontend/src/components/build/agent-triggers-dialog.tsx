@@ -37,11 +37,13 @@ import {
   AgentTriggerRun,
   AgentTriggerType,
   GmailAccount,
+  StagedTrigger,
   createAgentTrigger,
   deleteAgentTrigger,
   listAgentTriggerRuns,
   listAgentTriggers,
   listGmailAccounts,
+  stagedToPseudoTrigger,
   testAgentTrigger,
   updateAgentTrigger,
 } from "@/lib/agent-triggers-api"
@@ -62,6 +64,11 @@ interface AgentTriggersDialogProps {
   initialType?: AgentTriggerType | null
   gmailConnection?: GmailConnectionState | null
   onConnectGmail?: () => void
+  // Creation flow (#928): when the agent does not exist yet the parent owns a
+  // list of staged triggers. All create/update/delete operations mutate that
+  // list instead of calling the API; the builder posts the staged triggers
+  // right after the agent is created.
+  staged?: { triggers: StagedTrigger[]; onChange: (next: StagedTrigger[]) => void } | null
 }
 
 interface TriggerFormState {
@@ -186,6 +193,7 @@ export function AgentTriggersDialog({
   initialType = null,
   gmailConnection = null,
   onConnectGmail,
+  staged = null,
 }: AgentTriggersDialogProps) {
   const { t } = useI18n()
   const router = useRouter()
@@ -207,6 +215,22 @@ export function AgentTriggersDialog({
   const [gmailAccountsLoading, setGmailAccountsLoading] = useState(false)
   const selectedTriggerIdRef = useRef<number | null>(null)
   const activeTypeRef = useRef<AgentTriggerType | null>(null)
+
+  const stagedTriggersProp = staged?.triggers ?? null
+  const isStaging = !isValidAgentId(agentId) && stagedTriggersProp !== null
+  const canOperate = isValidAgentId(agentId) || isStaging
+
+  // Staged clientIds are stable negative numbers so they can serve as pseudo
+  // AgentTrigger ids without ever colliding with a real server id.
+  const nextStagedClientId = () =>
+    (stagedTriggersProp ?? []).reduce((min, item) => Math.min(min, item.clientId), 0) - 1
+
+  // Staging mode: mirror the parent-owned staged triggers into the dialog's
+  // trigger list so grouping/selection/form logic works unchanged.
+  useEffect(() => {
+    if (!isStaging || !stagedTriggersProp) return
+    setTriggers(stagedTriggersProp.map(stagedToPseudoTrigger))
+  }, [isStaging, stagedTriggersProp])
 
   const setSelectedTriggerId = useCallback((id: number | null) => {
     selectedTriggerIdRef.current = id
@@ -448,11 +472,25 @@ export function AgentTriggersDialog({
   }
 
   const createDefaultTrigger = async (type: AgentTriggerType, enabled: boolean) => {
-    if (!isValidAgentId(agentId)) return null
     const config = defaultConfigForType(type)
     if (type === "gmail" && gmailAccounts?.length === 1) {
       config.oauth_account_id = gmailAccounts[0].id
     }
+    if (isStaging && staged) {
+      const stagedTrigger: StagedTrigger = {
+        clientId: nextStagedClientId(),
+        type,
+        name: defaultNameForType(type),
+        enabled,
+        config,
+        prompt_template: null,
+        secret: null,
+      }
+      staged.onChange([...staged.triggers, stagedTrigger])
+      notifyChanged()
+      return stagedToPseudoTrigger(stagedTrigger)
+    }
+    if (!isValidAgentId(agentId)) return null
     const saved = await createAgentTrigger(agentId, {
       type,
       name: defaultNameForType(type),
@@ -467,7 +505,7 @@ export function AgentTriggersDialog({
   }
 
   const handleTypeToggle = async (type: AgentTriggerType, checked: boolean) => {
-    if (!isValidAgentId(agentId)) return
+    if (!canOperate) return
     const typeTriggers = triggerGroups[type]
     const primary =
       typeTriggers.find((trigger) => trigger.enabled) ??
@@ -489,6 +527,35 @@ export function AgentTriggersDialog({
     }
     setBusyType(type)
     try {
+      if (isStaging && staged) {
+        if (checked) {
+          if (primary) {
+            staged.onChange(
+              staged.triggers.map((item) =>
+                item.clientId === primary.id ? { ...item, enabled: true } : item,
+              ),
+            )
+            setSelectedTriggerId(primary.id)
+          } else {
+            const created = await createDefaultTrigger(type, true)
+            if (created) {
+              setActiveType(type)
+              setSelectedTriggerId(created.id)
+              setForm(formFromTrigger(created))
+            }
+          }
+        } else {
+          staged.onChange(
+            staged.triggers.map((item) =>
+              item.type === type ? { ...item, enabled: false } : item,
+            ),
+          )
+        }
+        notifyChanged()
+        toast.success(checked ? t("triggers.messages.enabled") : t("triggers.messages.disabled"))
+        return
+      }
+      if (!isValidAgentId(agentId)) return
       let preferredId: number | null = primary?.id ?? null
       if (checked) {
         if (primary) {
@@ -523,7 +590,7 @@ export function AgentTriggersDialog({
   }
 
   const handleSubmit = async () => {
-    if (!isValidAgentId(agentId)) return
+    if (!canOperate) return
     let payload
     try {
       payload = buildPayload()
@@ -532,6 +599,45 @@ export function AgentTriggersDialog({
       return
     }
 
+    if (isStaging && staged) {
+      if (selectedTrigger) {
+        staged.onChange(
+          staged.triggers.map((item) =>
+            item.clientId === selectedTrigger.id
+              ? {
+                  ...item,
+                  name: payload.name,
+                  enabled: payload.enabled,
+                  config: payload.config,
+                  prompt_template: payload.prompt_template,
+                  // Like the live edit flow, a blank secret keeps the current one.
+                  secret: payload.secret ?? item.secret,
+                }
+              : item,
+          ),
+        )
+      } else {
+        const clientId = nextStagedClientId()
+        staged.onChange([
+          ...staged.triggers,
+          {
+            clientId,
+            type: payload.type,
+            name: payload.name,
+            enabled: payload.enabled,
+            config: payload.config,
+            prompt_template: payload.prompt_template,
+            secret: payload.secret,
+          },
+        ])
+        setSelectedTriggerId(clientId)
+      }
+      notifyChanged()
+      toast.success(t("triggers.messages.staged"))
+      return
+    }
+
+    if (!isValidAgentId(agentId)) return
     setBusy(true)
     try {
       const saved = selectedTrigger
@@ -571,11 +677,21 @@ export function AgentTriggersDialog({
   }
 
   const handleDelete = async (trigger: AgentTrigger) => {
-    if (!isValidAgentId(agentId)) return
+    if (!canOperate) return
     if (deleteConfirmId !== trigger.id) {
       setDeleteConfirmId(trigger.id)
       return
     }
+    if (isStaging && staged) {
+      staged.onChange(staged.triggers.filter((item) => item.clientId !== trigger.id))
+      setSelectedTriggerId(null)
+      setRuns([])
+      setDeleteConfirmId(null)
+      notifyChanged()
+      toast.success(t("triggers.messages.deleted"))
+      return
+    }
+    if (!isValidAgentId(agentId)) return
     setBusy(true)
     try {
       await deleteAgentTrigger(agentId, trigger.id)
@@ -703,7 +819,7 @@ export function AgentTriggersDialog({
         <div className="flex items-center gap-3">
           <Switch
             checked={isEnabled}
-            disabled={busyType === type || !isValidAgentId(agentId)}
+            disabled={busyType === type || !canOperate}
             onCheckedChange={(checked) => void handleTypeToggle(type, checked)}
           />
           <button
@@ -724,7 +840,7 @@ export function AgentTriggersDialog({
       <Alert className="border-primary/20 bg-primary/5 text-primary">
         <Info className="h-4 w-4" />
         <AlertDescription className="text-sm text-foreground">
-          {t("triggers.overview.info")}
+          {t(isStaging ? "triggers.staging.info" : "triggers.overview.info")}
         </AlertDescription>
       </Alert>
 
@@ -846,7 +962,11 @@ export function AgentTriggersDialog({
                 type="password"
                 value={form.secret}
                 onChange={(event) => setFormValue("secret", event.target.value)}
-                placeholder={isNew ? t("triggers.form.secretPlaceholder") : t("triggers.form.secretEditPlaceholder")}
+                placeholder={
+                  isNew || isStaging
+                    ? t("triggers.form.secretPlaceholder")
+                    : t("triggers.form.secretEditPlaceholder")
+                }
               />
             </div>
           )}
@@ -992,7 +1112,16 @@ export function AgentTriggersDialog({
           </Alert>
         )}
 
-        {selectedTrigger?.type === "webhook" && (
+        {isStaging && activeType === "webhook" && (
+          <Alert className="border-primary/20 bg-primary/5">
+            <Info className="h-4 w-4" />
+            <AlertDescription className="text-sm text-foreground">
+              {t("triggers.staging.webhookPending")}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {!isStaging && selectedTrigger?.type === "webhook" && (
           <section className="space-y-3 rounded-lg border bg-muted/20 p-4">
             <div className="text-sm font-medium">{t("triggers.webhook.title")}</div>
             <div className="flex gap-2">
@@ -1013,17 +1142,17 @@ export function AgentTriggersDialog({
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4">
           <div className="flex flex-wrap gap-2">
-            <Button onClick={handleSubmit} disabled={busy || !isValidAgentId(agentId)}>
+            <Button onClick={handleSubmit} disabled={busy || !canOperate}>
               {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {isNew ? t("triggers.actions.enable") : t("triggers.actions.save")}
             </Button>
-            {selectedTrigger && (
+            {!isStaging && selectedTrigger && (
               <Button variant="outline" onClick={handleTest} disabled={busy}>
                 <Play className="mr-2 h-4 w-4" />
                 {t("triggers.actions.test")}
               </Button>
             )}
-            {selectedTrigger?.type === "webhook" && (
+            {!isStaging && selectedTrigger?.type === "webhook" && (
               <Button variant="outline" onClick={handleRotateSecret} disabled={busy}>
                 <RotateCcw className="mr-2 h-4 w-4" />
                 {t("triggers.actions.rotateSecret")}
@@ -1045,7 +1174,7 @@ export function AgentTriggersDialog({
           )}
         </div>
 
-        {selectedTrigger && (
+        {!isStaging && selectedTrigger && (
           <section className="space-y-3 rounded-lg border p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -1094,7 +1223,7 @@ export function AgentTriggersDialog({
           </section>
         )}
 
-        {selectedTrigger && (
+        {!isStaging && selectedTrigger && (
           <section className="space-y-3 rounded-lg border p-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>

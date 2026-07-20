@@ -53,6 +53,54 @@ export interface AgentTriggerPayload {
   rotate_secret?: boolean
 }
 
+// A trigger configured while the agent itself does not exist yet (issue #928).
+// Staged triggers live only in builder state; on agent creation each one is
+// posted through createAgentTrigger. clientId is a stable NEGATIVE number so
+// it can double as a pseudo AgentTrigger.id without ever colliding with (or
+// being mistaken for) a real server id.
+export interface StagedTrigger {
+  clientId: number
+  type: AgentTriggerType
+  name: string
+  enabled: boolean
+  config: Record<string, unknown>
+  prompt_template: string | null
+  secret: string | null
+}
+
+export function stagedToPseudoTrigger(staged: StagedTrigger): AgentTrigger {
+  return {
+    id: staged.clientId,
+    user_id: 0,
+    agent_id: 0,
+    type: staged.type,
+    name: staged.name,
+    enabled: staged.enabled,
+    config: staged.config,
+    prompt_template: staged.prompt_template,
+    webhook_token: null,
+    callback_id: null,
+    next_run_at: null,
+    last_run_at: null,
+    last_error: null,
+    created_at: null,
+    updated_at: null,
+  }
+}
+
+export function stagedToCreatePayload(
+  staged: StagedTrigger,
+): AgentTriggerPayload & { type: AgentTriggerType } {
+  return {
+    type: staged.type,
+    name: staged.name,
+    enabled: staged.enabled,
+    config: staged.config,
+    prompt_template: staged.prompt_template,
+    secret: staged.secret,
+  }
+}
+
 export interface AgentTriggerTestPayload {
   payload: Record<string, unknown>
   source_event_id?: string | null

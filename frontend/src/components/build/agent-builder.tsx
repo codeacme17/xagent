@@ -11,7 +11,7 @@ import { Switch } from "@/components/ui/switch"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
-import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow } from "lucide-react"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -50,7 +50,17 @@ import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentFlowView } from "./agent-flow-view"
-import { AgentTrigger, AgentTriggerType, listAgentTriggers } from "@/lib/agent-triggers-api"
+import {
+  AgentTrigger,
+  AgentTriggerType,
+  StagedTrigger,
+  createAgentTrigger,
+  listAgentTriggers,
+  stagedToCreatePayload,
+  stagedToPseudoTrigger,
+} from "@/lib/agent-triggers-api"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { copyToClipboard } from "@/lib/clipboard"
 import {
   sanitizeUnsharedConnectors,
   sanitizeUnsharedKnowledgeBases,
@@ -172,6 +182,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isTriggersDialogOpen, setIsTriggersDialogOpen] = useState(false)
   const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | null>(null)
   const [triggerSummary, setTriggerSummary] = useState<AgentTrigger[]>([])
+  // Triggers configured before the agent exists (#928). Posted via the
+  // trigger API right after the agent is created, then cleared.
+  const [stagedTriggers, setStagedTriggers] = useState<StagedTrigger[]>([])
+  // Auto-generated webhook secrets from staged-trigger creation; shown once.
+  const [createdWebhookSecrets, setCreatedWebhookSecrets] = useState<
+    { name: string; secret: string }[]
+  >([])
   const [showAIAssistant, setShowAIAssistant] = useState(false)
   const [viewMode, setViewMode] = useState<"config" | "flow">("config")
   const [configSynced, setConfigSynced] = useState(false)
@@ -231,13 +248,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     void refreshTriggerSummary()
   }, [refreshTriggerSummary])
 
+  // During creation the agent has no server-side triggers yet; the summary
+  // sections and flow view render the staged ones instead (#928).
+  const effectiveTriggerSummary = useMemo(
+    () => (localAgentId ? triggerSummary : stagedTriggers.map(stagedToPseudoTrigger)),
+    [localAgentId, triggerSummary, stagedTriggers],
+  )
+
   const triggerStats = useMemo(() => {
     const stats = {
       webhook: { total: 0, enabled: 0 },
       scheduled: { total: 0, enabled: 0 },
       gmail: { total: 0, enabled: 0 },
     }
-    triggerSummary.forEach((trigger) => {
+    effectiveTriggerSummary.forEach((trigger) => {
       if (trigger.type !== "webhook" && trigger.type !== "scheduled" && trigger.type !== "gmail") return
       stats[trigger.type].total += 1
       if (trigger.enabled) {
@@ -245,7 +269,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
     })
     return stats
-  }, [triggerSummary])
+  }, [effectiveTriggerSummary])
 
   const gmailConnection = useMemo(() => {
     const gmailApp = findMatchingMcpApp(officialApps, "gmail")
@@ -1213,6 +1237,41 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
+
+          // Staged triggers (configured before the agent existed, #928) go
+          // through the regular trigger API now that a real agent id exists.
+          // Failures don't roll back the agent; each one surfaces as a toast
+          // and the trigger can be re-added from the (now live) dialog.
+          if (stagedTriggers.length > 0) {
+            const results = await Promise.allSettled(
+              stagedTriggers.map((staged) =>
+                createAgentTrigger(newAgent.id, stagedToCreatePayload(staged)),
+              ),
+            )
+            const generatedSecrets: { name: string; secret: string }[] = []
+            results.forEach((result, index) => {
+              const staged = stagedTriggers[index]
+              if (result.status === "rejected") {
+                const reason =
+                  result.reason instanceof Error
+                    ? result.reason.message
+                    : String(result.reason)
+                toast.error(
+                  t("triggers.messages.stagedCreateFailed", { name: staged.name, error: reason }),
+                )
+              } else if (result.value.webhook_secret && !staged.secret) {
+                generatedSecrets.push({ name: staged.name, secret: result.value.webhook_secret })
+              }
+            })
+            setStagedTriggers([])
+            setCreatedWebhookSecrets(generatedSecrets)
+            try {
+              setTriggerSummary(await listAgentTriggers(newAgent.id))
+            } catch (error) {
+              console.error("Failed to refresh trigger summary:", error)
+            }
+          }
+
           // Newly created agents are always personal; promote if the user chose Team.
           const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
           setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
@@ -2080,7 +2139,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           )}
         </div>
 
-        {triggerSummary.some((trigger) => trigger.enabled) && (
+        {effectiveTriggerSummary.some((trigger) => trigger.enabled) && (
           <div className="space-y-2">
             <div className="flex items-center gap-1.5">
               <Label>{t("triggers.builder.title")}</Label>
@@ -2236,7 +2295,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               setTriggerDialogInitialType(null)
               setIsTriggersDialogOpen(true)
             }}
-            disabled={!localAgentId}
             className="h-7 border-dashed border-primary/45 bg-primary/5 px-2 text-xs text-primary hover:border-primary hover:bg-primary/10"
           >
             <Zap className="mr-1 h-3.5 w-3.5" />
@@ -2472,6 +2530,41 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               {t("builds.editor.success.createdDesc", { name: createdAgent?.name })}
             </DialogDescription>
           </DialogHeader>
+          {/* One-time reveal of webhook secrets generated for staged triggers
+              (#928). Closing this dialog navigates away and remounts the
+              builder, so this is the only chance to copy them. */}
+          {createdWebhookSecrets.length > 0 && (
+            <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+              <AlertCircle className="h-4 w-4" />
+              <AlertTitle>{t("triggers.secret.title")}</AlertTitle>
+              <AlertDescription>
+                <div className="mt-2 space-y-2">
+                  {createdWebhookSecrets.map((item) => (
+                    <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
+                      <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
+                      <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
+                        {item.secret}
+                      </code>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="secondary"
+                        className="h-7 w-7 shrink-0"
+                        onClick={async () => {
+                          if (await copyToClipboard(item.secret)) {
+                            toast.success(t("common.copied"))
+                          }
+                        }}
+                        title={t("common.copy")}
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </AlertDescription>
+            </Alert>
+          )}
           <DialogFooter className="gap-2 sm:justify-end">
             <div className="flex w-full sm:w-auto gap-2 justify-end">
               <Button variant="outline" onClick={handleDialogClose}>
@@ -2547,6 +2640,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
       <AgentTriggersDialog
         agentId={localAgentId ? Number(localAgentId) : null}
+        staged={localAgentId ? null : { triggers: stagedTriggers, onChange: setStagedTriggers }}
         agentName={name}
         open={isTriggersDialogOpen}
         onOpenChange={(dialogOpen) => {

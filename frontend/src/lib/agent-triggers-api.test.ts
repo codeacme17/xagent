@@ -11,8 +11,11 @@ vi.mock("@/lib/utils", () => ({
 }))
 
 import {
+  StagedTrigger,
   createAgentTrigger,
   listAgentTriggerRuns,
+  stagedToCreatePayload,
+  stagedToPseudoTrigger,
   updateAgentTrigger,
 } from "./agent-triggers-api"
 
@@ -118,5 +121,44 @@ describe("agent trigger API client", () => {
     )
     expect(runs).toHaveLength(1)
     expect(runs[0].task_id).toBe(99)
+  })
+})
+
+describe("staged triggers (agent creation flow)", () => {
+  const staged: StagedTrigger = {
+    clientId: -3,
+    type: "scheduled",
+    name: "Daily report",
+    enabled: true,
+    config: { interval_seconds: 3600 },
+    prompt_template: "Run {{payload}}",
+    secret: null,
+  }
+
+  it("maps a staged trigger to a pseudo AgentTrigger keyed by its negative clientId", () => {
+    const pseudo = stagedToPseudoTrigger(staged)
+
+    expect(pseudo.id).toBe(-3)
+    expect(pseudo.type).toBe("scheduled")
+    expect(pseudo.name).toBe("Daily report")
+    expect(pseudo.enabled).toBe(true)
+    expect(pseudo.config).toEqual({ interval_seconds: 3600 })
+    expect(pseudo.prompt_template).toBe("Run {{payload}}")
+    expect(pseudo.webhook_token).toBeNull()
+    expect(pseudo.callback_id).toBeNull()
+  })
+
+  it("builds a create payload without leaking the client-side id", () => {
+    const payload = stagedToCreatePayload(staged)
+
+    expect(payload).toEqual({
+      type: "scheduled",
+      name: "Daily report",
+      enabled: true,
+      config: { interval_seconds: 3600 },
+      prompt_template: "Run {{payload}}",
+      secret: null,
+    })
+    expect("clientId" in payload).toBe(false)
   })
 })

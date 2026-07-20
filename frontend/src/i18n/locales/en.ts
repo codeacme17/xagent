@@ -3545,10 +3545,13 @@ Build when you need.`,
     builder: {
       title: "Triggers",
       description: "Choose automatic entry points for this agent.",
-      saveFirst: "Save the agent before configuring triggers.",
       tooltip: "Triggers automatically start this agent when an external event or schedule fires.",
       open: "Triggers",
       configure: "Configure trigger"
+    },
+    staging: {
+      info: "Triggers configured here are saved with the draft and created automatically together with the agent.",
+      webhookPending: "The webhook URL and signing secret will be generated after the agent is created."
     },
     type: {
       webhook: "Webhook",
@@ -3653,6 +3656,8 @@ Build when you need.`,
       runsLoadFailed: "Failed to load trigger runs",
       created: "Trigger created",
       updated: "Trigger updated",
+      staged: "Trigger saved. It will be created together with the agent.",
+      stagedCreateFailed: "Failed to create trigger \"{name}\": {error}",
       enabled: "Trigger enabled",
       disabled: "Trigger disabled",
       deleted: "Trigger deleted",
