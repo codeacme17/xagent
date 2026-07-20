@@ -116,6 +116,7 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     status = Column(String(20), nullable=False, default="pending", index=True)
+    is_preview = Column(Boolean, nullable=False, default=False, server_default="0")
     snapshot = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)

@@ -41,6 +41,25 @@ export interface WorkforceRunListItem {
   created_at: string | null
 }
 
+export interface WorkforceRunHistoryItem {
+  id: number
+  task_id: number | null
+  status: string
+  is_preview: boolean
+  task_title: string | null
+  message: string | null
+  created_at: string | null
+  completed_at: string | null
+}
+
+export interface WorkforceRunHistoryResponse {
+  items: WorkforceRunHistoryItem[]
+  total: number
+  page: number
+  size: number
+  pages: number
+}
+
 export interface WorkforceListItem {
   id: number
   name: string

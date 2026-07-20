@@ -263,7 +263,10 @@ def _load_latest_runs_by_workforce(
             )
             .label("rank"),
         )
-        .filter(WorkforceRun.workforce_id.in_(workforce_ids))
+        .filter(
+            WorkforceRun.workforce_id.in_(workforce_ids),
+            WorkforceRun.is_preview.is_(False),
+        )
         .subquery()
     )
     latest_runs = (
@@ -754,6 +757,97 @@ async def create_workforce_run(
         "task_id": result.task.id,
         "status": result.workforce_run.status,
         "redirect_url": f"/task/{result.task.id}",
+    }
+
+
+_RUN_MESSAGE_PREVIEW_LIMIT = 200
+
+
+def _serialize_run_list_item(run: WorkforceRun) -> dict[str, Any]:
+    task = run.task
+    message = cast(str | None, task.description) if task is not None else None
+    if message and len(message) > _RUN_MESSAGE_PREVIEW_LIMIT:
+        message = message[:_RUN_MESSAGE_PREVIEW_LIMIT] + "..."
+    return {
+        "id": run.id,
+        "task_id": run.task_id,
+        "status": run.status,
+        "is_preview": bool(run.is_preview),
+        "task_title": task.title if task is not None else None,
+        "message": message,
+        "created_at": _serialize_datetime(run.created_at),
+        "completed_at": _serialize_datetime(run.completed_at),
+    }
+
+
+@router.get("/{workforce_id}/runs")
+async def list_workforce_runs(
+    workforce_id: int,
+    page: int = 1,
+    size: int = 20,
+    include_preview: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if page < 1 or size < 1 or size > 100:
+        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
+
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    query = db.query(WorkforceRun).filter(
+        WorkforceRun.workforce_id == int(workforce.id)
+    )
+    if not include_preview:
+        query = query.filter(WorkforceRun.is_preview.is_(False))
+
+    total = query.count()
+    runs = (
+        query.options(selectinload(WorkforceRun.task))
+        .order_by(WorkforceRun.created_at.desc(), WorkforceRun.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+        .all()
+    )
+    return {
+        "items": [_serialize_run_list_item(run) for run in runs],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size,
+    }
+
+
+@router.get("/{workforce_id}/runs/{run_id}")
+async def get_workforce_run(
+    workforce_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    run = (
+        db.query(WorkforceRun)
+        .options(selectinload(WorkforceRun.task))
+        .filter(
+            WorkforceRun.id == run_id,
+            WorkforceRun.workforce_id == int(workforce.id),
+        )
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workforce run not found")
+    return {
+        **_serialize_run_list_item(run),
+        "snapshot": run.snapshot,
     }
 
 

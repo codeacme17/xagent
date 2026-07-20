@@ -3898,6 +3898,28 @@ const zh = {
       inactiveDisabled: "请先发布这个 Workforce 再运行。",
       archivedDisabled: "已归档的 Workforce 不能运行。"
     },
+    runs: {
+      title: "运行记录",
+      historyTitle: "历史运行",
+      historyHint: "这个 Workforce 的历史运行记录。点击某次运行可重新打开对应会话。",
+      loading: "正在加载运行记录...",
+      loadError: "加载运行记录失败",
+      retry: "重试",
+      refresh: "刷新",
+      empty: "还没有运行记录",
+      emptyHint: "向这个 Workforce 发送任务后，运行记录会显示在这里。",
+      untitled: "运行 #{id}",
+      previewBadge: "预览",
+      taskDeleted: "会话不可用",
+      status: {
+        pending: "等待中",
+        running: "运行中",
+        paused: "已暂停",
+        completed: "已完成",
+        failed: "失败",
+        waiting_for_user: "等待用户",
+      }
+    },
     builder: {
       archivedReadOnly: "已归档的 Workforce 只能查看。"
     },

@@ -228,6 +228,7 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     assert task.connector_runtime_selected_refs == []
     assert workforce_run.task_id == task.id
     assert workforce_run.status == "running"
+    assert workforce_run.is_preview is False
     assert uploaded_file.task_id == task.id
     assert scheduled["task_id"] == task.id
     assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
@@ -276,6 +277,7 @@ async def test_create_workforce_run_allows_draft_only_for_preview(
 
     assert result.task.is_visible is False
     assert result.workforce_run.status == "running"
+    assert result.workforce_run.is_preview is True
 
 
 @pytest.mark.asyncio

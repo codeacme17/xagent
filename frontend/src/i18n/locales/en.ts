@@ -3898,6 +3898,28 @@ Build when you need.`,
       inactiveDisabled: "Publish this workforce before running it.",
       archivedDisabled: "Archived workforces cannot run."
     },
+    runs: {
+      title: "Runs",
+      historyTitle: "Run history",
+      historyHint: "Previous runs of this workforce. Click a run to reopen its conversation.",
+      loading: "Loading runs...",
+      loadError: "Failed to load runs",
+      retry: "Retry",
+      refresh: "Refresh",
+      empty: "No runs yet",
+      emptyHint: "Runs will appear here after you send this workforce a task.",
+      untitled: "Run #{id}",
+      previewBadge: "Preview",
+      taskDeleted: "Conversation unavailable",
+      status: {
+        pending: "Pending",
+        running: "Running",
+        paused: "Paused",
+        completed: "Completed",
+        failed: "Failed",
+        waiting_for_user: "Waiting for user",
+      }
+    },
     builder: {
       archivedReadOnly: "Archived workforces are read-only."
     },

@@ -119,21 +119,47 @@ def _create_workforce_run(
     user_id: int,
     status: str,
     created_at: datetime,
+    is_preview: bool = False,
+    task_id: int | None = None,
+    completed_at: datetime | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
         run = WorkforceRun(
             workforce_id=workforce_id,
-            task_id=None,
+            task_id=task_id,
             user_id=user_id,
             status=status,
+            is_preview=is_preview,
             snapshot={"workforce": {"id": workforce_id}},
             created_at=created_at,
+            completed_at=completed_at,
         )
         db.add(run)
         db.commit()
         db.refresh(run)
         return int(run.id)
+    finally:
+        db.close()
+
+
+def _create_task(user_id: int, *, title: str, description: str) -> int:
+    from xagent.web.models.task import Task, TaskStatus
+
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=user_id,
+            title=title,
+            description=description,
+            status=TaskStatus.COMPLETED,
+            source="internal",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
     finally:
         db.close()
 
@@ -707,6 +733,154 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         "is_preview": False,
         "is_visible": True,
     }
+
+
+def test_list_workforce_runs_orders_paginates_and_excludes_previews() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Runs History Workforce")
+    workforce_id = int(workforce["id"])
+    now = datetime.now(timezone.utc)
+
+    task_id = _create_task(
+        owner_id,
+        title="Runs History Workforce: analyze",
+        description="analyze " + "x" * 300,
+    )
+    oldest_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now,
+        task_id=task_id,
+        completed_at=now + timedelta(minutes=1),
+    )
+    preview_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now + timedelta(minutes=5),
+        is_preview=True,
+    )
+    latest_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="running",
+        created_at=now + timedelta(minutes=10),
+    )
+
+    response = client.get(f"/api/workforces/{workforce_id}/runs", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 2
+    assert payload["pages"] == 1
+    assert [item["id"] for item in payload["items"]] == [latest_run_id, oldest_run_id]
+
+    oldest_item = payload["items"][1]
+    assert oldest_item["task_id"] == task_id
+    assert oldest_item["status"] == "completed"
+    assert oldest_item["is_preview"] is False
+    assert oldest_item["task_title"] == "Runs History Workforce: analyze"
+    assert oldest_item["message"].endswith("...")
+    assert len(oldest_item["message"]) == 203
+    assert oldest_item["completed_at"] is not None
+
+    latest_item = payload["items"][0]
+    assert latest_item["task_id"] is None
+    assert latest_item["task_title"] is None
+    assert latest_item["message"] is None
+    assert latest_item["completed_at"] is None
+
+    with_previews = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"include_preview": "true"},
+    )
+    assert with_previews.status_code == 200
+    preview_payload = with_previews.json()
+    assert preview_payload["total"] == 3
+    assert [item["id"] for item in preview_payload["items"]] == [
+        latest_run_id,
+        preview_run_id,
+        oldest_run_id,
+    ]
+    assert preview_payload["items"][1]["is_preview"] is True
+
+    paged = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"page": 2, "size": 1},
+    )
+    assert paged.status_code == 200
+    paged_payload = paged.json()
+    assert paged_payload["total"] == 2
+    assert paged_payload["pages"] == 2
+    assert [item["id"] for item in paged_payload["items"]] == [oldest_run_id]
+
+    invalid = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"page": 0},
+    )
+    assert invalid.status_code == 400
+
+    # Preview runs are also excluded from the list endpoint's last_run.
+    list_response = client.get(
+        "/api/workforces",
+        headers=headers,
+        params={"search": "Runs History Workforce"},
+    )
+    assert list_response.status_code == 200
+    assert list_response.json()["items"][0]["last_run"]["id"] == latest_run_id
+
+
+def test_workforce_run_detail_and_access_control() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Run Detail Workforce")
+    workforce_id = int(workforce["id"])
+    now = datetime.now(timezone.utc)
+    run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now,
+    )
+
+    detail = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id}", headers=headers
+    )
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["id"] == run_id
+    assert detail_payload["snapshot"] == {"workforce": {"id": workforce_id}}
+
+    missing = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id + 999}", headers=headers
+    )
+    assert missing.status_code == 404
+
+    other_headers = _register_second_user()
+    other_workforce = _create_workforce(
+        other_headers,
+        name="Other Runs Workforce",
+        username="bob",
+    )
+    denied_list = client.get(
+        f"/api/workforces/{workforce_id}/runs", headers=other_headers
+    )
+    assert denied_list.status_code == 403
+    denied_detail = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id}", headers=other_headers
+    )
+    assert denied_detail.status_code == 403
+
+    # A run id from another workforce is not addressable through this one.
+    cross_lookup = client.get(
+        f"/api/workforces/{other_workforce['id']}/runs/{run_id}",
+        headers=other_headers,
+    )
+    assert cross_lookup.status_code == 404
 
 
 def test_canvas_read_returns_nodes_edges_and_layout() -> None:
