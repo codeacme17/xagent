@@ -197,7 +197,7 @@ export function AgentTriggersDialog({
 }: AgentTriggersDialogProps) {
   const { t } = useI18n()
   const router = useRouter()
-  const [triggers, setTriggers] = useState<AgentTrigger[]>([])
+  const [liveTriggers, setLiveTriggers] = useState<AgentTrigger[]>([])
   const [activeType, setActiveTypeState] = useState<AgentTriggerType | null>(null)
   const [selectedTriggerId, setSelectedTriggerIdState] = useState<number | null>(null)
   const [runs, setRuns] = useState<AgentTriggerRun[]>([])
@@ -230,12 +230,18 @@ export function AgentTriggersDialog({
   const nextStagedClientId = () =>
     (stagedTriggersProp ?? []).reduce((min, item) => Math.min(min, item.clientId), 0) - 1
 
-  // Staging mode: mirror the parent-owned staged triggers into the dialog's
-  // trigger list so grouping/selection/form logic works unchanged.
-  useEffect(() => {
-    if (!isStaging || !stagedTriggersProp) return
-    setTriggers(stagedTriggersProp.map(stagedToPseudoTrigger))
-  }, [isStaging, stagedTriggersProp])
+  // Staging mode: derive the trigger list from the parent-owned staged
+  // triggers so grouping/selection/form logic works unchanged. Derivation (not
+  // a state mirror) keeps `triggers` in sync within the same render — a
+  // useEffect mirror lags one render behind, which briefly resolved
+  // selectedTrigger to null after a save and reset the form.
+  const triggers = useMemo(
+    () =>
+      isStaging && stagedTriggersProp
+        ? stagedTriggersProp.map(stagedToPseudoTrigger)
+        : liveTriggers,
+    [isStaging, stagedTriggersProp, liveTriggers],
+  )
 
   const setSelectedTriggerId = useCallback((id: number | null) => {
     selectedTriggerIdRef.current = id
@@ -280,7 +286,7 @@ export function AgentTriggersDialog({
     setLoading(true)
     try {
       const data = await listAgentTriggers(agentId)
-      setTriggers(data)
+      setLiveTriggers(data)
 
       const currentSelectedId = preferredTriggerId ?? selectedTriggerIdRef.current
       if (currentSelectedId && data.some((trigger) => trigger.id === currentSelectedId)) {
@@ -909,6 +915,16 @@ export function AgentTriggersDialog({
   const renderDetail = () => {
     if (!activeType) return null
     const isNew = !selectedTrigger
+    // Whether leaving the secret field blank keeps an existing secret: true
+    // for live triggers (the server holds one) and for staged triggers that
+    // stored a user-provided secret; a staged trigger without one gets a
+    // generated secret when the agent is created.
+    const blankSecretKeepsCurrent = isStaging
+      ? Boolean(
+          selectedTrigger &&
+            stagedTriggersProp?.find((item) => item.clientId === selectedTrigger.id)?.secret,
+        )
+      : !isNew
 
     return (
       <div className="space-y-5">
@@ -979,9 +995,9 @@ export function AgentTriggersDialog({
                 value={form.secret}
                 onChange={(event) => setFormValue("secret", event.target.value)}
                 placeholder={
-                  isNew || isStaging
-                    ? t("triggers.form.secretPlaceholder")
-                    : t("triggers.form.secretEditPlaceholder")
+                  blankSecretKeepsCurrent
+                    ? t("triggers.form.secretEditPlaceholder")
+                    : t("triggers.form.secretPlaceholder")
                 }
               />
             </div>
