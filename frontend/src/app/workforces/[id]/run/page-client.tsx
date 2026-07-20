@@ -2,7 +2,7 @@
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
-import { useParams, useSearchParams } from "next/navigation"
+import { useParams, useRouter, useSearchParams } from "next/navigation"
 import {
   ReactFlow,
   Background,
@@ -274,6 +274,7 @@ export default function WorkforceRunPage() {
 function WorkforceRunPageInner() {
   const { t } = useI18n()
   const params = useParams()
+  const router = useRouter()
   const searchParams = useSearchParams()
   const { sendMessage, setTaskId, closeFilePreview, dispatch, state } = useApp()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
@@ -329,6 +330,10 @@ function WorkforceRunPageInner() {
     }
     setHistoryOpen(false)
     if (previewTaskIdRef.current === run.task_id) return
+    // Keep ?run= authoritative no matter which path opened the run, and mark
+    // it as opened so the deep-link effect doesn't refetch it.
+    openedRunParamRef.current = String(run.id)
+    router.replace(`/workforces/${id}/run?run=${run.id}`, { scroll: false })
     previewTaskIdRef.current = run.task_id
     setTaskStarted(true)
     closeFilePreview()

@@ -19,6 +19,7 @@ const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const routerReplaceMock = vi.hoisted(() => vi.fn())
 const setTaskIdMock = vi.hoisted(() => vi.fn())
 const paramsMock = vi.hoisted(() => ({ id: "42" as string | string[] | undefined }))
 const searchParamsMock = vi.hoisted(() => new URLSearchParams())
@@ -35,7 +36,7 @@ const translateMock = vi.hoisted(
 
 vi.mock("next/navigation", () => ({
   useParams: () => paramsMock,
-  useRouter: () => ({ push: routerPushMock }),
+  useRouter: () => ({ push: routerPushMock, replace: routerReplaceMock }),
   useSearchParams: () => searchParamsMock,
 }))
 
@@ -225,6 +226,7 @@ describe("workforce route entry points", () => {
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()
     routerPushMock.mockReset()
+    routerReplaceMock.mockReset()
     setTaskIdMock.mockReset()
     paramsMock.id = "42"
     searchParamsMock.delete("run")

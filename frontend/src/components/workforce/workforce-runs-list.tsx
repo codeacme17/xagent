@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from "react"
 import { History, Loader2, RefreshCw } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { listWorkforceRuns } from "@/lib/workforces-api"
+import { normalizeTaskStatus } from "@/lib/task-status"
 import type { WorkforceRunHistoryItem, WorkforceRunHistoryResponse } from "@/types/workforce"
 import { formatTime } from "@/lib/time-utils"
 import { Button } from "@/components/ui/button"
@@ -14,23 +15,8 @@ const RUN_STATUS_CLASSES: Record<string, string> = {
   running: "bg-blue-100 text-blue-700",
   pending: "bg-amber-100 text-amber-700",
   paused: "bg-amber-100 text-amber-700",
+  waiting_for_user: "bg-amber-100 text-amber-700",
   failed: "bg-red-100 text-red-700",
-}
-
-const KNOWN_RUN_STATUSES = [
-  "pending",
-  "running",
-  "paused",
-  "completed",
-  "failed",
-  "waiting_for_user",
-] as const
-type KnownRunStatus = (typeof KNOWN_RUN_STATUSES)[number]
-
-function knownRunStatus(status: string): KnownRunStatus | null {
-  return (KNOWN_RUN_STATUSES as readonly string[]).includes(status)
-    ? (status as KnownRunStatus)
-    : null
 }
 
 function runDuration(run: WorkforceRunHistoryItem): string | null {
@@ -50,7 +36,6 @@ interface WorkforceRunsListProps {
   workforceId: number | string
   onSelectRun?: (run: WorkforceRunHistoryItem) => void
   compact?: boolean
-  pageSize?: number
   className?: string
 }
 
@@ -58,11 +43,10 @@ export function WorkforceRunsList({
   workforceId,
   onSelectRun,
   compact = false,
-  pageSize,
   className,
 }: WorkforceRunsListProps) {
   const { t } = useI18n()
-  const size = pageSize ?? (compact ? 10 : 20)
+  const size = compact ? 10 : 20
 
   const [data, setData] = useState<WorkforceRunHistoryResponse | null>(null)
   const [page, setPage] = useState(1)
@@ -154,7 +138,7 @@ export function WorkforceRunsList({
             run.task_title || run.message || t("workforces.runs.untitled", { id: run.id })
           const duration = runDuration(run)
           const clickable = Boolean(onSelectRun && run.task_id)
-          const statusKey = knownRunStatus(run.status)
+          const statusKey = normalizeTaskStatus(run.status)
           return (
             <li key={run.id}>
               <button

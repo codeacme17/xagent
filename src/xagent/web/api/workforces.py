@@ -789,15 +789,15 @@ async def list_workforce_runs(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    if page < 1 or size < 1 or size > 100:
-        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
-
     workforce = ensure_workforce_access(
         db,
         user,
         _load_workforce(db, workforce_id),
         action="view",
     )
+    if page < 1 or size < 1 or size > 100:
+        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
+
     query = db.query(WorkforceRun).filter(
         WorkforceRun.workforce_id == int(workforce.id)
     )

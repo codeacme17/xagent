@@ -231,13 +231,11 @@ export async function listWorkforceRuns(
   params?: {
     page?: number
     size?: number
-    includePreview?: boolean
   },
 ): Promise<WorkforceRunHistoryResponse> {
   const searchParams = new URLSearchParams()
   if (params?.page) searchParams.set("page", String(params.page))
   if (params?.size) searchParams.set("size", String(params.size))
-  if (params?.includePreview) searchParams.set("include_preview", "true")
 
   const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ""
   const response = await apiRequest(
