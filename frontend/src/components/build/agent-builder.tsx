@@ -53,8 +53,10 @@ import { AgentFlowView } from "./agent-flow-view"
 import {
   AgentTrigger,
   AgentTriggerType,
+  FailedStagedTrigger,
   StagedTrigger,
   createAgentTrigger,
+  createStagedTriggers,
   listAgentTriggers,
   stagedToCreatePayload,
   stagedToPseudoTrigger,
@@ -185,10 +187,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Triggers configured before the agent exists (#928). Posted via the
   // trigger API right after the agent is created, then cleared.
   const [stagedTriggers, setStagedTriggers] = useState<StagedTrigger[]>([])
+  // Staged triggers whose POST failed after the agent was created. Their
+  // config is kept for retry/discard instead of being silently dropped.
+  const [failedStagedTriggers, setFailedStagedTriggers] = useState<FailedStagedTrigger[]>([])
   // Auto-generated webhook secrets from staged-trigger creation; shown once.
   const [createdWebhookSecrets, setCreatedWebhookSecrets] = useState<
     { name: string; secret: string }[]
   >([])
+  // Creation succeeded but ownership reconciliation opened the
+  // share-connectors dialog instead of the success dialog. The success dialog
+  // (which reveals generated webhook secrets) must still be shown once that
+  // flow resolves, whichever way it resolves.
+  const pendingCreationDialogRef = useRef(false)
   const [showAIAssistant, setShowAIAssistant] = useState(false)
   const [viewMode, setViewMode] = useState<"config" | "flow">("config")
   const [configSynced, setConfigSynced] = useState(false)
@@ -247,6 +257,36 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   useEffect(() => {
     void refreshTriggerSummary()
   }, [refreshTriggerSummary])
+
+  // Retry a staged trigger whose POST failed during agent creation. The agent
+  // exists by now, so this goes straight through the live trigger API.
+  const retryFailedTrigger = async (index: number) => {
+    if (!localAgentId) return
+    const entry = failedStagedTriggers[index]
+    if (!entry) return
+    try {
+      const created = await createAgentTrigger(localAgentId, stagedToCreatePayload(entry.staged))
+      setFailedStagedTriggers((prev) => prev.filter((_, i) => i !== index))
+      const secret = created.webhook_secret
+      if (secret && !entry.staged.secret) {
+        setCreatedWebhookSecrets((prev) => [...prev, { name: entry.staged.name, secret }])
+      }
+      void refreshTriggerSummary()
+      toast.success(t("triggers.messages.created"))
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      setFailedStagedTriggers((prev) =>
+        prev.map((item, i) => (i === index ? { ...item, error: reason } : item)),
+      )
+      toast.error(
+        t("triggers.messages.stagedCreateFailed", { name: entry.staged.name, error: reason }),
+      )
+    }
+  }
+
+  const discardFailedTrigger = (index: number) => {
+    setFailedStagedTriggers((prev) => prev.filter((_, i) => i !== index))
+  }
 
   // During creation the agent has no server-side triggers yet; the summary
   // sections and flow view render the staged ones instead (#928).
@@ -1116,6 +1156,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const result = await reconcileOwnership(localAgentId, null)
       if (result) {
         setOriginalData((current: any) => ({ ...current, ...result }))
+        pendingCreationDialogRef.current = false
         setShowSuccessDialog(true)
       }
     } catch (error) {
@@ -1131,6 +1172,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setUnsharedConnectors([])
     setUnsharedKnowledgeBases([])
     setOwnership("personal")
+    // If this share flow interrupted agent creation, the success dialog was
+    // deferred; show it now so generated webhook secrets are still revealed.
+    if (pendingCreationDialogRef.current) {
+      pendingCreationDialogRef.current = false
+      setShowSuccessDialog(true)
+    }
   }
 
   const handleCreate = async () => {
@@ -1240,31 +1287,21 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Staged triggers (configured before the agent existed, #928) go
           // through the regular trigger API now that a real agent id exists.
-          // Failures don't roll back the agent; each one surfaces as a toast
-          // and the trigger can be re-added from the (now live) dialog.
+          // Failures don't roll back the agent; failed configs are kept in
+          // failedStagedTriggers for retry/discard instead of being dropped.
           if (stagedTriggers.length > 0) {
-            const results = await Promise.allSettled(
-              stagedTriggers.map((staged) =>
-                createAgentTrigger(newAgent.id, stagedToCreatePayload(staged)),
-              ),
-            )
-            const generatedSecrets: { name: string; secret: string }[] = []
-            results.forEach((result, index) => {
-              const staged = stagedTriggers[index]
-              if (result.status === "rejected") {
-                const reason =
-                  result.reason instanceof Error
-                    ? result.reason.message
-                    : String(result.reason)
-                toast.error(
-                  t("triggers.messages.stagedCreateFailed", { name: staged.name, error: reason }),
-                )
-              } else if (result.value.webhook_secret && !staged.secret) {
-                generatedSecrets.push({ name: staged.name, secret: result.value.webhook_secret })
-              }
+            const outcome = await createStagedTriggers(newAgent.id, stagedTriggers)
+            outcome.failed.forEach((entry) => {
+              toast.error(
+                t("triggers.messages.stagedCreateFailed", {
+                  name: entry.staged.name,
+                  error: entry.error,
+                }),
+              )
             })
             setStagedTriggers([])
-            setCreatedWebhookSecrets(generatedSecrets)
+            setFailedStagedTriggers(outcome.failed)
+            setCreatedWebhookSecrets(outcome.generatedSecrets)
             try {
               setTriggerSummary(await listAgentTriggers(newAgent.id))
             } catch (error) {
@@ -1277,9 +1314,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
           // Only confirm success once ownership resolved. If a promote was blocked
           // (the share-connectors dialog opened, ownershipResult is null), don't
-          // stack a "created" dialog on top of it.
+          // stack a "created" dialog on top of it — but remember to show it when
+          // that flow resolves, or generated webhook secrets would never surface.
           if (ownershipResult) {
             setShowSuccessDialog(true)
+          } else {
+            pendingCreationDialogRef.current = true
           }
           setLocalAgentId(newAgent.id.toString())
 
@@ -1373,7 +1413,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       if (response.ok) {
         toast.success(t("builds.editor.success.published"))
         setShowSuccessDialog(false)
-        router.replace(`/build/${createdAgent.id}`)
+        if (failedStagedTriggers.length === 0) {
+          router.replace(`/build/${createdAgent.id}`)
+        }
       } else {
         const error = await response.json()
         toast.error(error.detail || t("builds.editor.error.publishFailed"))
@@ -1388,7 +1430,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const handleDialogClose = () => {
     setShowSuccessDialog(false)
-    if (createdAgent?.id) {
+    // router.replace remounts the builder and would drop the failed-trigger
+    // retry list. The URL was already pushState'd to /build/{id} at creation,
+    // so staying on this instance is safe while retries are pending.
+    if (createdAgent?.id && failedStagedTriggers.length === 0) {
       router.replace(`/build/${createdAgent.id}`)
     }
   }
@@ -2138,6 +2183,90 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             </div>
           )}
         </div>
+
+        {failedStagedTriggers.length > 0 && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>{t("triggers.staging.failedTitle")}</AlertTitle>
+            <AlertDescription>
+              <div className="mt-2 space-y-2">
+                {failedStagedTriggers.map((entry, index) => (
+                  <div key={entry.staged.clientId} className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-xs">
+                      <span className="font-medium">{entry.staged.name}</span>
+                      {` — ${entry.error}`}
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 px-2 text-xs"
+                      onClick={() => void retryFailedTrigger(index)}
+                    >
+                      {t("triggers.actions.retry")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                      onClick={() => discardFailedTrigger(index)}
+                    >
+                      {t("triggers.actions.discard")}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* One-time reveal for webhook secrets generated outside the creation
+            success dialog (e.g. a retried staged trigger). Also a fallback
+            surface while that dialog is open. */}
+        {createdWebhookSecrets.length > 0 && (
+          <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle className="flex items-center justify-between gap-2">
+              {t("triggers.secret.title")}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6 shrink-0"
+                onClick={() => setCreatedWebhookSecrets([])}
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </AlertTitle>
+            <AlertDescription>
+              <div className="mt-2 space-y-2">
+                {createdWebhookSecrets.map((item) => (
+                  <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
+                    <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
+                    <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
+                      {item.secret}
+                    </code>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="secondary"
+                      className="h-7 w-7 shrink-0"
+                      onClick={async () => {
+                        if (await copyToClipboard(item.secret)) {
+                          toast.success(t("common.copied"))
+                        }
+                      }}
+                      title={t("common.copy")}
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
 
         {effectiveTriggerSummary.some((trigger) => trigger.enabled) && (
           <div className="space-y-2">

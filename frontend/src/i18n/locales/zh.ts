@@ -3551,7 +3551,8 @@ const zh = {
     },
     staging: {
       info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
-      webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。"
+      webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
+      failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
     type: {
       webhook: "Webhook",
@@ -3607,7 +3608,9 @@ const zh = {
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
       test: "测试触发",
-      addAnother: "新增"
+      addAnother: "新增",
+      retry: "重试",
+      discard: "丢弃"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。"

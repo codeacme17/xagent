@@ -101,6 +101,45 @@ export function stagedToCreatePayload(
   }
 }
 
+export interface FailedStagedTrigger {
+  staged: StagedTrigger
+  error: string
+}
+
+export interface StagedTriggerCreateOutcome {
+  failed: FailedStagedTrigger[]
+  // Auto-generated webhook secrets (returned only once by the create API);
+  // omitted for triggers where the user supplied their own secret.
+  generatedSecrets: { name: string; secret: string }[]
+}
+
+// Post staged triggers against a freshly created agent. Failures never throw:
+// each failed trigger is returned with its config intact so the caller can
+// offer retry instead of discarding the user's input.
+export async function createStagedTriggers(
+  agentId: number | string,
+  staged: StagedTrigger[],
+): Promise<StagedTriggerCreateOutcome> {
+  const results = await Promise.allSettled(
+    staged.map((item) => createAgentTrigger(agentId, stagedToCreatePayload(item))),
+  )
+  const outcome: StagedTriggerCreateOutcome = { failed: [], generatedSecrets: [] }
+  results.forEach((result, index) => {
+    const item = staged[index]
+    if (result.status === "rejected") {
+      const error =
+        result.reason instanceof Error ? result.reason.message : String(result.reason)
+      outcome.failed.push({ staged: item, error })
+      return
+    }
+    const secret = result.value.webhook_secret
+    if (secret && !item.secret) {
+      outcome.generatedSecrets.push({ name: item.name, secret })
+    }
+  })
+  return outcome
+}
+
 export interface AgentTriggerTestPayload {
   payload: Record<string, unknown>
   source_event_id?: string | null

@@ -177,7 +177,11 @@ function runStatusClass(status: string): string {
 }
 
 function newestFirst(a: AgentTrigger, b: AgentTrigger): number {
-  return b.id - a.id
+  // Compare by magnitude: real ids are positive and grow with creation order,
+  // staged pseudo ids are negative and shrink (-1, -2, …). Plain b - a would
+  // invert the order for staged triggers; the two id spaces never mix in one
+  // list.
+  return Math.abs(b.id) - Math.abs(a.id)
 }
 
 function isValidAgentId(agentId: number | null): agentId is number {

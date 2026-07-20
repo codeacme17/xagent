@@ -3551,7 +3551,8 @@ Build when you need.`,
     },
     staging: {
       info: "Triggers configured here are saved with the draft and created automatically together with the agent.",
-      webhookPending: "The webhook URL and signing secret will be generated after the agent is created."
+      webhookPending: "The webhook URL and signing secret will be generated after the agent is created.",
+      failedTitle: "Some triggers could not be created. Their configuration is kept — retry or discard."
     },
     type: {
       webhook: "Webhook",
@@ -3607,7 +3608,9 @@ Build when you need.`,
       confirmDelete: "Confirm delete",
       rotateSecret: "Rotate secret",
       test: "Test trigger",
-      addAnother: "Add"
+      addAnother: "Add",
+      retry: "Retry",
+      discard: "Discard"
     },
     secret: {
       title: "Copy this secret now. It is shown only once."

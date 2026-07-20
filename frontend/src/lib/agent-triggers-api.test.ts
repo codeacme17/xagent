@@ -13,6 +13,7 @@ vi.mock("@/lib/utils", () => ({
 import {
   StagedTrigger,
   createAgentTrigger,
+  createStagedTriggers,
   listAgentTriggerRuns,
   stagedToCreatePayload,
   stagedToPseudoTrigger,
@@ -160,5 +161,70 @@ describe("staged triggers (agent creation flow)", () => {
       secret: null,
     })
     expect("clientId" in payload).toBe(false)
+  })
+
+  const webhookNoSecret: StagedTrigger = {
+    clientId: -1,
+    type: "webhook",
+    name: "Generated hook",
+    enabled: true,
+    config: {},
+    prompt_template: null,
+    secret: null,
+  }
+  const webhookCustomSecret: StagedTrigger = {
+    clientId: -2,
+    type: "webhook",
+    name: "Custom hook",
+    enabled: true,
+    config: {},
+    prompt_template: null,
+    secret: "user-supplied",
+  }
+
+  function createdTrigger(id: number, overrides: Record<string, unknown> = {}) {
+    return jsonResponse({
+      id,
+      user_id: 1,
+      agent_id: 42,
+      type: "webhook",
+      name: "created",
+      enabled: true,
+      config: {},
+      prompt_template: null,
+      webhook_token: null,
+      next_run_at: null,
+      last_run_at: null,
+      last_error: null,
+      created_at: null,
+      updated_at: null,
+      ...overrides,
+    })
+  }
+
+  it("keeps failed staged triggers (config intact) instead of dropping them", async () => {
+    apiRequestMock
+      .mockResolvedValueOnce(createdTrigger(11, { webhook_secret: "gen-secret" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ detail: "Gmail account not found" }, { status: 404 }),
+      )
+
+    const outcome = await createStagedTriggers(42, [webhookNoSecret, staged])
+
+    expect(outcome.failed).toHaveLength(1)
+    expect(outcome.failed[0].staged).toBe(staged)
+    expect(outcome.failed[0].error).toBe("Gmail account not found")
+    expect(outcome.generatedSecrets).toEqual([
+      { name: "Generated hook", secret: "gen-secret" },
+    ])
+  })
+
+  it("does not report user-supplied webhook secrets as generated", async () => {
+    apiRequestMock.mockResolvedValue(createdTrigger(12, { webhook_secret: "echoed-back" }))
+
+    const outcome = await createStagedTriggers(42, [webhookCustomSecret])
+
+    expect(outcome.failed).toHaveLength(0)
+    expect(outcome.generatedSecrets).toEqual([])
   })
 })
