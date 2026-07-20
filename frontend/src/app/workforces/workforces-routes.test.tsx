@@ -403,6 +403,10 @@ describe("workforce route entry points", () => {
     await waitFor(() => {
       expect(setTaskIdMock).toHaveBeenCalledWith(99, { navigate: false })
     })
+    // openRun must keep ?run= authoritative regardless of the opening path.
+    expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/42/run?run=9", {
+      scroll: false,
+    })
     expect(await screen.findByTestId("task-conversation-panel")).toBeInTheDocument()
   })
 

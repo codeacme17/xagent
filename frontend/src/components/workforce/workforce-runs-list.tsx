@@ -167,7 +167,8 @@ export function WorkforceRunsList({
                   <span
                     className={cn(
                       "ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
-                      RUN_STATUS_CLASSES[run.status] ?? "bg-muted text-muted-foreground",
+                      RUN_STATUS_CLASSES[statusKey ?? run.status] ??
+                        "bg-muted text-muted-foreground",
                     )}
                   >
                     {statusKey ? t(`workforces.runs.status.${statusKey}`) : run.status}
