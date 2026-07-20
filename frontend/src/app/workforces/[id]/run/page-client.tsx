@@ -369,11 +369,14 @@ function WorkforceRunPageInner() {
     if (openedRunParamRef.current === runParam) return
     openedRunParamRef.current = runParam
     let active = true
+    let settled = false
     void (async () => {
       try {
         const run = await getWorkforceRun(id, runParam)
+        settled = true
         if (active) openRun(run)
       } catch (err) {
+        settled = true
         if (active) {
           // Allow retrying the same ?run= value after a failed load.
           openedRunParamRef.current = null
@@ -383,6 +386,11 @@ function WorkforceRunPageInner() {
     })()
     return () => {
       active = false
+      // If the fetch was discarded mid-flight (StrictMode double-invoke or a
+      // dependency change), release the ref so the next effect run retries.
+      if (!settled && openedRunParamRef.current === runParam) {
+        openedRunParamRef.current = null
+      }
     }
   }, [id, runParam, openRun, t, closeFilePreview, dispatch, setTaskId])
 
