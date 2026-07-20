@@ -368,14 +368,22 @@ function WorkforceRunPageInner() {
     }
     if (openedRunParamRef.current === runParam) return
     openedRunParamRef.current = runParam
+    let active = true
     void (async () => {
       try {
         const run = await getWorkforceRun(id, runParam)
-        openRun(run)
+        if (active) openRun(run)
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : t("workforces.runs.loadError"))
+        if (active) {
+          // Allow retrying the same ?run= value after a failed load.
+          openedRunParamRef.current = null
+          toast.error(err instanceof Error ? err.message : t("workforces.runs.loadError"))
+        }
       }
     })()
+    return () => {
+      active = false
+    }
   }, [id, runParam, openRun, t, closeFilePreview, dispatch, setTaskId])
 
   const handleSend = useCallback(async (

@@ -35,9 +35,10 @@ function knownRunStatus(status: string): KnownRunStatus | null {
 
 function runDuration(run: WorkforceRunHistoryItem): string | null {
   if (!run.created_at || !run.completed_at) return null
-  const seconds = Math.round(
-    (new Date(run.completed_at).getTime() - new Date(run.created_at).getTime()) / 1000,
-  )
+  const start = new Date(run.created_at).getTime()
+  const end = new Date(run.completed_at).getTime()
+  if (Number.isNaN(start) || Number.isNaN(end)) return null
+  const seconds = Math.round((end - start) / 1000)
   if (seconds < 0) return null
   if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
@@ -86,6 +87,9 @@ export function WorkforceRunsList({
   )
 
   useEffect(() => {
+    // New workforce/size: drop the previous list so stale rows never flash.
+    // Pagination keeps the current list visible while the next page loads.
+    setData(null)
     void load(1)
   }, [load])
 
