@@ -220,6 +220,11 @@ export function AgentTriggersDialog({
   const isStaging = !isValidAgentId(agentId) && stagedTriggersProp !== null
   const canOperate = isValidAgentId(agentId) || isStaging
 
+  // Ref mirror so the dialog-open effect can pick a default selection without
+  // re-running whenever the staged list changes.
+  const stagedTriggersRef = useRef<StagedTrigger[] | null>(null)
+  stagedTriggersRef.current = stagedTriggersProp
+
   // Staged clientIds are stable negative numbers so they can serve as pseudo
   // AgentTrigger ids without ever colliding with a real server id.
   const nextStagedClientId = () =>
@@ -253,13 +258,13 @@ export function AgentTriggersDialog({
   }, [triggers])
 
   const activeTypeTriggers = activeType ? triggerGroups[activeType] : []
+  // A null selectedTriggerId means "creating a new trigger" (e.g. via the Add
+  // button), so it must NOT fall back to an existing trigger — that would make
+  // handleSubmit overwrite it. Every browse flow selects an id explicitly
+  // (openType, beginEdit, loadTriggers, the open effect).
   const selectedTrigger = useMemo(() => {
-    if (!activeType) return null
-    return (
-      activeTypeTriggers.find((trigger) => trigger.id === selectedTriggerId) ??
-      activeTypeTriggers[0] ??
-      null
-    )
+    if (!activeType || selectedTriggerId === null) return null
+    return activeTypeTriggers.find((trigger) => trigger.id === selectedTriggerId) ?? null
   }, [activeType, activeTypeTriggers, selectedTriggerId])
 
   const selectedWebhookUrl = webhookUrl(selectedTrigger)
@@ -320,9 +325,20 @@ export function AgentTriggersDialog({
     setRuns([])
     if (initialType) {
       setForm(emptyForm(initialType))
+      // Live mode gets its default selection from loadTriggers below; in
+      // staging mode it early-returns, so pick the primary staged trigger of
+      // the requested type here (selectedTrigger no longer falls back to the
+      // first trigger when nothing is selected).
+      if (isStaging) {
+        const typeStaged = (stagedTriggersRef.current ?? []).filter(
+          (item) => item.type === initialType,
+        )
+        const primary = typeStaged.find((item) => item.enabled) ?? typeStaged[0]
+        if (primary) setSelectedTriggerId(primary.clientId)
+      }
     }
     void loadTriggers(null)
-  }, [initialType, loadTriggers, open, setActiveType, setSelectedTriggerId])
+  }, [initialType, isStaging, loadTriggers, open, setActiveType, setSelectedTriggerId])
 
   useEffect(() => {
     if (!open) return
