@@ -122,6 +122,11 @@ interface TemplateRequirements {
   requiresKnowledgeBase: boolean
 }
 
+// Categories a user may never assign from the builder. `agent` (multi-agent
+// delegation) is configured through Workforce instead (issue #802); the
+// backend strips it on write as well (AGENT_CONFIG_UNASSIGNABLE_CATEGORIES).
+const isAssignableToolCategory = (c: string) => c !== 'agent'
+
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
@@ -598,10 +603,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
 
-          // Legacy agents may still have the unassignable `agent` category
-          // saved — never show or round-trip it (issue #802).
+          // Legacy agents may still have an unassignable category saved —
+          // never show or round-trip it.
           const rawToolCategories = agent.tool_categories || []
-          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && c !== 'agent'))
+          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
           setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
 
           // Admin inspecting someone else's agent: the mount-time /api/mcp/servers
@@ -673,7 +678,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Separate regular tools from MCP servers
           const allCategories = template.agent_config?.tool_categories || []
-          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && c !== 'agent'))
+          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
 
           const explicitlyConfiguredMcps = allCategories
             .filter((c: string) => c.startsWith('mcp:'))
@@ -765,10 +770,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   ]
 
   // Group tools by category for category selection. `mcp` has its own
-  // server-level selector; `agent` is not user-assignable — multi-agent
-  // delegation is configured through Workforce instead (issue #802).
+  // server-level selector; unassignable categories never appear.
   const toolCategories = Array.from(
-    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && c !== 'agent'))
+    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && isAssignableToolCategory(c)))
   ).sort()
 
   const toolCategoryOptions = toolCategories.map(category => {
