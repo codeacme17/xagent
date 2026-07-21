@@ -122,10 +122,11 @@ interface TemplateRequirements {
   requiresKnowledgeBase: boolean
 }
 
-// Categories a user may never assign from the builder. `agent` (multi-agent
-// delegation) is configured through Workforce instead (issue #802); the
-// backend strips it on write as well (AGENT_CONFIG_UNASSIGNABLE_CATEGORIES).
-const isAssignableToolCategory = (c: string) => c !== 'agent'
+// Categories a user may never assign from the builder, mirroring the
+// backend's AGENT_CONFIG_UNASSIGNABLE_CATEGORIES (which also strips them on
+// write): `agent` (multi-agent delegation) is configured through Workforce
+// instead (issue #802), and `other` is an internal fallback bucket.
+const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;

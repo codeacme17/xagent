@@ -128,6 +128,7 @@ const AVAILABLE_TOOLS = [
   { name: "calculator", description: "", category: "basic", enabled: true },
   { name: "web_search", description: "", category: "web_search", enabled: true },
   { name: "agent_7", description: "", category: "agent", enabled: true },
+  { name: "misc_tool", description: "", category: "other", enabled: true },
 ]
 
 function agentResponse(toolCategories: string[]) {
@@ -199,7 +200,7 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
 
   afterEach(() => cleanup())
 
-  it("does not offer the agent category even when agent-category tools exist", async () => {
+  it("does not offer unassignable categories even when such tools exist", async () => {
     installApi(["basic"])
     render(<AgentBuilder agentId={AGENT_ID} />)
 
@@ -208,8 +209,9 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
       expect(selector).toBeTruthy()
       expect(selector!.textContent).toContain("basic")
     })
-    const selector = toolCategorySelector()
-    expect(selector!.textContent!.split("|")).not.toContain("agent")
+    const offered = toolCategorySelector()!.textContent!.split("|")
+    expect(offered).not.toContain("agent")
+    expect(offered).not.toContain("other")
   })
 
   it("saves a legacy agent without writing the agent category back", async () => {
