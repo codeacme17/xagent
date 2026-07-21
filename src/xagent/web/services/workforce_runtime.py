@@ -183,6 +183,10 @@ def ensure_workforce_turn_allowed(
       prompt-building data while worker execution re-reads live Agent rows,
       so a drifted config silently changes behavior mid-session; reject and
       require a fresh session instead.
+    - ``workforce_run_not_found``: ``agent_config`` names a run that does
+      not exist (or belongs to another task/user). The runtime resolver
+      would silently degrade such a task to a bare manager agent with zero
+      delegation ability; fail loudly instead of executing it.
 
     No-op for non-workforce tasks and for runs whose snapshot predates the
     fingerprint (backwards compatibility). Preview runs skip the fingerprint
@@ -209,7 +213,7 @@ def ensure_workforce_turn_allowed(
         .first()
     )
     if run is None:
-        return
+        raise WorkforceTurnRejectedError("workforce_run_not_found")
 
     workforce = _load_workforce_for_fingerprint(db, int(run.workforce_id))
     if workforce is None or workforce.status == "archived":

@@ -229,6 +229,24 @@ def test_turn_guard_is_noop_for_non_workforce_tasks() -> None:
         db.close()
 
 
+def test_turn_guard_rejects_missing_run_row() -> None:
+    workforce_id = _create_active_workforce("Missing Run Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, run_id = _create_workforce_task_and_run(workforce_id, snapshot=snapshot)
+
+    db = _direct_db_session()
+    try:
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).delete()
+        db.commit()
+        with pytest.raises(WorkforceTurnRejectedError) as excinfo:
+            ensure_workforce_turn_allowed(
+                db, task_id=task_id, task_owner_user_id=_user_id()
+            )
+        assert excinfo.value.reason == "workforce_run_not_found"
+    finally:
+        db.close()
+
+
 def test_turn_guard_rejects_archived_workforce() -> None:
     workforce_id = _create_active_workforce("Archived Guard Workforce")
     snapshot = _build_snapshot(workforce_id)
