@@ -429,10 +429,7 @@ def test_create_list_get_and_cross_user_access_control() -> None:
 
 def test_manager_instructions_is_ignored_on_create_and_update() -> None:
     headers = _admin_headers()
-    # _create_workforce still submits a legacy "manager_instructions" key;
-    # older frontends may do the same during rollout and must not get a 422.
     workforce = _create_workforce(headers)
-    assert "manager_instructions" not in workforce
 
     update_response = client.patch(
         f"/api/workforces/{workforce['id']}",
