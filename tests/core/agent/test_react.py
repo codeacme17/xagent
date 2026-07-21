@@ -15,6 +15,7 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
     ReActReasoningMode,
+    ToolCallInterrupted,
     ToolCallRecord,
 )
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -1351,6 +1352,105 @@ async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
             "_xagent_step_id": "render_english_poster",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_react_interrupt_cancels_in_flight_tool() -> None:
+    class SlowVisionTool:
+        name = "understand_images"
+        description = "Analyze an image."
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def ainvoke(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {"success": True, "answer": "never"}
+
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = SlowVisionTool()
+    tool_call = {
+        "id": "call-vision",
+        "name": "understand_images",
+        "args": {"images": "file-id", "question": "What is shown?"},
+    }
+    task = asyncio.create_task(pattern._execute_tool_safely(tool_call, [tool], runtime))
+    await tool.started.wait()
+
+    runtime.request_interrupt("paused by websocket")
+
+    with pytest.raises(ToolCallInterrupted, match="paused by websocket"):
+        await task
+    assert tool.cancelled.is_set()
+    assert pattern.tool_ledger["call-vision"].status == "interrupted"
+    assert pattern.tool_ledger["call-vision"].error == "paused by websocket"
+
+
+@pytest.mark.asyncio
+async def test_react_tool_interrupt_checkpoint_uses_tool_safe_point() -> None:
+    class SlowVisionTool:
+        name = "understand_images"
+        description = "Analyze an image."
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ainvoke(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            await asyncio.sleep(60)
+            return {"success": True, "answer": "never"}
+
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="react-tool-safe-point")
+    context = ExecutionContext(execution_id="react-tool-safe-point")
+    context.add_user_message("Inspect this image.")
+    tool = SlowVisionTool()
+    llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "vision-1",
+                        "function": {
+                            "name": "understand_images",
+                            "arguments": json.dumps(
+                                {
+                                    "images": "file-id",
+                                    "question": "What is shown?",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    task = asyncio.create_task(
+        pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+    )
+    await tool.started.wait()
+    runtime.request_interrupt("paused by websocket")
+    result = await task
+
+    assert result["status"] == "interrupted"
+    checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(runtime.checkpoints)
+        if checkpoint["label"] == "interrupted"
+    )
+    assert checkpoint["metadata"] == {
+        "safe_point": "during_tool",
+        "reason": "paused by websocket",
+    }
 
 
 @pytest.mark.asyncio
