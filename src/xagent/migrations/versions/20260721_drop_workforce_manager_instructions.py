@@ -22,17 +22,23 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-def _has_column() -> bool:
+def _workforces_columns() -> set[str] | None:
+    """Column names of the workforces table, or None if the table is absent.
+
+    On fresh installations core tables are created by Base.metadata.create_all()
+    after Alembic runs, so the table may legitimately not exist yet.
+    """
     inspector = sa.inspect(op.get_bind())
     if "workforces" not in inspector.get_table_names():
-        return False
-    columns = {col["name"] for col in inspector.get_columns("workforces")}
-    return "manager_instructions" in columns
+        return None
+    return {col["name"] for col in inspector.get_columns("workforces")}
 
 
 def upgrade() -> None:
-    if not op.get_context().as_sql and not _has_column():
-        return
+    if not op.get_context().as_sql:
+        columns = _workforces_columns()
+        if columns is None or "manager_instructions" not in columns:
+            return
     # batch mode recreates the table on SQLite; on PostgreSQL it is a plain
     # ALTER TABLE ... DROP COLUMN.
     with op.batch_alter_table("workforces") as batch_op:
@@ -40,8 +46,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if not op.get_context().as_sql and _has_column():
-        return
+    if not op.get_context().as_sql:
+        columns = _workforces_columns()
+        if columns is None or "manager_instructions" in columns:
+            return
     # Structure only: the dropped values are not recoverable.
     with op.batch_alter_table("workforces") as batch_op:
         batch_op.add_column(sa.Column("manager_instructions", sa.Text(), nullable=True))
