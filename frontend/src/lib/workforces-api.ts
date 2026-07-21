@@ -10,6 +10,8 @@ import type {
   WorkforceDetail,
   WorkforceListResponse,
   WorkforcePromptCreatePayload,
+  WorkforceRunHistoryItem,
+  WorkforceRunHistoryResponse,
   WorkforceRunPayload,
   WorkforceRunResponse,
   WorkforceUpdatePayload,
@@ -219,6 +221,42 @@ export async function runWorkforce(
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to run workforce")
+  }
+  return response.json()
+}
+
+
+export async function listWorkforceRuns(
+  workforceId: number | string,
+  params?: {
+    page?: number
+    size?: number
+  },
+): Promise<WorkforceRunHistoryResponse> {
+  const searchParams = new URLSearchParams()
+  if (params?.page) searchParams.set("page", String(params.page))
+  if (params?.size) searchParams.set("size", String(params.size))
+
+  const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ""
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs${suffix}`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce runs")
+  }
+  return response.json()
+}
+
+
+export async function getWorkforceRun(
+  workforceId: number | string,
+  runId: number | string,
+): Promise<WorkforceRunHistoryItem> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs/${runId}`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce run")
   }
   return response.json()
 }
