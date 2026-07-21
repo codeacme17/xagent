@@ -37,7 +37,6 @@ class Workforce(Base):  # type: ignore[no-any-unimported]
         nullable=False,
         index=True,
     )
-    manager_instructions = Column(Text, nullable=True)
     status = Column(String(20), nullable=False, default="draft", index=True)
     canvas_layout = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

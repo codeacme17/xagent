@@ -58,7 +58,6 @@ class WorkforceCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: str | None = None
     manager_agent_id: int
-    manager_instructions: str | None = None
     canvas_layout: dict[str, Any] | None = None
     workers: list[WorkforceWorkerInput] = Field(default_factory=list)
 
@@ -71,7 +70,6 @@ class WorkforceUpdateRequest(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=200)
     description: str | None = None
     manager_agent_id: int | None = None
-    manager_instructions: str | None = None
     canvas_layout: dict[str, Any] | None = None
 
 
@@ -202,7 +200,6 @@ def _serialize_workforce_detail(
         "description": workforce.description,
         "status": workforce.status,
         "manager": _serialize_agent(workforce.manager_agent, user, scope),
-        "manager_instructions": workforce.manager_instructions,
         "workers": [
             _serialize_worker(worker, user, scope)
             for worker in _sorted_workers(workforce)
@@ -417,10 +414,6 @@ async def create_workforce(
             name=name,
             description=normalize_text(request.description, "description"),
             manager_agent_id=int(manager_agent.id),
-            manager_instructions=normalize_text(
-                request.manager_instructions,
-                "manager_instructions",
-            ),
             status="draft",
             canvas_layout=request.canvas_layout,
         )
@@ -521,11 +514,6 @@ async def update_workforce(
         )
     if _field_supplied(request, "description"):
         workforce_row.description = normalize_text(request.description, "description")
-    if _field_supplied(request, "manager_instructions"):
-        workforce_row.manager_instructions = normalize_text(
-            request.manager_instructions,
-            "manager_instructions",
-        )
     if _field_supplied(request, "canvas_layout"):
         workforce_row.canvas_layout = request.canvas_layout
     if _field_supplied(request, "manager_agent_id"):

@@ -118,7 +118,6 @@ def _create_workforce(
         name="Research Team",
         description="Coordinates research tasks",
         manager_agent_id=manager.id,
-        manager_instructions="Prefer concise synthesis.",
         status="active",
     )
     db.add(workforce)

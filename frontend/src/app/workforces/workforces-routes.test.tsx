@@ -169,7 +169,6 @@ const workforceDetail: WorkforceDetail = {
     logo_url: null,
     status: "published",
   },
-  manager_instructions: null,
   workers: [],
   canvas_layout: null,
   scope_type: "user",

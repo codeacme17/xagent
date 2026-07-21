@@ -114,7 +114,6 @@ export default function WorkforceDetailPage() {
         name: string
         description: string
         managerAgentId: string
-        managerInstructions: string
     }) => {
         if (!id) return
         try {
@@ -123,7 +122,6 @@ export default function WorkforceDetailPage() {
                 name: data.name,
                 description: data.description || null,
                 manager_agent_id: Number(data.managerAgentId),
-                manager_instructions: data.managerInstructions || null,
             })
             setWorkforce(next)
             toast.success(t("workforces.messages.updated"))
