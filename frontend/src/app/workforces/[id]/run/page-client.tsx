@@ -1,8 +1,8 @@
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
+import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
-import { useParams } from "next/navigation"
+import { useParams, useRouter, useSearchParams } from "next/navigation"
 import {
   ReactFlow,
   Background,
@@ -15,17 +15,22 @@ import {
   type Edge,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
-import { ArrowLeft, Crown, GitBranch, Pencil, Users, X } from "lucide-react"
+import { ArrowLeft, Crown, GitBranch, History, Pencil, Users, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
-import { type TaskStatus } from "@/lib/task-status"
-import { getWorkforce, runWorkforce } from "@/lib/workforces-api"
-import { WorkforceStatusBadge } from "@/components/workforce"
+import { normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
+import { getWorkforce, getWorkforceRun, runWorkforce } from "@/lib/workforces-api"
+import { WorkforceRunsList, WorkforceStatusBadge } from "@/components/workforce"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ResizableSplitLayout } from "@/components/layout/resizable-split-layout"
-import type { WorkforceDetail, WorkforceRunResponse } from "@/types/workforce"
+import type {
+  WorkforceDetail,
+  WorkforceRunHistoryItem,
+  WorkforceRunResponse,
+} from "@/types/workforce"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 
@@ -258,17 +263,31 @@ function WorkforceFlowPanel({ workforce, taskStatus, onClose }: WorkforceFlowPan
 // ─── Main page ─────────────────────────────────────────────────────────────────
 
 export default function WorkforceRunPage() {
+  // useSearchParams must be inside a Suspense boundary for static export.
+  return (
+    <Suspense fallback={null}>
+      <WorkforceRunPageInner />
+    </Suspense>
+  )
+}
+
+function WorkforceRunPageInner() {
   const { t } = useI18n()
   const params = useParams()
+  const router = useRouter()
+  const searchParams = useSearchParams()
   const { sendMessage, setTaskId, closeFilePreview, dispatch, state } = useApp()
   const id = Array.isArray(params.id) ? params.id[0] : params.id
+  const runParam = searchParams.get("run")
 
   const [workforce, setWorkforce] = useState<WorkforceDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [showFlow, setShowFlow] = useState(false)
   const [taskStarted, setTaskStarted] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   const previewTaskIdRef = useRef<number | null>(null)
+  const openedRunParamRef = useRef<string | null>(null)
   const taskStatus = state.currentTask?.status ?? null
 
   useEffect(() => {
@@ -303,6 +322,82 @@ export default function WorkforceRunPage() {
       set(null, { navigate: false })
     }
   }, [])
+
+  const openRun = useCallback((run: WorkforceRunHistoryItem) => {
+    if (!run.task_id) {
+      toast.error(t("workforces.runs.taskDeleted"))
+      return
+    }
+    setHistoryOpen(false)
+    if (previewTaskIdRef.current === run.task_id) return
+    // Keep ?run= authoritative no matter which path opened the run, and mark
+    // it as opened so the deep-link effect doesn't refetch it.
+    openedRunParamRef.current = String(run.id)
+    router.replace(`/workforces/${id}/run?run=${run.id}`, { scroll: false })
+    previewTaskIdRef.current = run.task_id
+    setTaskStarted(true)
+    closeFilePreview()
+    setTaskId(run.task_id, { navigate: false })
+    const title = run.task_title || run.message || `Run #${run.id}`
+    const taskPayload: Task = {
+      id: String(run.task_id),
+      title,
+      description: run.message ?? "",
+      status: normalizeTaskStatus(run.status) ?? "completed",
+      createdAt: run.created_at ?? new Date().toISOString(),
+      updatedAt: run.completed_at ?? run.created_at ?? new Date().toISOString(),
+    }
+    dispatch({ type: "SET_CURRENT_TASK", payload: taskPayload })
+  }, [closeFilePreview, setTaskId, dispatch, t])
+
+  useEffect(() => {
+    if (!id) return
+    if (!runParam) {
+      // Navigating back to the plain run page (e.g. browser back clearing
+      // ?run=) should return to the fresh "start a new run" state instead of
+      // staying stuck in the previously opened conversation.
+      if (openedRunParamRef.current !== null) {
+        openedRunParamRef.current = null
+        previewTaskIdRef.current = null
+        setTaskStarted(false)
+        closeFilePreview()
+        dispatch({ type: "CLEAR_MESSAGES" })
+        dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+        dispatch({ type: "SET_STEPS", payload: [] })
+        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+        dispatch({ type: "SET_CURRENT_TASK", payload: null })
+        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        setTaskId(null, { navigate: false })
+      }
+      return
+    }
+    if (openedRunParamRef.current === runParam) return
+    openedRunParamRef.current = runParam
+    let active = true
+    let settled = false
+    void (async () => {
+      try {
+        const run = await getWorkforceRun(id, runParam)
+        settled = true
+        if (active) openRun(run)
+      } catch (err) {
+        settled = true
+        if (active) {
+          // Allow retrying the same ?run= value after a failed load.
+          openedRunParamRef.current = null
+          toast.error(err instanceof Error ? err.message : t("workforces.runs.loadError"))
+        }
+      }
+    })()
+    return () => {
+      active = false
+      // If the fetch was discarded mid-flight (StrictMode double-invoke or a
+      // dependency change), release the ref so the next effect run retries.
+      if (!settled && openedRunParamRef.current === runParam) {
+        openedRunParamRef.current = null
+      }
+    }
+  }, [id, runParam, openRun, t, closeFilePreview, dispatch, setTaskId])
 
   const handleSend = useCallback(async (
     content: string,
@@ -378,6 +473,19 @@ export default function WorkforceRunPage() {
 
         <div className="flex-1" />
 
+        <Popover open={historyOpen} onOpenChange={setHistoryOpen}>
+          <PopoverTrigger asChild>
+            <Button variant="outline" size="sm" className="gap-1.5">
+              <History className="h-3.5 w-3.5" />
+              {t("workforces.runs.title")}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="max-h-[70vh] w-96 overflow-y-auto p-3">
+            {historyOpen && id && (
+              <WorkforceRunsList workforceId={id} compact onSelectRun={openRun} />
+            )}
+          </PopoverContent>
+        </Popover>
         <Button
           variant={showFlow ? "secondary" : "outline"}
           size="sm"

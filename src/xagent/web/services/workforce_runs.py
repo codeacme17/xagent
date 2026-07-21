@@ -151,6 +151,7 @@ async def create_workforce_run(
             task_id=int(task.id),
             user_id=int(user.id),
             status="pending",
+            is_preview=is_preview,
             snapshot=snapshot,
         )
         db.add(workforce_run)

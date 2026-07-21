@@ -25,8 +25,16 @@ from .streaming import merge_streamed_tool_call_arguments
 logger = logging.getLogger(__name__)
 
 
-class LLMCallInterrupted(Exception):
+class ExecutionInterrupted(Exception):
+    """Base signal for an execution interrupted at an active I/O boundary."""
+
+
+class LLMCallInterrupted(ExecutionInterrupted):
     """Raised when an active LLM call is cancelled by an execution interrupt."""
+
+
+class ToolCallInterrupted(ExecutionInterrupted):
+    """Raised when an active tool call is cancelled by an execution interrupt."""
 
 
 async def prepare_llm_for_context(
@@ -105,11 +113,19 @@ class PatternRuntime:
         init=False,
         repr=False,
     )
+    _active_tool_tasks: set[asyncio.Future[Any]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt_requested = True
         self.interrupt_reason = reason
         for task in list(self._active_llm_tasks):
+            if not task.done():
+                task.cancel()
+        for task in list(self._active_tool_tasks):
             if not task.done():
                 task.cancel()
 
@@ -157,6 +173,33 @@ class PatternRuntime:
             raise
         finally:
             self._active_llm_tasks.discard(task)
+
+    async def run_tool_call(self, invoke: Callable[[], Any]) -> Any:
+        """Run a tool call as a cancellable subtask owned by this runtime."""
+
+        if self._interrupt_requested:
+            raise ToolCallInterrupted(
+                self.interrupt_reason or "interrupted before tool call"
+            )
+
+        call = invoke()
+        if not inspect.isawaitable(call):
+            return call
+
+        task: asyncio.Future[Any] = asyncio.ensure_future(call)
+        self._active_tool_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError as exc:
+            if self._interrupt_requested:
+                raise ToolCallInterrupted(
+                    self.interrupt_reason or "interrupted during tool call"
+                ) from exc
+            raise
+        finally:
+            if not task.done():
+                task.cancel()
+            self._active_tool_tasks.discard(task)
 
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         """Stream only the final user-facing answer through the outbound boundary."""
@@ -742,17 +785,11 @@ class PatternRuntime:
                 "success": True,
             },
         )
-        if self.tracer is None:
-            return
-        payload = {
-            "name": f"tool.{tool_call['name']}",
-            "status": "success",
-            "output": result,
-        }
-        self.finished_spans.append(payload)
-        finish_span = getattr(self.tracer, "finish_span", None)
-        if callable(finish_span):
-            await self._maybe_await(finish_span(**payload))
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="success",
+            output=result,
+        )
 
     async def on_tool_error(
         self,
@@ -782,12 +819,58 @@ class PatternRuntime:
             step_id=self._step_id_from_payload(tool_call),
             data=data,
         )
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="error",
+            output={"error": str(error)},
+        )
+
+    async def on_tool_cancelled(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        reason: str | None = None,
+    ) -> None:
+        """Close an in-flight tool trace without reporting a pause as an error."""
+
+        cancellation_reason = reason or "Tool execution interrupted"
+        await self._emit_trace_event(
+            TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL),
+            task_id=self._task_id_from_payload(tool_call),
+            step_id=self._step_id_from_payload(tool_call),
+            data={
+                "tool_name": tool_call.get("name"),
+                "tool_params": tool_call.get("args", {}),
+                "tool_call_id": tool_call.get("id"),
+                "success": False,
+                "interrupted": True,
+                "interrupt_reason": cancellation_reason,
+            },
+        )
+        await self._finish_tool_span(
+            tool_call=tool_call,
+            status="cancelled",
+            output={
+                "interrupted": True,
+                "reason": cancellation_reason,
+            },
+        )
+
+    async def _finish_tool_span(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        status: str,
+        output: Any,
+    ) -> None:
+        """Finish one tool span with the common tracer bookkeeping."""
+
         if self.tracer is None:
             return
         payload = {
             "name": f"tool.{tool_call['name']}",
-            "status": "error",
-            "output": {"error": str(error)},
+            "status": status,
+            "output": output,
         }
         self.finished_spans.append(payload)
         finish_span = getattr(self.tracer, "finish_span", None)

@@ -41,6 +41,25 @@ export interface WorkforceRunListItem {
   created_at: string | null
 }
 
+export interface WorkforceRunHistoryItem {
+  id: number
+  task_id: number | null
+  status: string
+  is_preview: boolean
+  task_title: string | null
+  message: string | null
+  created_at: string | null
+  completed_at: string | null
+}
+
+export interface WorkforceRunHistoryResponse {
+  items: WorkforceRunHistoryItem[]
+  total: number
+  page: number
+  size: number
+  pages: number
+}
+
 export interface WorkforceListItem {
   id: number
   name: string
@@ -59,7 +78,6 @@ export interface WorkforceDetail {
   description: string | null
   status: WorkforceStatus
   manager: WorkforceAgentSummary
-  manager_instructions: string | null
   workers: WorkforceWorker[]
   canvas_layout: Record<string, unknown> | null
   scope_type: string
@@ -114,7 +132,6 @@ export interface WorkforceCreatePayload {
   name: string
   description?: string
   manager_agent_id: number
-  manager_instructions?: string
   canvas_layout?: Record<string, unknown> | null
   workers?: WorkforceWorkerPayload[]
 }
@@ -127,7 +144,6 @@ export interface WorkforceUpdatePayload {
   name?: string
   description?: string | null
   manager_agent_id?: number
-  manager_instructions?: string | null
   canvas_layout?: Record<string, unknown> | null
 }
 

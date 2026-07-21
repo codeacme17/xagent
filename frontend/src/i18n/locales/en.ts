@@ -3543,10 +3543,14 @@ Build when you need.`,
     builder: {
       title: "Triggers",
       description: "Choose automatic entry points for this agent.",
-      saveFirst: "Save the agent before configuring triggers.",
       tooltip: "Triggers automatically start this agent when an external event or schedule fires.",
       open: "Triggers",
       configure: "Configure trigger"
+    },
+    staging: {
+      info: "Triggers configured here are saved with the draft and created automatically together with the agent.",
+      webhookPending: "The webhook URL and signing secret will be generated after the agent is created.",
+      failedTitle: "Some triggers could not be created. Their configuration is kept — retry or discard."
     },
     type: {
       webhook: "Webhook",
@@ -3602,7 +3606,10 @@ Build when you need.`,
       confirmDelete: "Confirm delete",
       rotateSecret: "Rotate secret",
       test: "Test trigger",
-      addAnother: "Add"
+      addAnother: "Add",
+      retry: "Retry",
+      discard: "Discard",
+      confirmDiscard: "Confirm discard"
     },
     secret: {
       title: "Copy this secret now. It is shown only once."
@@ -3651,6 +3658,8 @@ Build when you need.`,
       runsLoadFailed: "Failed to load trigger runs",
       created: "Trigger created",
       updated: "Trigger updated",
+      staged: "Trigger saved. It will be created together with the agent.",
+      stagedCreateFailed: "Failed to create trigger \"{name}\": {error}",
       enabled: "Trigger enabled",
       disabled: "Trigger disabled",
       deleted: "Trigger deleted",
@@ -3716,7 +3725,6 @@ Build when you need.`,
       name: "Name",
       description: "Description",
       manager: "Manager",
-      managerInstructions: "Manager Instructions",
       workers: "Workers",
       publishedAgent: "Published Agent",
       alias: "Alias",
@@ -3728,7 +3736,6 @@ Build when you need.`,
       requireApproval: "Require approval before running",
       requireApprovalHint: "Workforce Lead will ask you before delegating to this agent",
       workforceName: "Workforce Name",
-      workforceInstructions: "Workforce Instructions",
       agentManager: "Agent Manager",
     },
     list: {
@@ -3820,12 +3827,9 @@ Build when you need.`,
       placeholders: {
         name: "Marketing Launch Workforce",
         description: "Coordinate research, content, and launch tasks.",
-        managerInstructions: "Coordinate workers, reconcile conflicting outputs, and return a single answer."
       },
       fields: {
         workforceName: "Workforce Name",
-        workforceInstructions: "Workforce Instructions",
-        workforceInstructionsHint: "Describe how the Workforce Lead should orchestrate work and what a successful output looks like.",
         agentManager: "Agent Manager",
         agentManagerHint: "This is the agent your workforce reports to. It understands your instructions and coordinates all sub-agents to get the work done.",
       },
@@ -3872,7 +3876,6 @@ Build when you need.`,
     review: {
       potentialRisks: "Potential Risks",
       untitled: "Untitled Workforce",
-      noManagerInstructions: "No manager instructions",
       canvasPreview: "Canvas Preview",
       workforceLead: "Workforce Lead",
       subAgentsDelegation: "Sub-agents & Delegation",
@@ -3895,6 +3898,28 @@ Build when you need.`,
       readyDesc: "Send a message and {manager} will coordinate the team to complete your request.",
       inactiveDisabled: "Publish this workforce before running it.",
       archivedDisabled: "Archived workforces cannot run."
+    },
+    runs: {
+      title: "Runs",
+      historyTitle: "Run history",
+      historyHint: "Previous runs of this workforce. Click a run to reopen its conversation.",
+      loading: "Loading runs...",
+      loadError: "Failed to load runs",
+      retry: "Retry",
+      refresh: "Refresh",
+      empty: "No runs yet",
+      emptyHint: "Runs will appear here after you send this workforce a task.",
+      untitled: "Run #{id}",
+      previewBadge: "Preview",
+      taskDeleted: "Conversation unavailable",
+      status: {
+        pending: "Pending",
+        running: "Running",
+        paused: "Paused",
+        completed: "Completed",
+        failed: "Failed",
+        waiting_for_user: "Waiting for user",
+      }
     },
     builder: {
       archivedReadOnly: "Archived workforces are read-only."

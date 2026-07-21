@@ -3543,10 +3543,14 @@ const zh = {
     builder: {
       title: "Triggers",
       description: "选择此 Agent 的自动触发入口。",
-      saveFirst: "保存 Agent 后即可配置 Triggers。",
       tooltip: "Triggers 会在外部事件或定时计划发生时自动启动此 Agent。",
       open: "Triggers",
       configure: "配置 Trigger"
+    },
+    staging: {
+      info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
+      webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
+      failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
     type: {
       webhook: "Webhook",
@@ -3602,7 +3606,10 @@ const zh = {
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
       test: "测试触发",
-      addAnother: "新增"
+      addAnother: "新增",
+      retry: "重试",
+      discard: "丢弃",
+      confirmDiscard: "确认丢弃"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。"
@@ -3651,6 +3658,8 @@ const zh = {
       runsLoadFailed: "加载 Trigger 运行记录失败",
       created: "Trigger 已创建",
       updated: "Trigger 已更新",
+      staged: "Trigger 已暂存，创建 Agent 时自动生效。",
+      stagedCreateFailed: "Trigger「{name}」创建失败：{error}",
       enabled: "Trigger 已启用",
       disabled: "Trigger 已停用",
       deleted: "Trigger 已删除",
@@ -3716,7 +3725,6 @@ const zh = {
       name: "名称",
       description: "描述",
       manager: "Manager",
-      managerInstructions: "Manager 指令",
       workers: "Workers",
       publishedAgent: "已发布 Agent",
       alias: "别名",
@@ -3728,7 +3736,6 @@ const zh = {
       requireApproval: "运行前需要审批",
       requireApprovalHint: "Workforce 负责人在委派此 Agent 前会征求您的确认",
       workforceName: "Workforce 名称",
-      workforceInstructions: "Workforce 指令",
       agentManager: "Agent Manager",
     },
     list: {
@@ -3820,12 +3827,9 @@ const zh = {
       placeholders: {
         name: "营销发布 Workforce",
         description: "协调调研、内容和发布任务。",
-        managerInstructions: "协调 workers，处理冲突结果，并返回统一答案。"
       },
       fields: {
         workforceName: "Workforce 名称",
-        workforceInstructions: "Workforce 指令",
-        workforceInstructionsHint: "描述 Workforce Lead 应如何编排工作，以及成功的输出是什么样子的。",
         agentManager: "Agent Manager",
         agentManagerHint: "这是你的 Workforce 汇报的 Agent，它理解你的指令并协调所有子 Agent 完成工作。",
       },
@@ -3872,7 +3876,6 @@ const zh = {
     review: {
       potentialRisks: "潜在风险",
       untitled: "未命名 Workforce",
-      noManagerInstructions: "没有 manager 指令",
       canvasPreview: "画布预览",
       workforceLead: "Workforce Lead",
       subAgentsDelegation: "Sub-agents 与委派",
@@ -3895,6 +3898,28 @@ const zh = {
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
       inactiveDisabled: "请先发布这个 Workforce 再运行。",
       archivedDisabled: "已归档的 Workforce 不能运行。"
+    },
+    runs: {
+      title: "运行记录",
+      historyTitle: "历史运行",
+      historyHint: "这个 Workforce 的历史运行记录。点击某次运行可重新打开对应会话。",
+      loading: "正在加载运行记录...",
+      loadError: "加载运行记录失败",
+      retry: "重试",
+      refresh: "刷新",
+      empty: "还没有运行记录",
+      emptyHint: "向这个 Workforce 发送任务后，运行记录会显示在这里。",
+      untitled: "运行 #{id}",
+      previewBadge: "预览",
+      taskDeleted: "会话不可用",
+      status: {
+        pending: "等待中",
+        running: "运行中",
+        paused: "已暂停",
+        completed: "已完成",
+        failed: "失败",
+        waiting_for_user: "等待用户",
+      }
     },
     builder: {
       archivedReadOnly: "已归档的 Workforce 只能查看。"

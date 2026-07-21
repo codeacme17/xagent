@@ -4,7 +4,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const getWorkforceMock = vi.hoisted(() => vi.fn())
+const getWorkforceRunMock = vi.hoisted(() => vi.fn())
 const listAgentOptionsMock = vi.hoisted(() => vi.fn().mockResolvedValue([]))
+const listWorkforceRunsMock = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ items: [], total: 0, page: 1, size: 10, pages: 0 }),
+)
 const listWorkforcesMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
 const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
@@ -15,8 +19,10 @@ const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const routerReplaceMock = vi.hoisted(() => vi.fn())
 const setTaskIdMock = vi.hoisted(() => vi.fn())
 const paramsMock = vi.hoisted(() => ({ id: "42" as string | string[] | undefined }))
+const searchParamsMock = vi.hoisted(() => new URLSearchParams())
 const translateMock = vi.hoisted(
   () => (key: string, vars?: Record<string, string | number>) => {
     if (!vars) return key
@@ -30,7 +36,8 @@ const translateMock = vi.hoisted(
 
 vi.mock("next/navigation", () => ({
   useParams: () => paramsMock,
-  useRouter: () => ({ push: routerPushMock }),
+  useRouter: () => ({ push: routerPushMock, replace: routerReplaceMock }),
+  useSearchParams: () => searchParamsMock,
 }))
 
 vi.mock("next/link", () => ({
@@ -75,7 +82,9 @@ vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
   archiveWorkforce: archiveWorkforceMock,
   getWorkforce: getWorkforceMock,
+  getWorkforceRun: getWorkforceRunMock,
   listAgentOptions: listAgentOptionsMock,
+  listWorkforceRuns: listWorkforceRunsMock,
   listWorkforces: listWorkforcesMock,
   publishWorkforce: publishWorkforceMock,
   removeWorkforceAgent: removeWorkforceAgentMock,
@@ -160,7 +169,6 @@ const workforceDetail: WorkforceDetail = {
     logo_url: null,
     status: "published",
   },
-  manager_instructions: null,
   workers: [],
   canvas_layout: null,
   scope_type: "user",
@@ -202,7 +210,11 @@ const listResponse: WorkforceListResponse = {
 describe("workforce route entry points", () => {
   beforeEach(() => {
     getWorkforceMock.mockReset()
+    getWorkforceRunMock.mockReset()
     listAgentOptionsMock.mockReset().mockResolvedValue([])
+    listWorkforceRunsMock
+      .mockReset()
+      .mockResolvedValue({ items: [], total: 0, page: 1, size: 10, pages: 0 })
     listWorkforcesMock.mockReset()
     runWorkforceMock.mockReset()
     addWorkforceAgentMock.mockReset()
@@ -213,8 +225,10 @@ describe("workforce route entry points", () => {
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()
     routerPushMock.mockReset()
+    routerReplaceMock.mockReset()
     setTaskIdMock.mockReset()
     paramsMock.id = "42"
+    searchParamsMock.delete("run")
   })
 
   afterEach(() => {
@@ -332,6 +346,67 @@ describe("workforce route entry points", () => {
         message: "test message",
       })
     })
+  })
+
+  it("shows run history in the detail page runs tab and opens a run", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    listWorkforceRunsMock.mockResolvedValue({
+      items: [
+        {
+          id: 9,
+          task_id: 99,
+          status: "completed",
+          is_preview: false,
+          task_title: "Launch Workforce: draft plan",
+          message: "draft plan",
+          created_at: "2026-07-19T10:00:00Z",
+          completed_at: "2026-07-19T10:03:00Z",
+        },
+      ],
+      total: 1,
+      page: 1,
+      size: 20,
+      pages: 1,
+    })
+
+    render(<WorkforceDetailPage />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /workforces.runs.title/ }))
+
+    const runRow = await screen.findByText("Launch Workforce: draft plan")
+    expect(listWorkforceRunsMock).toHaveBeenCalledWith("42", { page: 1, size: 20 })
+
+    fireEvent.click(runRow)
+    expect(routerPushMock).toHaveBeenCalledWith("/workforces/42/run?run=9")
+  })
+
+  it("opens a past run on the run page via the run query param", async () => {
+    searchParamsMock.set("run", "9")
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    getWorkforceRunMock.mockResolvedValueOnce({
+      id: 9,
+      task_id: 99,
+      status: "completed",
+      is_preview: false,
+      task_title: "Launch Workforce: draft plan",
+      message: "draft plan",
+      created_at: "2026-07-19T10:00:00Z",
+      completed_at: "2026-07-19T10:03:00Z",
+    })
+
+    render(<WorkforceRunPage />)
+
+    await waitFor(() => {
+      expect(getWorkforceRunMock).toHaveBeenCalledWith("42", "9")
+    })
+    await waitFor(() => {
+      expect(setTaskIdMock).toHaveBeenCalledWith(99, { navigate: false })
+    })
+    // openRun must keep ?run= authoritative regardless of the opening path.
+    expect(routerReplaceMock).toHaveBeenCalledWith("/workforces/42/run?run=9", {
+      scroll: false,
+    })
+    expect(await screen.findByTestId("task-conversation-panel")).toBeInTheDocument()
   })
 
   it("keeps the current manager visible when it is hidden from agent options", async () => {
