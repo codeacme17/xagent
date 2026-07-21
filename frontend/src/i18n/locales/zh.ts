@@ -3545,10 +3545,14 @@ const zh = {
     builder: {
       title: "Triggers",
       description: "选择此 Agent 的自动触发入口。",
-      saveFirst: "保存 Agent 后即可配置 Triggers。",
       tooltip: "Triggers 会在外部事件或定时计划发生时自动启动此 Agent。",
       open: "Triggers",
       configure: "配置 Trigger"
+    },
+    staging: {
+      info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
+      webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
+      failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
     type: {
       webhook: "Webhook",
@@ -3604,7 +3608,10 @@ const zh = {
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
       test: "测试触发",
-      addAnother: "新增"
+      addAnother: "新增",
+      retry: "重试",
+      discard: "丢弃",
+      confirmDiscard: "确认丢弃"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。"
@@ -3653,6 +3660,8 @@ const zh = {
       runsLoadFailed: "加载 Trigger 运行记录失败",
       created: "Trigger 已创建",
       updated: "Trigger 已更新",
+      staged: "Trigger 已暂存，创建 Agent 时自动生效。",
+      stagedCreateFailed: "Trigger「{name}」创建失败：{error}",
       enabled: "Trigger 已启用",
       disabled: "Trigger 已停用",
       deleted: "Trigger 已删除",
