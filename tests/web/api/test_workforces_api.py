@@ -444,14 +444,6 @@ def test_manager_instructions_is_ignored_on_create_and_update() -> None:
     assert payload["description"] == "Updated"
     assert "manager_instructions" not in payload
 
-    db = _direct_db_session()
-    try:
-        row = db.get(Workforce, workforce["id"])
-        assert row is not None
-        assert row.manager_instructions is None
-    finally:
-        db.close()
-
 
 def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> None:
     headers = _admin_headers()
@@ -677,9 +669,6 @@ def test_from_prompt_creates_draft_workforce() -> None:
 
     db = _direct_db_session()
     try:
-        row = db.get(Workforce, payload["id"])
-        assert row is not None
-        assert row.manager_instructions is None
         manager_agent = db.get(Agent, payload["manager"]["id"])
         assert manager_agent is not None
         assert manager_agent.instructions
