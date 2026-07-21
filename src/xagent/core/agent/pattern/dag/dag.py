@@ -18,7 +18,7 @@ from ...language import (
     output_language_policy,
 )
 from ...result import unwrap_final_answer_content
-from ...runtime import LLMCallInterrupted, PatternRuntime
+from ...runtime import ExecutionInterrupted, LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
@@ -79,6 +79,9 @@ class _DAGStepRuntime:
 
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def run_tool_call(self, invoke: Any) -> Any:
+        return await self.parent.run_tool_call(invoke)
 
     async def run_streaming_llm_call(
         self,
@@ -172,6 +175,16 @@ class _DAGStepRuntime:
     ) -> None:
         await self.parent.on_tool_error(
             tool_call=self._with_step(tool_call), error=error, result=result
+        )
+
+    async def on_tool_cancelled(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        reason: str | None = None,
+    ) -> None:
+        await self.parent.on_tool_cancelled(
+            tool_call=self._with_step(tool_call), reason=reason
         )
 
     async def on_llm_start(
@@ -856,7 +869,7 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
-        except LLMCallInterrupted:
+        except ExecutionInterrupted:
             raise
         except Exception as exc:
             step.status = "failed"
