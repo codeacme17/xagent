@@ -323,6 +323,22 @@ class ToolSelectionSpec(ABC):
                     tool_categories,
                 )
                 continue
+            elif entry == "agent":
+                # No longer assignable (issue #802): multi-agent delegation
+                # is a Workforce concern, injected via
+                # ``published_agent_ids`` + ``name_allowlist`` rather than
+                # this category. Legacy agent rows may still carry it —
+                # dropping it here disables their account-wide delegation
+                # (and the agent management tools) at runtime without a
+                # data migration. Any ``published_agent_ids`` passed
+                # alongside (workforce) is unaffected.
+                logger.warning(
+                    "Dropping non-assignable 'agent' tool category from "
+                    "tool_categories=%r; multi-agent delegation is "
+                    "configured through Workforce instead (issue #802)",
+                    tool_categories,
+                )
+                continue
             else:
                 plain_cats.add(entry)
 
