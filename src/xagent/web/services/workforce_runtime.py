@@ -226,33 +226,33 @@ def ensure_workforce_turn_allowed(
         raise WorkforceTurnRejectedError("workforce_config_changed")
 
 
-async def terminate_active_workforce_runs(
+@dataclass(frozen=True)
+class WorkforceRunPauseTarget:
+    """A previously RUNNING task that still needs a PAUSE after archive."""
+
+    run_id: int
+    task_id: int
+
+
+def cancel_active_workforce_runs(
     db: Session,
     workforce_id: int,
-    *,
-    actor_user_id: int | None,
-) -> int:
-    """Cancel every in-flight run of a workforce (called on archive).
+) -> list[WorkforceRunPauseTarget]:
+    """Mark every in-flight run of a workforce terminal ``cancelled``.
 
     Archiving only flips ``Workforce.status``; without this, in-flight runs
     keep executing because turn resolution never re-checks live workforce
-    state. For each active run: a durable PAUSE command stops a currently
-    RUNNING task through the existing command pipeline, and the run itself
-    is marked terminal ``cancelled`` (which ``sync_workforce_run_status``
-    treats as non-overwritable, so the PAUSE landing later cannot flip the
-    run back to ``paused``). New turns are rejected separately by
-    ``ensure_workforce_turn_allowed``.
+    state. ``cancelled`` is non-overwritable in ``sync_workforce_run_status``,
+    so a PAUSE landing later cannot flip the run back to ``paused``. New
+    turns are rejected separately by ``ensure_workforce_turn_allowed``.
 
-    Returns the number of runs transitioned to ``cancelled``. Commits are
-    left to the caller, except those performed internally by the command
-    transport's durable enqueue.
+    Deliberately does NOT commit and does NOT touch the command transport:
+    the caller commits the archive flip and these cancellations in one
+    atomic transaction, then dispatches PAUSE to the returned targets via
+    :func:`pause_workforce_tasks_after_archive`. (The durable enqueue commits
+    internally, so calling it on this session mid-loop would leak a partial
+    archive state.)
     """
-    from .task_command_transport import (
-        TaskCommandKind,
-        dispatch_task_command_promptly,
-        enqueue_task_command,
-    )
-
     runs = (
         db.query(WorkforceRun)
         .options(selectinload(WorkforceRun.task))
@@ -263,38 +263,68 @@ async def terminate_active_workforce_runs(
         .all()
     )
 
-    cancelled = 0
+    pause_targets: list[WorkforceRunPauseTarget] = []
     for run in runs:
         task = run.task
         if task is not None and task.status == TaskStatus.RUNNING:
-            try:
-                enqueued = enqueue_task_command(
-                    db,
-                    task_id=int(task.id),
-                    actor_user_id=actor_user_id,
-                    command_id=f"workforce-archive-{int(run.id)}",
-                    kind=TaskCommandKind.PAUSE,
-                    payload={},
-                )
-                from ..api.websocket import execute_durable_task_command
-
-                await dispatch_task_command_promptly(
-                    execute_durable_task_command,
-                    command_db_id=enqueued.command_id,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to pause running task %s while archiving workforce %s",
-                    task.id,
-                    workforce_id,
-                    exc_info=True,
-                )
+            pause_targets.append(
+                WorkforceRunPauseTarget(run_id=int(run.id), task_id=int(task.id))
+            )
         setattr(run, "status", "cancelled")
         if run.completed_at is None:
             setattr(run, "completed_at", datetime.now(timezone.utc))
-        cancelled += 1
+    return pause_targets
 
-    return cancelled
+
+async def pause_workforce_tasks_after_archive(
+    pause_targets: list[WorkforceRunPauseTarget],
+    *,
+    workforce_id: int,
+    actor_user_id: int | None,
+) -> None:
+    """Best-effort PAUSE dispatch for tasks left running by an archive.
+
+    Runs AFTER the caller committed the archive/cancel transaction, on its
+    own short-lived sessions, so the durable enqueue's internal commit can
+    never leak a partial archive state. A failed pause is logged and skipped:
+    the run is already terminal and the turn-entry guard blocks new turns,
+    so the orphaned execution can only run its current turn to completion.
+    """
+    if not pause_targets:
+        return
+
+    from ..models.database import get_session_local
+    from .task_command_transport import (
+        TaskCommandKind,
+        dispatch_task_command_promptly,
+        enqueue_task_command,
+    )
+
+    SessionLocal = get_session_local()
+    for target in pause_targets:
+        try:
+            with SessionLocal() as command_db:
+                enqueued = enqueue_task_command(
+                    command_db,
+                    task_id=target.task_id,
+                    actor_user_id=actor_user_id,
+                    command_id=f"workforce-archive-{target.run_id}",
+                    kind=TaskCommandKind.PAUSE,
+                    payload={},
+                )
+            from ..api.websocket import execute_durable_task_command
+
+            await dispatch_task_command_promptly(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to pause running task %s while archiving workforce %s",
+                target.task_id,
+                workforce_id,
+                exc_info=True,
+            )
 
 
 def _map_task_status(status: Any) -> str | None:

@@ -374,6 +374,50 @@ async def test_create_workforce_run_threads_source_and_idempotency(
         db.close()
 
 
+async def test_idempotency_replay_with_deleted_task_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    workforce_id = _create_active_workforce("Deleted Task Workforce")
+
+    async def _stub_begin_turn(**_kwargs: Any) -> _StubTurnStarted:
+        return _StubTurnStarted()
+
+    monkeypatch.setattr(
+        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+    )
+
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        workforce = _load_workforce(db, workforce_id)
+        result = await workforce_runs_service.create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="hello",
+            idempotency_key="orphan-key",
+        )
+        run_id = int(result.workforce_run.id)
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).update(
+            {"task_id": None}
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as excinfo:
+            await workforce_runs_service.create_workforce_run(
+                db,
+                user,
+                workforce,
+                message="hello again",
+                idempotency_key="orphan-key",
+            )
+        assert excinfo.value.status_code == 409
+    finally:
+        db.close()
+
+
 async def test_create_workforce_run_defaults_to_internal_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

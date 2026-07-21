@@ -37,7 +37,10 @@ from ..services.workforce_access import (
 from ..services.workforce_creator import create_workforce_from_prompt
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
-from ..services.workforce_runtime import terminate_active_workforce_runs
+from ..services.workforce_runtime import (
+    cancel_active_workforce_runs,
+    pause_workforce_tasks_after_archive,
+)
 from ..services.workforce_snapshot import (
     normalize_text,
     normalize_workforce_status,
@@ -751,13 +754,17 @@ async def archive_workforce(
     cast(Any, workforce).status = "archived"
     # Archive must also stop what is already running: flipping the status
     # alone leaves in-flight runs executing (turn resolution never re-checks
-    # live workforce state) and external sessions open.
-    await terminate_active_workforce_runs(
-        db,
-        int(workforce.id),
+    # live workforce state) and external sessions open. The status flip and
+    # every run cancellation commit atomically; PAUSE dispatch for still
+    # RUNNING tasks happens after the commit (best-effort, own sessions).
+    workforce_id_value = int(workforce.id)
+    pause_targets = cancel_active_workforce_runs(db, workforce_id_value)
+    db.commit()
+    await pause_workforce_tasks_after_archive(
+        pause_targets,
+        workforce_id=workforce_id_value,
         actor_user_id=int(user.id),
     )
-    db.commit()
     return {"id": workforce.id, "status": workforce.status}
 
 

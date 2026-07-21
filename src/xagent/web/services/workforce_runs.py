@@ -81,16 +81,36 @@ def _normalize_idempotency_key(value: str | None) -> str | None:
     return normalized
 
 
-def _find_existing_run_by_idempotency_key(
+def _replay_existing_run_by_idempotency_key(
     db: Session, workforce: Workforce, idempotency_key: str
-) -> WorkforceRun | None:
-    return (
+) -> WorkforceRunStartResult | None:
+    """Resolve an idempotency-key replay to the original run, if any.
+
+    Raises 409 when the key was already used but its task is gone
+    (``task_id`` is ``SET NULL`` on task deletion): the original result can
+    no longer be replayed, and inserting a fresh run under the same key
+    would only trip the unique index.
+    """
+    existing = (
         db.query(WorkforceRun)
         .filter(
             WorkforceRun.workforce_id == int(workforce.id),
             WorkforceRun.idempotency_key == idempotency_key,
         )
         .first()
+    )
+    if existing is None:
+        return None
+    if existing.task is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency key was already used by a run whose task no longer exists",
+        )
+    return WorkforceRunStartResult(
+        workforce_run=existing,
+        task=cast(Task, existing.task),
+        background_task=None,
+        created=False,
     )
 
 
@@ -143,16 +163,11 @@ async def create_workforce_run(
     normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
 
     if normalized_idempotency_key is not None:
-        existing = _find_existing_run_by_idempotency_key(
+        replayed = _replay_existing_run_by_idempotency_key(
             db, workforce, normalized_idempotency_key
         )
-        if existing is not None and existing.task is not None:
-            return WorkforceRunStartResult(
-                workforce_run=existing,
-                task=cast(Task, existing.task),
-                background_task=None,
-                created=False,
-            )
+        if replayed is not None:
+            return replayed
 
     selected_files = _normalize_selected_file_ids(selected_file_ids)
     snapshot = build_workforce_snapshot(
@@ -225,16 +240,11 @@ async def create_workforce_run(
         # winner's run instead of surfacing the constraint violation.
         db.rollback()
         if normalized_idempotency_key is not None:
-            existing = _find_existing_run_by_idempotency_key(
+            replayed = _replay_existing_run_by_idempotency_key(
                 db, workforce, normalized_idempotency_key
             )
-            if existing is not None and existing.task is not None:
-                return WorkforceRunStartResult(
-                    workforce_run=existing,
-                    task=cast(Task, existing.task),
-                    background_task=None,
-                    created=False,
-                )
+            if replayed is not None:
+                return replayed
         raise
     except Exception:
         db.rollback()
