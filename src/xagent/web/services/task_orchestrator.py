@@ -499,6 +499,27 @@ def _begin_turn_atomic_sync(
     db = SessionLocal()
     run_id = str(uuid4())
     try:
+        if kind != TurnKind.CREATE:
+            # Workforce tasks: reject APPEND turns whose owning workforce was
+            # archived or whose live config drifted from the run's pinned
+            # fingerprint. CREATE turns are validated upstream by
+            # ``create_workforce_run``; non-workforce tasks are a no-op.
+            # Raises before the claim UPDATE, preserving the "only raises
+            # before commit" invariant.
+            from .workforce_runtime import (
+                WorkforceTurnRejectedError,
+                ensure_workforce_turn_allowed,
+            )
+
+            try:
+                ensure_workforce_turn_allowed(
+                    db,
+                    task_id=task_id,
+                    task_owner_user_id=task_owner_user_id,
+                )
+            except WorkforceTurnRejectedError as exc:
+                raise TaskTurnError(exc.reason) from exc
+
         claimed = (
             db.query(Task)
             .filter(

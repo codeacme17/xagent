@@ -37,6 +37,7 @@ from ..services.workforce_access import (
 from ..services.workforce_creator import create_workforce_from_prompt
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
+from ..services.workforce_runtime import terminate_active_workforce_runs
 from ..services.workforce_snapshot import (
     normalize_text,
     normalize_workforce_status,
@@ -748,6 +749,14 @@ async def archive_workforce(
         action="edit",
     )
     cast(Any, workforce).status = "archived"
+    # Archive must also stop what is already running: flipping the status
+    # alone leaves in-flight runs executing (turn resolution never re-checks
+    # live workforce state) and external sessions open.
+    await terminate_active_workforce_runs(
+        db,
+        int(workforce.id),
+        actor_user_id=int(user.id),
+    )
     db.commit()
     return {"id": workforce.id, "status": workforce.status}
 
@@ -948,6 +957,7 @@ def _serialize_run_list_item(run: WorkforceRun) -> dict[str, Any]:
         "task_id": run.task_id,
         "status": run.status,
         "is_preview": bool(run.is_preview),
+        "source": task.source if task is not None else None,
         "task_title": task.title if task is not None else None,
         "message": message,
         "created_at": _serialize_datetime(run.created_at),
