@@ -24,14 +24,23 @@ from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
 from .agent_tool_names import gen_agent_tool_name, parse_agent_tool_id
-from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .base import (
+    AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
+    AbstractBaseTool,
+    ToolCategory,
+    ToolVisibility,
+)
 
 logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
 
 
 def _assignable_tool_categories() -> list[str]:
-    return [cat.value for cat in ToolCategory if cat is not ToolCategory.OTHER]
+    return [
+        cat.value
+        for cat in ToolCategory
+        if cat.value not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+    ]
 
 
 class _DelegatedAgentDatabaseTraceHandler:

@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from sqlalchemy.orm import Session
 
+from ...core.tools.adapters.vibe.base import AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
 from ...core.utils.type_check import ensure_list
 from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.agent_api_key import AgentApiKey
@@ -108,7 +109,11 @@ def _assert_can_set_visibility(
 
 
 def clean_tool_categories(categories: Any) -> list[str]:
-    return [c for c in (ensure_list(categories) or []) if c != "other"]
+    return [
+        c
+        for c in (ensure_list(categories) or [])
+        if c not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+    ]
 
 
 def new_widget_key() -> str:

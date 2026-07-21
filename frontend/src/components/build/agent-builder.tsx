@@ -134,6 +134,12 @@ interface TemplateRequirements {
   requiresKnowledgeBase: boolean
 }
 
+// Categories a user may never assign from the builder, mirroring the
+// backend's AGENT_CONFIG_UNASSIGNABLE_CATEGORIES (which also strips them on
+// write): `agent` (multi-agent delegation) is configured through Workforce
+// instead (issue #802), and `other` is an internal fallback bucket.
+const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
+
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
 // creation success dialog and inline in the config form (retry path / while
 // the dialog is closed); only the inline instance is dismissible.
@@ -764,8 +770,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSelectedKbs(agent.knowledge_bases || [])
           setSelectedSkills(agent.skills || [])
 
+          // Legacy agents may still have an unassignable category saved —
+          // never show or round-trip it.
           const rawToolCategories = agent.tool_categories || []
-          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:')))
+          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
           setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
 
           // Admin inspecting someone else's agent: the mount-time /api/mcp/servers
@@ -837,7 +845,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Separate regular tools from MCP servers
           const allCategories = template.agent_config?.tool_categories || []
-          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:')))
+          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
 
           const explicitlyConfiguredMcps = allCategories
             .filter((c: string) => c.startsWith('mcp:'))
@@ -928,9 +936,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }))
   ]
 
-  // Group tools by category for category selection
+  // Group tools by category for category selection. `mcp` has its own
+  // server-level selector; unassignable categories never appear.
   const toolCategories = Array.from(
-    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp'))
+    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && isAssignableToolCategory(c)))
   ).sort()
 
   const toolCategoryOptions = toolCategories.map(category => {
@@ -959,7 +968,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       'ppt': t('builds.configForm.tools.categoryDescriptions.ppt'),
       'office': t('builds.configForm.tools.categoryDescriptions.office'),
       'special_image': t('builds.configForm.tools.categoryDescriptions.specialImage'),
-      'agent': t('builds.configForm.tools.categoryDescriptions.agent'),
       'database': t('builds.configForm.tools.categoryDescriptions.database'),
       'skill': t('builds.configForm.tools.categoryDescriptions.skill'),
     }
@@ -981,7 +989,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       'ppt': t('builds.configForm.tools.categories.ppt'),
       'office': t('builds.configForm.tools.categories.office'),
       'special_image': t('builds.configForm.tools.categories.specialImage'),
-      'agent': t('builds.configForm.tools.categories.agent'),
       'database': t('builds.configForm.tools.categories.database'),
       'skill': t('builds.configForm.tools.categories.skill'),
     }

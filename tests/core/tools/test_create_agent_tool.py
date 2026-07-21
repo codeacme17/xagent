@@ -149,7 +149,9 @@ class TestCreateAgentTool:
         )
 
     @pytest.mark.asyncio
-    async def test_assignable_tool_categories_hide_other(self) -> None:
+    async def test_assignable_tool_categories_hide_unassignable(self) -> None:
+        """Neither ``other`` (internal fallback) nor ``agent`` (Workforce-only
+        delegation, issue #802) is advertised as assignable."""
         categories = (await ListToolCategoriesTool().run_json_async({}))["categories"]
         create_description = CreateAgentTool(
             session_factory=None, user_id=1
@@ -168,9 +170,16 @@ class TestCreateAgentTool:
             if "Available categories:" in line
         )
 
-        assert "other" not in categories
-        assert "other" not in create_categories_line
-        assert "other" not in update_categories_line
+        def advertised(line: str) -> list[str]:
+            return [
+                c.strip() for c in line.split("Available categories:")[1].split(",")
+            ]
+
+        for hidden in ("other", "agent"):
+            assert hidden not in categories
+            assert hidden not in advertised(create_categories_line)
+            assert hidden not in advertised(update_categories_line)
+        assert "basic" in categories
 
     def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
         assert _coerce_db_task_id(12) == 12
@@ -893,6 +902,66 @@ class TestCreateAgentTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_create_agent_strips_agent_tool_category(self) -> None:
+        """A builder-passed ``agent`` category never reaches the DB (#802)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_strip", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "strip_agent",
+                        "description": "Agent that tried to delegate",
+                        "instructions": "Agent that tried to delegate",
+                        "tool_categories": ["file", "agent"],
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "strip_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories == ["file"]
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_create_agent_duplicate_name_auto_renames(self) -> None:
         """Test that duplicate agent names are auto-renamed and created."""
         db, db_path, SessionLocal = _create_session()
@@ -1245,6 +1314,51 @@ class TestUpdateAgentTool:
             assert existing_agent.name == "partial_agent"  # Unchanged
             assert existing_agent.description == "New description only"  # Changed
             assert existing_agent.instructions == "Original instructions"  # Unchanged
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_update_agent_strips_agent_tool_category(self) -> None:
+        """A builder-passed ``agent`` category never reaches the DB (#802)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_strip_up", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            existing_agent = Agent(
+                user_id=user.id,
+                name="strip_update_agent",
+                description="Original description",
+                instructions="Original instructions",
+                tool_categories=["basic"],
+                status=AgentStatus.DRAFT,
+            )
+            db.add(existing_agent)
+            db.commit()
+            db.refresh(existing_agent)
+
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": existing_agent.id,
+                    "tool_categories": ["web_search", "agent"],
+                }
+            )
+
+            assert result["status"] == "success"
+
+            db.refresh(existing_agent)
+            assert existing_agent.tool_categories == ["web_search"]
 
         finally:
             db.close()
