@@ -376,4 +376,42 @@ describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
       expect(onChange).toHaveBeenCalledWith([])
     })
   })
+
+  it("updates the selected staged trigger in place on save", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Old name")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Old name")
+
+    fireEvent.change(screen.getByLabelText("triggers.form.name"), {
+      target: { value: "New name" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.save" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, name: "New name", type: "webhook" }),
+      ])
+    })
+  })
+
+  it("disables every staged trigger of a type when its switch is toggled off", async () => {
+    const onChange = renderStaging([
+      stagedWebhook(-1, "Hook one"),
+      stagedWebhook(-2, "Hook two"),
+    ])
+
+    await screen.findByText("triggers.staging.info")
+    const [webhookSwitch] = screen.getAllByRole("switch")
+    expect(webhookSwitch).toHaveAttribute("aria-checked", "true")
+
+    fireEvent.click(webhookSwitch)
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, enabled: false }),
+        expect.objectContaining({ clientId: -2, enabled: false }),
+      ])
+    })
+  })
 })

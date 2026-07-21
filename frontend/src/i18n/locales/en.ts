@@ -3610,7 +3610,8 @@ Build when you need.`,
       test: "Test trigger",
       addAnother: "Add",
       retry: "Retry",
-      discard: "Discard"
+      discard: "Discard",
+      confirmDiscard: "Confirm discard"
     },
     secret: {
       title: "Copy this secret now. It is shown only once."

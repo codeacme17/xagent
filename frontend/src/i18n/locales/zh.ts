@@ -3610,7 +3610,8 @@ const zh = {
       test: "测试触发",
       addAnother: "新增",
       retry: "重试",
-      discard: "丢弃"
+      discard: "丢弃",
+      confirmDiscard: "确认丢弃"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。"

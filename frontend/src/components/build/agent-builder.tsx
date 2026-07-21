@@ -134,6 +134,65 @@ interface TemplateRequirements {
   requiresKnowledgeBase: boolean
 }
 
+// One-time reveal of auto-generated webhook secrets. Rendered both inside the
+// creation success dialog and inline in the config form (retry path / while
+// the dialog is closed); only the inline instance is dismissible.
+function WebhookSecretsAlert({
+  secrets,
+  onDismiss,
+}: {
+  secrets: { name: string; secret: string }[]
+  onDismiss?: () => void
+}) {
+  const { t } = useI18n()
+  if (secrets.length === 0) return null
+  return (
+    <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+      <AlertCircle className="h-4 w-4" />
+      <AlertTitle className="flex items-center justify-between gap-2">
+        {t("triggers.secret.title")}
+        {onDismiss && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0"
+            onClick={onDismiss}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        )}
+      </AlertTitle>
+      <AlertDescription>
+        <div className="mt-2 space-y-2">
+          {secrets.map((item) => (
+            <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
+              <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
+                {item.secret}
+              </code>
+              <Button
+                type="button"
+                size="icon"
+                variant="secondary"
+                className="h-7 w-7 shrink-0"
+                onClick={async () => {
+                  if (await copyToClipboard(item.secret)) {
+                    toast.success(t("common.copied"))
+                  }
+                }}
+                title={t("common.copy")}
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
   const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
@@ -258,25 +317,51 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     void refreshTriggerSummary()
   }, [refreshTriggerSummary])
 
+  // While failed retries (or an unread secret) are on screen, dialog-close
+  // handlers skip router.replace to keep this instance mounted; this flag
+  // remembers that a navigation is owed once both lists drain.
+  const navPendingRef = useRef(false)
+  const reconcileDeferredNavigation = (
+    nextFailed: FailedStagedTrigger[],
+    nextSecrets: { name: string; secret: string }[],
+  ) => {
+    if (!navPendingRef.current) return
+    if (nextFailed.length > 0 || nextSecrets.length > 0) return
+    navPendingRef.current = false
+    if (createdAgent?.id) {
+      router.replace(`/build/${createdAgent.id}`)
+    }
+  }
+
   // Retry a staged trigger whose POST failed during agent creation. The agent
   // exists by now, so this goes straight through the live trigger API.
-  const retryFailedTrigger = async (index: number) => {
+  // Entries are keyed by their stable clientId — a positional index goes
+  // stale when another entry is discarded while a retry is in flight.
+  const retryFailedTrigger = async (clientId: number) => {
     if (!localAgentId) return
-    const entry = failedStagedTriggers[index]
+    const entry = failedStagedTriggers.find((item) => item.staged.clientId === clientId)
     if (!entry) return
     try {
       const created = await createAgentTrigger(localAgentId, stagedToCreatePayload(entry.staged))
-      setFailedStagedTriggers((prev) => prev.filter((_, i) => i !== index))
+      const nextFailed = failedStagedTriggers.filter(
+        (item) => item.staged.clientId !== clientId,
+      )
+      let nextSecrets = createdWebhookSecrets
       const secret = created.webhook_secret
       if (secret && !entry.staged.secret) {
-        setCreatedWebhookSecrets((prev) => [...prev, { name: entry.staged.name, secret }])
+        nextSecrets = [...createdWebhookSecrets, { name: entry.staged.name, secret }]
       }
+      setFailedStagedTriggers(nextFailed)
+      setCreatedWebhookSecrets(nextSecrets)
       void refreshTriggerSummary()
       toast.success(t("triggers.messages.created"))
+      reconcileDeferredNavigation(nextFailed, nextSecrets)
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
       setFailedStagedTriggers((prev) =>
-        prev.map((item, i) => (i === index ? { ...item, error: reason } : item)),
+        prev.map((item) =>
+          item.staged.clientId === clientId ? { ...item, error: reason } : item,
+        ),
       )
       toast.error(
         t("triggers.messages.stagedCreateFailed", { name: entry.staged.name, error: reason }),
@@ -284,8 +369,25 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
-  const discardFailedTrigger = (index: number) => {
-    setFailedStagedTriggers((prev) => prev.filter((_, i) => i !== index))
+  // Discarding drops the entered config irreversibly, so it uses the same
+  // two-click confirm pattern as trigger deletion in the dialog.
+  const [discardConfirmClientId, setDiscardConfirmClientId] = useState<number | null>(null)
+  const discardFailedTrigger = (clientId: number) => {
+    if (discardConfirmClientId !== clientId) {
+      setDiscardConfirmClientId(clientId)
+      return
+    }
+    setDiscardConfirmClientId(null)
+    const nextFailed = failedStagedTriggers.filter(
+      (item) => item.staged.clientId !== clientId,
+    )
+    setFailedStagedTriggers(nextFailed)
+    reconcileDeferredNavigation(nextFailed, createdWebhookSecrets)
+  }
+
+  const dismissWebhookSecrets = () => {
+    setCreatedWebhookSecrets([])
+    reconcileDeferredNavigation(failedStagedTriggers, [])
   }
 
   // During creation the agent has no server-side triggers yet; the summary
@@ -1415,6 +1517,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         setShowSuccessDialog(false)
         if (failedStagedTriggers.length === 0) {
           router.replace(`/build/${createdAgent.id}`)
+        } else {
+          navPendingRef.current = true
         }
       } else {
         const error = await response.json()
@@ -1432,9 +1536,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setShowSuccessDialog(false)
     // router.replace remounts the builder and would drop the failed-trigger
     // retry list. The URL was already pushState'd to /build/{id} at creation,
-    // so staying on this instance is safe while retries are pending.
-    if (createdAgent?.id && failedStagedTriggers.length === 0) {
+    // so staying on this instance is safe while retries are pending; the
+    // deferred navigation runs once the failed list drains.
+    if (!createdAgent?.id) return
+    if (failedStagedTriggers.length === 0) {
       router.replace(`/build/${createdAgent.id}`)
+    } else {
+      navPendingRef.current = true
     }
   }
 
@@ -2190,7 +2298,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <AlertTitle>{t("triggers.staging.failedTitle")}</AlertTitle>
             <AlertDescription>
               <div className="mt-2 space-y-2">
-                {failedStagedTriggers.map((entry, index) => (
+                {failedStagedTriggers.map((entry) => (
                   <div key={entry.staged.clientId} className="flex flex-wrap items-center gap-2">
                     <span className="min-w-0 flex-1 truncate text-xs">
                       <span className="font-medium">{entry.staged.name}</span>
@@ -2201,18 +2309,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                       size="sm"
                       variant="secondary"
                       className="h-7 px-2 text-xs"
-                      onClick={() => void retryFailedTrigger(index)}
+                      onClick={() => void retryFailedTrigger(entry.staged.clientId)}
                     >
                       {t("triggers.actions.retry")}
                     </Button>
                     <Button
                       type="button"
                       size="sm"
-                      variant="ghost"
+                      variant={
+                        discardConfirmClientId === entry.staged.clientId
+                          ? "destructive"
+                          : "ghost"
+                      }
                       className="h-7 px-2 text-xs"
-                      onClick={() => discardFailedTrigger(index)}
+                      onClick={() => discardFailedTrigger(entry.staged.clientId)}
                     >
-                      {t("triggers.actions.discard")}
+                      {discardConfirmClientId === entry.staged.clientId
+                        ? t("triggers.actions.confirmDiscard")
+                        : t("triggers.actions.discard")}
                     </Button>
                   </div>
                 ))}
@@ -2222,50 +2336,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         )}
 
         {/* One-time reveal for webhook secrets generated outside the creation
-            success dialog (e.g. a retried staged trigger). Also a fallback
-            surface while that dialog is open. */}
-        {createdWebhookSecrets.length > 0 && (
-          <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle className="flex items-center justify-between gap-2">
-              {t("triggers.secret.title")}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 shrink-0"
-                onClick={() => setCreatedWebhookSecrets([])}
-              >
-                <X className="h-3.5 w-3.5" />
-              </Button>
-            </AlertTitle>
-            <AlertDescription>
-              <div className="mt-2 space-y-2">
-                {createdWebhookSecrets.map((item) => (
-                  <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
-                    <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
-                    <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
-                      {item.secret}
-                    </code>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="secondary"
-                      className="h-7 w-7 shrink-0"
-                      onClick={async () => {
-                        if (await copyToClipboard(item.secret)) {
-                          toast.success(t("common.copied"))
-                        }
-                      }}
-                      title={t("common.copy")}
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </AlertDescription>
-          </Alert>
+            success dialog (e.g. a retried staged trigger). Hidden while the
+            dialog is open — it shows the same list itself. */}
+        {!showSuccessDialog && (
+          <WebhookSecretsAlert secrets={createdWebhookSecrets} onDismiss={dismissWebhookSecrets} />
         )}
 
         {effectiveTriggerSummary.some((trigger) => trigger.enabled) && (
@@ -2660,40 +2734,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             </DialogDescription>
           </DialogHeader>
           {/* One-time reveal of webhook secrets generated for staged triggers
-              (#928). Closing this dialog navigates away and remounts the
-              builder, so this is the only chance to copy them. */}
-          {createdWebhookSecrets.length > 0 && (
-            <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>{t("triggers.secret.title")}</AlertTitle>
-              <AlertDescription>
-                <div className="mt-2 space-y-2">
-                  {createdWebhookSecrets.map((item) => (
-                    <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
-                      <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
-                      <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
-                        {item.secret}
-                      </code>
-                      <Button
-                        type="button"
-                        size="icon"
-                        variant="secondary"
-                        className="h-7 w-7 shrink-0"
-                        onClick={async () => {
-                          if (await copyToClipboard(item.secret)) {
-                            toast.success(t("common.copied"))
-                          }
-                        }}
-                        title={t("common.copy")}
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              </AlertDescription>
-            </Alert>
-          )}
+              (#928). Closing this dialog usually navigates away and remounts
+              the builder, so this is the moment to copy them. */}
+          <WebhookSecretsAlert secrets={createdWebhookSecrets} />
           <DialogFooter className="gap-2 sm:justify-end">
             <div className="flex w-full sm:w-auto gap-2 justify-end">
               <Button variant="outline" onClick={handleDialogClose}>
