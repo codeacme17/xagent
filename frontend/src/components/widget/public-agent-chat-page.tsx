@@ -30,6 +30,8 @@ type PublicAuthResult = {
   agent_logo?: string | null
   agent_description?: string | null
   suggested_prompts?: string[] | null
+  // Set instead of agent_id when the share token exposes a workforce.
+  workforce_id?: number | null
 }
 
 interface PublicConversationContentProps {
@@ -38,6 +40,7 @@ interface PublicConversationContentProps {
   normalizedGuestId?: string | null
   accessToken: string
   agentId: number | null
+  workforceId: number | null
   agentName: string | null
   agentLogo: string | null
   agentDescription: string | null
@@ -50,6 +53,7 @@ function PublicConversationContent({
   normalizedGuestId,
   accessToken,
   agentId,
+  workforceId,
   agentName,
   agentLogo,
   agentDescription,
@@ -159,14 +163,34 @@ function PublicConversationContent({
         },
       })
 
-      await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
+      if (!workforceId) {
+        await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
+      } else if (files?.length) {
+        // Workforce share sessions start their first turn inside task
+        // creation (the backend routes it through create_workforce_run), so
+        // sending the message again over the websocket would duplicate the
+        // turn — the connection replays it from history instead. Files
+        // picked alongside the first message still get attached to the task
+        // workspace so later turns can use them.
+        for (const file of files) {
+          const formData = new FormData()
+          formData.append("file", file)
+          formData.append("task_type", "task")
+          formData.append("task_id", newTaskId.toString())
+          await fetch(`${getApiUrl()}${publicApiPrefix}/files/upload`, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${accessToken}` },
+            body: formData,
+          }).catch((err) => console.error(err))
+        }
+      }
       setDraftMessage("")
       setDraftFiles([])
     } catch (error) {
       setIsBootstrappingTask(false)
       throw error
     }
-  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t])
+  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t, workforceId])
 
   useEffect(() => {
     if (state.taskId || createTaskError) {
@@ -386,6 +410,7 @@ export function PublicAgentChatPage({
         normalizedGuestId={normalizedGuestId}
         accessToken={resolvedAuthResult.access_token}
         agentId={resolvedAuthResult.agent_id ?? searchAgentId ?? null}
+        workforceId={resolvedAuthResult.workforce_id ?? null}
         agentName={resolvedAuthResult.agent_name ?? null}
         agentLogo={resolvedAuthResult.agent_logo ?? null}
         agentDescription={resolvedAuthResult.agent_description ?? null}
