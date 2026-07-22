@@ -145,7 +145,7 @@ def _bind_selected_files_to_task(
             uploaded_file.task_id = int(task.id)
 
 
-async def create_workforce_run(
+def create_workforce_run_record(
     db: Session,
     user: User,
     workforce: Workforce | None,
@@ -158,6 +158,13 @@ async def create_workforce_run(
     source: str | None = None,
     idempotency_key: str | None = None,
 ) -> WorkforceRunStartResult:
+    """Create the WorkforceRun + pending Task without starting the turn.
+
+    Synchronous creation half of ``create_workforce_run``; callers with their
+    own dispatch phase (the trigger pipeline's prepare step) use this directly
+    and start the turn later through the orchestrator. ``background_task`` is
+    always None in the returned result.
+    """
     workforce = ensure_workforce_access(db, user, workforce, action="run")
     workforce_id = int(workforce.id)
     normalized_message = normalize_text(message, "message", required=True)
@@ -267,6 +274,44 @@ async def create_workforce_run(
 
     db.refresh(task)
     db.refresh(workforce_run)
+
+    return WorkforceRunStartResult(
+        workforce_run=workforce_run,
+        task=task,
+        background_task=None,
+    )
+
+
+async def create_workforce_run(
+    db: Session,
+    user: User,
+    workforce: Workforce | None,
+    *,
+    message: str,
+    selected_file_ids: list[str] | None = None,
+    execution_mode: str | None = None,
+    is_preview: bool = False,
+    is_visible: bool = True,
+    source: str | None = None,
+    idempotency_key: str | None = None,
+) -> WorkforceRunStartResult:
+    record = create_workforce_run_record(
+        db,
+        user,
+        workforce,
+        message=message,
+        selected_file_ids=selected_file_ids,
+        execution_mode=execution_mode,
+        is_preview=is_preview,
+        is_visible=is_visible,
+        source=source,
+        idempotency_key=idempotency_key,
+    )
+    if not record.created:
+        return record
+
+    task = record.task
+    workforce_run = record.workforce_run
     task_id = int(task.id)
 
     try:
@@ -275,7 +320,7 @@ async def create_workforce_run(
             task_owner_user_id=int(user.id),
             # Workforce runs as the requesting user; actor == owner here.
             actor_user_id=int(user.id),
-            payload=TaskTurnPayload(transcript_message=normalized_message),
+            payload=TaskTurnPayload(transcript_message=str(task.description or "")),
             kind=TurnKind.CREATE,
             force_fresh=False,
         )

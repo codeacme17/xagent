@@ -3747,6 +3747,7 @@ const zh = {
       publish: "发布",
       unpublish: "取消发布",
       archive: "归档",
+      triggers: "触发器",
       createTeam: "创建团队",
       change: "更换",
       addAgent: "添加 Agent",
