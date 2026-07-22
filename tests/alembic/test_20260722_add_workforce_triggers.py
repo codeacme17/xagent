@@ -47,13 +47,10 @@ def _create_legacy_schema(connection) -> None:
         )
         """
     )
-    connection.execute(
-        sa.text("INSERT INTO agents (id, origin) VALUES (1, 'user')")
-    )
+    connection.execute(sa.text("INSERT INTO agents (id, origin) VALUES (1, 'user')"))
     connection.execute(
         sa.text(
-            "INSERT INTO agents (id, origin) "
-            "VALUES (2, 'workforce_generated_manager')"
+            "INSERT INTO agents (id, origin) VALUES (2, 'workforce_generated_manager')"
         )
     )
     connection.execute(
@@ -72,8 +69,7 @@ def _create_legacy_schema(connection) -> None:
 
 def _columns(connection) -> dict[str, dict]:
     return {
-        column["name"]: column
-        for column in sa.inspect(connection).get_columns(TABLE)
+        column["name"]: column for column in sa.inspect(connection).get_columns(TABLE)
     }
 
 
@@ -129,9 +125,7 @@ def test_downgrade_drops_workforce_rows_and_restores_agent_id_not_null() -> None
         with Operations.context(operations.get_context()):
             migration.upgrade()
 
-        connection.execute(
-            sa.text("INSERT INTO workforces (id) VALUES (7)")
-        )
+        connection.execute(sa.text("INSERT INTO workforces (id) VALUES (7)"))
         connection.execute(
             sa.text(
                 f"INSERT INTO {TABLE} "

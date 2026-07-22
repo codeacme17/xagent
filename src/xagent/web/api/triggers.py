@@ -15,7 +15,6 @@ from ..models.database import get_db
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
 from ..models.workforce import Workforce
-from ..services.workforce_access import ensure_workforce_access
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
@@ -48,6 +47,7 @@ from ..services.triggers import (
     update_workforce_trigger,
     verify_webhook_secret,
 )
+from ..services.workforce_access import ensure_workforce_access
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +491,7 @@ def _workforce_or_404(
     workforce_id: int,
     action: str,
 ) -> Workforce:
-    workforce = db.query(Workforce).filter(Workforce.id == workforce_id).first()
+    workforce = db.get(Workforce, workforce_id)
     return ensure_workforce_access(db, user, workforce, action=action)
 
 

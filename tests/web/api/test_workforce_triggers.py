@@ -160,9 +160,7 @@ def test_workforce_trigger_crud_roundtrip() -> None:
     assert created["callback_id"]
     assert created["webhook_secret"]
 
-    listed = client.get(
-        f"/api/workforces/{workforce_id}/triggers", headers=headers
-    )
+    listed = client.get(f"/api/workforces/{workforce_id}/triggers", headers=headers)
     assert listed.status_code == 200
     rows = listed.json()
     assert [row["id"] for row in rows] == [created["id"]]
@@ -395,9 +393,7 @@ def test_manager_agent_trigger_cannot_fire_defense_in_depth() -> None:
 
         from xagent.web.models.trigger import AgentTrigger
 
-        trigger = (
-            db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
-        )
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
         with pytest.raises(TriggerRunPreparationError) as excinfo:
             prepare_trigger_run(
                 db,

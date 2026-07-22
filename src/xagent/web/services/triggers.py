@@ -909,12 +909,10 @@ def _attach_workforce_task_to_trigger_run(
     # would otherwise risk an import cycle with this module.
     from .workforce_runs import create_workforce_run_record
 
-    user = db.query(User).filter(User.id == int(trigger.user_id)).first()
+    user = db.get(User, int(trigger.user_id))
     if user is None:
         raise TriggerServiceError("Trigger owner not found")
-    workforce = (
-        db.query(Workforce).filter(Workforce.id == int(trigger.workforce_id)).first()
-    )
+    workforce = db.get(Workforce, int(trigger.workforce_id))
     record = create_workforce_run_record(
         db,
         user,
@@ -970,7 +968,7 @@ def _attach_task_to_trigger_run(
         return _attach_workforce_task_to_trigger_run(
             db, trigger=trigger, run=run, prompt=prompt, test=test
         )
-    agent = db.query(Agent).filter(Agent.id == trigger.agent_id).first()
+    agent = db.get(Agent, trigger.agent_id)
     if agent is None:
         raise TriggerServiceError("Agent not found")
     if is_workforce_generated_manager_agent(agent):
