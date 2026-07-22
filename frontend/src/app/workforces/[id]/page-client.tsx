@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, History, LayoutDashboard, MessageSquare } from "lucide-react"
+import { ArrowLeft, History, LayoutDashboard, MessageSquare, Rocket } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -28,6 +28,7 @@ import type {
 } from "@/types/workforce"
 import {
     normalizeWorkerSortOrder,
+    DeployWorkforceDialog,
     WorkforceCanvas,
     WorkforceConfigPanel,
     WorkforceRunsList,
@@ -58,6 +59,7 @@ export default function WorkforceDetailPage() {
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [activeView, setActiveView] = useState<ActiveView>("configure")
+    const [deployOpen, setDeployOpen] = useState(false)
 
     const previewTaskIdRef = useRef<number | null>(null)
     const isArchived = workforce?.status === "archived"
@@ -360,6 +362,17 @@ export default function WorkforceDetailPage() {
                             {t("workforces.actions.archive")}
                         </Button>
                     )}
+                    {workforce.status === "active" && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setDeployOpen(true)}
+                            disabled={!!isArchived}
+                        >
+                            <Rocket className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.deploy") || "Deploy"}
+                        </Button>
+                    )}
                     {workforce.status === "active" ? (
                         <Button variant="outline" size="sm" onClick={unpublishCurrentWorkforce} disabled={saving || !!isArchived}>
                             {t("workforces.actions.unpublish")}
@@ -371,6 +384,15 @@ export default function WorkforceDetailPage() {
                     )}
                 </div>
             </div>
+
+            {workforce && (
+                <DeployWorkforceDialog
+                    open={deployOpen}
+                    workforceId={workforce.id}
+                    workforceName={workforce.name}
+                    onClose={() => setDeployOpen(false)}
+                />
+            )}
 
             {/* Body: main view + test panel */}
             <div className="flex-1 min-h-0 overflow-hidden">

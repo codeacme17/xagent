@@ -3403,6 +3403,16 @@ const zh = {
       manage_key: "管理 API Key"
     }
   },
+  deploy_workforce: {
+    title: "通过 REST API / SDK 部署",
+    desc: "使用 Workforce API Key 创建运行，然后轮询 GET /v1/chat/tasks/{id} 获取结果。",
+    copy: "复制",
+    new_key: "请立即复制此 Key —— 它不会再次显示。",
+    keys_title: "API Keys",
+    label_placeholder: "标签（可选），如 CI 流水线",
+    create_key: "创建 Key",
+    no_keys: "还没有 API Key。"
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API 凭证",
@@ -3747,6 +3757,7 @@ const zh = {
       publish: "发布",
       unpublish: "取消发布",
       archive: "归档",
+      deploy: "部署",
       createTeam: "创建团队",
       change: "更换",
       addAgent: "添加 Agent",
