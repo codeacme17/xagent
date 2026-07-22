@@ -20,6 +20,7 @@ from .connector_runtime import (
 )
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
+from .workforce_lifecycle import acquire_workforce_lifecycle_fence
 from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
 from .workforce_snapshot import (
     build_workforce_snapshot,
@@ -158,6 +159,7 @@ async def create_workforce_run(
     idempotency_key: str | None = None,
 ) -> WorkforceRunStartResult:
     workforce = ensure_workforce_access(db, user, workforce, action="run")
+    workforce_id = int(workforce.id)
     normalized_message = normalize_text(message, "message", required=True)
     normalized_source = _normalize_run_source(source)
     normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
@@ -170,34 +172,31 @@ async def create_workforce_run(
             return replayed
 
     selected_files = _normalize_selected_file_ids(selected_file_ids)
-    snapshot = build_workforce_snapshot(
-        db,
-        user,
-        workforce,
-        is_preview=is_preview,
-    )
-    policy = get_workforce_policy()
-    policy.before_workforce_run(db, user, workforce)
-    manager_execution_mode = normalize_execution_mode(
-        execution_mode or cast(Any, workforce.manager_agent).execution_mode
-    )
 
     try:
-        # Close the TOCTOU window against a concurrent archive:
-        # validate_workforce_for_run read the status with a plain SELECT, so
-        # an archive committing between that read and our commit would let a
-        # run slip onto an archived workforce after its cancellation sweep
-        # already ran. Re-read the status under a row lock (held to commit;
-        # no-op on SQLite, whose writers serialize anyway) so the archive's
-        # UPDATE and this insert cannot interleave.
-        locked_status = (
-            db.query(Workforce.status)
-            .filter(Workforce.id == int(workforce.id))
-            .with_for_update()
-            .scalar()
+        # The lifecycle fence takes a real row lock (a no-op UPDATE, so it
+        # also locks on SQLite where SELECT FOR UPDATE is ignored) and
+        # re-reads the current row; building the snapshot below re-validates
+        # archived/active UNDER that lock, closing the TOCTOU window against
+        # a concurrent archive whose cancellation sweep could not see this
+        # run's uncommitted insert.
+        workforce = ensure_workforce_access(
+            db,
+            user,
+            acquire_workforce_lifecycle_fence(db, workforce_id),
+            action="run",
         )
-        if locked_status == "archived" or locked_status is None:
-            raise HTTPException(status_code=409, detail="Workforce was archived")
+        snapshot = build_workforce_snapshot(
+            db,
+            user,
+            workforce,
+            is_preview=is_preview,
+        )
+        policy = get_workforce_policy()
+        policy.before_workforce_run(db, user, workforce)
+        manager_execution_mode = normalize_execution_mode(
+            execution_mode or cast(Any, workforce.manager_agent).execution_mode
+        )
 
         task = Task(
             user_id=int(user.id),

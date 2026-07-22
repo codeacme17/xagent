@@ -1,7 +1,8 @@
+import logging
 from datetime import timezone
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
@@ -35,6 +36,10 @@ from ..services.workforce_access import (
     resolve_create_scope,
 )
 from ..services.workforce_creator import create_workforce_from_prompt
+from ..services.workforce_lifecycle import (
+    acquire_workforce_lifecycle_fence,
+    discard_draft_workforce,
+)
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
 from ..services.workforce_runtime import (
@@ -54,6 +59,7 @@ from .public_trace_events import (
 )
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
+logger = logging.getLogger(__name__)
 
 
 class WorkforceWorkerInput(BaseModel):
@@ -752,14 +758,14 @@ async def archive_workforce(
         action="edit",
     )
     workforce_id_value = int(workforce.id)
-    # Serialize against create_workforce_run's own FOR UPDATE status check:
-    # without this row lock, archive's cancellation sweep can run while a
-    # concurrent create's uncommitted run is invisible to it (the session is
-    # autoflush=False, so even the status flip below stays in memory), letting
-    # that run permanently evade cancellation. Lock ordering: whichever side
-    # takes the row lock first fully finishes before the other reads status /
-    # sweeps. No-op on SQLite, whose writers serialize anyway.
-    db.refresh(workforce, with_for_update=True)
+    # Serialize against create_workforce_run, which takes the same lifecycle
+    # fence: without this row lock, archive's cancellation sweep can run
+    # while a concurrent create's uncommitted run is invisible to it (the
+    # session is autoflush=False, so even the status flip below stays in
+    # memory), letting that run permanently evade cancellation. The fence's
+    # no-op UPDATE locks on SQLite too, where SELECT FOR UPDATE is ignored.
+    if acquire_workforce_lifecycle_fence(db, workforce_id_value) is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
     cast(Any, workforce).status = "archived"
     # Archive must also stop what is already running: flipping the status
     # alone leaves in-flight runs executing (turn resolution never re-checks
@@ -774,6 +780,29 @@ async def archive_workforce(
         actor_user_id=int(user.id),
     )
     return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/discard", status_code=204)
+def discard_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    try:
+        discard_draft_workforce(db, user, _load_workforce(db, workforce_id))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to discard workforce %s", workforce_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workforce_discard_failed",
+                "message": "Failed to discard workforce",
+            },
+        ) from None
+    return Response(status_code=204)
 
 
 @router.post("/{workforce_id}/publish")
