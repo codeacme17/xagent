@@ -7,12 +7,16 @@ import { TaskConversationPanel } from "@/components/task/task-conversation-panel
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import {
+  uploadPublicChatFile,
+  type PublicChatUploadedFile,
+} from "@/lib/public-chat-file-upload"
+import { normalizeTaskStatus } from "@/lib/task-status"
+import {
   getApiUrl,
   getFilePublicDownloadUrl,
   getFilePublicPreviewUrl,
   setPublicAccessToken,
 } from "@/lib/utils"
-import { normalizeTaskStatus } from "@/lib/task-status"
 
 interface PublicAgentChatPageProps {
   authMode: "widget" | "share"
@@ -46,6 +50,8 @@ interface PublicConversationContentProps {
   agentDescription: string | null
   suggestedPrompts: string[]
 }
+
+type PublicMessageConfig = Record<string, unknown>
 
 function PublicConversationContent({
   authMode,
@@ -104,7 +110,11 @@ function PublicConversationContent({
     localStorage.removeItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
 
-  const handleSend = useCallback(async (message: string, config?: any, files?: File[]) => {
+  const handleSend = useCallback(async (
+    message: string,
+    config?: PublicMessageConfig,
+    files?: File[],
+  ) => {
     if (state.taskId) {
       await sendMessage(message, config, files)
       return
@@ -173,15 +183,14 @@ function PublicConversationContent({
         // picked alongside the first message still get attached to the task
         // workspace so later turns can use them.
         for (const file of files) {
-          const formData = new FormData()
-          formData.append("file", file)
-          formData.append("task_type", "task")
-          formData.append("task_id", newTaskId.toString())
-          await fetch(`${getApiUrl()}${publicApiPrefix}/files/upload`, {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${accessToken}` },
-            body: formData,
-          }).catch((err) => console.error(err))
+          await uploadPublicChatFile({
+            url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
+            accessToken,
+            file,
+            taskType: "task",
+            taskId: newTaskId,
+            fallbackError: t("files.uploadFailed"),
+          })
         }
       }
       setDraftMessage("")
@@ -347,35 +356,17 @@ export function PublicAgentChatPage({
     buildFileDownloadUrl: ({ baseUrl, fileId }) =>
       getFilePublicDownloadUrl(fileId, baseUrl),
     uploadFiles: async (files, params) => {
-      const uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
+      const uploadedFiles: PublicChatUploadedFile[] = []
 
       for (const file of files) {
-        const formData = new FormData()
-        formData.append("file", file)
-        formData.append("task_type", params.taskType)
-        if (params.taskId) {
-          formData.append("task_id", params.taskId.toString())
-        }
-
-        const response = await fetch(`${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${publicAccessToken}`,
-          },
-          body: formData,
-        })
-
-        const data = await response.json().catch(() => null)
-        if (!response.ok || !data?.success || typeof data.file_id !== "string") {
-          throw new Error(data?.detail || data?.message || t("files.uploadFailed"))
-        }
-
-        uploadedFiles.push({
-          file_id: data.file_id as string,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-        })
+        uploadedFiles.push(await uploadPublicChatFile({
+          url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
+          accessToken: publicAccessToken,
+          file,
+          taskType: params.taskType,
+          taskId: params.taskId,
+          fallbackError: t("files.uploadFailed"),
+        }))
       }
 
       return uploadedFiles
