@@ -913,6 +913,8 @@ def _attach_workforce_task_to_trigger_run(
     if user is None:
         raise TriggerServiceError("Trigger owner not found")
     workforce = db.get(Workforce, int(trigger.workforce_id))
+    if workforce is None:
+        raise TriggerServiceError("Workforce not found")
     record = create_workforce_run_record(
         db,
         user,

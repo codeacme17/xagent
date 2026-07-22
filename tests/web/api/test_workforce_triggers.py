@@ -14,11 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.web.api import triggers as trigger_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
+from xagent.web.services import triggers as trigger_service
 from xagent.web.services.connector_runtime import (
     set_connector_runtime_resolver_for_testing,
 )
@@ -38,6 +40,30 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+def test_workforce_trigger_run_read_routes_are_sync() -> None:
+    assert not asyncio.iscoroutinefunction(
+        trigger_api.list_workforce_trigger_runs_route
+    )
+    assert not asyncio.iscoroutinefunction(trigger_api.get_workforce_trigger_run_route)
+
+
+def test_missing_workforce_raises_trigger_service_error() -> None:
+    db = MagicMock()
+    db.get.side_effect = [MagicMock(), None]
+    trigger = MagicMock(user_id=1, workforce_id=999)
+
+    with pytest.raises(
+        trigger_service.TriggerServiceError, match="Workforce not found"
+    ):
+        trigger_service._attach_workforce_task_to_trigger_run(
+            db,
+            trigger=trigger,
+            run=MagicMock(id=1),
+            prompt="hello",
+            test=False,
+        )
 
 
 @pytest.fixture(autouse=True)

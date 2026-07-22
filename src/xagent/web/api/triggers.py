@@ -622,7 +622,7 @@ async def delete_workforce_trigger_route(
     "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs",
     response_model=list[TriggerRunResponse],
 )
-async def list_workforce_trigger_runs_route(
+def list_workforce_trigger_runs_route(
     workforce_id: int,
     trigger_id: int,
     current_user: User = Depends(get_current_user),
@@ -649,7 +649,7 @@ async def list_workforce_trigger_runs_route(
     "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}",
     response_model=TriggerRunResponse,
 )
-async def get_workforce_trigger_run_route(
+def get_workforce_trigger_run_route(
     workforce_id: int,
     trigger_id: int,
     run_id: int,
