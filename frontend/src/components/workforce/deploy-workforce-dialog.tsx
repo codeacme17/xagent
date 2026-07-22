@@ -120,8 +120,15 @@ export function DeployWorkforceDialog({
       )
       setRevealedKey(created.full_key)
       setNewLabel("")
-      const rows = await listAgentApiKeys({ workforceId })
-      setKeys(rows)
+      try {
+        const rows = await listAgentApiKeys({ workforceId })
+        setKeys(rows)
+      } catch {
+        // The key already exists and its one-shot secret must remain visible.
+        // Report only the secondary refresh failure so users do not retry the
+        // creation and accidentally issue duplicate credentials.
+        toast.error(t("apiKeysPage.messages.loadFailed"))
+      }
     } catch {
       toast.error(t("apiKeysPage.messages.createFailed"))
     } finally {
