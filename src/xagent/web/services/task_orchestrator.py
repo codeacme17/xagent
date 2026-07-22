@@ -604,6 +604,7 @@ def _begin_turn_atomic_sync(
                     db,
                     task_id=task_id,
                     task_owner_user_id=task_owner_user_id,
+                    agent_config=agent_config,
                 )
             except WorkforceTurnRejectedError as exc:
                 db.rollback()

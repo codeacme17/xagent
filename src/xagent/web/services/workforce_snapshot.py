@@ -192,13 +192,19 @@ def build_agent_tool_overrides(
 
 
 def _fingerprint_agent_payload(agent: Agent) -> dict[str, Any]:
+    # knowledge_bases / skills / tool_categories are order-insensitive sets
+    # persisted verbatim from the frontend's multi-selects, which append in
+    # click order. Canonicalize (sort) them so re-saving the same set in a
+    # different array order doesn't change the fingerprint and force-reject
+    # in-flight sessions. json.dumps(sort_keys=True) sorts dict keys only,
+    # not list contents.
     return {
         "instructions": agent.instructions,
         "execution_mode": agent.execution_mode,
         "models": agent.models or {},
-        "knowledge_bases": agent.knowledge_bases or [],
-        "skills": agent.skills or [],
-        "tool_categories": agent.tool_categories or [],
+        "knowledge_bases": sorted(agent.knowledge_bases or [], key=str),
+        "skills": sorted(agent.skills or [], key=str),
+        "tool_categories": sorted(agent.tool_categories or [], key=str),
     }
 
 

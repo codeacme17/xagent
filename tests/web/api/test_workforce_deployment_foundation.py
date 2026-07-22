@@ -7,10 +7,11 @@ terminating in-flight runs.
 
 from __future__ import annotations
 
-import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from xagent.web.models.agent import Agent, AgentStatus
@@ -340,12 +341,8 @@ async def test_append_turn_maps_guard_rejection_to_task_turn_error() -> None:
 # ===== create_workforce_run: source + idempotency =====
 
 
-class _StubTurnStarted:
-    def __init__(self) -> None:
-        async def _noop() -> None:
-            return None
-
-        self.background_task = asyncio.get_event_loop().create_task(_noop())
+def _stub_turn_started() -> SimpleNamespace:
+    return SimpleNamespace(background_task=None)
 
 
 async def test_create_workforce_run_threads_source_and_idempotency(
@@ -353,8 +350,8 @@ async def test_create_workforce_run_threads_source_and_idempotency(
 ) -> None:
     workforce_id = _create_active_workforce("Source Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> _StubTurnStarted:
-        return _StubTurnStarted()
+    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+        return _stub_turn_started()
 
     monkeypatch.setattr(
         workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
@@ -399,8 +396,8 @@ async def test_idempotency_replay_with_deleted_task_conflicts(
 
     workforce_id = _create_active_workforce("Deleted Task Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> _StubTurnStarted:
-        return _StubTurnStarted()
+    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+        return _stub_turn_started()
 
     monkeypatch.setattr(
         workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
@@ -441,8 +438,8 @@ async def test_create_workforce_run_defaults_to_internal_source(
 ) -> None:
     workforce_id = _create_active_workforce("Default Source Workforce")
 
-    async def _stub_begin_turn(**_kwargs: Any) -> _StubTurnStarted:
-        return _StubTurnStarted()
+    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+        return _stub_turn_started()
 
     monkeypatch.setattr(
         workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
@@ -528,5 +525,175 @@ def test_archive_cancels_active_runs_and_keeps_terminal_ones() -> None:
         assert sync_workforce_run_status(db, task, TaskStatus.PAUSED) is False
         db.refresh(running_run)
         assert running_run.status == "cancelled"
+    finally:
+        db.close()
+
+
+# ===== Review follow-ups (#952 re-review) =====
+
+
+def test_fingerprint_is_insensitive_to_list_order() -> None:
+    workforce_id = _create_active_workforce("List Order Workforce")
+
+    db = _direct_db_session()
+    try:
+        workforce = _load_workforce(db, workforce_id)
+        worker_agent = workforce.workers[0].agent
+        worker_agent.knowledge_bases = ["kb-b", "kb-a"]
+        worker_agent.skills = ["skill-2", "skill-1"]
+        worker_agent.tool_categories = ["web", "files"]
+        db.commit()
+        before = compute_live_workforce_config_fingerprint(workforce)
+
+        # Re-saving the same sets in a different click order must not change
+        # the fingerprint (would otherwise force-reject in-flight sessions).
+        worker_agent.knowledge_bases = ["kb-a", "kb-b"]
+        worker_agent.skills = ["skill-1", "skill-2"]
+        worker_agent.tool_categories = ["files", "web"]
+        db.commit()
+        db.expire_all()
+        workforce = _load_workforce(db, workforce_id)
+        assert compute_live_workforce_config_fingerprint(workforce) == before
+    finally:
+        db.close()
+
+
+async def test_idempotency_concurrent_insert_falls_back_to_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the ``except IntegrityError`` fallback: the pre-insert lookup
+    misses (simulating a concurrent inserter that has not committed yet), the
+    insert then trips the unique index, and the loser returns the winner's
+    run instead of surfacing a 500."""
+    workforce_id = _create_active_workforce("Race Workforce")
+
+    async def _stub_begin_turn(**_kwargs: Any) -> SimpleNamespace:
+        return _stub_turn_started()
+
+    monkeypatch.setattr(
+        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub_begin_turn
+    )
+
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        workforce = _load_workforce(db, workforce_id)
+        winner = await workforce_runs_service.create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="winner",
+            idempotency_key="race-key",
+        )
+        winner_run_id = int(winner.workforce_run.id)
+
+        real_replay = workforce_runs_service._replay_existing_run_by_idempotency_key
+        calls = {"n": 0}
+
+        def _miss_first_then_real(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # pre-insert lookup misses: race window
+            return real_replay(*args, **kwargs)
+
+        monkeypatch.setattr(
+            workforce_runs_service,
+            "_replay_existing_run_by_idempotency_key",
+            _miss_first_then_real,
+        )
+
+        loser = await workforce_runs_service.create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="loser (concurrent retry)",
+            idempotency_key="race-key",
+        )
+        assert calls["n"] >= 2  # IntegrityError fallback re-queried
+        assert loser.created is False
+        assert loser.background_task is None
+        assert int(loser.workforce_run.id) == winner_run_id
+    finally:
+        db.close()
+
+
+def test_deployment_model_defaults_and_owner_uniqueness() -> None:
+    from xagent.web.models.deployment import Deployment, DeploymentOwnerType
+
+    _admin_headers()  # initialize the test DB/app
+    db = _direct_db_session()
+    try:
+        agent_row = Deployment(owner_type=DeploymentOwnerType.AGENT.value, owner_id=1)
+        # Same owner_id under a different owner_type must coexist.
+        workforce_row = Deployment(
+            owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=1
+        )
+        db.add_all([agent_row, workforce_row])
+        db.commit()
+
+        assert agent_row.widget_enabled is False
+        assert agent_row.share_enabled is False
+        assert agent_row.widget_key is None
+        assert agent_row.share_token is None
+        assert agent_row.created_at is not None
+
+        duplicate = Deployment(
+            owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=1
+        )
+        db.add(duplicate)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def test_ws_append_rejection_surfaces_workforce_reason() -> None:
+    """Transport-boundary pin: the websocket path must surface the specific
+    workforce rejection instead of the generic (and misleading) "task busy"
+    message — an archived workforce can never be retried into success."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.web.api.websocket import handle_chat_message
+
+    workforce_id = _create_active_workforce("WS Reason Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, _ = _create_workforce_task_and_run(workforce_id, snapshot=snapshot)
+
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        db.query(Workforce).filter(Workforce.id == workforce_id).update(
+            {"status": "archived"}
+        )
+        db.commit()
+
+        ws_manager = MagicMock(
+            broadcast_to_task=AsyncMock(), send_personal_message=AsyncMock()
+        )
+        errors: list[dict[str, Any]] = []
+        with patch("xagent.web.api.websocket.manager", ws_manager):
+            await handle_chat_message(
+                MagicMock(),
+                task_id,
+                {"message": "follow-up", "user": user, "files": []},
+            )
+            # The durable command may detach past the 50ms dispatch window;
+            # wait for the agent_error broadcast like the owner-actor tests.
+            for _ in range(200):
+                errors = [
+                    call.args[0]
+                    for call in ws_manager.broadcast_to_task.await_args_list
+                    if call.args and call.args[0].get("type") == "agent_error"
+                ]
+                if errors:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("agent_error broadcast did not arrive in time")
+
+        assert "archived" in errors[0]["message"]
+        assert "busy" not in errors[0]["message"]
     finally:
         db.close()

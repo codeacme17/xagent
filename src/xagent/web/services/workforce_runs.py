@@ -183,6 +183,22 @@ async def create_workforce_run(
     )
 
     try:
+        # Close the TOCTOU window against a concurrent archive:
+        # validate_workforce_for_run read the status with a plain SELECT, so
+        # an archive committing between that read and our commit would let a
+        # run slip onto an archived workforce after its cancellation sweep
+        # already ran. Re-read the status under a row lock (held to commit;
+        # no-op on SQLite, whose writers serialize anyway) so the archive's
+        # UPDATE and this insert cannot interleave.
+        locked_status = (
+            db.query(Workforce.status)
+            .filter(Workforce.id == int(workforce.id))
+            .with_for_update()
+            .scalar()
+        )
+        if locked_status == "archived" or locked_status is None:
+            raise HTTPException(status_code=409, detail="Workforce was archived")
+
         task = Task(
             user_id=int(user.id),
             title=_build_task_title(workforce, normalized_message),

@@ -168,6 +168,7 @@ def ensure_workforce_turn_allowed(
     *,
     task_id: int,
     task_owner_user_id: int,
+    agent_config: dict[str, Any] | None = None,
 ) -> None:
     """Gate a new turn on a workforce task against the live workforce state.
 
@@ -191,15 +192,22 @@ def ensure_workforce_turn_allowed(
     No-op for non-workforce tasks and for runs whose snapshot predates the
     fingerprint (backwards compatibility). Preview runs skip the fingerprint
     check: the builder edits config while previewing by design.
+
+    ``agent_config`` may be passed by callers that already read the task row
+    (the turn orchestrator reads it in its post-claim snapshot SELECT) to
+    save a redundant round-trip; when omitted it is read here, scoped to the
+    owner.
     """
-    row = (
-        db.query(Task.agent_config)
-        .filter(Task.id == int(task_id), Task.user_id == int(task_owner_user_id))
-        .first()
-    )
-    if row is None or not isinstance(row[0], dict):
-        return
-    workforce_run_id = row[0].get("workforce_run_id")
+    if agent_config is None:
+        row = (
+            db.query(Task.agent_config)
+            .filter(Task.id == int(task_id), Task.user_id == int(task_owner_user_id))
+            .first()
+        )
+        if row is None or not isinstance(row[0], dict):
+            return
+        agent_config = row[0]
+    workforce_run_id = agent_config.get("workforce_run_id")
     if not isinstance(workforce_run_id, int):
         return
 
