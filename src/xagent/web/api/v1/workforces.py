@@ -20,7 +20,7 @@ import logging
 from typing import NoReturn, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
@@ -50,8 +50,8 @@ def _load_workforce_for_run(db: Session, workforce_id: int) -> Workforce | None:
     return (
         db.query(Workforce)
         .options(
-            selectinload(Workforce.manager_agent),
-            selectinload(Workforce.workers).selectinload(WorkforceAgent.agent),
+            joinedload(Workforce.manager_agent),
+            selectinload(Workforce.workers).joinedload(WorkforceAgent.agent),
         )
         .filter(Workforce.id == workforce_id)
         .first()
@@ -143,7 +143,7 @@ async def create_workforce_run_endpoint(
     # ``create_workforce_run`` acts as the workforce owner. Resolve the
     # user from the workforce's owner_user_id (the key carries no user
     # session of its own).
-    owner = db.query(User).filter(User.id == workforce.owner_user_id).first()
+    owner = db.get(User, int(workforce.owner_user_id))
     if owner is None:
         raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
 
