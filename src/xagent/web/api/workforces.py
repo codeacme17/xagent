@@ -751,13 +751,23 @@ async def archive_workforce(
         _load_workforce(db, workforce_id),
         action="edit",
     )
+    workforce_id_value = int(workforce.id)
+    # Serialize against create_workforce_run's own FOR UPDATE status check:
+    # without this row lock, archive's cancellation sweep can run while a
+    # concurrent create's uncommitted run is invisible to it (the session is
+    # autoflush=False, so even the status flip below stays in memory), letting
+    # that run permanently evade cancellation. Lock ordering: whichever side
+    # takes the row lock first fully finishes before the other reads status /
+    # sweeps. No-op on SQLite, whose writers serialize anyway.
+    db.query(Workforce.id).filter(
+        Workforce.id == workforce_id_value
+    ).with_for_update().scalar()
     cast(Any, workforce).status = "archived"
     # Archive must also stop what is already running: flipping the status
     # alone leaves in-flight runs executing (turn resolution never re-checks
     # live workforce state) and external sessions open. The status flip and
     # every run cancellation commit atomically; PAUSE dispatch for still
     # RUNNING tasks happens after the commit (best-effort, own sessions).
-    workforce_id_value = int(workforce.id)
     pause_targets = cancel_active_workforce_runs(db, workforce_id_value)
     db.commit()
     await pause_workforce_tasks_after_archive(

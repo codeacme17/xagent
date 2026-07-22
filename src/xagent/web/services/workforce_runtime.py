@@ -16,6 +16,7 @@ from .task_lease_service import (
     release_task_lease,
 )
 from .workforce_snapshot import (
+    WORKFORCE_CONFIG_FINGERPRINT_VERSION,
     build_agent_tool_overrides,
     compute_live_workforce_config_fingerprint,
 )
@@ -172,9 +173,12 @@ def ensure_workforce_turn_allowed(
 ) -> None:
     """Gate a new turn on a workforce task against the live workforce state.
 
-    Called at the shared turn-entry point for APPEND turns (CREATE turns are
-    covered by ``validate_workforce_for_run`` inside ``create_workforce_run``).
-    Rejects with :class:`WorkforceTurnRejectedError` when:
+    Called at the shared turn-entry point for every turn kind. CREATE turns
+    are already validated upstream by ``validate_workforce_for_run``, but an
+    archive can commit between ``create_workforce_run``'s commit and the
+    claim — its cancellation sweep marks the run cancelled yet cannot stop a
+    turn that never started — so this check is the last line before
+    execution. Rejects with :class:`WorkforceTurnRejectedError` when:
 
     - ``workforce_archived``: the owning workforce was archived (or its row
       is gone). Archive terminates external exposure; long-lived sessions
@@ -232,6 +236,15 @@ def ensure_workforce_turn_allowed(
     snapshot: dict[str, Any] = run.snapshot if isinstance(run.snapshot, dict) else {}
     pinned = snapshot.get("config_fingerprint")
     if not isinstance(pinned, str) or not pinned:
+        return
+    # Only compare fingerprints pinned by the CURRENT algorithm: a version
+    # bump (algorithm change) would otherwise make every pre-existing run's
+    # pinned value mismatch the freshly computed live one and spuriously
+    # reject those sessions on deploy — the exact failure the fingerprint
+    # exists to prevent. Runs pinned under an older version are exempt.
+    if snapshot.get("config_fingerprint_version") != (
+        WORKFORCE_CONFIG_FINGERPRINT_VERSION
+    ):
         return
     live = compute_live_workforce_config_fingerprint(workforce)
     if live != pinned:

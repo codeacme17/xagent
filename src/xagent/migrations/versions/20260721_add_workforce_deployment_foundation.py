@@ -87,7 +87,10 @@ def upgrade() -> None:
             "ix_deployments_widget_key", DEPLOYMENTS_TABLE, ["widget_key"], unique=True
         )
         op.create_index(
-            "ix_deployments_share_token", DEPLOYMENTS_TABLE, ["share_token"]
+            "ix_deployments_share_token",
+            DEPLOYMENTS_TABLE,
+            ["share_token"],
+            unique=True,
         )
 
     if RUNS_TABLE in table_names:

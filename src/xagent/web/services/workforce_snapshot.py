@@ -191,6 +191,16 @@ def build_agent_tool_overrides(
     return overrides
 
 
+# Version of the fingerprint ALGORITHM, stored alongside the pinned value in
+# the run snapshot. The turn-entry guard only compares pinned vs live when the
+# pinned version matches; a version bump therefore exempts runs pinned under an
+# older algorithm instead of spuriously rejecting them with
+# "workforce_config_changed" on deploy. Bump whenever the payload shape or
+# canonicalization below changes. History: 1 = unsorted list fields (never
+# released); 2 = list fields canonicalized via sort.
+WORKFORCE_CONFIG_FINGERPRINT_VERSION = 2
+
+
 def _fingerprint_agent_payload(agent: Agent) -> dict[str, Any]:
     # knowledge_bases / skills / tool_categories are order-insensitive sets
     # persisted verbatim from the frontend's multi-selects, which append in
@@ -224,7 +234,7 @@ def compute_workforce_config_fingerprint(
     rather than silently executing with drifted config.
     """
     payload = {
-        "version": 1,
+        "version": WORKFORCE_CONFIG_FINGERPRINT_VERSION,
         "workforce": {"id": workforce.id, "name": workforce.name},
         "manager": {
             "agent_id": manager_agent.id,
@@ -335,6 +345,7 @@ def build_workforce_snapshot(
     snapshot["config_fingerprint"] = compute_workforce_config_fingerprint(
         workforce, manager_agent, enabled_workers
     )
+    snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
     return snapshot
 
 

@@ -581,19 +581,20 @@ def _begin_turn_atomic_sync(
             .one()
         )
 
-        if (
-            kind != TurnKind.CREATE
-            and isinstance(agent_config, dict)
-            and isinstance(agent_config.get("workforce_run_id"), int)
+        if isinstance(agent_config, dict) and isinstance(
+            agent_config.get("workforce_run_id"), int
         ):
-            # Workforce tasks: reject APPEND turns whose owning workforce was
+            # Workforce tasks: reject turns whose owning workforce was
             # archived or whose live config drifted from the run's pinned
-            # fingerprint. CREATE turns are validated upstream by
-            # ``create_workforce_run``. The workforce_run_id probe piggybacks
-            # on the snapshot SELECT above, so non-workforce tasks pay zero
-            # extra roundtrips; a rejection raises before commit, rolling the
-            # claim back and preserving the "only raises before commit"
-            # invariant.
+            # fingerprint. CREATE turns are also gated: although
+            # ``create_workforce_run`` validates upstream, an archive can
+            # commit between that commit and this claim (its cancellation
+            # sweep marks the run cancelled but cannot stop a turn that never
+            # started) — this check is the last line before execution. The
+            # workforce_run_id probe piggybacks on the snapshot SELECT above,
+            # so non-workforce tasks pay zero extra roundtrips; a rejection
+            # raises before commit, rolling the claim back and preserving the
+            # "only raises before commit" invariant.
             from .workforce_runtime import (
                 WorkforceTurnRejectedError,
                 ensure_workforce_turn_allowed,

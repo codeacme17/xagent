@@ -697,3 +697,66 @@ async def test_ws_append_rejection_surfaces_workforce_reason() -> None:
         assert "busy" not in errors[0]["message"]
     finally:
         db.close()
+
+
+async def test_create_turn_guard_rejects_archived_workforce() -> None:
+    """The last-line guard: an archive committing between
+    ``create_workforce_run``'s commit and ``begin_turn``'s claim (the sweep
+    cancels the run but cannot stop a turn that never started) must reject
+    the CREATE turn instead of executing on the archived workforce."""
+    workforce_id = _create_active_workforce("Create Guard Workforce")
+    snapshot = _build_snapshot(workforce_id)
+    task_id, _ = _create_workforce_task_and_run(
+        workforce_id,
+        snapshot=snapshot,
+        task_status=TaskStatus.PENDING,
+        run_status="pending",
+    )
+
+    db = _direct_db_session()
+    try:
+        db.query(Workforce).filter(Workforce.id == workforce_id).update(
+            {"status": "archived"}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(TaskTurnError) as excinfo:
+        await TaskTurnOrchestrator.begin_turn(
+            task_id=task_id,
+            task_owner_user_id=_user_id(),
+            payload=TaskTurnPayload(transcript_message="first message"),
+            kind=TurnKind.CREATE,
+        )
+    assert excinfo.value.reason == "workforce_archived"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.PENDING  # claim rolled back
+    finally:
+        db.close()
+
+
+def test_fingerprint_version_mismatch_exempts_old_pins() -> None:
+    """A fingerprint algorithm change must not spuriously reject runs pinned
+    under the previous algorithm: only same-version pins are compared."""
+    workforce_id = _create_active_workforce("Version Exempt Workforce")
+    snapshot = _build_snapshot(workforce_id)
+
+    # Simulate a run pinned by an older algorithm: wrong version + a value
+    # the current algorithm would never produce.
+    old_snapshot = dict(snapshot)
+    old_snapshot["config_fingerprint"] = "0" * 64
+    old_snapshot["config_fingerprint_version"] = 1
+    task_id, _ = _create_workforce_task_and_run(workforce_id, snapshot=old_snapshot)
+
+    db = _direct_db_session()
+    try:
+        # Exempt despite the mismatched value.
+        ensure_workforce_turn_allowed(
+            db, task_id=task_id, task_owner_user_id=_user_id()
+        )
+    finally:
+        db.close()

@@ -51,9 +51,10 @@ class Deployment(Base):  # type: ignore[no-any-unimported]
     allowed_domains = Column(JSON, nullable=True, default=list)
     widget_key = Column(String(255), nullable=True, unique=True, index=True)
 
-    # Shareable-link channel (public chat page).
+    # Shareable-link channel (public chat page). Like widget_key, the token
+    # is a lookup credential and must resolve to at most one deployment.
     share_enabled = Column(Boolean, default=False, nullable=False)
-    share_token = Column(String(255), nullable=True, index=True)
+    share_token = Column(String(255), nullable=True, unique=True, index=True)
     share_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
