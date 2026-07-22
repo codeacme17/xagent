@@ -6,10 +6,7 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
-import {
-  uploadPublicChatFile,
-  type PublicChatUploadedFile,
-} from "@/lib/public-chat-file-upload"
+import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
@@ -182,16 +179,14 @@ function PublicConversationContent({
         // turn — the connection replays it from history instead. Files
         // picked alongside the first message still get attached to the task
         // workspace so later turns can use them.
-        for (const file of files) {
-          await uploadPublicChatFile({
-            url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
-            accessToken,
-            file,
-            taskType: "task",
-            taskId: newTaskId,
-            fallbackError: t("files.uploadFailed"),
-          })
-        }
+        await Promise.all(files.map((file) => uploadPublicChatFile({
+          url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
+          accessToken,
+          file,
+          taskType: "task",
+          taskId: newTaskId,
+          fallbackError: t("files.uploadFailed"),
+        })))
       }
       setDraftMessage("")
       setDraftFiles([])
@@ -355,22 +350,17 @@ export function PublicAgentChatPage({
       getFilePublicPreviewUrl(fileId, baseUrl),
     buildFileDownloadUrl: ({ baseUrl, fileId }) =>
       getFilePublicDownloadUrl(fileId, baseUrl),
-    uploadFiles: async (files, params) => {
-      const uploadedFiles: PublicChatUploadedFile[] = []
-
-      for (const file of files) {
-        uploadedFiles.push(await uploadPublicChatFile({
+    uploadFiles: (files, params) =>
+      Promise.all(files.map((file) =>
+        uploadPublicChatFile({
           url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
           accessToken: publicAccessToken,
           file,
           taskType: params.taskType,
           taskId: params.taskId,
           fallbackError: t("files.uploadFailed"),
-        }))
-      }
-
-      return uploadedFiles
-    },
+        }),
+      )),
   }), [authMode, publicAccessToken, t])
 
   if (isInitializing) {
