@@ -460,7 +460,7 @@ class AgentStore:
 
         for field, value in updates.items():
             if field == "tool_categories":
-                value = clean_tool_categories(value)
+                value = normalize_tool_categories(value)
             setattr(agent, field, value)
 
         self.db.commit()

@@ -91,6 +91,64 @@ def test_add_agent_empty_tool_categories_persists_empty_list(
     assert agent.tool_categories == []
 
 
+def test_update_agent_fields_preserves_none_tool_categories(
+    db: Session, user_id: int
+) -> None:
+    store = AgentStore(db)
+    agent = store.add_agent(
+        user_id=user_id,
+        name="update-to-unconfigured",
+        description=None,
+        instructions=None,
+        tool_categories=["file"],
+    )
+    db.commit()
+
+    updated = store.update_agent_fields(
+        user_id, int(agent.id), {"tool_categories": None}
+    )
+    assert updated is not None
+    assert updated.tool_categories is None
+
+
+def test_update_agent_fields_keeps_empty_tool_categories(
+    db: Session, user_id: int
+) -> None:
+    store = AgentStore(db)
+    agent = store.add_agent(
+        user_id=user_id,
+        name="update-to-zero-tools",
+        description=None,
+        instructions=None,
+        tool_categories=["file"],
+    )
+    db.commit()
+
+    updated = store.update_agent_fields(user_id, int(agent.id), {"tool_categories": []})
+    assert updated is not None
+    assert updated.tool_categories == []
+
+
+def test_update_agent_fields_strips_unassignable_tool_categories(
+    db: Session, user_id: int
+) -> None:
+    store = AgentStore(db)
+    agent = store.add_agent(
+        user_id=user_id,
+        name="update-strips-unassignable",
+        description=None,
+        instructions=None,
+        tool_categories=[],
+    )
+    db.commit()
+
+    updated = store.update_agent_fields(
+        user_id, int(agent.id), {"tool_categories": ["file", "agent", "other"]}
+    )
+    assert updated is not None
+    assert updated.tool_categories == ["file"]
+
+
 def test_agent_response_dict_renders_null_as_empty_list(
     db: Session, user_id: int
 ) -> None:
