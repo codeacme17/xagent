@@ -759,9 +759,7 @@ async def archive_workforce(
     # that run permanently evade cancellation. Lock ordering: whichever side
     # takes the row lock first fully finishes before the other reads status /
     # sweeps. No-op on SQLite, whose writers serialize anyway.
-    db.query(Workforce.id).filter(
-        Workforce.id == workforce_id_value
-    ).with_for_update().scalar()
+    db.refresh(workforce, with_for_update=True)
     cast(Any, workforce).status = "archived"
     # Archive must also stop what is already running: flipping the status
     # alone leaves in-flight runs executing (turn resolution never re-checks
