@@ -974,6 +974,69 @@ def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> N
         db.close()
 
 
+def _create_widget_task(guest_headers: dict[str, str], agent_id: int) -> Any:
+    return client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "hello",
+            "description": "hello",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+
+
+def test_disabled_widget_invalidates_existing_guest_tokens() -> None:
+    """Disabling an agent's widget must invalidate already-issued guest JWTs
+    on their next request (mirrors the workforce/share widget path)."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Disable Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    # Sanity: the guest token works while the widget is enabled.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    disabled = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_rotated_widget_key_invalidates_existing_guest_tokens() -> None:
+    """Rotating an agent's widget key must invalidate already-issued guest
+    JWTs on their next request."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Rotate Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
 def test_share_link_requires_published_agent() -> None:
     headers = _admin_headers()
     owner_id = _user_id("admin")
