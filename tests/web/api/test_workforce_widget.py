@@ -22,7 +22,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.models.workforce import WorkforceRun
 from xagent.web.services import workforce_runs as workforce_runs_service
 
 from .conftest import (
@@ -106,7 +106,9 @@ def _enable_widget(
         headers=_admin_headers(),
         json={
             "widget_enabled": True,
-            "allowed_domains": allowed_domains if allowed_domains is not None else ["*"],
+            "allowed_domains": allowed_domains
+            if allowed_domains is not None
+            else ["*"],
         },
     )
     assert response.status_code == 200, response.text
@@ -159,9 +161,7 @@ def test_widget_enable_rotate_disable_lifecycle() -> None:
     headers = _admin_headers()
 
     # Default state: widget is opt-in and starts disabled with no key.
-    initial = client.get(
-        f"/api/workforces/{workforce_id}/widget-key", headers=headers
-    )
+    initial = client.get(f"/api/workforces/{workforce_id}/widget-key", headers=headers)
     assert initial.status_code == 200, initial.text
     assert initial.json() == {
         "workforce_id": workforce_id,
@@ -188,9 +188,7 @@ def test_widget_enable_rotate_disable_lifecycle() -> None:
     finally:
         db.close()
 
-    fetched = client.get(
-        f"/api/workforces/{workforce_id}/widget-key", headers=headers
-    )
+    fetched = client.get(f"/api/workforces/{workforce_id}/widget-key", headers=headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["widget_key"] == key
     assert fetched.json()["allowed_domains"] == ["example.com"]

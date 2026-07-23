@@ -19,6 +19,7 @@ from .agent_team_scope import (
     validate_team_agent_connectors,
     validate_team_agent_knowledge_bases,
 )
+
 # Single source of truth for the widget embed credential; re-exported here so
 # existing ``from ..services.agent_store import new_widget_key`` callers keep
 # working (the agent and workforce channels mint the same kind of key).

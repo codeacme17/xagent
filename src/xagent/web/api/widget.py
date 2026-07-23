@@ -195,9 +195,7 @@ def _resolve_widget_owner_by_key(db: Session, widget_key: str) -> ResolvedWidget
     )
     if deployment is not None:
         workforce = (
-            db.query(Workforce)
-            .filter(Workforce.id == int(deployment.owner_id))
-            .first()
+            db.query(Workforce).filter(Workforce.id == int(deployment.owner_id)).first()
         )
         if workforce is not None and workforce.status == "active":
             return ResolvedWidgetOwner(
@@ -363,9 +361,7 @@ async def authenticate_widget(
 
     if owner.workforce is not None:
         workforce = owner.workforce
-        user = (
-            db.query(User).filter(User.id == int(workforce.owner_user_id)).first()
-        )
+        user = db.query(User).filter(User.id == int(workforce.owner_user_id)).first()
         if not user:
             raise HTTPException(status_code=401, detail="Widget owner not found")
         access_token = create_public_chat_access_token(

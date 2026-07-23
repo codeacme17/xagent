@@ -654,9 +654,7 @@ async def _create_workforce_widget_chat_task(
     if request.agent_id is not None:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
 
-    workforce = (
-        db.query(Workforce).filter(Workforce.id == widget_workforce_id).first()
-    )
+    workforce = db.query(Workforce).filter(Workforce.id == widget_workforce_id).first()
     if workforce is None:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
 
