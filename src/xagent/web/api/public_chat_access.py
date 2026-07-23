@@ -69,6 +69,9 @@ class PublicChatAccessContext:
     guest_id: str
     auth_mode: str = "widget"
     widget_agent_id: int | None = None
+    # Set instead of ``widget_agent_id`` when the widget key exposes a
+    # workforce. Exactly one of the two is populated for a widget guest.
+    widget_workforce_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,39 @@ def ensure_share_workforce_available(
     return workforce
 
 
+def ensure_widget_workforce_available(
+    db: Session,
+    widget_workforce_id: int,
+    user_id: int,
+    *,
+    expected_widget_key: str | None = None,
+) -> Workforce:
+    """Resolve a widget-guest workforce id to a live, widget-enabled workforce.
+
+    Mirrors :func:`ensure_share_workforce_available` for the widget channel:
+    the credential lives in the workforce's ``deployments`` row, so disabling
+    the widget or rotating its key (``expected_widget_key`` mismatch) revokes
+    every outstanding guest token on its next request. External access requires
+    the workforce to still be published (``status == "active"``).
+    """
+    workforce = db.query(Workforce).filter(Workforce.id == widget_workforce_id).first()
+    deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, widget_workforce_id)
+    if (
+        not workforce
+        or int(workforce.owner_user_id) != user_id
+        or workforce.status != "active"
+        or deployment is None
+        or not deployment.widget_enabled
+        or not deployment.widget_key
+        or (
+            expected_widget_key is not None
+            and deployment.widget_key != expected_widget_key
+        )
+    ):
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    return workforce
+
+
 def get_public_chat_user(
     token: str,
     db: Session,
@@ -168,6 +204,8 @@ def get_public_chat_user(
         guest_id = payload.get("guest_id")
         auth_mode = payload.get("auth_mode") or "widget"
         widget_agent_id = payload.get("widget_agent_id")
+        widget_workforce_id = payload.get("widget_workforce_id")
+        widget_key = payload.get("widget_key")
         if expected_auth_mode and auth_mode != expected_auth_mode:
             raise HTTPException(status_code=403, detail="Access denied")
 
@@ -181,18 +219,35 @@ def get_public_chat_user(
         if not user:
             raise ValueError("User not found")
 
-        if auth_mode == "widget":
-            if not isinstance(widget_agent_id, int):
-                raise ValueError("Invalid widget token payload")
+        if isinstance(widget_workforce_id, int):
+            # Workforce widget: re-validate the deployment on every use so
+            # disabling the widget or rotating its key cuts off live guests,
+            # mirroring the workforce share path.
+            ensure_widget_workforce_available(
+                db,
+                widget_workforce_id,
+                int(user_id),
+                expected_widget_key=widget_key
+                if isinstance(widget_key, str) and widget_key
+                else None,
+            )
+            return PublicChatAccessContext(
+                user=user,
+                channel_id=channel_id,
+                guest_id=guest_id,
+                auth_mode=auth_mode,
+                widget_workforce_id=widget_workforce_id,
+            )
+
+        if not isinstance(widget_agent_id, int):
+            raise ValueError("Invalid widget token payload")
 
         return PublicChatAccessContext(
             user=user,
             channel_id=channel_id,
             guest_id=guest_id,
             auth_mode=auth_mode,
-            widget_agent_id=widget_agent_id
-            if isinstance(widget_agent_id, int)
-            else None,
+            widget_agent_id=widget_agent_id,
         )
     except Exception as exc:
         logger.error("Public chat token validation error: %s", exc)
@@ -283,9 +338,60 @@ def build_share_chat_dependency() -> Callable[..., ShareChatAccessContext]:
     return dependency
 
 
+def _get_task_for_workforce_widget_context(
+    db: Session, task_id: int, access_context: PublicChatAccessContext
+) -> Task:
+    """Scope a widget guest to a workforce-widget task.
+
+    Mirrors :func:`_get_task_for_workforce_share_context` but retains the
+    widget channel's per-guest isolation: the task must belong to this guest
+    (``guest_id``), target this workforce, and be backed by a real
+    ``WorkforceRun`` row (so a guest cannot address an arbitrary task id).
+    """
+    widget_workforce_id = access_context.widget_workforce_id
+    assert widget_workforce_id is not None
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.user_id == access_context.user.id,
+        )
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
+    if task.channel_id is not None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    if not isinstance(task.agent_config, dict):
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    if task.agent_config.get("auth_mode") != "widget":
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    if task.agent_config.get("guest_id") != access_context.guest_id:
+        raise HTTPException(status_code=403, detail="Access denied for this guest")
+    if int(task.agent_config.get("widget_workforce_id") or 0) != widget_workforce_id:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    workforce_run_id = task.agent_config.get("workforce_run_id")
+    if not isinstance(workforce_run_id, int):
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    run = (
+        db.query(WorkforceRun)
+        .filter(
+            WorkforceRun.id == workforce_run_id,
+            WorkforceRun.task_id == int(task.id),
+            WorkforceRun.workforce_id == widget_workforce_id,
+        )
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+    return task
+
+
 def get_task_for_public_context(
     db: Session, task_id: int, access_context: PublicChatAccessContext
 ) -> Task:
+    if access_context.widget_workforce_id is not None:
+        return _get_task_for_workforce_widget_context(db, task_id, access_context)
     task = (
         db.query(Task)
         .filter(
@@ -410,7 +516,37 @@ async def upload_public_chat_files(
         raise HTTPException(status_code=422, detail="No files provided")
 
     if not task_id:
-        raise HTTPException(status_code=400, detail="task_id is required")
+        # A workforce widget session starts its first turn inside task
+        # creation, so its opening-message attachments must be uploaded BEFORE
+        # any task exists and then threaded in as selected_file_ids. Allow that
+        # task-less upload only for workforce widget guests; the agent widget
+        # path still requires an existing task (files ride the first WS
+        # message), preserving its task_id-required contract. Mirrors
+        # ``upload_share_chat_files``.
+        if access_context.widget_workforce_id is None:
+            raise HTTPException(status_code=400, detail="task_id is required")
+        # Reachable by anyone holding the widget credential before any task
+        # (hence any owner association) exists, so cap the per-request file
+        # count to blunt the worst abuse case cheaply — mirroring the share
+        # task-less path. Owner storage quota + GC of orphaned (task_id IS
+        # NULL) rows are tracked as hardening in #973.
+        if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Too many files in one request "
+                    f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
+                ),
+            )
+        return await store_uploaded_files(
+            upload_items=upload_items,
+            task_type=task_type,
+            task_id=None,
+            folder=folder,
+            user=access_context.user,
+            db=db,
+            single_file_mode=file is not None and (not files),
+        )
 
     try:
         parsed_task_id = int(task_id)
@@ -499,6 +635,58 @@ async def upload_share_chat_files(
     )
 
 
+async def _create_workforce_widget_chat_task(
+    *,
+    request: TaskCreateRequest,
+    access_context: PublicChatAccessContext,
+    db: Session,
+) -> TaskCreateResponse:
+    """Guest task creation for a widget-embedded workforce.
+
+    Like the workforce share path, a workforce session must enter through
+    ``create_workforce_run`` (which pins the config snapshot, creates the
+    ``WorkforceRun`` record, and begins the first turn) rather than the agent
+    widget path's bare PENDING task. ``guest_id`` is threaded into the config
+    so the widget channel keeps its per-guest task isolation.
+    """
+    widget_workforce_id = access_context.widget_workforce_id
+    assert widget_workforce_id is not None
+    if request.agent_id is not None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+
+    workforce = (
+        db.query(Workforce).filter(Workforce.id == widget_workforce_id).first()
+    )
+    if workforce is None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
+
+    result = await create_workforce_run(
+        db,
+        access_context.user,
+        workforce,
+        message=request.description or "",
+        selected_file_ids=request.files,
+        source="widget",
+        is_visible=False,
+        extra_agent_config={
+            "auth_mode": "widget",
+            "widget_workforce_id": int(workforce.id),
+            "guest_id": access_context.guest_id,
+        },
+    )
+    task = result.task
+    return TaskCreateResponse(
+        task_id=task.id,
+        title=task.title,
+        status=task.status.value,
+        created_at=format_datetime_for_api(task.created_at)
+        if task.created_at
+        else None,
+        channel_id=task.channel_id,
+        channel_name=task.channel_name,
+    )
+
+
 async def create_public_chat_task(
     *,
     request: TaskCreateRequest,
@@ -506,6 +694,11 @@ async def create_public_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if access_context.widget_workforce_id is not None:
+        return await _create_workforce_widget_chat_task(
+            request=request, access_context=access_context, db=db
+        )
+
     task_description = request.description or ""
 
     channel = (

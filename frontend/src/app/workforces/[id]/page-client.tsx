@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, History, LayoutDashboard, MessageSquare, Share } from "lucide-react"
+import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Share } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -32,6 +32,7 @@ import {
     WorkforceConfigPanel,
     WorkforceRunsList,
     WorkforceShareDialog,
+    WorkforceWidgetDialog,
     WorkforceStatusBadge,
     type WorkerEditState,
 } from "@/components/workforce"
@@ -60,6 +61,7 @@ export default function WorkforceDetailPage() {
     const [error, setError] = useState<string | null>(null)
     const [activeView, setActiveView] = useState<ActiveView>("configure")
     const [isShareDialogOpen, setIsShareDialogOpen] = useState(false)
+    const [isWidgetDialogOpen, setIsWidgetDialogOpen] = useState(false)
 
     const previewTaskIdRef = useRef<number | null>(null)
     const isArchived = workforce?.status === "archived"
@@ -368,6 +370,12 @@ export default function WorkforceDetailPage() {
                             {t("workforces.actions.share")}
                         </Button>
                     )}
+                    {!isArchived && (
+                        <Button variant="outline" size="sm" onClick={() => setIsWidgetDialogOpen(true)} disabled={saving}>
+                            <LayoutGrid className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.embed")}
+                        </Button>
+                    )}
                     {workforce.status === "active" ? (
                         <Button variant="outline" size="sm" onClick={unpublishCurrentWorkforce} disabled={saving || !!isArchived}>
                             {t("workforces.actions.unpublish")}
@@ -384,6 +392,12 @@ export default function WorkforceDetailPage() {
                 workforce={workforce}
                 open={isShareDialogOpen}
                 onClose={() => setIsShareDialogOpen(false)}
+            />
+
+            <WorkforceWidgetDialog
+                workforce={workforce}
+                open={isWidgetDialogOpen}
+                onClose={() => setIsWidgetDialogOpen(false)}
             />
 
             {/* Body: main view + test panel */}
