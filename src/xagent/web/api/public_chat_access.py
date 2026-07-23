@@ -43,6 +43,12 @@ from .websocket import (
 logger = logging.getLogger(__name__)
 db_session_context = contextmanager(get_db)
 
+# Cap on files per task-less share upload request. This path predates any
+# task/owner association (workforce first-turn attachments), so it is the one
+# public-share write surface with no downstream owner scoping; the cap blocks
+# the worst single-request abuse. Broader quota + orphan GC tracked in #973.
+MAX_TASKLESS_SHARE_UPLOAD_FILES = 10
+
 
 class PublicChatAuthResponse(BaseModel):
     access_token: str
@@ -310,7 +316,12 @@ def _get_task_for_workforce_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:
     workforce = access_context.workforce
-    assert workforce is not None
+    # Callers today only reach here behind an `if workforce is not None`
+    # guard, but raise explicitly rather than assert: `python -O` strips
+    # asserts, and this is an auth boundary — a future unguarded caller must
+    # fail closed, not fall through with workforce=None.
+    if workforce is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
     workforce_id = int(workforce.id)
     task = (
         db.query(Task)
@@ -448,6 +459,19 @@ async def upload_share_chat_files(
         # message), preserving its task_id-required contract.
         if access_context.workforce is None:
             raise HTTPException(status_code=400, detail="task_id is required")
+        # This branch is reachable by anyone holding the public share link
+        # before any task (hence any owner association) exists, so cap the
+        # per-request file count to blunt the worst abuse case cheaply.
+        # Owner storage quota + GC of orphaned (task_id IS NULL) rows are
+        # tracked as hardening in #973.
+        if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Too many files in one request "
+                    f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
+                ),
+            )
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
@@ -570,7 +594,9 @@ async def _create_workforce_share_chat_task(
     binds them to its task and the first turn actually sees them.
     """
     workforce = access_context.workforce
-    assert workforce is not None
+    # Auth boundary: fail closed rather than assert (stripped under -O).
+    if workforce is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
     if request.agent_id is not None:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
 

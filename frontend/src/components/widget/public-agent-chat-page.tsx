@@ -117,6 +117,14 @@ function PublicConversationContent({
       return
     }
 
+    // For a workforce share the first turn starts inside task creation, which
+    // rejects an empty message server-side (400) — AFTER any files uploaded
+    // above would already be orphaned. Guard the empty case here so files are
+    // never uploaded for a turn that cannot start.
+    if (workforceId && !message.trim()) {
+      return
+    }
+
     setIsBootstrappingTask(true)
     try {
       const taskPayload: Record<string, string | number | string[]> = {

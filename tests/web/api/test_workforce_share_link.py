@@ -597,6 +597,53 @@ def test_workforce_share_first_turn_attachments_reach_run(
         db.close()
 
 
+def test_taskless_share_upload_enforces_file_count_cap() -> None:
+    """R1-1: the task-less workforce-share upload path is reachable by any
+    share-link holder before a task/owner exists, so it caps files per
+    request to blunt the worst storage-abuse case."""
+    from xagent.web.api.public_chat_access import MAX_TASKLESS_SHARE_UPLOAD_FILES
+
+    workforce_id = _create_workforce("Upload Cap Workforce")
+    token = _enable_share(workforce_id)
+    guest_headers = _authenticate_share_guest(token)
+
+    over_cap = [
+        (
+            "files",
+            (f"f{i}.txt", io.BytesIO(b"x"), "text/plain"),
+        )
+        for i in range(MAX_TASKLESS_SHARE_UPLOAD_FILES + 1)
+    ]
+    rejected = client.post(
+        "/api/share/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files=over_cap,
+    )
+    assert rejected.status_code == 422, rejected.text
+    assert str(MAX_TASKLESS_SHARE_UPLOAD_FILES) in rejected.json()["detail"]
+
+
+def test_rotate_before_enable_leaves_link_disabled() -> None:
+    """R1-3: rotating before any enable must not expose the workforce — the
+    deployment row carries a token but stays disabled, so auth rejects it."""
+    workforce_id = _create_workforce("Rotate First Workforce")
+    headers = _admin_headers()
+
+    rotated = client.post(
+        f"/api/workforces/{workforce_id}/share-link/rotate", headers=headers
+    )
+    assert rotated.status_code == 200, rotated.text
+    body = rotated.json()
+    assert body["share_enabled"] is False
+    token = body["share_token"]
+    assert token
+
+    # A tokened-but-disabled link authenticates no one.
+    auth = client.post("/api/share/auth", json={"share_token": token})
+    assert auth.status_code == 404, auth.text
+
+
 def test_agent_share_taskless_upload_still_requires_task_id() -> None:
     """The task-less upload relaxation is workforce-only; the agent share
     path keeps its task_id-required contract (files ride the first WS turn)."""
