@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import secrets
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.deployment import Deployment, DeploymentOwnerType
@@ -35,12 +36,28 @@ def get_deployment(
 def get_or_create_deployment(
     db: Session, owner_type: DeploymentOwnerType, owner_id: int
 ) -> Deployment:
-    """Return the owner's deployment row, inserting (flush, no commit) if absent."""
+    """Return the owner's deployment row, inserting (flush, no commit) if absent.
+
+    The insert races against ``uq_deployment_owner``: two near-simultaneous
+    callers (double-click, two tabs) both see no row and both try to insert.
+    The loser's flush raises ``IntegrityError``; recover by rolling back and
+    re-reading the winner's row so the caller resolves idempotently instead
+    of surfacing a 500. Callers invoke this as the first mutation of their
+    transaction, so the rollback discards nothing else.
+    """
     deployment = get_deployment(db, owner_type, owner_id)
-    if deployment is None:
-        deployment = Deployment(owner_type=owner_type.value, owner_id=int(owner_id))
-        db.add(deployment)
+    if deployment is not None:
+        return deployment
+    deployment = Deployment(owner_type=owner_type.value, owner_id=int(owner_id))
+    db.add(deployment)
+    try:
         db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = get_deployment(db, owner_type, owner_id)
+        if existing is None:
+            raise
+        return existing
     return deployment
 
 

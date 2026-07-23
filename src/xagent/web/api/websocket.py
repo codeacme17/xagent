@@ -4178,8 +4178,14 @@ async def _handle_chat_message_unserialized(
                         # not project that onto the WorkforceRun; without an
                         # explicit sync a multi-turn APPEND leaves the run
                         # stuck on its previous terminal status in runs
-                        # history. Terminal statuses re-sync on completion,
-                        # so a failure here is non-fatal.
+                        # history. This is a best-effort projection, not a
+                        # guaranteed-fresh read: begin_turn commits in its own
+                        # DB session, so this ``db.refresh`` may not observe
+                        # that commit yet and the sync can no-op on a stale
+                        # terminal status. That is acceptable — terminal
+                        # statuses re-sync on completion, so a stale/failed
+                        # projection here only delays the "running" flip and
+                        # is non-fatal.
                         if is_workforce_task(task):
                             try:
                                 db.refresh(task)

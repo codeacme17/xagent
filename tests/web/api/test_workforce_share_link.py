@@ -18,6 +18,7 @@ import pytest
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import workforce_runs as workforce_runs_service
@@ -225,8 +226,94 @@ def test_share_link_mutations_rejected_for_archived_workforce() -> None:
     archived = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
     assert archived.status_code == 200, archived.text
 
+    # enable/rotate re-expose the workforce, so they stay blocked on archive.
     enabled = client.post(f"/api/workforces/{workforce_id}/share-link", headers=headers)
     assert enabled.status_code == 409, enabled.text
+    rotated = client.post(
+        f"/api/workforces/{workforce_id}/share-link/rotate", headers=headers
+    )
+    assert rotated.status_code == 409, rotated.text
+
+
+def test_share_link_disable_allowed_for_archived_workforce() -> None:
+    """m2: disable only removes access, so it stays available (idempotent
+    revoke) on an archived workforce, unlike enable/rotate."""
+    workforce_id = _create_workforce("Archived Disable Workforce")
+    headers = _admin_headers()
+    _enable_share(workforce_id)
+
+    archived = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
+    assert archived.status_code == 200, archived.text
+
+    disabled = client.delete(
+        f"/api/workforces/{workforce_id}/share-link", headers=headers
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["share_enabled"] is False
+    assert disabled.json()["share_token"] is None
+
+
+def test_rotate_preserves_disabled_state() -> None:
+    """m1: rotating a disabled link only replaces the token; it must not
+    silently re-enable public access."""
+    workforce_id = _create_workforce("Rotate Preserve Workforce")
+    headers = _admin_headers()
+    _enable_share(workforce_id)
+
+    disabled = client.delete(
+        f"/api/workforces/{workforce_id}/share-link", headers=headers
+    )
+    assert disabled.status_code == 200, disabled.text
+
+    rotated = client.post(
+        f"/api/workforces/{workforce_id}/share-link/rotate", headers=headers
+    )
+    assert rotated.status_code == 200, rotated.text
+    body = rotated.json()
+    assert body["share_enabled"] is False  # preserved, not force-enabled
+    assert body["share_token"]  # token still rotated
+
+
+def test_get_or_create_deployment_recovers_from_insert_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """m3: a concurrent insert losing the uq_deployment_owner race must
+    resolve to the winner's row, not surface an IntegrityError as a 500."""
+    from xagent.web.services import deployments as deployments_service
+
+    workforce_id = _create_workforce("Race Workforce")
+
+    db = _direct_db_session()
+    try:
+        # The winner's row already exists in the DB.
+        winner = Deployment(
+            owner_type=DeploymentOwnerType.WORKFORCE.value,
+            owner_id=workforce_id,
+            share_enabled=True,
+            share_token="winner-token",
+        )
+        db.add(winner)
+        db.commit()
+
+        # Simulate the TOCTOU: the pre-insert lookup sees nothing, so this
+        # caller tries to insert and trips the unique constraint.
+        calls = {"n": 0}
+        real_get = deployments_service.get_deployment
+
+        def _racy_get(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real_get(*args, **kwargs)
+
+        monkeypatch.setattr(deployments_service, "get_deployment", _racy_get)
+
+        resolved = deployments_service.get_or_create_deployment(
+            db, DeploymentOwnerType.WORKFORCE, workforce_id
+        )
+        assert resolved.share_token == "winner-token"
+    finally:
+        db.close()
 
 
 # ===== Public share auth =====
@@ -302,6 +389,26 @@ def test_rotated_workforce_share_token_invalidates_existing_guest_tokens() -> No
     assert stale.status_code == 404, stale.text
 
     # Previously issued guest JWTs are invalidated by the token mismatch.
+    response = client.post(
+        "/api/share/chat/task/create",
+        headers=guest_headers,
+        json={"title": "hello", "description": "hello"},
+    )
+    assert response.status_code == 403, response.text
+
+
+def test_disabled_workforce_share_invalidates_existing_guest_tokens() -> None:
+    """Disabling a link (not just rotating) must invalidate already-issued
+    guest JWTs on their next request."""
+    workforce_id = _create_workforce("Disable Invalidate Workforce")
+    token = _enable_share(workforce_id)
+    guest_headers = _authenticate_share_guest(token)
+
+    disabled = client.delete(
+        f"/api/workforces/{workforce_id}/share-link", headers=_admin_headers()
+    )
+    assert disabled.status_code == 200, disabled.text
+
     response = client.post(
         "/api/share/chat/task/create",
         headers=guest_headers,
@@ -440,6 +547,87 @@ def test_share_guest_can_upload_to_own_shared_task(
         files={"file": ("note.txt", io.BytesIO(b"hello"), "text/plain")},
     )
     assert upload.status_code == 200, upload.text
+
+
+def test_workforce_share_first_turn_attachments_reach_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: opening-message files are uploaded task-lessly, then threaded into
+    the run's task so the very first turn actually sees them."""
+    workforce_id = _create_workforce("First Turn File Workforce")
+    token = _enable_share(workforce_id)
+    guest_headers = _authenticate_share_guest(token)
+    _stub_begin_turn(monkeypatch)
+
+    # 1) Task-less upload is allowed for workforce guests (no task exists yet).
+    upload = client.post(
+        "/api/share/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("brief.txt", io.BytesIO(b"trip brief"), "text/plain")},
+    )
+    assert upload.status_code == 200, upload.text
+    file_id = upload.json()["file_id"]
+
+    db = _direct_db_session()
+    try:
+        pre = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert pre.task_id is None  # not yet bound to any task
+    finally:
+        db.close()
+
+    # 2) Create the run with that file id: it must bind to the run's task.
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "summarize",
+            "description": "summarize this",
+            "files": [file_id],
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        bound = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert bound.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_agent_share_taskless_upload_still_requires_task_id() -> None:
+    """The task-less upload relaxation is workforce-only; the agent share
+    path keeps its task_id-required contract (files ride the first WS turn)."""
+    _admin_headers()
+    owner_id = _user_id()
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=owner_id,
+            name="Plain Upload Agent",
+            description="d",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            share_enabled=True,
+            share_token="agent-taskless-token",
+        )
+        db.add(agent)
+        db.commit()
+    finally:
+        db.close()
+    guest_headers = _authenticate_share_guest("agent-taskless-token")
+
+    upload = client.post(
+        "/api/share/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("note.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert upload.status_code == 400, upload.text
+    assert upload.json()["detail"] == "task_id is required"
 
 
 def test_agent_share_guest_cannot_access_workforce_task(

@@ -440,7 +440,23 @@ async def upload_share_chat_files(
         raise HTTPException(status_code=422, detail="No files provided")
 
     if not task_id:
-        raise HTTPException(status_code=400, detail="task_id is required")
+        # A workforce share session starts its first turn inside task
+        # creation, so its opening-message attachments must be uploaded
+        # BEFORE any task exists and then threaded in as selected_file_ids.
+        # Allow that task-less upload only for workforce guests; the agent
+        # path still requires an existing task (files ride the first WS
+        # message), preserving its task_id-required contract.
+        if access_context.workforce is None:
+            raise HTTPException(status_code=400, detail="task_id is required")
+        return await store_uploaded_files(
+            upload_items=upload_items,
+            task_type=task_type,
+            task_id=None,
+            folder=folder,
+            user=access_context.user,
+            db=db,
+            single_file_mode=file is not None and (not files),
+        )
 
     try:
         parsed_task_id = int(task_id)
@@ -548,6 +564,10 @@ async def _create_workforce_share_chat_task(
     through ``create_workforce_run``: it pins the config snapshot, creates the
     ``WorkforceRun`` record, and begins the first turn with the guest's
     message — so ``request.description`` doubles as the opening message.
+
+    Opening-message attachments are uploaded task-lessly by the client first
+    (there is no task yet), then passed here as ``request.files`` so the run
+    binds them to its task and the first turn actually sees them.
     """
     workforce = access_context.workforce
     assert workforce is not None
@@ -559,6 +579,7 @@ async def _create_workforce_share_chat_task(
         access_context.user,
         workforce,
         message=request.description or "",
+        selected_file_ids=request.files,
         source="shared_link",
         is_visible=False,
         extra_agent_config={

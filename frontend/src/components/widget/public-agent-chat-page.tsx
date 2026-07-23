@@ -119,7 +119,7 @@ function PublicConversationContent({
 
     setIsBootstrappingTask(true)
     try {
-      const taskPayload: Record<string, string | number> = {
+      const taskPayload: Record<string, string | number | string[]> = {
         title: message,
         description: message,
       }
@@ -128,6 +128,21 @@ function PublicConversationContent({
       }
 
       setCreateTaskError(null)
+
+      // Workforce shares start their first turn inside task creation, so any
+      // opening-message attachments must be uploaded (task-lessly — no task
+      // exists yet) and threaded in as file ids BEFORE the run begins;
+      // otherwise the first turn never sees them.
+      if (workforceId && files?.length) {
+        const uploaded = await Promise.all(files.map((file) => uploadPublicChatFile({
+          url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
+          accessToken,
+          file,
+          taskType: "task",
+          fallbackError: t("files.uploadFailed"),
+        })))
+        taskPayload.files = uploaded.map((item) => item.file_id)
+      }
 
       const response = await fetch(`${getApiUrl()}${publicApiPrefix}/chat/task/create`, {
         method: "POST",
@@ -172,22 +187,11 @@ function PublicConversationContent({
 
       if (!workforceId) {
         await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
-      } else if (files?.length) {
-        // Workforce share sessions start their first turn inside task
-        // creation (the backend routes it through create_workforce_run), so
-        // sending the message again over the websocket would duplicate the
-        // turn — the connection replays it from history instead. Files
-        // picked alongside the first message still get attached to the task
-        // workspace so later turns can use them.
-        await Promise.all(files.map((file) => uploadPublicChatFile({
-          url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
-          accessToken,
-          file,
-          taskType: "task",
-          taskId: newTaskId,
-          fallbackError: t("files.uploadFailed"),
-        })))
       }
+      // Workforce share sessions already started their first turn (with the
+      // files threaded in above) inside task creation — the connection
+      // replays it from history, so re-sending over the websocket would
+      // duplicate the turn.
       setDraftMessage("")
       setDraftFiles([])
     } catch (error) {

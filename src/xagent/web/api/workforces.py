@@ -951,7 +951,12 @@ async def rotate_workforce_share_link(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> WorkforceShareLinkResponse:
-    """Rotate the public share link token for an active workforce."""
+    """Rotate the public share link token for an active workforce.
+
+    Rotation only replaces the token; it preserves the current
+    ``share_enabled`` state rather than force-enabling, so resetting a
+    disabled link does not silently re-expose the workforce.
+    """
     workforce = ensure_workforce_access(
         db, user, _load_workforce(db, workforce_id), action="edit"
     )
@@ -960,7 +965,6 @@ async def rotate_workforce_share_link(
         deployment = get_or_create_deployment(
             db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
         )
-        cast(Any, deployment).share_enabled = True
         cast(Any, deployment).share_token = new_share_token()
         cast(Any, deployment).share_updated_at = datetime.now(timezone.utc)
     return _serialize_workforce_share_link(workforce, deployment)
@@ -972,10 +976,19 @@ async def disable_workforce_share_link(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> WorkforceShareLinkResponse:
-    """Disable and revoke the public share link for a workforce."""
-    workforce = ensure_workforce_access(
-        db, user, _load_workforce(db, workforce_id), action="edit"
-    )
+    """Disable and revoke the public share link for a workforce.
+
+    Revocation is idempotent and, unlike enable/rotate, is allowed on
+    archived workforces: it only ever *removes* access, so it mirrors the
+    read endpoint's permission check (``can_edit_workforce`` without the
+    archived-edit 409) for symmetry rather than routing through
+    ``ensure_workforce_access(action="edit")``.
+    """
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
     deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, int(workforce.id))
     if deployment is not None:
         with _commit_or_rollback(db):
