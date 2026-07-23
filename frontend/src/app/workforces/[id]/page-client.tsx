@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Share } from "lucide-react"
+import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Share, Webhook } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -36,6 +36,7 @@ import {
     WorkforceStatusBadge,
     type WorkerEditState,
 } from "@/components/workforce"
+import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ResizableSplitLayout } from "@/components/layout/resizable-split-layout"
 import { Button } from "@/components/ui/button"
@@ -60,6 +61,7 @@ export default function WorkforceDetailPage() {
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [activeView, setActiveView] = useState<ActiveView>("configure")
+    const [triggersOpen, setTriggersOpen] = useState(false)
     const [isShareDialogOpen, setIsShareDialogOpen] = useState(false)
     const [isWidgetDialogOpen, setIsWidgetDialogOpen] = useState(false)
 
@@ -360,6 +362,17 @@ export default function WorkforceDetailPage() {
                 <div className="flex items-center gap-2">
                     {error && <span className="text-xs text-red-500">{error}</span>}
                     {!isArchived && (
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setTriggersOpen(true)}
+                            disabled={saving}
+                        >
+                            <Webhook className="mr-1.5 h-3.5 w-3.5" />
+                            {t("workforces.actions.triggers")}
+                        </Button>
+                    )}
+                    {!isArchived && (
                         <Button variant="ghost" size="sm" onClick={archiveCurrentWorkforce} disabled={saving}>
                             {t("workforces.actions.archive")}
                         </Button>
@@ -462,6 +475,14 @@ export default function WorkforceDetailPage() {
                     }
                 />
             </div>
+
+            <AgentTriggersDialog
+                agentId={null}
+                owner={{ kind: "workforce", id: id ?? workforce.id }}
+                agentName={workforce.name}
+                open={triggersOpen}
+                onOpenChange={setTriggersOpen}
+            />
         </div>
     )
 }

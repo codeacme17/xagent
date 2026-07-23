@@ -3749,6 +3749,7 @@ const zh = {
       publish: "发布",
       unpublish: "取消发布",
       archive: "归档",
+      triggers: "触发器",
       share: "分享",
       embed: "嵌入",
       createTeam: "创建团队",
