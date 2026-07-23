@@ -20,7 +20,12 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260722_add_workforce_id_to_agent_api_keys"
-down_revision: Union[str, None] = "20260721_add_workforce_deployment_foundation"
+# Re-parented onto #950's workforce-triggers migration when the REST/SDK
+# and webhook channels merged, linearizing what were two heads off
+# 20260721_add_workforce_deployment_foundation. The two are additive and
+# order-independent (this one adds agent_api_keys.workforce_id; the other
+# adds the workforce trigger tables).
+down_revision: Union[str, None] = "20260722_add_workforce_triggers"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

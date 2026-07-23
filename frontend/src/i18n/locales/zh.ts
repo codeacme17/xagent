@@ -3760,6 +3760,7 @@ const zh = {
       unpublish: "取消发布",
       archive: "归档",
       deploy: "部署",
+      triggers: "触发器",
       share: "分享",
       createTeam: "创建团队",
       change: "更换",
