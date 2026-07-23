@@ -229,8 +229,14 @@ export function AgentTriggersDialog({
   const stagedTriggersProp = staged?.triggers ?? null
   const isStaging = !isValidAgentId(agentId) && stagedTriggersProp !== null
   // The live-CRUD target. Explicit owner (e.g. a workforce) wins; otherwise
-  // fall back to the agent. Memoized on primitives so it stays referentially
-  // stable across renders and can safely sit in effect/callback deps.
+  // fall back to the agent. Memoized on the owner's primitive fields (not the
+  // `owner` object identity) so an inline object literal from the caller still
+  // yields a referentially stable value safe for effect/callback deps.
+  //
+  // ASSUMPTION: callers pass owner by value (kind + id), never relying on a
+  // stable object reference. If a future caller memoizes `owner` and expects
+  // identity-based change detection, revisit these deps — an owner whose
+  // primitives are unchanged but whose reference changed will NOT re-run this.
   const resolvedOwner = useMemo<TriggerOwnerRef | null>(() => {
     if (owner) return owner
     if (isValidAgentId(agentId)) return { kind: "agent", id: agentId }

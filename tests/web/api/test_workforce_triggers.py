@@ -218,6 +218,50 @@ def test_workforce_trigger_crud_roundtrip() -> None:
     )
 
 
+def test_create_trigger_requires_exactly_one_owner() -> None:
+    db = _direct_db_session()
+    try:
+        with pytest.raises(trigger_service.TriggerServiceError, match="exactly one"):
+            trigger_service._create_trigger(
+                db, user_id=1, agent_id=1, workforce_id=1, trigger_type="webhook"
+            )
+        with pytest.raises(trigger_service.TriggerServiceError, match="exactly one"):
+            trigger_service._create_trigger(db, user_id=1, trigger_type="webhook")
+    finally:
+        db.close()
+
+
+def test_workforce_trigger_rejects_connector_runtime_context() -> None:
+    headers = _admin_headers()
+    workforce_id = _create_workforce(headers)
+
+    # A connector-runtime payload validates for agent triggers but the
+    # workforce run path is selection-only, so it must be rejected up front
+    # rather than silently dropped at fire time.
+    config = {
+        "connector_runtime_context": [
+            {"connector_type": "mcp", "connector_id": "srv", "context": {}}
+        ]
+    }
+    resp = client.post(
+        f"/api/workforces/{workforce_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "WF hook", "config": config},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "connector_runtime_context" in resp.json()["detail"]
+
+    # Creating without it, then trying to add it via update, is also rejected.
+    created = _create_workforce_webhook_trigger(headers, workforce_id)
+    patched = client.patch(
+        f"/api/workforces/{workforce_id}/triggers/{created['id']}",
+        headers=headers,
+        json={"config": config},
+    )
+    assert patched.status_code == 400, patched.text
+    assert "connector_runtime_context" in patched.json()["detail"]
+
+
 def test_workforce_trigger_routes_reject_other_user() -> None:
     headers = _admin_headers()
     workforce_id = _create_workforce(headers)

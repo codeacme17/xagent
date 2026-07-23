@@ -368,6 +368,23 @@ def _trigger_connector_runtime_payload(config: dict[str, Any] | None) -> Any:
     return config.get("connector_runtime_context")
 
 
+def _reject_workforce_connector_runtime(config: dict[str, Any] | None) -> None:
+    """Reject connector-runtime payloads on workforce-owned triggers.
+
+    Workforce runs are created through ``create_workforce_run_record``, whose
+    connector-runtime handling is selection-only (see
+    ``prepare_connector_runtime_selection_snapshot``): the non-/v1 creation
+    path does not accept per-invocation runtime payloads. The shared trigger
+    ``config`` schema would otherwise let such a payload validate and then be
+    silently dropped at fire time, so reject it up front instead.
+    """
+    if _trigger_connector_runtime_payload(config):
+        raise TriggerServiceError(
+            "Workforce triggers do not support connector_runtime_context; "
+            "the workforce run resolves connectors from its manager agent."
+        )
+
+
 def _validate_persisted_connector_runtime_config(config: dict[str, Any]) -> None:
     try:
         reject_ephemeral_connector_runtime_payload(
@@ -558,6 +575,8 @@ def _create_trigger(
 
     resolved_type = _normalize_trigger_type(trigger_type)
     resolved_config = dict(config or {})
+    if workforce_id is not None:
+        _reject_workforce_connector_runtime(resolved_config)
     resource_id = _validate_config(
         db,
         user_id=user_id,
@@ -654,6 +673,8 @@ def _apply_trigger_updates(
         setattr(trigger, "prompt_template", updates["prompt_template"])
     if "config" in updates and updates["config"] is not None:
         config = dict(updates["config"])
+        if trigger.workforce_id is not None:
+            _reject_workforce_connector_runtime(config)
         resource_id = _validate_config(
             db,
             user_id=user_id,

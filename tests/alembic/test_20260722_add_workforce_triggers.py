@@ -92,6 +92,26 @@ def test_upgrade_adds_column_relaxes_agent_id_and_disables_manager_triggers() ->
         }
         assert "ix_agent_triggers_workforce_id" in index_names
 
+        # The exactly-one-owner CHECK constraint rejects both-null / both-set.
+        import pytest
+
+        with pytest.raises(Exception):
+            connection.execute(
+                sa.text(
+                    f"INSERT INTO {TABLE} "
+                    "(id, user_id, agent_id, workforce_id, type, name, enabled, config)"
+                    " VALUES (90, 1, NULL, NULL, 'webhook', 'no owner', 1, '{}')"
+                )
+            )
+        with pytest.raises(Exception):
+            connection.execute(
+                sa.text(
+                    f"INSERT INTO {TABLE} "
+                    "(id, user_id, agent_id, workforce_id, type, name, enabled, config)"
+                    " VALUES (91, 1, 1, 1, 'webhook', 'two owners', 1, '{}')"
+                )
+            )
+
         rows = connection.execute(
             sa.text(f"SELECT id, enabled FROM {TABLE} ORDER BY id")
         ).fetchall()

@@ -17,7 +17,7 @@ Create Date: 2026-07-22
 
 """
 
-from typing import Sequence, Union
+from typing import Any, Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
@@ -34,11 +34,15 @@ AGENTS_TABLE = "agents"
 WORKFORCE_ID_COLUMN = "workforce_id"
 WORKFORCE_ID_INDEX = "ix_agent_triggers_workforce_id"
 WORKFORCE_ID_FK = "fk_agent_triggers_workforce_id"
+SINGLE_OWNER_CHECK = "ck_agent_triggers_single_owner"
+# Portable across SQLite and PostgreSQL: exactly one of agent_id / workforce_id
+# is set. `(x IS NULL)` yields a comparable boolean/int on both dialects.
+SINGLE_OWNER_CONDITION = "(agent_id IS NULL) <> (workforce_id IS NULL)"
 
 WORKFORCE_GENERATED_MANAGER_ORIGIN = "workforce_generated_manager"
 
 
-def _columns(inspector: Inspector, table: str) -> dict[str, dict]:
+def _columns(inspector: Inspector, table: str) -> dict[str, Any]:
     return {col["name"]: col for col in inspector.get_columns(table)}
 
 
@@ -100,6 +104,12 @@ def upgrade() -> None:
                         ["id"],
                         ondelete="CASCADE",
                     )
+                # DB-level backstop for the exactly-one-owner invariant the
+                # service layer enforces, guarding direct/buggy inserts that
+                # bypass it. Added only on the initial column-add (idempotent).
+                batch.create_check_constraint(
+                    SINGLE_OWNER_CHECK, sa.text(SINGLE_OWNER_CONDITION)
+                )
             if agent_id_not_nullable:
                 batch.alter_column(
                     "agent_id", existing_type=sa.Integer(), nullable=True
@@ -136,5 +146,7 @@ def downgrade() -> None:
         if WORKFORCE_ID_INDEX in _index_names(inspector, TRIGGERS_TABLE):
             op.drop_index(WORKFORCE_ID_INDEX, table_name=TRIGGERS_TABLE)
         with op.batch_alter_table(TRIGGERS_TABLE) as batch:
+            # Drop the check before the column it references disappears.
+            batch.drop_constraint(SINGLE_OWNER_CHECK, type_="check")
             batch.drop_column(WORKFORCE_ID_COLUMN)
             batch.alter_column("agent_id", existing_type=sa.Integer(), nullable=False)
