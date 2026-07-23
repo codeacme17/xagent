@@ -723,7 +723,7 @@ async def public_chat_websocket_endpoint(
         else:
             logger.error("Public chat WebSocket error: %s", exc)
     finally:
-        manager.disconnect(websocket, task_id)
+        manager.disconnect(websocket)
 
 
 async def share_chat_websocket_endpoint(
@@ -777,4 +777,4 @@ async def share_chat_websocket_endpoint(
         else:
             logger.error("Share chat WebSocket error: %s", exc)
     finally:
-        manager.disconnect(websocket, task_id)
+        manager.disconnect(websocket)
