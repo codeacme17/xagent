@@ -120,7 +120,7 @@ def ensure_widget_agent_available(
     if (
         not agent
         or is_workforce_generated_manager_agent(agent)
-        or int(agent.user_id) != int(user_id)
+        or agent.user_id != user_id
         or not agent.widget_enabled
         or not agent.widget_key
         or (expected_widget_key is not None and agent.widget_key != expected_widget_key)
