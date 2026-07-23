@@ -349,7 +349,12 @@ def _get_task_for_workforce_widget_context(
     ``WorkforceRun`` row (so a guest cannot address an arbitrary task id).
     """
     widget_workforce_id = access_context.widget_workforce_id
-    assert widget_workforce_id is not None
+    # Callers today only reach here behind an `if widget_workforce_id is not
+    # None` guard, but raise explicitly rather than assert: `python -O` strips
+    # asserts, and this is an auth boundary — a future unguarded caller must
+    # fail closed, not fall through with widget_workforce_id=None.
+    if widget_workforce_id is None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
     task = (
         db.query(Task)
         .filter(
@@ -650,7 +655,10 @@ async def _create_workforce_widget_chat_task(
     so the widget channel keeps its per-guest task isolation.
     """
     widget_workforce_id = access_context.widget_workforce_id
-    assert widget_workforce_id is not None
+    # Auth boundary: fail closed rather than assert (`python -O` strips
+    # asserts), matching the share-channel sibling.
+    if widget_workforce_id is None:
+        raise HTTPException(status_code=403, detail="Widget is unavailable")
     if request.agent_id is not None:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
 

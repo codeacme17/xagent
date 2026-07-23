@@ -871,11 +871,11 @@ class WorkforceShareLinkResponse(BaseModel):
     share_updated_at: str | None
 
 
-def _ensure_shareable_workforce(workforce: Workforce) -> Workforce:
+def _ensure_active_workforce(workforce: Workforce, detail: str) -> Workforce:
+    """Guard a deployment-channel mutation that must not run on a non-active
+    workforce (shared by the share-link and widget enable/rotate paths)."""
     if workforce.status != "active":
-        raise HTTPException(
-            status_code=400, detail="Only active workforces can be shared"
-        )
+        raise HTTPException(status_code=400, detail=detail)
     return workforce
 
 
@@ -932,7 +932,7 @@ async def enable_workforce_share_link(
     workforce = ensure_workforce_access(
         db, user, _load_workforce(db, workforce_id), action="edit"
     )
-    _ensure_shareable_workforce(workforce)
+    _ensure_active_workforce(workforce, "Only active workforces can be shared")
     with _commit_or_rollback(db):
         deployment = get_or_create_deployment(
             db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
@@ -961,7 +961,7 @@ async def rotate_workforce_share_link(
     workforce = ensure_workforce_access(
         db, user, _load_workforce(db, workforce_id), action="edit"
     )
-    _ensure_shareable_workforce(workforce)
+    _ensure_active_workforce(workforce, "Only active workforces can be shared")
     with _commit_or_rollback(db):
         deployment = get_or_create_deployment(
             db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
@@ -1020,15 +1020,6 @@ class WorkforceWidgetUpdateRequest(BaseModel):
     allowed_domains: list[str] | None = None
 
 
-def _ensure_widget_configurable_workforce(workforce: Workforce) -> Workforce:
-    if workforce.status != "active":
-        raise HTTPException(
-            status_code=400,
-            detail="Only active workforces can enable the widget",
-        )
-    return workforce
-
-
 def _serialize_workforce_widget(
     workforce: Workforce, deployment: Deployment | None
 ) -> WorkforceWidgetResponse:
@@ -1076,17 +1067,27 @@ async def update_workforce_widget(
 ) -> WorkforceWidgetResponse:
     """Update a workforce's widget configuration (enable flag / allowed
     domains). Enabling requires an active workforce and lazily mints a widget
-    key so the embed snippet is immediately usable."""
-    workforce = ensure_workforce_access(
-        db, user, _load_workforce(db, workforce_id), action="edit"
-    )
+    key so the embed snippet is immediately usable.
+
+    Gated on ``can_edit_workforce`` (not ``ensure_workforce_access(edit)``) so
+    that, like ``DELETE /{id}/share-link``, an owner can still turn the widget
+    off on an archived workforce; re-enabling stays blocked by
+    ``_ensure_active_workforce`` below. Guest access is independently blocked
+    once ``status != "active"`` regardless of the stored flag."""
+    workforce = _load_workforce(db, workforce_id)
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    if not can_edit_workforce(db, user, workforce):
+        raise HTTPException(status_code=403, detail="Access denied")
     with _commit_or_rollback(db):
         deployment = get_or_create_deployment(
             db, DeploymentOwnerType.WORKFORCE, int(workforce.id)
         )
         if request.widget_enabled is not None:
             if request.widget_enabled:
-                _ensure_widget_configurable_workforce(workforce)
+                _ensure_active_workforce(
+                    workforce, "Only active workforces can enable the widget"
+                )
                 if not deployment.widget_key:
                     cast(Any, deployment).widget_key = new_widget_key()
             cast(Any, deployment).widget_enabled = request.widget_enabled
@@ -1112,7 +1113,7 @@ async def rotate_workforce_widget_key(
     workforce = ensure_workforce_access(
         db, user, _load_workforce(db, workforce_id), action="edit"
     )
-    _ensure_widget_configurable_workforce(workforce)
+    _ensure_active_workforce(workforce, "Only active workforces can enable the widget")
     with _commit_or_rollback(db):
         deployment = get_or_create_deployment(
             db, DeploymentOwnerType.WORKFORCE, int(workforce.id)

@@ -119,10 +119,12 @@ def _enable_widget(
     return str(key)
 
 
-def _authenticate_widget_guest_by_key(widget_key: str) -> dict[str, str]:
+def _authenticate_widget_guest_by_key(
+    widget_key: str, guest_id: str = "guest_test"
+) -> dict[str, str]:
     response = client.post(
         "/api/widget/auth",
-        json={"guest_id": "guest_test", "widget_key": widget_key},
+        json={"guest_id": guest_id, "widget_key": widget_key},
     )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
@@ -255,16 +257,40 @@ def test_widget_enable_rotate_rejected_for_archived_workforce() -> None:
     archived = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
     assert archived.status_code == 200, archived.text
 
+    # Re-enabling re-exposes the workforce, so it stays blocked on archive
+    # (400 from _ensure_active_workforce; the PUT itself uses the archived-safe
+    # can_edit gate so disabling still works — see the disable test below).
     enabled = client.put(
         f"/api/workforces/{workforce_id}/widget",
         headers=headers,
         json={"widget_enabled": True},
     )
-    assert enabled.status_code == 409, enabled.text
+    assert enabled.status_code == 400, enabled.text
+    # Rotate keeps the stricter edit gate, so it 409s on an archived workforce.
     rotated = client.post(
         f"/api/workforces/{workforce_id}/widget-key/rotate", headers=headers
     )
     assert rotated.status_code == 409, rotated.text
+
+
+def test_widget_disable_allowed_for_archived_workforce() -> None:
+    """Mirrors the share-link disable path: turning the widget off only removes
+    access, so it stays available on an archived workforce (archived-safe
+    ``can_edit_workforce`` gate)."""
+    workforce_id = _create_workforce("Archived Disable Widget Workforce")
+    headers = _admin_headers()
+    _enable_widget(workforce_id)
+
+    archived = client.delete(f"/api/workforces/{workforce_id}", headers=headers)
+    assert archived.status_code == 200, archived.text
+
+    disabled = client.put(
+        f"/api/workforces/{workforce_id}/widget",
+        headers=headers,
+        json={"widget_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["widget_enabled"] is False
 
 
 def test_widget_rotate_preserves_disabled_state() -> None:
@@ -555,3 +581,97 @@ def test_agent_widget_taskless_upload_still_requires_task_id() -> None:
     )
     assert rejected.status_code == 400, rejected.text
     assert "task_id" in rejected.json()["detail"]
+
+
+# ===== Widget task-access scoping =====
+
+
+def test_widget_task_access_scoped_to_guest_and_workforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A widget guest may only reach its OWN task on ITS workforce: another
+    guest of the same workforce, or any guest of a different workforce, is
+    rejected (guest_id + widget_workforce_id scoping in
+    ``_get_task_for_workforce_widget_context``)."""
+    _stub_begin_turn(monkeypatch)
+    wf_a = _create_workforce("Scope Widget A")
+    key_a = _enable_widget(wf_a)
+    wf_b = _create_workforce("Scope Widget B")
+    key_b = _enable_widget(wf_b)
+
+    owner = _authenticate_widget_guest_by_key(key_a, guest_id="guest-owner")
+    created = client.post(
+        "/api/widget/chat/task/create",
+        headers=owner,
+        json={"title": "hi", "description": "hi"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    upload = [("files", ("f.txt", io.BytesIO(b"x"), "text/plain"))]
+
+    # Same workforce, a different guest -> rejected.
+    intruder = _authenticate_widget_guest_by_key(key_a, guest_id="guest-intruder")
+    r1 = client.post(
+        "/api/widget/files/upload",
+        headers=intruder,
+        data={"task_type": "task", "task_id": str(task_id)},
+        files=upload,
+    )
+    assert r1.status_code == 403, r1.text
+
+    # A guest of a different workforce (even reusing the guest id) -> rejected.
+    cross_wf = _authenticate_widget_guest_by_key(key_b, guest_id="guest-owner")
+    r2 = client.post(
+        "/api/widget/files/upload",
+        headers=cross_wf,
+        data={"task_type": "task", "task_id": str(task_id)},
+        files=upload,
+    )
+    assert r2.status_code == 403, r2.text
+
+
+def test_widget_auth_accepts_legacy_agent_ticket_without_owner_type() -> None:
+    """Backward-compat: agent embed tickets minted before workforce support
+    carried no ``owner_type`` claim; ``_owner_from_embed_ticket`` must still
+    resolve them as agent tickets."""
+    from datetime import datetime, timedelta, timezone
+
+    from jose import jwt
+
+    from xagent.web.api.widget import EMBED_TICKET_TYPE
+    from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+    _admin_headers()
+    owner_id = _user_id()
+    agent_id = _create_published_agent(owner_id, "Legacy Ticket Agent")
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.widget_enabled = True
+        agent.widget_key = "legacy-agent-widget-key"
+        agent.allowed_domains = ["example.com"]
+        db.commit()
+    finally:
+        db.close()
+
+    legacy_ticket = jwt.encode(
+        {
+            "type": EMBED_TICKET_TYPE,
+            "agent_id": agent_id,
+            "embed_origin": "example.com",
+            # No "owner_type" -- exactly how pre-workforce tickets looked.
+            "exp": datetime.now(timezone.utc) + timedelta(seconds=60),
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    auth = client.post(
+        "/api/widget/auth",
+        json={"guest_id": "guest_test", "embed_ticket": legacy_ticket},
+    )
+    assert auth.status_code == 200, auth.text
+    body = auth.json()
+    assert body["agent_id"] == agent_id
+    assert body.get("workforce_id") is None
