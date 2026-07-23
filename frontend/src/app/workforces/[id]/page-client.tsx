@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Share, Webhook } from "lucide-react"
+import { ArrowLeft, History, LayoutDashboard, LayoutGrid, MessageSquare, Rocket, Share, Webhook } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -28,6 +28,7 @@ import type {
 } from "@/types/workforce"
 import {
     normalizeWorkerSortOrder,
+    DeployWorkforceDialog,
     WorkforceCanvas,
     WorkforceConfigPanel,
     WorkforceRunsList,
@@ -61,6 +62,7 @@ export default function WorkforceDetailPage() {
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [activeView, setActiveView] = useState<ActiveView>("configure")
+    const [deployOpen, setDeployOpen] = useState(false)
     const [triggersOpen, setTriggersOpen] = useState(false)
     const [isShareDialogOpen, setIsShareDialogOpen] = useState(false)
     const [isWidgetDialogOpen, setIsWidgetDialogOpen] = useState(false)
@@ -377,6 +379,16 @@ export default function WorkforceDetailPage() {
                             {t("workforces.actions.archive")}
                         </Button>
                     )}
+                    {workforce.status === "active" && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setDeployOpen(true)}
+                        >
+                            <Rocket className="h-3.5 w-3.5 mr-1" />
+                            {t("workforces.actions.deploy") || "Deploy"}
+                        </Button>
+                    )}
                     {!isArchived && (
                         <Button variant="outline" size="sm" onClick={() => setIsShareDialogOpen(true)} disabled={saving}>
                             <Share className="h-3.5 w-3.5 mr-1" />
@@ -401,6 +413,14 @@ export default function WorkforceDetailPage() {
                 </div>
             </div>
 
+            {workforce && (
+                <DeployWorkforceDialog
+                    open={deployOpen}
+                    workforceId={workforce.id}
+                    workforceName={workforce.name}
+                    onClose={() => setDeployOpen(false)}
+                />
+            )}
             <WorkforceShareDialog
                 workforce={workforce}
                 open={isShareDialogOpen}

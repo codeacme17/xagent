@@ -3405,6 +3405,16 @@ Build when you need.`,
       manage_key: "Manage API Key"
     }
   },
+  deploy_workforce: {
+    title: "Deploy via REST API / SDK",
+    desc: "Create runs on this workforce with a workforce API key, then poll GET /v1/chat/tasks/{id} for results.",
+    copy: "Copy",
+    new_key: "Copy this key now — it won't be shown again.",
+    keys_title: "API keys",
+    label_placeholder: "Label (optional), e.g. CI pipeline",
+    create_key: "Create key",
+    no_keys: "No API keys yet."
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API credential",
@@ -3749,6 +3759,7 @@ Build when you need.`,
       publish: "Publish",
       unpublish: "Unpublish",
       archive: "Archive",
+      deploy: "Deploy",
       triggers: "Triggers",
       share: "Share",
       embed: "Embed",

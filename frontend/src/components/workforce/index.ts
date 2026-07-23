@@ -1,3 +1,4 @@
+export { DeployWorkforceDialog } from "./deploy-workforce-dialog"
 export { ManagerStep } from "./manager-step"
 export { ReviewStep } from "./review-step"
 export { WorkforceCanvas } from "./workforce-canvas"
