@@ -20,6 +20,7 @@ from .connector_runtime import (
 )
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
+from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 from .workforce_lifecycle import acquire_workforce_lifecycle_fence
 from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
 from .workforce_snapshot import (
@@ -43,7 +44,11 @@ def normalize_execution_mode(value: str | None) -> str:
     normalized = (value or ExecutionMode.BALANCED.value).strip().lower()
     allowed = {mode.value for mode in ExecutionMode}
     if normalized not in allowed:
-        raise HTTPException(status_code=400, detail="Invalid execution mode")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Invalid execution mode",
+            code=WorkforceRunErrorCode.INVALID_EXECUTION_MODE,
+        )
     return normalized
 
 
@@ -90,7 +95,11 @@ def _normalize_idempotency_key(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     if not normalized or len(normalized) > 128:
-        raise HTTPException(status_code=400, detail="Invalid idempotency key")
+        raise WorkforceRunError(
+            status_code=400,
+            detail="Invalid idempotency key",
+            code=WorkforceRunErrorCode.INVALID_IDEMPOTENCY_KEY,
+        )
     return normalized
 
 
@@ -115,9 +124,10 @@ def _replay_existing_run_by_idempotency_key(
     if existing is None:
         return None
     if existing.task is None:
-        raise HTTPException(
+        raise WorkforceRunError(
             status_code=409,
             detail="Idempotency key was already used by a run whose task no longer exists",
+            code=WorkforceRunErrorCode.IDEMPOTENCY_CONFLICT,
         )
     return WorkforceRunStartResult(
         workforce_run=existing,
@@ -150,7 +160,11 @@ def _bind_selected_files_to_task(
         file_id for file_id in selected_file_ids if file_id not in found_file_ids
     ]
     if missing_file_ids:
-        raise HTTPException(status_code=404, detail="Selected file not found")
+        raise WorkforceRunError(
+            status_code=404,
+            detail="Selected file not found",
+            code=WorkforceRunErrorCode.FILE_NOT_FOUND,
+        )
 
     for uploaded_file in uploaded_files:
         if uploaded_file.task_id is None:
