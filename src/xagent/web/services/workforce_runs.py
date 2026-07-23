@@ -341,6 +341,10 @@ async def create_workforce_run(
             task_owner_user_id=int(user.id),
             # Workforce runs as the requesting user; actor == owner here.
             actor_user_id=int(user.id),
+            # Intentionally equal to the normalized message: create_workforce_run_record
+            # sets task.description = normalize_text(message). Read it back from the
+            # record so this wrapper stays a thin dispatch layer; keep them in sync if
+            # description derivation ever changes.
             payload=TaskTurnPayload(transcript_message=str(task.description or "")),
             kind=TurnKind.CREATE,
             force_fresh=False,

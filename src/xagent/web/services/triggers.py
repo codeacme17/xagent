@@ -541,7 +541,16 @@ def create_workforce_trigger(
     prompt_template: str | None = None,
     secret: str | None = None,
 ) -> tuple[AgentTrigger, str | None]:
-    """Create a workforce-owned trigger (workforce access checked by caller)."""
+    """Create a workforce-owned trigger (workforce access checked by caller).
+
+    Note on execution identity: unlike agent triggers (which only their agent's
+    owner can create), a workforce trigger can be created by anyone with
+    workforce ``edit`` access, and ``user_id`` — the creator — is persisted as
+    the identity the eventual workforce run executes as. This is not an
+    escalation: the firing path re-checks ``ensure_workforce_access(action=
+    "run")`` in ``create_workforce_run_record``, so a creator who later loses
+    access is rejected at fire time.
+    """
     return _create_trigger(
         db,
         user_id=user_id,
@@ -969,14 +978,15 @@ def _attach_workforce_task_to_trigger_run(
         setattr(run, "task_id", task_id)
         db.add(run)
     # Arm only a run that has not moved past preparation; a replay must not
-    # regress a RUNNING/COMPLETED run.
+    # regress a RUNNING/COMPLETED run, and re-writing an already-PENDING run
+    # is a no-op we skip.
     if str(run.status) not in (
         TriggerRunStatus.RUNNING.value,
         TriggerRunStatus.COMPLETED.value,
+        TriggerRunStatus.PENDING.value,
     ):
-        if str(run.status) != TriggerRunStatus.PENDING.value:
-            setattr(run, "status", TriggerRunStatus.PENDING.value)
-            db.add(run)
+        setattr(run, "status", TriggerRunStatus.PENDING.value)
+        db.add(run)
     db.commit()
     db.refresh(run)
     return run

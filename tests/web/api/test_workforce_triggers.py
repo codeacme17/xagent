@@ -17,7 +17,7 @@ import pytest
 from xagent.web.api import triggers as trigger_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
-from xagent.web.models.trigger import TriggerRun, TriggerRunStatus
+from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
 from xagent.web.services import triggers as trigger_service
@@ -555,5 +555,70 @@ def test_scheduled_workforce_trigger_scan_and_dispatch(mock_bg_scheduler) -> Non
         assert str(started.status) == TriggerRunStatus.RUNNING.value
         task = db.query(Task).filter(Task.id == int(run.task_id)).one()
         assert task.status == TaskStatus.RUNNING
+    finally:
+        db.close()
+
+
+def test_workforce_reattach_is_idempotent_on_replay() -> None:
+    """A crash between create_workforce_run_record's commit and the attach
+    commit leaves run.task_id unset; a retry replays the same workforce run
+    and must not duplicate it, clobber config, or regress an advanced run."""
+    headers = _admin_headers()
+    workforce_id = _create_workforce(headers, publish=True)
+    trigger = _create_workforce_webhook_trigger(headers, workforce_id)
+
+    db = _direct_db_session()
+    try:
+        trig = db.get(AgentTrigger, trigger["id"])
+        run = TriggerRun(
+            trigger_id=int(trig.id),
+            status=TriggerRunStatus.PENDING.value,
+            idempotency_key="wf-replay-1",
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        first = trigger_service._attach_workforce_task_to_trigger_run(
+            db, trigger=trig, run=run, prompt="handle it", test=False
+        )
+        first_task_id = int(first.task_id)
+        first_config = dict(
+            db.query(Task).filter(Task.id == first_task_id).one().agent_config or {}
+        )
+        wr_count = (
+            db.query(WorkforceRun)
+            .filter(WorkforceRun.workforce_id == workforce_id)
+            .count()
+        )
+        assert wr_count == 1
+        assert first_config.get("workforce_run_id") is not None
+        assert first_config.get("trigger_run_id") == int(run.id)
+
+        # Simulate the crash-and-advance window: task_id lost, run already RUNNING.
+        setattr(run, "task_id", None)
+        setattr(run, "status", TriggerRunStatus.RUNNING.value)
+        db.commit()
+
+        second = trigger_service._attach_workforce_task_to_trigger_run(
+            db, trigger=trig, run=run, prompt="handle it", test=False
+        )
+
+        # Same task re-linked, no duplicate workforce run, config preserved,
+        # and the RUNNING status is not knocked back to PENDING.
+        assert int(second.task_id) == first_task_id
+        assert (
+            db.query(WorkforceRun)
+            .filter(WorkforceRun.workforce_id == workforce_id)
+            .count()
+            == 1
+        )
+        assert str(second.status) == TriggerRunStatus.RUNNING.value
+        assert (
+            dict(
+                db.query(Task).filter(Task.id == first_task_id).one().agent_config or {}
+            )
+            == first_config
+        )
     finally:
         db.close()
