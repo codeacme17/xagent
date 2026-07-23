@@ -66,6 +66,18 @@ def _build_task_title(workforce: Workforce, message: str) -> str:
     return title[:50] + "..." if len(title) > 50 else title
 
 
+def _merge_agent_config(
+    task_config: dict[str, Any], extra_agent_config: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay caller-supplied config keys (e.g. share-channel markers) onto
+    the snapshot-built task config. The built config wins on key collisions so
+    callers can never clobber runtime-critical keys like ``workforce_run_id``.
+    """
+    if not extra_agent_config:
+        return task_config
+    return {**extra_agent_config, **task_config}
+
+
 def _normalize_run_source(value: str | None) -> str:
     normalized = (value or "internal").strip().lower()
     if not normalized:
@@ -157,6 +169,7 @@ def create_workforce_run_record(
     is_visible: bool = True,
     source: str | None = None,
     idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
 ) -> WorkforceRunStartResult:
     """Create the WorkforceRun + pending Task without starting the turn.
 
@@ -211,9 +224,12 @@ def create_workforce_run_record(
             description=normalized_message,
             status=TaskStatus.PENDING,
             agent_id=int(workforce.manager_agent_id),
-            agent_config=build_workforce_task_config(
-                snapshot,
-                selected_file_ids=selected_files,
+            agent_config=_merge_agent_config(
+                build_workforce_task_config(
+                    snapshot,
+                    selected_file_ids=selected_files,
+                ),
+                extra_agent_config,
             ),
             execution_mode=manager_execution_mode,
             source=normalized_source,
@@ -248,10 +264,13 @@ def create_workforce_run_record(
         setattr(
             task,
             "agent_config",
-            build_workforce_task_config(
-                snapshot,
-                selected_file_ids=selected_files,
-                workforce_run_id=workforce_run_id,
+            _merge_agent_config(
+                build_workforce_task_config(
+                    snapshot,
+                    selected_file_ids=selected_files,
+                    workforce_run_id=workforce_run_id,
+                ),
+                extra_agent_config,
             ),
         )
         policy.after_workforce_run_created(db, user, workforce, workforce_run, task)
@@ -294,6 +313,7 @@ async def create_workforce_run(
     is_visible: bool = True,
     source: str | None = None,
     idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
 ) -> WorkforceRunStartResult:
     record = create_workforce_run_record(
         db,
@@ -306,6 +326,7 @@ async def create_workforce_run(
         is_visible=is_visible,
         source=source,
         idempotency_key=idempotency_key,
+        extra_agent_config=extra_agent_config,
     )
     if not record.created:
         return record
