@@ -231,6 +231,42 @@ def test_create_trigger_requires_exactly_one_owner() -> None:
         db.close()
 
 
+def test_single_owner_check_constraint_on_init_db_schema() -> None:
+    """The exactly-one-owner CHECK must exist on the ORM-built (fresh) schema.
+
+    The API test DB is built by init_db via Base.metadata.create_all, i.e. the
+    same path fresh installs take (stamp-to-head, no migration run). A raw
+    insert that violates the invariant must be rejected at the DB level, not
+    only by the service guard.
+    """
+    import sqlalchemy as sa
+
+    db = _direct_db_session()
+    try:
+        # neither owner set
+        with pytest.raises(Exception):
+            db.execute(
+                sa.text(
+                    "INSERT INTO agent_triggers "
+                    "(user_id, agent_id, workforce_id, type, name, enabled, config) "
+                    "VALUES (1, NULL, NULL, 'webhook', 'no owner', 1, '{}')"
+                )
+            )
+        db.rollback()
+        # both owners set
+        with pytest.raises(Exception):
+            db.execute(
+                sa.text(
+                    "INSERT INTO agent_triggers "
+                    "(user_id, agent_id, workforce_id, type, name, enabled, config) "
+                    "VALUES (1, 1, 1, 'webhook', 'two owners', 1, '{}')"
+                )
+            )
+        db.rollback()
+    finally:
+        db.close()
+
+
 def test_workforce_trigger_rejects_connector_runtime_context() -> None:
     headers = _admin_headers()
     workforce_id = _create_workforce(headers)

@@ -951,19 +951,32 @@ def _attach_workforce_task_to_trigger_run(
         # impossible, so failing is correct rather than starting a fresh run.)
         idempotency_key=f"trigger:{run.id}",
     )
+    # Idempotent re-attach. create_workforce_run_record commits the
+    # WorkforceRun+Task before this function's own commit below, so a crash in
+    # between leaves run.task_id unset; a retry replays the same workforce run
+    # (record.created is False) and re-enters here. Only apply what is still
+    # missing and never knock a run that already advanced back to PENDING.
     task = record.task
-    setattr(
-        task,
-        "agent_config",
-        {
-            **dict(task.agent_config or {}),
-            **_trigger_execution_context(trigger=trigger, run=run, test=test),
-        },
-    )
-    db.add(task)
-    setattr(run, "task_id", int(task.id))
-    setattr(run, "status", TriggerRunStatus.PENDING.value)
-    db.add(run)
+    task_id = int(task.id)
+    merged_config = {
+        **dict(task.agent_config or {}),
+        **_trigger_execution_context(trigger=trigger, run=run, test=test),
+    }
+    if merged_config != dict(task.agent_config or {}):
+        setattr(task, "agent_config", merged_config)
+        db.add(task)
+    if run.task_id is None or int(run.task_id) != task_id:
+        setattr(run, "task_id", task_id)
+        db.add(run)
+    # Arm only a run that has not moved past preparation; a replay must not
+    # regress a RUNNING/COMPLETED run.
+    if str(run.status) not in (
+        TriggerRunStatus.RUNNING.value,
+        TriggerRunStatus.COMPLETED.value,
+    ):
+        if str(run.status) != TriggerRunStatus.PENDING.value:
+            setattr(run, "status", TriggerRunStatus.PENDING.value)
+            db.add(run)
     db.commit()
     db.refresh(run)
     return run

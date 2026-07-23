@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -66,6 +67,16 @@ class AgentTrigger(Base):  # type: ignore
     """
 
     __tablename__ = "agent_triggers"
+    __table_args__ = (
+        # Exactly one owner. Mirrors the CHECK the migration adds to upgraded
+        # databases so fresh installs (schema built from these models via
+        # Base.metadata.create_all) enforce the same invariant. Keep the name
+        # in sync with the migration so downgrade can drop it.
+        CheckConstraint(
+            "(agent_id IS NULL) <> (workforce_id IS NULL)",
+            name="ck_agent_triggers_single_owner",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(

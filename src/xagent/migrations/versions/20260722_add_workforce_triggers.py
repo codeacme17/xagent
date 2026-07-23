@@ -50,6 +50,17 @@ def _index_names(inspector: Inspector, table: str) -> list[str]:
     return [str(index["name"]) for index in inspector.get_indexes(table)]
 
 
+def _check_constraint_names(inspector: Inspector, table: str) -> set[str]:
+    try:
+        return {
+            str(cc["name"])
+            for cc in inspector.get_check_constraints(table)
+            if cc.get("name")
+        }
+    except NotImplementedError:
+        return set()
+
+
 def _disable_orphaned_manager_triggers(bind: sa.engine.Connection) -> None:
     """Disable triggers bound to workforce-generated manager agents.
 
@@ -145,8 +156,16 @@ def downgrade() -> None:
 
         if WORKFORCE_ID_INDEX in _index_names(inspector, TRIGGERS_TABLE):
             op.drop_index(WORKFORCE_ID_INDEX, table_name=TRIGGERS_TABLE)
+        # Only drop the check when it is actually present. A fresh install
+        # created before the ORM-level constraint existed could have been
+        # stamped to head without it; an unconditional drop would raise
+        # "No such constraint" during the batch rebuild.
+        has_check = SINGLE_OWNER_CHECK in _check_constraint_names(
+            inspector, TRIGGERS_TABLE
+        )
         with op.batch_alter_table(TRIGGERS_TABLE) as batch:
             # Drop the check before the column it references disappears.
-            batch.drop_constraint(SINGLE_OWNER_CHECK, type_="check")
+            if has_check:
+                batch.drop_constraint(SINGLE_OWNER_CHECK, type_="check")
             batch.drop_column(WORKFORCE_ID_COLUMN)
             batch.alter_column("agent_id", existing_type=sa.Integer(), nullable=False)
