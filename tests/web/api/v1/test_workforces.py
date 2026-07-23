@@ -104,6 +104,47 @@ def _create_active_workforce(
     return workforce_id
 
 
+def _create_draft_workforce(
+    headers: dict[str, str], name: str = "Draft Workforce"
+) -> int:
+    """Create a workforce WITHOUT publishing it (status stays 'draft')."""
+    owner_id = _user_id()
+    manager_agent_id = _create_published_agent(owner_id, f"{name} Manager")
+    worker_agent_id = _create_published_agent(owner_id, f"{name} Worker")
+    resp = client.post(
+        "/api/workforces",
+        headers=headers,
+        json={
+            "name": name,
+            "description": "Draft for SDK tests",
+            "manager_agent_id": manager_agent_id,
+            "workers": [
+                {
+                    "source_type": "existing",
+                    "agent_id": worker_agent_id,
+                    "alias": "worker-1",
+                    "assignment_instructions": "Handle everything",
+                    "enabled": True,
+                    "sort_order": 1,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return int(resp.json()["id"])
+
+
+def _set_workforce_status(workforce_id: int, status: str) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Workforce).filter(Workforce.id == workforce_id).update(
+            {"status": status}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def _create_workforce_key(headers: dict[str, str], workforce_id: int) -> str:
     resp = client.post(
         "/api/agent-api-keys",
@@ -421,3 +462,168 @@ def test_cross_workforce_task_isolation():
     resp = client.get(f"/v1/chat/tasks/{task_a}", headers=_bearer(key_b))
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== Error-branch coverage (regression guard for the stable error-code
+# mapping in _raise_v1_for_workforce_http_error / raise_for_turn_rejection).
+# These are the least-tested but most breakage-prone paths, so each asserts
+# on the exact error.code SDK clients switch on. =====
+
+
+def test_archived_workforce_run_returns_workforce_archived():
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Archived WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+    _set_workforce_status(workforce_id, "archived")
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "go"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "workforce_archived"
+
+
+def test_draft_workforce_run_returns_workforce_not_active():
+    headers = _admin_headers()
+    workforce_id = _create_draft_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "go"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "workforce_not_active"
+
+
+def test_invalid_execution_mode_returns_invalid_input():
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Bad Mode WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {"role": "user", "content": "go"},
+            "execution_mode": "turbo-nonsense",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_bad_file_id_returns_file_not_found_not_workforce_not_found():
+    """A bad message.files id must surface as file_not_found, not the
+    misleading workforce_not_found (Roger review, PR #968)."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Bad File WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {
+                "role": "user",
+                "content": "go",
+                "files": ["file-does-not-exist"],
+            }
+        },
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "file_not_found"
+
+
+def test_idempotency_conflict_when_original_task_deleted():
+    """Reusing an idempotency key whose run's task was deleted (task_id
+    SET NULL) can't be replayed -> idempotency_conflict 409."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Idem Conflict WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    first = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {"role": "user", "content": "go"},
+            "idempotency_key": "conflict-key",
+        },
+    )
+    assert first.status_code == 202, first.text
+    run_id = first.json()["workforce_run_id"]
+
+    # Simulate the run's task being deleted (FK is ON DELETE SET NULL).
+    from xagent.web.models.workforce import WorkforceRun
+
+    db = _direct_db_session()
+    try:
+        db.query(WorkforceRun).filter(WorkforceRun.id == run_id).update(
+            {"task_id": None}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {"role": "user", "content": "go again"},
+            "idempotency_key": "conflict-key",
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "idempotency_conflict"
+
+
+def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
+    """A non-transient workforce turn rejection on append maps to its own
+    stable v1 code (not the misleading retryable task_busy)."""
+    from xagent.web.api.v1 import tasks as v1_tasks
+    from xagent.web.services.task_orchestrator import TaskTurnError
+
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Append Reject WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    run = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "first"}},
+    ).json()
+    task_id = run["task_id"]
+
+    # Terminal status so _resolve/append reaches the turn kickoff.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        db.commit()
+    finally:
+        db.close()
+
+    for reason, expected_code, expected_status in (
+        ("workforce_config_changed", "workforce_config_changed", 409),
+        ("workforce_archived", "workforce_archived", 409),
+        ("workforce_run_not_found", "task_not_found", 404),
+        ("busy", "task_busy", 409),
+    ):
+
+        async def _reject(reason=reason, **_kwargs):
+            raise TaskTurnError(reason)
+
+        monkeypatch.setattr(v1_tasks.TaskTurnOrchestrator, "begin_turn", _reject)
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "workforce_id": workforce_id,
+                "message": {"role": "user", "content": "next"},
+            },
+        )
+        assert resp.status_code == expected_status, resp.text
+        assert resp.json()["error"]["code"] == expected_code

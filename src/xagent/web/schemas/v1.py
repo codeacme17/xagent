@@ -389,13 +389,6 @@ class CreateWorkforceRunRequest(BaseModel):
             "the original run rather than creating a new one."
         ),
     )
-    metadata: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Free-form correlation data the SDK caller can pass through "
-            "(trace_id, request_id, etc). Not interpreted server-side."
-        ),
-    )
 
 
 class CreateWorkforceRunResponse(BaseModel):

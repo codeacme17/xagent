@@ -71,6 +71,11 @@ class V1ErrorCode(str, Enum):
     # be reused. 409.
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
+    # A file id passed in ``message.files`` on run creation isn't
+    # accessible to the caller. 404 -- distinct from workforce_not_found
+    # so SDK clients can tell "bad file" from "bad workforce".
+    FILE_NOT_FOUND = "file_not_found"
+
     # Caller is authenticated and agent_id is right, but the task_id
     # they asked for doesn't exist or doesn't belong to their agent.
     # Also 404 for the same leak-prevention reason.
@@ -139,6 +144,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.IDEMPOTENCY_CONFLICT: (
         "This idempotency key was already used by a run that can no longer be replayed."
     ),
+    V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",

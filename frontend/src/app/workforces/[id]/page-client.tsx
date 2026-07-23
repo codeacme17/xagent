@@ -367,7 +367,6 @@ export default function WorkforceDetailPage() {
                             variant="outline"
                             size="sm"
                             onClick={() => setDeployOpen(true)}
-                            disabled={!!isArchived}
                         >
                             <Rocket className="h-3.5 w-3.5 mr-1" />
                             {t("workforces.actions.deploy") || "Deploy"}

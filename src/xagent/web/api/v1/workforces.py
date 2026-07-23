@@ -30,6 +30,7 @@ from ...schemas.v1 import (
     CreateWorkforceRunRequest,
     CreateWorkforceRunResponse,
 )
+from ...services.workforce_errors import WorkforceRunErrorCode
 from ...services.workforce_runs import create_workforce_run
 from .deps import get_workforce_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode
@@ -58,42 +59,52 @@ def _load_workforce_for_run(db: Session, workforce_id: int) -> Workforce | None:
     )
 
 
+# Stable service-layer code -> (v1 wire code, HTTP status). Switching on
+# WorkforceRunError.code -- a machine discriminant -- rather than the
+# free-text detail keeps this mapping robust against message rewording,
+# mirroring how ``raise_for_turn_rejection`` keys off TaskTurnError.reason.
+_SERVICE_CODE_TO_V1: dict[str, tuple[V1ErrorCode, int]] = {
+    WorkforceRunErrorCode.ARCHIVED: (V1ErrorCode.WORKFORCE_ARCHIVED, 409),
+    WorkforceRunErrorCode.NOT_ACTIVE: (V1ErrorCode.WORKFORCE_NOT_ACTIVE, 409),
+    WorkforceRunErrorCode.IDEMPOTENCY_CONFLICT: (
+        V1ErrorCode.IDEMPOTENCY_CONFLICT,
+        409,
+    ),
+    WorkforceRunErrorCode.FILE_NOT_FOUND: (V1ErrorCode.FILE_NOT_FOUND, 404),
+    WorkforceRunErrorCode.INVALID_EXECUTION_MODE: (V1ErrorCode.INVALID_INPUT, 422),
+    WorkforceRunErrorCode.INVALID_IDEMPOTENCY_KEY: (V1ErrorCode.INVALID_INPUT, 422),
+}
+
+
 def _raise_v1_for_workforce_http_error(exc: HTTPException) -> NoReturn:
-    """Translate the run service's ``HTTPException`` into the v1 envelope.
+    """Translate the run service's exception into the v1 envelope.
 
-    The service is shared with the JWT web channel and raises bare
-    ``HTTPException``; map each to a stable ``V1ErrorCode`` so SDK
-    clients switch on ``body.error.code``. Detail-string matching is
-    used only to split the several 400/409 cases the service overloads
-    onto one status code.
+    ``WorkforceRunError`` carries a stable ``code`` we switch on directly;
+    plain ``HTTPException``s (e.g. ``ensure_workforce_access``'s 404/403)
+    have no code, so they fall through to a conservative status-based
+    mapping.
     """
-    status = exc.status_code
     detail = str(exc.detail or "")
-    lowered = detail.lower()
+    code = getattr(exc, "code", None)
+    mapped = _SERVICE_CODE_TO_V1.get(code) if code is not None else None
+    if mapped is not None:
+        v1_code, http_status = mapped
+        message = detail or None if http_status == 422 else None
+        raise V1ApiError(v1_code, http_status, message=message) from exc
 
-    if status == 404:
-        raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404) from exc
-    if status == 403:
-        # Hide existence: the key binds to this workforce, so a 403 here
-        # is a policy edge (e.g. a swapped-in SaaS policy) -- surface it
-        # as not-found rather than leaking "exists but forbidden".
+    # Codeless HTTPException fallback. ``ensure_workforce_access`` raises
+    # 404 (missing) / 403 (policy) -- both surface as workforce_not_found
+    # so "exists but forbidden" isn't observable; other statuses map
+    # conservatively.
+    status = exc.status_code
+    if status in (403, 404):
         raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404) from exc
     if status == 409:
-        if "idempotency" in lowered:
-            raise V1ApiError(V1ErrorCode.IDEMPOTENCY_CONFLICT, 409) from exc
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409) from exc
     if status == 400:
-        if "archived" in lowered:
-            raise V1ApiError(V1ErrorCode.WORKFORCE_ARCHIVED, 409) from exc
-        if "must be active" in lowered:
-            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_ACTIVE, 409) from exc
-        # Invalid execution mode / idempotency key / empty message: a
-        # client-input error. 422 mirrors the Pydantic-rejection code SDK
-        # clients already map for other bad-body cases.
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 422, message=detail or None
         ) from exc
-    # Anything else is an unexpected server-side failure.
     raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500) from exc
 
 
