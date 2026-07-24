@@ -135,7 +135,12 @@ function PublicConversationContent({
     if (!SHARE_ACCESS_DENIED_REASONS.has(connectionError.message)) {
       return
     }
-    localStorage.removeItem(storageKey)
+    try {
+      localStorage.removeItem(storageKey)
+    } catch {
+      // Non-fatal: localStorage may be unavailable (private mode / sandboxed
+      // iframe); the reset below still recovers the session.
+    }
     setTaskId(null, { navigate: false })
   }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
@@ -199,7 +204,12 @@ function PublicConversationContent({
         // legacy token rejected post-#973). Drop the persisted token and force
         // a fresh auth rather than leaving the visitor on a dead session.
         if (authMode === "share" && (response.status === 401 || response.status === 403)) {
-          localStorage.removeItem(storageKey)
+          try {
+            localStorage.removeItem(storageKey)
+          } catch {
+            // Non-fatal: still force a fresh auth below even if localStorage
+            // is unavailable (private mode / sandboxed iframe).
+          }
           onAuthInvalidated?.()
         }
         const errorData = await response.json().catch(() => null)
@@ -362,7 +372,12 @@ export function PublicAgentChatPage({
 
   const onAuthInvalidated = useCallback(() => {
     if (shareAuthStorageKey) {
-      localStorage.removeItem(shareAuthStorageKey)
+      try {
+        localStorage.removeItem(shareAuthStorageKey)
+      } catch {
+        // Non-fatal: the state resets below re-auth regardless of whether
+        // localStorage is available (private mode / sandboxed iframe).
+      }
     }
     setAuthResult(null)
     setPublicAccessToken(null)
