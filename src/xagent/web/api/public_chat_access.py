@@ -829,6 +829,15 @@ async def share_chat_websocket_endpoint(
         with db_session_context() as db:
             access_context = get_share_chat_user(token, db)
             get_task_for_share_context(db, task_id, access_context)
+    except HTTPException as exc:
+        # Mirror the per-message revalidation path (below): an access denial —
+        # e.g. a returning guest whose persisted task belongs to another guest,
+        # or a pre-#973 legacy task — closes 4003 with the real reason so the
+        # frontend recovery flow can distinguish it from a transport failure and
+        # start a fresh session. A bare 4001 here would discard the reason and
+        # defeat that recovery (#973).
+        await websocket.close(code=4003, reason=exc.detail)
+        return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
