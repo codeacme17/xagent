@@ -49,15 +49,18 @@ interface PublicConversationContentProps {
   onAuthInvalidated?: () => void
 }
 
-// WS-close reasons that mean "this task/token isn't yours" rather than a
-// transport failure — used to distinguish a per-guest access denial
-// (recoverable by starting a fresh session) from a generic connection drop
-// (must not wipe the session). #973. The first two are backend
-// HTTPException.detail strings surfaced as event.reason on a 4003 close; the
-// third is use-websocket.ts's fallback when a 4003 carries no reason.
+// WS-close reasons that mean "this task isn't yours" rather than a transport
+// failure — used to distinguish a per-guest access denial (recoverable by
+// starting a fresh session) from a generic connection drop (must not wipe the
+// session). #973. Scoped to the guest-mismatch case only: "Share link is
+// unavailable" is emitted by many non-recoverable causes (owner disabled the
+// link, unpublished agent/workforce, channel mismatch), so treating it as
+// recoverable would trigger a pointless clear + re-auth round-trip that still
+// lands on the terminal error. "Access denied for this guest" is the backend
+// HTTPException.detail surfaced as event.reason on a 4003 close; "Access
+// denied" is use-websocket.ts's fallback when a 4003 carries no reason.
 const SHARE_ACCESS_DENIED_REASONS = new Set([
   "Access denied for this guest",
-  "Share link is unavailable",
   "Access denied",
 ])
 
