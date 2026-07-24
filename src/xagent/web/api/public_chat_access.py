@@ -171,7 +171,7 @@ def ensure_share_workforce_available(
     deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, share_workforce_id)
     if (
         not workforce
-        or int(workforce.owner_user_id) != user_id
+        or workforce.owner_user_id != user_id
         or workforce.status != "active"
         or deployment is None
         or not deployment.share_enabled
@@ -204,7 +204,7 @@ def ensure_widget_workforce_available(
     deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, widget_workforce_id)
     if (
         not workforce
-        or int(workforce.owner_user_id) != user_id
+        or workforce.owner_user_id != user_id
         or workforce.status != "active"
         or deployment is None
         or not deployment.widget_enabled

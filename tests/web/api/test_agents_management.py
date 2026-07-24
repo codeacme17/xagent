@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
 from xagent.web.api import agents as agents_api
+from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (
     EMBED_TICKET_TYPE,
     WIDGET_CREDENTIAL_REQUIRED_DETAIL,
@@ -1032,6 +1033,99 @@ def test_rotated_widget_key_invalidates_existing_guest_tokens() -> None:
     rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
     assert rotate.status_code == 200, rotate.text
 
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_widget_guest_token_rejected_when_agent_becomes_generated_manager() -> None:
+    """``ensure_widget_agent_available`` must reject a live guest token once the
+    backing agent is a workforce-generated manager, tripping the check at the
+    task-create site (not just at ``/api/widget/auth``)."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Becomes Manager Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # Flip the agent into a generated manager after the token was issued.
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def _mint_legacy_widget_guest_token(
+    *,
+    user_id: int,
+    agent_id: int,
+    guest_id: str = "guest-legacy",
+) -> dict[str, str]:
+    """Mint a widget guest JWT the way it was minted before the ``widget_key``
+    claim shipped (issue #988): no key embedded. Exercises the backward-compat
+    branch in ``ensure_widget_agent_available``."""
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.id == user_id).one()
+        username = str(user.username)
+    finally:
+        db.close()
+    token = create_public_chat_access_token(
+        {
+            "sub": username,
+            "user_id": user_id,
+            "channel_id": None,
+            "guest_id": guest_id,
+            "auth_mode": "widget",
+            "widget_agent_id": agent_id,
+        }
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_legacy_guest_token_without_widget_key_stays_gated_on_widget_enabled() -> None:
+    """Guest tokens minted before the ``widget_key`` claim shipped carry no key:
+    they still work while the widget is enabled, survive key rotation (no key to
+    compare), but are revoked when the widget is disabled. Locks in the
+    transitional contract documented on ``ensure_widget_agent_available``."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Legacy Token Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _mint_legacy_widget_guest_token(user_id=owner_id, agent_id=agent_id)
+
+    # (a) A keyless legacy token works while the widget is enabled.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # (c) Rotating the key does not revoke a keyless token: there is no key
+    # claim to compare, so it stays gated on widget_enabled only.
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # (b) Disabling the widget still revokes it.
+    disabled = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
     response = _create_widget_task(guest_headers, agent_id)
     assert response.status_code == 403, response.text
     assert response.json()["detail"] == "Widget is unavailable"
