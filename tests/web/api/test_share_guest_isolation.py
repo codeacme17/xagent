@@ -17,8 +17,10 @@ import io
 from types import SimpleNamespace
 from typing import Any
 
+import jwt
 import pytest
 
+from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
@@ -104,6 +106,17 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
+def _minted_guest_id(headers: dict[str, str]) -> str:
+    """Decode the guest JWT to recover the server-minted ``guest_id``, so tests
+    can assert the persisted task carries *this guest's* id (not merely that
+    *some* id is present)."""
+    token = headers["Authorization"].removeprefix("Bearer ")
+    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    guest_id = payload["guest_id"]
+    assert isinstance(guest_id, str) and guest_id.strip()
+    return guest_id
+
+
 def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _stub(**_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(background_task=None)
@@ -153,12 +166,12 @@ def test_agent_share_guest_cannot_touch_other_guests_task() -> None:
     assert created.status_code == 200, created.text
     task_b = int(created.json()["task_id"])
 
-    # Guest B stamped the task; the config carries B's guest id.
+    # Guest B stamped the task; the config carries *B's* minted guest id.
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
         assert int(task.agent_id) == agent_id
-        assert isinstance(task.agent_config.get("guest_id"), str)
+        assert task.agent_config.get("guest_id") == _minted_guest_id(guest_b)
     finally:
         db.close()
 
@@ -166,6 +179,46 @@ def test_agent_share_guest_cannot_touch_other_guests_task() -> None:
     assert _upload_to_task(guest_a, task_b).status_code == 403
     # Guest B still reaches its own task.
     assert _upload_to_task(guest_b, task_b).status_code == 200
+
+
+# ===== agent-share task creation is tamper-proof against a forged guest_id =====
+
+
+def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
+    """``TaskCreateRequest.agent_config`` is client-controlled, and
+    ``create_share_chat_task`` relies on assigning the server keys *after*
+    copying it. A guest posting a forged ``guest_id`` in the body must not be
+    able to stamp its task with another guest's id — the server-minted value
+    always wins. Guards against a future reorder regressing this silently."""
+    agent_id = _create_published_agent("Tamper Agent", "tamper-agent-tok")
+    assert agent_id
+    victim = _authenticate_share_guest("tamper-agent-tok")
+    attacker = _authenticate_share_guest("tamper-agent-tok")
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=attacker,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {"guest_id": _minted_guest_id(victim)},
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        # The persisted id is the attacker's own minted id, never the forged
+        # victim id from the request body.
+        assert task.agent_config.get("guest_id") == _minted_guest_id(attacker)
+        assert task.agent_config.get("guest_id") != _minted_guest_id(victim)
+    finally:
+        db.close()
+
+    # And the forged value buys no access to the victim's tasks anyway.
+    assert _upload_to_task(attacker, task_id).status_code == 200
 
 
 # ===== workforce-share cross-guest isolation =====
@@ -191,7 +244,7 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
-        assert isinstance(task.agent_config.get("guest_id"), str)
+        assert task.agent_config.get("guest_id") == _minted_guest_id(guest_b)
     finally:
         db.close()
 
