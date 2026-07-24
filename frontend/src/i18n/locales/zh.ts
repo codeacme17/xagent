@@ -3609,6 +3609,7 @@ const zh = {
   triggers: {
     title: "Triggers",
     subtitle: "选择此 Agent 的触发方式",
+    deleteConfirm: "确定删除该触发器？",
     defaults: {
       webhookName: "API / Webhook",
       scheduledName: "Schedule",
@@ -3691,9 +3692,6 @@ const zh = {
     },
     actions: {
       new: "新建",
-      create: "创建 Trigger",
-      enable: "启用 Trigger",
-      save: "保存修改",
       delete: "删除",
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
@@ -3704,7 +3702,8 @@ const zh = {
       confirmDiscard: "确认丢弃"
     },
     secret: {
-      title: "请立即复制此 secret，它只显示一次。"
+      title: "请立即复制此 secret，它只显示一次。",
+      dismiss: "我已保存该 secret"
     },
     webhook: {
       title: "Webhook 地址",
