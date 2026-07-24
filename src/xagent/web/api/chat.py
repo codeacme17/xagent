@@ -2289,6 +2289,49 @@ class AgentServiceManager:
             except Exception:
                 logger.warning("Quota gate check failed open", exc_info=True)
 
+        # Per-share run quota (#973): the run gate above bounds the OWNER's
+        # team quota, but every anonymous share run bills the owner, so one
+        # public link could still drain the whole team quota. This adds a
+        # per-link + per-guest rolling ceiling on top, keyed off the share
+        # markers PR1 stamped into agent_config. Only share tasks are gated;
+        # fails open (availability) like the run gate above.
+        if gate_task is not None:
+            try:
+                share_config = getattr(gate_task, "agent_config", None)
+                if (
+                    isinstance(share_config, Mapping)
+                    and share_config.get("auth_mode") == "share"
+                ):
+                    guest_id = share_config.get("guest_id")
+                    workforce_id = share_config.get("share_workforce_id")
+                    agent_share_id = share_config.get("share_agent_id")
+                    if workforce_id is not None:
+                        share_key = f"workforce:{int(workforce_id)}"
+                    elif agent_share_id is not None:
+                        share_key = f"agent:{int(agent_share_id)}"
+                    else:
+                        share_key = None
+                    if share_key and isinstance(guest_id, str) and guest_id:
+                        from ..services.share_rate_limit import (
+                            get_share_rate_limiter,
+                        )
+
+                        if not get_share_rate_limiter().allow_run(share_key, guest_id):
+                            reason_message = (
+                                "This shared link has reached its usage limit. "
+                                "Please try again later."
+                            )
+                            return {
+                                "success": False,
+                                "status": "quota_exceeded",
+                                "output": reason_message,
+                                "error": reason_message,
+                                "error_code": "share_run_quota_exceeded",
+                                "error_details": None,
+                            }
+            except Exception:
+                logger.warning("Share run quota check failed open", exc_info=True)
+
         if manage_task_lease and db_session and tracker_task_id:
             from ..services.task_execution_controller import (
                 task_execution_controller,

@@ -1,0 +1,231 @@
+"""Rate-limit enforcement on the public share endpoints (#973, PR2).
+
+Each anonymous share surface returns 429 once its bucket is exhausted. The
+autouse conftest fixture resets the share limiter before every test; each test
+tightens the relevant limit to 1/minute via env and resets again so the new
+limiter reads it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.user import User
+from xagent.web.services.share_rate_limit import reset_share_rate_limiter
+
+from .conftest import _admin_headers, _direct_db_session, _setup_admin, client
+
+pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+def _user_id() -> int:
+    _setup_admin()
+    db = _direct_db_session()
+    try:
+        return int(db.query(User).filter(User.username == "admin").one().id)
+    finally:
+        db.close()
+
+
+def _published_share_agent(token: str) -> int:
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=_user_id(),
+            name="RL Agent",
+            description="d",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+            share_enabled=True,
+            share_token=token,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        return int(agent.id)
+    finally:
+        db.close()
+
+
+def _create_workforce(name: str) -> str:
+    headers = _admin_headers()
+    owner = _user_id()
+
+    def _agent(agent_name: str, tok: str) -> int:
+        db = _direct_db_session()
+        try:
+            a = Agent(
+                user_id=owner,
+                name=agent_name,
+                description="d",
+                instructions="i",
+                execution_mode="balanced",
+                status=AgentStatus.PUBLISHED,
+                share_enabled=True,
+                share_token=tok,
+            )
+            db.add(a)
+            db.commit()
+            db.refresh(a)
+            return int(a.id)
+        finally:
+            db.close()
+
+    resp = client.post(
+        "/api/workforces",
+        headers=headers,
+        json={
+            "name": name,
+            "description": "rl",
+            "manager_agent_id": _agent(f"{name} Mgr", f"{name}-mgr"),
+            "workers": [
+                {
+                    "source_type": "existing",
+                    "agent_id": _agent(f"{name} Wrk", f"{name}-wrk"),
+                    "alias": "w1",
+                    "assignment_instructions": "go",
+                    "enabled": True,
+                    "sort_order": 1,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    wf_id = int(resp.json()["id"])
+    published = client.post(f"/api/workforces/{wf_id}/publish", headers=headers)
+    assert published.status_code == 200, published.text
+    share = client.post(f"/api/workforces/{wf_id}/share-link", headers=headers)
+    assert share.status_code == 200, share.text
+    return str(share.json()["share_token"])
+
+
+def _guest_headers(token: str) -> dict[str, str]:
+    resp = client.post("/api/share/auth", json={"share_token": token})
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def test_share_auth_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_SHARE_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+    _published_share_agent("rl-auth-tok")
+
+    first = client.post("/api/share/auth", json={"share_token": "rl-auth-tok"})
+    assert first.status_code == 200, first.text
+    second = client.post("/api/share/auth", json={"share_token": "rl-auth-tok"})
+    assert second.status_code == 429, second.text
+
+
+def test_share_task_create_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _published_share_agent("rl-create-tok")
+    guest = _guest_headers("rl-create-tok")
+
+    # Tighten only after the guest token is minted (auth has its own bucket).
+    monkeypatch.setenv("XAGENT_SHARE_TASK_CREATE_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"title": "hi", "description": "hi"}
+    first = client.post("/api/share/chat/task/create", headers=guest, json=body)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/share/chat/task/create", headers=guest, json=body)
+    assert second.status_code == 429, second.text
+
+
+def test_share_upload_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = _create_workforce("RL Upload WF")
+    guest = _guest_headers(token)
+
+    monkeypatch.setenv("XAGENT_SHARE_UPLOAD_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    def _upload():
+        return client.post(
+            "/api/share/files/upload",
+            headers=guest,
+            data={"task_type": "task"},
+            files={"file": ("n.txt", io.BytesIO(b"x"), "text/plain")},
+        )
+
+    assert _upload().status_code == 200
+    assert _upload().status_code == 429
+
+
+class _FakeWebSocket:
+    """Minimal websocket double: yields queued frames, then disconnects."""
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = list(frames)
+
+    async def receive_text(self) -> str:
+        from fastapi import WebSocketDisconnect
+
+        if not self._frames:
+            raise WebSocketDisconnect(code=1000)
+        return self._frames.pop(0)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_ws_turn_rate_limited_rejects_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited websocket turn is rejected (message_rejected) and never
+    dispatched to handle_chat_message; the connection stays open."""
+    from xagent.web.api import public_chat_access as pca
+
+    monkeypatch.setenv("XAGENT_SHARE_WS_TURN_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    ctx = pca.ShareChatAccessContext(
+        user=MagicMock(id=1),
+        share_token="tok",
+        guest_id="guest-ws",
+        agent=MagicMock(),
+    )
+    monkeypatch.setattr(pca, "get_share_chat_user", lambda *a, **k: ctx)
+    monkeypatch.setattr(pca, "get_task_for_share_context", lambda *a, **k: MagicMock())
+
+    @contextlib.contextmanager
+    def _fake_db():
+        yield MagicMock()
+
+    monkeypatch.setattr(pca, "db_session_context", _fake_db)
+    monkeypatch.setattr(
+        pca, "manager", MagicMock(connect=AsyncMock(), disconnect=MagicMock())
+    )
+    monkeypatch.setattr(pca, "handle_status_request", AsyncMock())
+    dispatch = AsyncMock()
+    monkeypatch.setattr(pca, "handle_chat_message", dispatch)
+    delivery = AsyncMock()
+    monkeypatch.setattr(pca, "send_message_delivery", delivery)
+
+    # Two chat turns: the first is admitted (dispatched), the second trips the
+    # 1/minute per-guest bucket and is rejected.
+    frames = [
+        json.dumps({"type": "chat", "client_message_id": "m1", "message": "hi"}),
+        json.dumps({"type": "chat", "client_message_id": "m2", "message": "again"}),
+    ]
+    await pca.share_chat_websocket_endpoint(
+        websocket=_FakeWebSocket(frames), task_id=1, token="jwt"
+    )
+
+    assert dispatch.await_count == 1  # only the admitted turn dispatched
+    assert delivery.await_count == 1  # the rejected turn got a delivery ack
+    _, kwargs = delivery.await_args
+    assert kwargs["accepted"] is False
+    assert kwargs["client_message_id"] == "m2"

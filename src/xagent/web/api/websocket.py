@@ -220,7 +220,7 @@ def _client_message_id(value: Any) -> str | None:
     return normalized
 
 
-async def _send_message_delivery(
+async def send_message_delivery(
     websocket: WebSocket,
     *,
     client_message_id: str | None,
@@ -2007,7 +2007,7 @@ async def execute_resume_background(
         if delivery_websocket is None or delivery_client_message_id is None:
             return
         try:
-            await _send_message_delivery(
+            await send_message_delivery(
                 delivery_websocket,
                 client_message_id=delivery_client_message_id,
                 turn_id=delivery_turn_id or delivery_client_message_id,
@@ -3104,7 +3104,7 @@ async def handle_chat_message(
         )
     except (PermissionError, ValueError) as exc:
         client_message_id = _client_message_id(message_data.get("client_message_id"))
-        await _send_message_delivery(
+        await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
@@ -3123,7 +3123,7 @@ async def handle_chat_message(
             await _handle_chat_message_unserialized(websocket, task_id, message_data)
         return
     if not enqueued.payload_matches:
-        await _send_message_delivery(
+        await send_message_delivery(
             websocket,
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
@@ -3133,7 +3133,7 @@ async def handle_chat_message(
         )
         return
     if enqueued.status == COMMAND_FAILED:
-        await _send_message_delivery(
+        await send_message_delivery(
             websocket,
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
@@ -3142,7 +3142,7 @@ async def handle_chat_message(
             retry_with_new_id=True,
         )
         return
-    await _send_message_delivery(
+    await send_message_delivery(
         websocket,
         client_message_id=_client_message_id(message_data.get("client_message_id")),
         turn_id=enqueued.client_command_id,
@@ -3281,7 +3281,7 @@ async def _handle_chat_message_unserialized(
             message_data["_durable_command_error"] = message or "Message was rejected"
         if suppress_delivery_ack:
             return
-        await _send_message_delivery(
+        await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=turn_id,

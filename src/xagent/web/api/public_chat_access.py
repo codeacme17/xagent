@@ -32,8 +32,10 @@ from ..services.connector_runtime import (
 from ..services.deployments import get_deployment
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
+from ..services.share_rate_limit import get_share_rate_limiter
 from .files import store_uploaded_files
 from .websocket import (
+    send_message_delivery,
     handle_chat_message,
     handle_execute_task,
     handle_intervention,
@@ -853,11 +855,35 @@ async def share_chat_websocket_endpoint(
             message_data["user_id"] = access_context.user.id
             message_data["user"] = access_context.user
 
-            if message_data.get("type") == "chat":
+            message_type = message_data.get("type")
+            # Abuse control (#973): follow-up turns bypass the HTTP task-create
+            # limiter and each starts an owner-billed run, so rate-limit the
+            # run-starting turn types per guest here. Reject the turn (the
+            # client surfaces it and can retry) rather than closing — a rate
+            # limit is transient. Interventions are control messages, not new
+            # runs, so they are not gated.
+            if message_type in ("chat", "execute_task") and (
+                not get_share_rate_limiter().allow_ws_turn(
+                    current_access_context.guest_id
+                )
+            ):
+                await send_message_delivery(
+                    websocket,
+                    client_message_id=message_data.get("client_message_id"),
+                    turn_id=str(message_data.get("client_message_id") or ""),
+                    accepted=False,
+                    message=(
+                        "You're sending messages too quickly. "
+                        "Please wait a moment and try again."
+                    ),
+                )
+                continue
+
+            if message_type == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
-            elif message_data.get("type") == "execute_task":
+            elif message_type == "execute_task":
                 await handle_execute_task(websocket, task_id, message_data)
-            elif message_data.get("type") == "intervention":
+            elif message_type == "intervention":
                 await handle_intervention(websocket, task_id, message_data)
     except Exception as exc:
         from fastapi import WebSocketDisconnect

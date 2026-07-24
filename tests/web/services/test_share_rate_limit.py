@@ -1,0 +1,134 @@
+"""Unit tests for the share-channel rate limiter / run quota (#973, PR2)."""
+
+from __future__ import annotations
+
+import pytest
+
+from xagent.web.services.share_rate_limit import (
+    ShareRateLimiter,
+    get_share_rate_limiter,
+    reset_share_rate_limiter,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset() -> None:
+    reset_share_rate_limiter()
+    yield
+    reset_share_rate_limiter()
+
+
+def _limiter_with(monkeypatch: pytest.MonkeyPatch, **env: str) -> ShareRateLimiter:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    reset_share_rate_limiter()
+    return get_share_rate_limiter()
+
+
+def test_auth_per_token_bucket_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_AUTH_RATE_LIMIT="2/minute",
+        XAGENT_SHARE_AUTH_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_auth("tok", "1.1.1.1") is True
+    assert limiter.allow_auth("tok", "1.1.1.1") is True
+    assert limiter.allow_auth("tok", "1.1.1.1") is False
+
+
+def test_auth_per_ip_ceiling_trips_across_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_AUTH_RATE_LIMIT="100/minute",
+        XAGENT_SHARE_AUTH_IP_RATE_LIMIT="2/minute",
+    )
+    # Rotating the share token must not escape the per-IP ceiling.
+    assert limiter.allow_auth("tok-a", "9.9.9.9") is True
+    assert limiter.allow_auth("tok-b", "9.9.9.9") is True
+    assert limiter.allow_auth("tok-c", "9.9.9.9") is False
+
+
+def test_task_create_per_guest_bucket_trips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_TASK_CREATE_RATE_LIMIT="1/minute",
+        XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_task_create("tok", "guest-1") is True
+    assert limiter.allow_task_create("tok", "guest-1") is False
+    # A different guest on the same link has an independent bucket.
+    assert limiter.allow_task_create("tok", "guest-2") is True
+
+
+def test_task_create_token_ceiling_trips_across_guests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_TASK_CREATE_RATE_LIMIT="100/minute",
+        XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_task_create("tok", "guest-1") is True
+    assert limiter.allow_task_create("tok", "guest-2") is True
+    assert limiter.allow_task_create("tok", "guest-3") is False
+
+
+def test_ws_turn_and_upload_are_per_guest(monkeypatch: pytest.MonkeyPatch) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_WS_TURN_RATE_LIMIT="1/minute",
+        XAGENT_SHARE_UPLOAD_RATE_LIMIT="1/minute",
+    )
+    assert limiter.allow_ws_turn("g") is True
+    assert limiter.allow_ws_turn("g") is False
+    assert limiter.allow_ws_turn("other") is True
+    assert limiter.allow_upload("g") is True
+    assert limiter.allow_upload("g") is False
+
+
+def test_run_quota_per_share_and_per_guest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_RUN_QUOTA="3/day",
+        XAGENT_SHARE_RUN_GUEST_QUOTA="2/hour",
+    )
+    # Per-guest window (2) trips before the per-share quota (3) for one guest.
+    assert limiter.allow_run("agent:1", "g1") is True
+    assert limiter.allow_run("agent:1", "g1") is True
+    assert limiter.allow_run("agent:1", "g1") is False
+
+
+def test_run_guest_denial_does_not_consume_share_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-guest window denial must not burn a per-share-quota slot."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_RUN_QUOTA="3/day",
+        XAGENT_SHARE_RUN_GUEST_QUOTA="1/hour",
+    )
+    assert limiter.allow_run("agent:1", "g1") is True  # share=1, g1=1
+    assert limiter.allow_run("agent:1", "g1") is False  # g1 window blocks
+    # g1's denials didn't consume the share quota, so two fresh guests still fit.
+    assert limiter.allow_run("agent:1", "g2") is True  # share=2
+    assert limiter.allow_run("agent:1", "g3") is True  # share=3
+    assert limiter.allow_run("agent:1", "g4") is False  # share quota (3) hit
+
+
+def test_run_share_quota_trips_across_guests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_RUN_QUOTA="2/day",
+        XAGENT_SHARE_RUN_GUEST_QUOTA="100/hour",
+    )
+    assert limiter.allow_run("workforce:5", "g1") is True
+    assert limiter.allow_run("workforce:5", "g2") is True
+    assert limiter.allow_run("workforce:5", "g3") is False
