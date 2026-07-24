@@ -31,6 +31,7 @@ from ..services.connector_runtime import (
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
+from ..services.share_rate_limit import get_share_rate_limiter
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
@@ -41,6 +42,7 @@ from .websocket import (
     handle_intervention,
     handle_status_request,
     manager,
+    send_message_delivery,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,9 @@ def mint_share_guest_id() -> str:
 class _ChatAccessContext(Protocol):
     @property
     def user(self) -> User: ...
+
+    @property
+    def guest_id(self) -> str: ...
 
 
 _ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
@@ -1050,6 +1055,7 @@ def _authorize_chat_websocket_sync(
         return WebSocketPrincipal(
             id=int(user_id),
             is_admin=bool(access_context.user.is_admin),
+            guest_id=access_context.guest_id,
         )
 
 
@@ -1209,11 +1215,37 @@ async def share_chat_websocket_endpoint(
             message_data["user_id"] = current_principal.id
             message_data["user"] = current_principal
 
-            if message_data.get("type") == "chat":
+            message_type = message_data.get("type")
+            # Abuse control (#973): follow-up turns bypass the HTTP task-create
+            # limiter and each starts an owner-billed run, so rate-limit the
+            # run-starting turn types per guest here. Reject the turn (the
+            # client surfaces it and can retry) rather than closing — a rate
+            # limit is transient. Interventions are control messages, not new
+            # runs, so they are not gated.
+            if (
+                message_type in ("chat", "execute_task")
+                and current_principal.guest_id
+                and not get_share_rate_limiter().allow_ws_turn(
+                    current_principal.guest_id
+                )
+            ):
+                await send_message_delivery(
+                    websocket,
+                    client_message_id=message_data.get("client_message_id"),
+                    turn_id=str(message_data.get("client_message_id") or ""),
+                    accepted=False,
+                    message=(
+                        "You're sending messages too quickly. "
+                        "Please wait a moment and try again."
+                    ),
+                )
+                continue
+
+            if message_type == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
-            elif message_data.get("type") == "execute_task":
+            elif message_type == "execute_task":
                 await handle_execute_task(websocket, task_id, message_data)
-            elif message_data.get("type") == "intervention":
+            elif message_type == "intervention":
                 await handle_intervention(websocket, task_id, message_data)
     except Exception as exc:
         from fastapi import WebSocketDisconnect
