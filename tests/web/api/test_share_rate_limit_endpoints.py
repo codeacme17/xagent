@@ -229,3 +229,58 @@ async def test_ws_turn_rate_limited_rejects_without_dispatch(
     _, kwargs = delivery.await_args
     assert kwargs["accepted"] is False
     assert kwargs["client_message_id"] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_ws_turn_rate_limited_without_client_id_sends_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited turn that carries no client_message_id still surfaces the
+    throttle: send_message_delivery no-ops without an id, so a generic error
+    frame is sent instead (the client isn't left with a silently dropped turn)."""
+    from xagent.web.api import public_chat_access as pca
+
+    monkeypatch.setenv("XAGENT_SHARE_WS_TURN_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    ctx = pca.ShareChatAccessContext(
+        user=MagicMock(id=1),
+        share_token="tok",
+        guest_id="guest-noid",
+        agent=MagicMock(),
+    )
+    monkeypatch.setattr(pca, "get_share_chat_user", lambda *a, **k: ctx)
+    monkeypatch.setattr(pca, "get_task_for_share_context", lambda *a, **k: MagicMock())
+
+    @contextlib.contextmanager
+    def _fake_db():
+        yield MagicMock()
+
+    monkeypatch.setattr(pca, "db_session_context", _fake_db)
+    manager = MagicMock(
+        connect=AsyncMock(),
+        disconnect=MagicMock(),
+        send_personal_message=AsyncMock(),
+    )
+    monkeypatch.setattr(pca, "manager", manager)
+    monkeypatch.setattr(pca, "handle_status_request", AsyncMock())
+    monkeypatch.setattr(pca, "handle_chat_message", AsyncMock())
+    monkeypatch.setattr(pca, "send_message_delivery", AsyncMock())
+
+    # Two untagged chat turns: the second trips the 1/minute bucket. Without a
+    # client_message_id, the rejection must arrive as a generic error frame.
+    frames = [
+        json.dumps({"type": "chat", "message": "hi"}),
+        json.dumps({"type": "chat", "message": "again"}),
+    ]
+    await pca.share_chat_websocket_endpoint(
+        websocket=_FakeWebSocket(frames), task_id=1, token="jwt"
+    )
+
+    error_frames = [
+        call.args[0]
+        for call in manager.send_personal_message.await_args_list
+        if call.args and call.args[0].get("type") == "error"
+    ]
+    assert len(error_frames) == 1
+    assert "too quickly" in error_frames[0]["message"]

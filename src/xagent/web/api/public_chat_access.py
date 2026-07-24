@@ -867,16 +867,27 @@ async def share_chat_websocket_endpoint(
                     current_access_context.guest_id
                 )
             ):
+                client_message_id = message_data.get("client_message_id")
+                rate_limited_message = (
+                    "You're sending messages too quickly. "
+                    "Please wait a moment and try again."
+                )
                 await send_message_delivery(
                     websocket,
-                    client_message_id=message_data.get("client_message_id"),
-                    turn_id=str(message_data.get("client_message_id") or ""),
+                    client_message_id=client_message_id,
+                    turn_id=str(client_message_id or ""),
                     accepted=False,
-                    message=(
-                        "You're sending messages too quickly. "
-                        "Please wait a moment and try again."
-                    ),
+                    message=rate_limited_message,
                 )
+                # send_message_delivery no-ops without a client_message_id, so
+                # a client that didn't tag the turn would otherwise get zero
+                # feedback and see the message silently dropped. Fall back to a
+                # generic error so the throttle is always surfaced.
+                if client_message_id is None:
+                    await manager.send_personal_message(
+                        {"type": "error", "message": rate_limited_message},
+                        websocket,
+                    )
                 continue
 
             if message_type == "chat":
