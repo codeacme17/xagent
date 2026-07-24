@@ -17,17 +17,21 @@ import io
 from types import SimpleNamespace
 from typing import Any
 
-import jwt
 import pytest
 
 from xagent.web.api.public_chat_access import create_public_chat_access_token
-from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services import workforce_runs as workforce_runs_service
 
-from .conftest import _admin_headers, _direct_db_session, _setup_admin, client
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _setup_admin,
+    client,
+    share_guest_id,
+)
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
@@ -106,17 +110,6 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
-def _minted_guest_id(headers: dict[str, str]) -> str:
-    """Decode the guest JWT to recover the server-minted ``guest_id``, so tests
-    can assert the persisted task carries *this guest's* id (not merely that
-    *some* id is present)."""
-    token = headers["Authorization"].removeprefix("Bearer ")
-    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    guest_id = payload["guest_id"]
-    assert isinstance(guest_id, str) and guest_id.strip()
-    return guest_id
-
-
 def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _stub(**_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(background_task=None)
@@ -171,7 +164,9 @@ def test_agent_share_guest_cannot_touch_other_guests_task() -> None:
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
         assert int(task.agent_id) == agent_id
-        assert task.agent_config.get("guest_id") == _minted_guest_id(guest_b)
+        assert task.agent_config.get("guest_id") == share_guest_id(
+            guest_b["Authorization"]
+        )
     finally:
         db.close()
 
@@ -201,7 +196,7 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         json={
             "title": "forged",
             "description": "forged",
-            "agent_config": {"guest_id": _minted_guest_id(victim)},
+            "agent_config": {"guest_id": share_guest_id(victim["Authorization"])},
         },
     )
     assert created.status_code == 200, created.text
@@ -212,8 +207,12 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         task = db.query(Task).filter(Task.id == task_id).one()
         # The persisted id is the attacker's own minted id, never the forged
         # victim id from the request body.
-        assert task.agent_config.get("guest_id") == _minted_guest_id(attacker)
-        assert task.agent_config.get("guest_id") != _minted_guest_id(victim)
+        assert task.agent_config.get("guest_id") == share_guest_id(
+            attacker["Authorization"]
+        )
+        assert task.agent_config.get("guest_id") != share_guest_id(
+            victim["Authorization"]
+        )
     finally:
         db.close()
 
@@ -244,7 +243,9 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
-        assert task.agent_config.get("guest_id") == _minted_guest_id(guest_b)
+        assert task.agent_config.get("guest_id") == share_guest_id(
+            guest_b["Authorization"]
+        )
     finally:
         db.close()
 
