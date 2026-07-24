@@ -46,7 +46,20 @@ interface PublicConversationContentProps {
   agentLogo: string | null
   agentDescription: string | null
   suggestedPrompts: string[]
+  onAuthInvalidated?: () => void
 }
+
+// WS-close reasons that mean "this task/token isn't yours" rather than a
+// transport failure — used to distinguish a per-guest access denial
+// (recoverable by starting a fresh session) from a generic connection drop
+// (must not wipe the session). #973. The first two are backend
+// HTTPException.detail strings surfaced as event.reason on a 4003 close; the
+// third is use-websocket.ts's fallback when a 4003 carries no reason.
+const SHARE_ACCESS_DENIED_REASONS = new Set([
+  "Access denied for this guest",
+  "Share link is unavailable",
+  "Access denied",
+])
 
 type PublicMessageConfig = Record<string, unknown>
 
@@ -61,8 +74,9 @@ function PublicConversationContent({
   agentLogo,
   agentDescription,
   suggestedPrompts,
+  onAuthInvalidated,
 }: PublicConversationContentProps) {
-  const { state, dispatch, sendMessage, setTaskId } = useApp()
+  const { state, dispatch, sendMessage, setTaskId, connectionError } = useApp()
   const { t } = useI18n()
   const [createTaskError, setCreateTaskError] = useState<string | null>(null)
   const [draftMessage, setDraftMessage] = useState("")
@@ -106,6 +120,24 @@ function PublicConversationContent({
 
     localStorage.removeItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
+
+  // Recover a returning share visitor whose persisted taskId belongs to a
+  // different guest_id (e.g. a pre-#973 task created before per-guest
+  // isolation): the WS connect closes 4003 with an access-denied reason. Drop
+  // the stale taskId and fall back to the start screen so the visitor opens a
+  // fresh session under their current guest token — instead of being stuck on
+  // an error. Scoped to access-denied reasons so a transient transport drop
+  // never wipes a live session.
+  useEffect(() => {
+    if (authMode !== "share" || !connectionError || !state.taskId) {
+      return
+    }
+    if (!SHARE_ACCESS_DENIED_REASONS.has(connectionError.message)) {
+      return
+    }
+    localStorage.removeItem(storageKey)
+    setTaskId(null, { navigate: false })
+  }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
   const handleSend = useCallback(async (
     message: string,
@@ -162,6 +194,14 @@ function PublicConversationContent({
       })
 
       if (!response.ok) {
+        // A share task-create carries no task id, so 401/403 here means the
+        // guest token itself is no longer valid (rotated/disabled link, or a
+        // legacy token rejected post-#973). Drop the persisted token and force
+        // a fresh auth rather than leaving the visitor on a dead session.
+        if (authMode === "share" && (response.status === 401 || response.status === 403)) {
+          localStorage.removeItem(storageKey)
+          onAuthInvalidated?.()
+        }
         const errorData = await response.json().catch(() => null)
         const errorMessage = errorData?.detail || t("widgetChat.messages.error_init")
         setCreateTaskError(errorMessage)
@@ -206,7 +246,7 @@ function PublicConversationContent({
       setIsBootstrappingTask(false)
       throw error
     }
-  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t, workforceId])
+  }, [accessToken, agentId, agentLogo, agentName, authMode, dispatch, onAuthInvalidated, publicApiPrefix, sendMessage, setTaskId, state.taskId, storageKey, t, workforceId])
 
   useEffect(() => {
     if (state.taskId || createTaskError) {
@@ -309,10 +349,68 @@ export function PublicAgentChatPage({
   const [isInitializing, setIsInitializing] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [authResult, setAuthResult] = useState<PublicAuthResult | null>(null)
+  // Bumped to force a fresh /api/share/auth when a persisted guest token turns
+  // out to be invalid (see onAuthInvalidated below).
+  const [reauthNonce, setReauthNonce] = useState(0)
+
+  // The guest token is minted server-side and carries the per-guest isolation
+  // credential (#973). Persist it per share link and REUSE it across reloads
+  // instead of re-authing every mount: re-authing would mint a new guest_id
+  // each time, so a returning visitor's own tasks would fail the per-guest
+  // check. Widget keeps its old behavior (its guest_id is client-supplied).
+  const shareAuthStorageKey = authMode === "share" ? `share_auth_${routeToken}` : null
+
+  const onAuthInvalidated = useCallback(() => {
+    if (shareAuthStorageKey) {
+      localStorage.removeItem(shareAuthStorageKey)
+    }
+    setAuthResult(null)
+    setPublicAccessToken(null)
+    setIsInitializing(true)
+    setReauthNonce((n) => n + 1)
+  }, [shareAuthStorageKey])
 
   useEffect(() => {
+    const persistShareAuth = (data: PublicAuthResult) => {
+      if (!shareAuthStorageKey) {
+        return
+      }
+      try {
+        localStorage.setItem(shareAuthStorageKey, JSON.stringify(data))
+      } catch {
+        // Non-fatal: without persistence the visitor simply re-auths (and gets
+        // a new guest session) on the next reload.
+      }
+    }
+
+    const readPersistedShareAuth = (): PublicAuthResult | null => {
+      if (!shareAuthStorageKey) {
+        return null
+      }
+      try {
+        const raw = localStorage.getItem(shareAuthStorageKey)
+        if (!raw) {
+          return null
+        }
+        const parsed = JSON.parse(raw) as PublicAuthResult
+        return typeof parsed?.access_token === "string" && parsed.access_token
+          ? parsed
+          : null
+      } catch {
+        return null
+      }
+    }
+
     const initPublicChat = async () => {
       try {
+        const persisted = readPersistedShareAuth()
+        if (persisted) {
+          setAuthResult(persisted)
+          setPublicAccessToken(persisted.access_token ?? null)
+          setErrorMessage(null)
+          return
+        }
+
         const authPath = authMode === "share" ? "/api/share/auth" : "/api/widget/auth"
         const authPayload = authMode === "share"
           ? { share_token: routeToken }
@@ -337,6 +435,7 @@ export function PublicAgentChatPage({
         }
 
         const authData = await authResponse.json()
+        persistShareAuth(authData)
         setAuthResult(authData)
         setPublicAccessToken(authData.access_token ?? null)
         setErrorMessage(null)
@@ -351,7 +450,7 @@ export function PublicAgentChatPage({
 
     initPublicChat()
     return () => setPublicAccessToken(null)
-  }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, t])
+  }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, shareAuthStorageKey, reauthNonce, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
 
@@ -408,6 +507,7 @@ export function PublicAgentChatPage({
         agentLogo={resolvedAuthResult.agent_logo ?? null}
         agentDescription={resolvedAuthResult.agent_description ?? null}
         suggestedPrompts={resolvedAuthResult.suggested_prompts ?? []}
+        onAuthInvalidated={onAuthInvalidated}
       />
     </AppProvider>
   )
