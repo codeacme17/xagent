@@ -49,20 +49,60 @@ interface PublicConversationContentProps {
   onAuthInvalidated?: () => void
 }
 
-// WS-close reasons that mean "this task isn't yours" rather than a transport
-// failure — used to distinguish a per-guest access denial (recoverable by
-// starting a fresh session) from a generic connection drop (must not wipe the
-// session). #973. Scoped to the guest-mismatch case only: "Share link is
-// unavailable" is emitted by many non-recoverable causes (owner disabled the
-// link, unpublished agent/workforce, channel mismatch), so treating it as
-// recoverable would trigger a pointless clear + re-auth round-trip that still
-// lands on the terminal error. "Access denied for this guest" is the backend
-// HTTPException.detail surfaced as event.reason on a 4003 close; "Access
-// denied" is use-websocket.ts's fallback when a 4003 carries no reason.
+// WS-close reasons that mean "this session isn't usable as-is" rather than a
+// transport failure — used to distinguish a recoverable auth/isolation denial
+// (recoverable by dropping the stale task/token and starting fresh) from a
+// generic connection drop (must not wipe the session). #973. NOT the
+// non-recoverable causes: "Share link is unavailable" is emitted when the owner
+// disabled the link, unpublished the agent/workforce, or the channel
+// mismatches, so treating it as recoverable would trigger a pointless clear +
+// re-auth round-trip that still lands on the terminal error.
+//   - "Access denied for this guest": the per-guest isolation denial — a
+//     returning visitor's persisted taskId belongs to another (or a pre-#973)
+//     guest. Backend HTTPException.detail surfaced as event.reason on a 4003.
+//   - "Access denied": use-websocket.ts's fallback when a 4003 carries no
+//     reason.
+//   - "Invalid share token": the persisted guest JWT is no longer decodable —
+//     in practice an expired token (30-day TTL) reused by a visitor returning
+//     with intact localStorage. Recovery drops the stale token so the next
+//     mount re-auths fresh; without it the visitor is stuck on a dead session
+//     the WS-resume path can never re-auth on its own.
 const SHARE_ACCESS_DENIED_REASONS = new Set([
   "Access denied for this guest",
   "Access denied",
+  "Invalid share token",
 ])
+
+// localStorage.removeItem can throw in restricted contexts (private mode /
+// sandboxed iframe). Every share-recovery path that clears a key must survive
+// that so the in-memory session reset still proceeds. #973.
+const safeRemoveItem = (key: string) => {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // Non-fatal: the caller's state reset recovers the session regardless.
+  }
+}
+
+// A persisted guest JWT past its exp (30-day TTL) is dead on arrival: reusing
+// it fails every request, and over the WS-resume path it strands the visitor on
+// a session that can never re-auth on its own. Treat an expired token as absent
+// so the mount re-auths fresh, instead of relying on a failed connect to
+// recover. Only the unverified exp claim is read as a liveness pre-filter —
+// signature verification stays server-side, and any parse failure falls through
+// to the server (which fails closed and hits the reactive recovery path). #973.
+const isShareTokenExpired = (token: string): boolean => {
+  try {
+    const payload = token.split(".")[1]
+    if (!payload) {
+      return false
+    }
+    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))
+    return typeof claims.exp === "number" && claims.exp * 1000 <= Date.now()
+  } catch {
+    return false
+  }
+}
 
 type PublicMessageConfig = Record<string, unknown>
 
@@ -124,7 +164,7 @@ function PublicConversationContent({
       return
     }
 
-    localStorage.removeItem(storageKey)
+    safeRemoveItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
 
   // Recover a returning share visitor whose persisted taskId belongs to a
@@ -141,12 +181,7 @@ function PublicConversationContent({
     if (!SHARE_ACCESS_DENIED_REASONS.has(connectionError.message)) {
       return
     }
-    try {
-      localStorage.removeItem(storageKey)
-    } catch {
-      // Non-fatal: localStorage may be unavailable (private mode / sandboxed
-      // iframe); the reset below still recovers the session.
-    }
+    safeRemoveItem(storageKey)
     setTaskId(null, { navigate: false })
   }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
@@ -210,12 +245,7 @@ function PublicConversationContent({
         // legacy token rejected post-#973). Drop the persisted token and force
         // a fresh auth rather than leaving the visitor on a dead session.
         if (authMode === "share" && (response.status === 401 || response.status === 403)) {
-          try {
-            localStorage.removeItem(storageKey)
-          } catch {
-            // Non-fatal: still force a fresh auth below even if localStorage
-            // is unavailable (private mode / sandboxed iframe).
-          }
+          safeRemoveItem(storageKey)
           onAuthInvalidated?.()
         }
         const errorData = await response.json().catch(() => null)
@@ -378,12 +408,7 @@ export function PublicAgentChatPage({
 
   const onAuthInvalidated = useCallback(() => {
     if (shareAuthStorageKey) {
-      try {
-        localStorage.removeItem(shareAuthStorageKey)
-      } catch {
-        // Non-fatal: the state resets below re-auth regardless of whether
-        // localStorage is available (private mode / sandboxed iframe).
-      }
+      safeRemoveItem(shareAuthStorageKey)
     }
     setAuthResult(null)
     setPublicAccessToken(null)
@@ -429,6 +454,12 @@ export function PublicAgentChatPage({
           || !isNullableNumber((parsed as PublicAuthResult).agent_id)
           || !isNullableNumber((parsed as PublicAuthResult).workforce_id)
         ) {
+          return null
+        }
+        // Drop an expired token here so the mount re-auths fresh instead of
+        // reusing a dead credential (which the WS-resume path can't recover
+        // from on its own). #973.
+        if (isShareTokenExpired((parsed as PublicAuthResult).access_token)) {
           return null
         }
         return parsed as PublicAuthResult
