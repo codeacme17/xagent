@@ -22,8 +22,11 @@ extracted yet, only the stable ``remote_ip_from_request`` helper is imported.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
+from collections.abc import Callable
+from typing import TypeVar
 
 from limits import RateLimitItem, parse
 from limits.storage import MemoryStorage, storage_from_string
@@ -74,6 +77,37 @@ def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
         return parse(fallback)
 
 
+_F = TypeVar("_F", bound=Callable[..., bool])
+
+
+def _fail_open(method: _F) -> _F:
+    """Make an ``allow_*`` gate fail open on storage/backend errors.
+
+    Rate limiting is a non-blocking guard, not a correctness gate: when the
+    Redis backend is down or misconfigured the limiter calls raise, and on a
+    public share surface that would 500 the auth/upload/create endpoints and
+    tear down live websockets. A transient infra blip must not lock every
+    visitor out, so any exception is logged and treated as "admit" — matching
+    the fail-open run gate at the ``execute_task`` chokepoint. (A genuine
+    over-limit still returns ``False`` normally; only raised errors admit.)
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "ShareRateLimiter", *args: object, **kwargs: object) -> bool:
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            logger.warning(
+                "Share rate limiter (%s) failed open: %s",
+                method.__name__,
+                exc,
+                exc_info=True,
+            )
+            return True
+
+    return wrapper  # type: ignore[return-value]
+
+
 class ShareRateLimiter:
     """Moving-window limiter over Redis or in-process memory for share channels."""
 
@@ -109,6 +143,7 @@ class ShareRateLimiter:
             get_share_run_guest_quota(), fallback="60/hour"
         )
 
+    @_fail_open
     def allow_auth(self, share_token: str, remote_ip: str | None) -> bool:
         """Count one auth attempt; False when a bucket is exceeded.
 
@@ -122,6 +157,7 @@ class ShareRateLimiter:
             self._auth_token_limit, _AUTH_TOKEN_NAMESPACE, share_token or "unknown"
         )
 
+    @_fail_open
     def allow_task_create(self, share_token: str, guest_id: str) -> bool:
         """Count one task-create; False when a bucket is exceeded.
 
@@ -140,18 +176,21 @@ class ShareRateLimiter:
             guest_id or "unknown",
         )
 
+    @_fail_open
     def allow_ws_turn(self, guest_id: str) -> bool:
         """Count one websocket turn for a guest; False when exceeded."""
         return self._limiter.hit(
             self._ws_turn_limit, _WS_TURN_NAMESPACE, guest_id or "unknown"
         )
 
+    @_fail_open
     def allow_upload(self, guest_id: str) -> bool:
         """Count one share upload for a guest; False when exceeded."""
         return self._limiter.hit(
             self._upload_limit, _UPLOAD_NAMESPACE, guest_id or "unknown"
         )
 
+    @_fail_open
     def allow_run(self, share_key: str, guest_id: str) -> bool:
         """Count one owner-billed share run; False when a quota is exceeded.
 
