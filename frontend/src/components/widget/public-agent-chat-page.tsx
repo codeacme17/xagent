@@ -392,10 +392,25 @@ export function PublicAgentChatPage({
         if (!raw) {
           return null
         }
-        const parsed = JSON.parse(raw) as PublicAuthResult
-        return typeof parsed?.access_token === "string" && parsed.access_token
-          ? parsed
-          : null
+        const parsed: unknown = JSON.parse(raw)
+        // Reject anything that isn't a well-shaped auth blob so a corrupt or
+        // cross-version localStorage entry falls back to a clean re-auth rather
+        // than flowing malformed values downstream. agent_id/workforce_id are
+        // display/routing hints (never the isolation credential — that lives in
+        // the signed guest JWT), but keep their optional-number contract intact.
+        const isNullableNumber = (value: unknown) =>
+          value === undefined || value === null || typeof value === "number"
+        if (
+          !parsed
+          || typeof parsed !== "object"
+          || typeof (parsed as PublicAuthResult).access_token !== "string"
+          || !(parsed as PublicAuthResult).access_token
+          || !isNullableNumber((parsed as PublicAuthResult).agent_id)
+          || !isNullableNumber((parsed as PublicAuthResult).workforce_id)
+        ) {
+          return null
+        }
+        return parsed as PublicAuthResult
       } catch {
         return null
       }
