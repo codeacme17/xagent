@@ -132,3 +132,24 @@ def test_run_share_quota_trips_across_guests(
     assert limiter.allow_run("workforce:5", "g1") is True
     assert limiter.allow_run("workforce:5", "g2") is True
     assert limiter.allow_run("workforce:5", "g3") is False
+
+
+def test_all_gates_fail_open_on_backend_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising storage backend (e.g. Redis down) must ADMIT, not 500/lock
+    out — every allow_* gate is decorated to fail open. A genuine over-limit
+    (returning False) is unaffected; only raised errors admit."""
+
+    def _boom(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("redis unavailable")
+
+    limiter = _limiter_with(monkeypatch)
+    monkeypatch.setattr(limiter._limiter, "hit", _boom)
+    monkeypatch.setattr(limiter._limiter, "test", _boom)
+
+    assert limiter.allow_auth("tok", "1.1.1.1") is True
+    assert limiter.allow_task_create("tok", "g") is True
+    assert limiter.allow_ws_turn("g") is True
+    assert limiter.allow_upload("g") is True
+    assert limiter.allow_run("agent:1", "g") is True
