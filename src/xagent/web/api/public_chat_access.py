@@ -249,7 +249,9 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         # Fail closed on tokens minted before per-guest isolation (#973): they
         # carry no guest_id, so they cannot be scoped to a single guest and are
         # rejected rather than silently granted the old no-isolation behavior.
-        if not isinstance(guest_id, str) or not guest_id:
+        # A whitespace-only id is treated as absent (it could never match a
+        # server-minted token_urlsafe value and must not pass as a real guest).
+        if not isinstance(guest_id, str) or not guest_id.strip():
             raise ValueError("Invalid share token payload")
 
         user = db.query(User).filter(User.id == user_id).first()

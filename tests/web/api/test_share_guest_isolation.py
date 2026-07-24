@@ -221,6 +221,28 @@ def test_legacy_agent_share_token_without_guest_id_is_rejected() -> None:
     assert response.status_code == 401, response.text
 
 
+def test_share_token_with_whitespace_guest_id_is_rejected() -> None:
+    """A whitespace-only guest_id is treated as absent (fail-closed): it could
+    never match a server-minted token_urlsafe id and must not pass."""
+    agent_id = _create_published_agent("Whitespace Agent", "whitespace-tok")
+    forged = create_public_chat_access_token(
+        {
+            "sub": "admin",
+            "user_id": _user_id(),
+            "auth_mode": "share",
+            "share_agent_id": agent_id,
+            "share_token": "whitespace-tok",
+            "guest_id": "   ",
+        }
+    )
+    response = client.post(
+        "/api/share/chat/task/create",
+        headers={"Authorization": f"Bearer {forged}"},
+        json={"title": "hi", "description": "hi"},
+    )
+    assert response.status_code == 401, response.text
+
+
 def test_legacy_workforce_share_token_without_guest_id_is_rejected() -> None:
     workforce_id = _create_workforce("Legacy WF")
     token = _enable_workforce_share(workforce_id)
