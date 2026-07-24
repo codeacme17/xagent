@@ -1533,6 +1533,41 @@ class TestShareRateLimitConfig:
         assert getattr(config, func_name)() == default
 
 
+class TestOrphanUploadGcConfig:
+    """Config for task-less public-upload orphan GC (#973)."""
+
+    def test_ttl_default(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        monkeypatch.delenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", raising=False)
+        assert get_taskless_upload_ttl_seconds() == 48 * 60 * 60
+
+    def test_ttl_env_override(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        monkeypatch.setenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", "86400")
+        assert get_taskless_upload_ttl_seconds() == 86400
+
+    def test_ttl_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        # Below the 1h floor -> default (guards against reaping mid-first-turn).
+        monkeypatch.setenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", "5")
+        assert get_taskless_upload_ttl_seconds() == 48 * 60 * 60
+
+    def test_sweep_interval_default(self, monkeypatch):
+        from xagent.config import get_orphan_upload_sweep_interval_seconds
+
+        monkeypatch.delenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", raising=False)
+        assert get_orphan_upload_sweep_interval_seconds() == 3600
+
+    def test_sweep_interval_env_override(self, monkeypatch):
+        from xagent.config import get_orphan_upload_sweep_interval_seconds
+
+        monkeypatch.setenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", "900")
+        assert get_orphan_upload_sweep_interval_seconds() == 900
+
+
 class TestGmailPubSubProvisioningConfig:
     """Config for per-mailbox Gmail Pub/Sub provisioning."""
 

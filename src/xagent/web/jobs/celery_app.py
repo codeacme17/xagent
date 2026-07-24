@@ -10,6 +10,7 @@ from ...config import (
     get_background_job_visibility_timeout_seconds,
     get_celery_broker_url,
     get_celery_result_backend,
+    get_orphan_upload_sweep_interval_seconds,
 )
 
 
@@ -23,6 +24,7 @@ def create_celery_app() -> Any:
     result_backend = get_celery_result_backend()
     visibility_timeout = get_background_job_visibility_timeout_seconds()
     sweep_interval = get_background_job_sweep_interval_seconds()
+    orphan_upload_sweep_interval = get_orphan_upload_sweep_interval_seconds()
     app = Celery("xagent", broker=broker_url, backend=result_backend)
     app.conf.update(
         broker_connection_retry_on_startup=True,
@@ -38,11 +40,18 @@ def create_celery_app() -> Any:
             "xagent.web.jobs.trigger_tasks.scan_due_triggers": {
                 "queue": "triggers",
             },
+            "xagent.web.jobs.maintenance_tasks.sweep_orphaned_uploads": {
+                "queue": "default",
+            },
         },
         beat_schedule={
             "scan-due-triggers-and-stale-jobs": {
                 "task": "xagent.web.jobs.trigger_tasks.scan_due_triggers",
                 "schedule": float(sweep_interval),
+            },
+            "sweep-orphaned-taskless-uploads": {
+                "task": "xagent.web.jobs.maintenance_tasks.sweep_orphaned_uploads",
+                "schedule": float(orphan_upload_sweep_interval),
             },
         },
         task_serializer="json",
@@ -62,6 +71,7 @@ def register_celery_tasks() -> None:
     for module_name in (
         "xagent.web.jobs.tasks",
         "xagent.web.jobs.trigger_tasks",
+        "xagent.web.jobs.maintenance_tasks",
     ):
         import_module(module_name)
 

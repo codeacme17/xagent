@@ -92,6 +92,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
+ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
@@ -580,6 +582,39 @@ def get_background_job_sweep_interval_seconds() -> int:
         BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
         300,
         minimum=30,
+    )
+
+
+def get_taskless_upload_ttl_seconds() -> int:
+    """Age after which an unbound task-less public upload is GC-eligible (#973).
+
+    A task-less public-share upload is bound to its task at run start; if the
+    guest never completes task creation it stays orphaned. Rows older than
+    this (and still unbound) are reaped. Default 48h — long enough that a slow
+    but real first turn is never reaped mid-flow.
+
+    Priority:
+        1. XAGENT_TASKLESS_UPLOAD_TTL_SECONDS environment variable
+        2. Default 172800 (48 hours)
+    """
+    return _get_positive_int_env(
+        TASKLESS_UPLOAD_TTL_SECONDS,
+        48 * 60 * 60,
+        minimum=60 * 60,
+    )
+
+
+def get_orphan_upload_sweep_interval_seconds() -> int:
+    """How often the orphan task-less-upload GC sweep runs (#973).
+
+    Priority:
+        1. XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default 3600 (hourly)
+    """
+    return _get_positive_int_env(
+        ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS,
+        60 * 60,
+        minimum=60,
     )
 
 

@@ -33,6 +33,12 @@ class UploadedFile(Base):  # type: ignore
     etag = Column(String(255), nullable=True)
     workspace_relative_path = Column(String(2048), nullable=True)
     workspace_category = Column(String(64), nullable=True)
+    # Provenance marker for uploads created before any task/owner binding
+    # exists (currently the task-less public-share path, #973). NULL for the
+    # overwhelming majority of rows (task-bound / logged-in draft uploads);
+    # only orphan GC keys off this so a coarse "task_id IS NULL" sweep can't
+    # reap a logged-in user's un-sent draft attachments.
+    upload_source = Column(String(64), nullable=True)
     storage_status = Column(String(32), nullable=False, default="legacy")
     mime_type = Column(String(255), nullable=True)
     file_size = Column(Integer, nullable=False, default=0)

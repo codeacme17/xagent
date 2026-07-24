@@ -70,6 +70,7 @@ def build_uploaded_file_record(
     mime_type: str | None = None,
     workspace_relative_path: str | None = None,
     workspace_category: str | None = None,
+    upload_source: str | None = None,
 ) -> UploadedFile:
     resolved_filename = filename or local_path.name
     resolved_mime_type = mime_type or guess_media_type(resolved_filename)
@@ -84,6 +85,7 @@ def build_uploaded_file_record(
         storage_status="pending",
         workspace_relative_path=workspace_relative_path,
         workspace_category=workspace_category,
+        upload_source=upload_source,
     )
 
 
@@ -105,6 +107,7 @@ class UploadedFileStore:
         storage_key: str | None = None,
         workspace_relative_path: str | None = None,
         workspace_category: str | None = None,
+        upload_source: str | None = None,
     ) -> UploadedFile:
         file_record = build_uploaded_file_record(
             local_path=local_path,
@@ -115,6 +118,7 @@ class UploadedFileStore:
             mime_type=mime_type,
             workspace_relative_path=workspace_relative_path,
             workspace_category=workspace_category,
+            upload_source=upload_source,
         )
         self.db.add(file_record)
         self.db.flush()

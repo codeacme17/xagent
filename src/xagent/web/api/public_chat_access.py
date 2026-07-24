@@ -32,6 +32,7 @@ from ..services.connector_runtime import (
 from ..services.deployments import get_deployment
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
+from ..services.orphan_upload_gc import TASKLESS_SHARE_UPLOAD_SOURCE
 from ..services.share_rate_limit import get_share_rate_limiter
 from .files import store_uploaded_files
 from .websocket import (
@@ -446,6 +447,25 @@ def get_task_for_share_context(
     return task
 
 
+def _enforce_public_upload_storage_gate(db: Session, owner: User) -> None:
+    """Refuse a public upload when the owner is at their storage limit (#973).
+
+    Mirrors the KB ingest gate: the hook is a no-op in stock xagent and only
+    the cloud app layer registers it. Charged to the share/widget entity
+    OWNER — the same attribution as the run gate and the on-disk write, since
+    the file consumes the owner's storage. Fails open on any error so quota
+    infra problems never block uploads; raises 402 on a truthy reason.
+    """
+    try:
+        from ..services.quota_hooks import check_storage_gate
+
+        reason = check_storage_gate(db, getattr(owner, "id", None))
+    except Exception:
+        reason = None
+    if reason:
+        raise HTTPException(status_code=402, detail=reason)
+
+
 async def upload_public_chat_files(
     *,
     file: UploadFile | None,
@@ -466,6 +486,8 @@ async def upload_public_chat_files(
 
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
+
+    _enforce_public_upload_storage_gate(db, access_context.user)
 
     if not task_id:
         raise HTTPException(status_code=400, detail="task_id is required")
@@ -508,6 +530,8 @@ async def upload_share_chat_files(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    _enforce_public_upload_storage_gate(db, access_context.user)
+
     if not task_id:
         # A workforce share session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded
@@ -520,8 +544,6 @@ async def upload_share_chat_files(
         # This branch is reachable by anyone holding the public share link
         # before any task (hence any owner association) exists, so cap the
         # per-request file count to blunt the worst abuse case cheaply.
-        # Owner storage quota + GC of orphaned (task_id IS NULL) rows are
-        # tracked as hardening in #973.
         if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
             raise HTTPException(
                 status_code=422,
@@ -530,6 +552,9 @@ async def upload_share_chat_files(
                     f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
                 ),
             )
+        # Stamp the task-less-share provenance marker so orphan GC (#973) can
+        # reap these rows if the guest never completes task creation, without
+        # a coarse task_id-IS-NULL sweep touching other paths' unbound drafts.
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
@@ -538,6 +563,7 @@ async def upload_share_chat_files(
             user=access_context.user,
             db=db,
             single_file_mode=file is not None and (not files),
+            upload_source=TASKLESS_SHARE_UPLOAD_SOURCE,
         )
 
     try:

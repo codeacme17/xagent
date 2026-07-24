@@ -218,6 +218,7 @@ async def store_uploaded_files(
     user: User,
     db: Session,
     single_file_mode: bool,
+    upload_source: str | None = None,
 ) -> Dict[str, Any]:
     parsed_task_id = _parse_task_id(task_id)
     uploaded_files = []
@@ -256,6 +257,7 @@ async def store_uploaded_files(
                 task_id=parsed_task_id,
                 filename=Path(uploaded.filename).name,
                 mime_type=uploaded.content_type,
+                upload_source=upload_source,
             )
             if file_record.storage_key:
                 written_storage_keys.append(str(file_record.storage_key))
