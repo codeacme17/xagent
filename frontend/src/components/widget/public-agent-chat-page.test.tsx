@@ -53,7 +53,15 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 vi.mock("@/components/chat/ChatStartScreen", () => ({
   ChatStartScreen: ({ onSend, title }: { onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>; title: string }) => (
-    <button type="button" onClick={() => onSend("first message", [], { mode: "balanced" })}>
+    <button
+      type="button"
+      onClick={() => {
+        // The real component surfaces a failed send via createTaskError state;
+        // swallow the rejection here so a deliberate task-create failure under
+        // test doesn't register as an unhandled promise rejection.
+        void onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
+      }}
+    >
       start:{title}
     </button>
   ),
@@ -112,6 +120,28 @@ function renderWidgetPage(overrides: Partial<React.ComponentProps<typeof PublicA
       {...overrides}
     />,
   )
+}
+
+function renderSharePage(overrides: Partial<React.ComponentProps<typeof PublicAgentChatPage>> = {}) {
+  return render(
+    <PublicAgentChatPage
+      authMode="share"
+      routeToken="share-tok"
+      guestId={null}
+      searchAgentId={null}
+      {...overrides}
+    />,
+  )
+}
+
+const SHARE_AUTH_KEY = "share_auth_share-tok"
+
+// Build a JWT-shaped token whose (unverified) exp claim the client reads as a
+// liveness pre-filter. base64url payload, matching isShareTokenExpired's decode.
+function makeShareJwt(claims: Record<string, unknown>): string {
+  const b64 = (obj: object) =>
+    btoa(JSON.stringify(obj)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+  return `${b64({ alg: "none" })}.${b64(claims)}.sig`
 }
 
 async function expectWidgetAuthFailure(detail: string) {
@@ -455,5 +485,102 @@ describe("PublicAgentChatPage", () => {
     await waitFor(() => {
       expect(localStorage.getItem("widget_task_wf8_guest-1")).toBe("43")
     })
+  })
+
+  it("authenticates a share link and persists the guest token for reuse", async () => {
+    localStorage.clear()
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderSharePage()
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://api.example/api/share/auth",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ share_token: "share-tok" }),
+      },
+    )
+    // The server-minted guest token is persisted per link so a reload reuses
+    // the same guest_id instead of minting a fresh (task-orphaning) session.
+    expect(JSON.parse(localStorage.getItem(SHARE_AUTH_KEY) ?? "null")).toMatchObject({
+      access_token: "public-access-token",
+    })
+    expect(app.provider).toMatchObject({ token: "public-access-token" })
+    expect(app.provider?.transport?.buildWebSocketUrl?.({
+      baseUrl: "wss://api.example",
+      taskId: 42,
+      token: app.provider?.token,
+    })).toBe("wss://api.example/api/share/chat/ws/42?token=public-access-token")
+  })
+
+  it("reuses a persisted, unexpired share token without re-authing", async () => {
+    localStorage.clear()
+    localStorage.setItem(SHARE_AUTH_KEY, JSON.stringify(successfulAgentAuth))
+
+    renderSharePage()
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(app.provider).toMatchObject({ token: "public-access-token" })
+  })
+
+  it("drops an expired persisted share token and re-authenticates", async () => {
+    localStorage.clear()
+    const expired = makeShareJwt({ exp: Math.floor(Date.now() / 1000) - 60 })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: expired }),
+    )
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderSharePage()
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    // Expired token ignored -> a fresh /api/share/auth is issued.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://api.example/api/share/auth",
+      expect.objectContaining({ method: "POST" }),
+    )
+  })
+
+  it("ignores a corrupt persisted share auth blob and re-authenticates", async () => {
+    localStorage.clear()
+    // No access_token -> fails the shape guard -> clean re-auth.
+    localStorage.setItem(SHARE_AUTH_KEY, JSON.stringify({ agent_id: 17 }))
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderSharePage()
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("drops the guest token and re-auths when share task creation is rejected", async () => {
+    localStorage.clear()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse({ detail: "Share link is unavailable" }, 403))
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderSharePage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Agent" }))
+
+    // A 401/403 on task-create invalidates the guest token: it's dropped and a
+    // fresh /api/share/auth is forced instead of stranding the visitor.
+    await waitFor(() => {
+      const authCalls = fetchMock.mock.calls.filter(
+        (call) => call[0] === "https://api.example/api/share/auth",
+      )
+      expect(authCalls.length).toBe(2)
+    })
+    errorSpy.mockRestore()
   })
 })
