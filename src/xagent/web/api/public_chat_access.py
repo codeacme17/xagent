@@ -1071,24 +1071,30 @@ async def share_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
+    # Accept the handshake *before* the auth/access checks. uvicorn only
+    # preserves a close code + reason on the wire for a *post-accept* close: a
+    # pre-accept ``websocket.close()`` is collapsed into a bare HTTP 403 with an
+    # empty body, so the browser sees a rejected Upgrade (onerror + onclose
+    # code=1006, reason="") and the code/reason never arrive. Accepting first
+    # makes the 4003 below a real close whose reason reaches the client — the
+    # same post-accept behavior the per-message revalidation loop already relies
+    # on — so the frontend can tell an access denial (e.g. a returning guest
+    # whose persisted task belongs to another guest, or a pre-#973 legacy task)
+    # apart from a transport failure and recover (#973).
+    await websocket.accept()
     try:
         with db_session_context() as db:
             access_context = get_share_chat_user(token, db)
             get_task_for_share_context(db, task_id, access_context)
     except HTTPException as exc:
-        # Mirror the per-message revalidation path (below): an access denial —
-        # e.g. a returning guest whose persisted task belongs to another guest,
-        # or a pre-#973 legacy task — closes 4003 with the real reason so the
-        # frontend recovery flow can distinguish it from a transport failure and
-        # start a fresh session. A bare 4001 here would discard the reason and
-        # defeat that recovery (#973).
         await websocket.close(code=4003, reason=exc.detail)
         return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Already accepted above; register the live socket without re-accepting.
+    manager.register_connection(websocket, task_id)
 
     try:
         await handle_status_request(websocket, task_id, access_context.user)
