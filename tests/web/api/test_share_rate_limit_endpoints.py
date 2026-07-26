@@ -168,6 +168,12 @@ class _FakeWebSocket:
 
     def __init__(self, frames: list[str]) -> None:
         self._frames = list(frames)
+        self.accepted = False
+
+    async def accept(self) -> None:
+        # The endpoint accepts before auth so denial reasons survive the
+        # handshake (#973); the double just records it.
+        self.accepted = True
 
     async def receive_text(self) -> str:
         from fastapi import WebSocketDisconnect
