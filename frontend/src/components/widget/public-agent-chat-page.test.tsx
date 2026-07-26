@@ -7,6 +7,7 @@ const app = vi.hoisted(() => ({
   dispatch: vi.fn(),
   sendMessage: vi.fn(),
   setTaskId: vi.fn(),
+  connectionError: null as Error | null,
   state: {
     taskId: null as number | null,
     currentTask: null,
@@ -43,6 +44,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
       dispatch: app.dispatch,
       sendMessage: app.sendMessage,
       setTaskId: app.setTaskId,
+      connectionError: app.connectionError,
     }
   },
 }))
@@ -202,6 +204,7 @@ describe("PublicAgentChatPage", () => {
       app.rerender?.((value) => value + 1)
     })
     app.setTaskId.mockClear()
+    app.connectionError = null
     app.state = {
       taskId: null,
       currentTask: null,
@@ -582,5 +585,65 @@ describe("PublicAgentChatPage", () => {
       expect(authCalls.length).toBe(2)
     })
     errorSpy.mockRestore()
+  })
+
+  const futureExp = () => Math.floor(Date.now() / 1000) + 3600
+
+  it("resumes a task persisted under the caller's own guest_id", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    // The task-id key is scoped by guest_id (agent 17 / guest-A).
+    localStorage.setItem("share_task_share-tok_17_guest-A", "71")
+
+    renderSharePage()
+
+    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("does not resume a task persisted under a different guest_id", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    // A task minted under guest-B lives under guest-B's key. guest-A must never
+    // read it back — otherwise that foreign task would be permanently orphaned.
+    localStorage.setItem("share_task_share-tok_17_guest-B", "99")
+
+    renderSharePage()
+
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(app.setTaskId).not.toHaveBeenCalledWith(99, { navigate: false })
+  })
+
+  it("clears a stale task when the server denies access for this guest", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    const taskKey = "share_task_share-tok_17_guest-A"
+    localStorage.setItem(taskKey, "71")
+    // The WS layer reports a per-guest access denial as a post-accept 4003
+    // whose reason surfaces here (see use-websocket.ts onclose 4003 handling).
+    app.connectionError = new Error("Access denied for this guest")
+
+    renderSharePage()
+
+    // The recovery effect drops the stale task and its persisted pointer so the
+    // visitor lands on the start screen instead of a dead session.
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    })
+    expect(localStorage.getItem(taskKey)).toBeNull()
   })
 })
