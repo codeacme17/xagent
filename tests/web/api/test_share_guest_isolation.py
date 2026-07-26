@@ -18,19 +18,21 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services import workforce_runs as workforce_runs_service
+from xagent.web.services.workforce_snapshot import build_workforce_task_config
 
 from .conftest import (
     _admin_headers,
     _direct_db_session,
     _setup_admin,
+    _share_guest_id,
     client,
-    share_guest_id,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -140,7 +142,12 @@ def test_share_auth_mints_distinct_guest_ids_per_call() -> None:
     first = client.post("/api/share/auth", json={"share_token": "distinct-tok"})
     second = client.post("/api/share/auth", json={"share_token": "distinct-tok"})
     assert first.status_code == 200 and second.status_code == 200
-    assert first.json()["access_token"] != second.json()["access_token"]
+    # Assert on the decoded ``guest_id`` claim itself — the isolation credential —
+    # not merely that the two opaque tokens differ (which any varying claim, e.g.
+    # a future ``jti``, would satisfy without proving guest ids are distinct).
+    first_guest = _share_guest_id(first.json()["access_token"])
+    second_guest = _share_guest_id(second.json()["access_token"])
+    assert first_guest != second_guest
 
 
 # ===== agent-share cross-guest isolation =====
@@ -164,7 +171,7 @@ def test_agent_share_guest_cannot_touch_other_guests_task() -> None:
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
         assert int(task.agent_id) == agent_id
-        assert task.agent_config.get("guest_id") == share_guest_id(
+        assert task.agent_config.get("guest_id") == _share_guest_id(
             guest_b["Authorization"]
         )
     finally:
@@ -174,6 +181,72 @@ def test_agent_share_guest_cannot_touch_other_guests_task() -> None:
     assert _upload_to_task(guest_a, task_b).status_code == 403
     # Guest B still reaches its own task.
     assert _upload_to_task(guest_b, task_b).status_code == 200
+
+
+def test_agent_share_ws_connect_denies_foreign_guest() -> None:
+    """The WS connect path routes through the same per-guest gate. A guest with
+    a valid share JWT for the link still cannot open another guest's task over
+    the socket, and the denial arrives as a 4003 close carrying the reason the
+    frontend recovery flow keys on (#973). The endpoint accepts the handshake
+    before its auth check, so this close is post-accept and its code/reason
+    survive on the wire (a pre-accept close would collapse to a bare 403)."""
+    _create_published_agent("WS Iso Agent", "ws-iso-tok")
+    guest_a = _authenticate_share_guest("ws-iso-tok")
+    guest_b = _authenticate_share_guest("ws-iso-tok")
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest_b,
+        json={"title": "b ws task", "description": "b ws task"},
+    )
+    assert created.status_code == 200, created.text
+    task_b = int(created.json()["task_id"])
+
+    token_a = guest_a["Authorization"].removeprefix("Bearer ")
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(
+            f"/api/share/chat/ws/{task_b}?token={token_a}"
+        ) as ws:
+            ws.receive_text()
+    assert denied.value.code == 4003
+    assert denied.value.reason == "Access denied for this guest"
+
+
+def test_agent_share_task_without_guest_id_is_denied() -> None:
+    """A pre-migration task whose *stored* ``agent_config`` lacks ``guest_id``
+    (distinct from a legacy token) is unreachable by any guest: the strict
+    inequality in the gate treats a missing id as a mismatch, so even the guest
+    that created it is denied once the id is gone."""
+    _create_published_agent("PreMig Agent", "premig-tok")
+    guest = _authenticate_share_guest("premig-tok")
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={"title": "t", "description": "t"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    # Simulate a pre-#973 task by dropping guest_id from its stored config.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        stripped = {k: v for k, v in task.agent_config.items() if k != "guest_id"}
+        task.agent_config = stripped
+        db.commit()
+    finally:
+        db.close()
+
+    assert _upload_to_task(guest, task_id).status_code == 403
+
+
+def test_build_workforce_task_config_never_emits_guest_id() -> None:
+    """Workforce-share isolation threads ``guest_id`` via ``extra_agent_config``
+    and depends on the snapshot config NOT carrying its own ``guest_id`` (which
+    would clobber the server value in ``{**extra_agent_config, **task_config}``).
+    Pin that invariant so a future snapshot field can't silently break it."""
+    config = build_workforce_task_config({"workforce": {"id": 1}})
+    assert "guest_id" not in config
 
 
 # ===== agent-share task creation is tamper-proof against a forged guest_id =====
@@ -196,7 +269,7 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         json={
             "title": "forged",
             "description": "forged",
-            "agent_config": {"guest_id": share_guest_id(victim["Authorization"])},
+            "agent_config": {"guest_id": _share_guest_id(victim["Authorization"])},
         },
     )
     assert created.status_code == 200, created.text
@@ -207,10 +280,10 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         task = db.query(Task).filter(Task.id == task_id).one()
         # The persisted id is the attacker's own minted id, never the forged
         # victim id from the request body.
-        assert task.agent_config.get("guest_id") == share_guest_id(
+        assert task.agent_config.get("guest_id") == _share_guest_id(
             attacker["Authorization"]
         )
-        assert task.agent_config.get("guest_id") != share_guest_id(
+        assert task.agent_config.get("guest_id") != _share_guest_id(
             victim["Authorization"]
         )
     finally:
@@ -243,7 +316,7 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_b).one()
-        assert task.agent_config.get("guest_id") == share_guest_id(
+        assert task.agent_config.get("guest_id") == _share_guest_id(
             guest_b["Authorization"]
         )
     finally:

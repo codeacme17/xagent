@@ -25,13 +25,13 @@ import shutil
 import tempfile
 from typing import Iterator
 
-import jwt
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from jose import jwt
 from sqlalchemy.orm import Session
 
 from xagent.web.api.a2a import router as a2a_router
@@ -284,13 +284,15 @@ def _direct_db_session() -> Session:
     return next(get_db())
 
 
-def share_guest_id(token: str) -> str:
+def _share_guest_id(token: str) -> str:
     """Decode a share guest JWT and return its server-minted ``guest_id`` (#973).
 
-    Accepts either a raw access token or a full ``Authorization: Bearer <token>``
-    header value, so callers holding either shape reuse one decode path. Asserts
-    the id is a non-empty string, letting tests compare against *this guest's*
-    minted id rather than merely checking one is present.
+    Uses ``jose`` (a declared dependency) to match production, not PyJWT (only a
+    transitive one). Accepts either a raw access token or a full
+    ``Authorization: Bearer <token>`` header value, so callers holding either
+    shape reuse one decode path. Asserts the id is a non-empty string, letting
+    tests compare against *this guest's* minted id rather than merely checking
+    one is present.
     """
     payload = jwt.decode(
         token.removeprefix("Bearer "), JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]

@@ -40,8 +40,8 @@ from .conftest import (
     _admin_headers,
     _direct_db_session,
     _register_second_user,
+    _share_guest_id,
     client,
-    share_guest_id,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -1634,7 +1634,7 @@ def test_share_public_file_preview_requires_valid_share_token() -> None:
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
-        guest_id=share_guest_id(access_token),
+        guest_id=_share_guest_id(access_token),
     )
 
     preview_without_token = client.get(f"/api/files/public/preview/{file_id}")
@@ -1676,7 +1676,7 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
-        guest_id=share_guest_id(access_token),
+        guest_id=_share_guest_id(access_token),
         filename="download-note.txt",
     )
 
