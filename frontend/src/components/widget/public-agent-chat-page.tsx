@@ -84,24 +84,42 @@ const safeRemoveItem = (key: string) => {
   }
 }
 
+// Decode a JWT's payload segment WITHOUT verifying its signature — a read-only
+// liveness/identity pre-filter for client-side routing only. Every security
+// decision (signature, expiry-on-use, isolation) stays server-side. Returns
+// null on any malformed input so callers fall back to their safe default. #973.
+const decodeJwtClaims = (token: string): Record<string, unknown> | null => {
+  try {
+    const payload = token.split(".")[1]
+    if (!payload) {
+      return null
+    }
+    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))
+    return typeof claims === "object" && claims !== null ? claims : null
+  } catch {
+    return null
+  }
+}
+
 // A persisted guest JWT past its exp (30-day TTL) is dead on arrival: reusing
 // it fails every request, and over the WS-resume path it strands the visitor on
 // a session that can never re-auth on its own. Treat an expired token as absent
 // so the mount re-auths fresh, instead of relying on a failed connect to
-// recover. Only the unverified exp claim is read as a liveness pre-filter —
-// signature verification stays server-side, and any parse failure falls through
-// to the server (which fails closed and hits the reactive recovery path). #973.
+// recover. Any parse failure falls through to the server (which fails closed).
 const isShareTokenExpired = (token: string): boolean => {
-  try {
-    const payload = token.split(".")[1]
-    if (!payload) {
-      return false
-    }
-    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))
-    return typeof claims.exp === "number" && claims.exp * 1000 <= Date.now()
-  } catch {
-    return false
-  }
+  const exp = decodeJwtClaims(token)?.exp
+  return typeof exp === "number" && exp * 1000 <= Date.now()
+}
+
+// The server-minted guest_id (#973) that scopes every piece of per-guest client
+// state. It lives only inside the signed guest JWT, so derive it here to scope
+// the persisted task-id key: a task-id minted under guest A can then never be
+// read back under guest B's token (two-tab race, post-expiry re-auth, or a
+// pre-#973 legacy token), which would otherwise leave that task permanently
+// unreachable. Falls back to a stable bucket on any decode failure.
+const shareGuestIdFromToken = (token: string): string => {
+  const guestId = decodeJwtClaims(token)?.guest_id
+  return typeof guestId === "string" && guestId ? guestId : "anonymous"
 }
 
 type PublicMessageConfig = Record<string, unknown>
@@ -127,7 +145,11 @@ function PublicConversationContent({
   const [isBootstrappingTask, setIsBootstrappingTask] = useState(false)
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
   const storageKey = authMode === "share"
-    ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}`
+    // Scope the persisted task-id by guest_id (decoded from the guest JWT) so a
+    // task minted under one guest is never read back under another's token — a
+    // two-tab race, a post-expiry re-auth, or a pre-#973 legacy token would
+    // otherwise leave that task permanently unreachable. #973.
+    ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}_${shareGuestIdFromToken(accessToken)}`
     // Include the owner id so two different widgets embedded on the same site
     // (which share a guest id) don't collide on one stored task. A workforce
     // widget has no agentId, so fall back to its workforceId.
@@ -167,13 +189,16 @@ function PublicConversationContent({
     safeRemoveItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
 
-  // Recover a returning share visitor whose persisted taskId belongs to a
-  // different guest_id (e.g. a pre-#973 task created before per-guest
-  // isolation): the WS connect closes 4003 with an access-denied reason. Drop
-  // the stale taskId and fall back to the start screen so the visitor opens a
-  // fresh session under their current guest token — instead of being stuck on
-  // an error. Scoped to access-denied reasons so a transient transport drop
-  // never wipes a live session.
+  // Backstop recovery for a share session the server rejects mid-flight. The
+  // guest-scoped storageKey above already makes a *foreign* taskId structurally
+  // unreadable, so this covers the residual case where an otherwise-valid
+  // session is denied at the WS layer — e.g. "Invalid share token" from a
+  // mid-session secret rotation. The backend accepts the socket before its
+  // auth check, so this close arrives as a real 4003 with its reason intact
+  // (a pre-accept close would collapse to a bare 403 the browser reports as
+  // code 1006). Drop the stale taskId and fall back to the start screen instead
+  // of stranding the visitor on an error. Scoped to access-denied reasons so a
+  // transient transport drop never wipes a live session. #973.
   useEffect(() => {
     if (authMode !== "share" || !connectionError || !state.taskId) {
       return
