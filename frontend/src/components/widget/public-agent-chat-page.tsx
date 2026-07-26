@@ -62,11 +62,13 @@ interface PublicConversationContentProps {
 //     guest. Backend HTTPException.detail surfaced as event.reason on a 4003.
 //   - "Access denied": use-websocket.ts's fallback when a 4003 carries no
 //     reason.
-//   - "Invalid share token": the persisted guest JWT is no longer decodable —
-//     in practice an expired token (30-day TTL) reused by a visitor returning
-//     with intact localStorage. Recovery drops the stale token so the next
-//     mount re-auths fresh; without it the visitor is stuck on a dead session
-//     the WS-resume path can never re-auth on its own.
+//   - "Invalid share token": the persisted guest JWT no longer validates
+//     server-side (e.g. a mid-session secret rotation; plain expiry is already
+//     caught proactively at mount by isShareTokenExpired). Recovery here drops
+//     only the stale *task-id* key and lands the visitor on the start screen;
+//     the token/auth-blob key is cleared separately by onAuthInvalidated when
+//     the first send hits a task-create 401, which then re-auths. Without this,
+//     the WS-resume path would strand the visitor with no send to trigger that.
 const SHARE_ACCESS_DENIED_REASONS = new Set([
   "Access denied for this guest",
   "Access denied",

@@ -646,4 +646,29 @@ describe("PublicAgentChatPage", () => {
     })
     expect(localStorage.getItem(taskKey)).toBeNull()
   })
+
+  it("keeps an active task on a transient (non-access-denied) connection error", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    const taskKey = "share_task_share-tok_17_guest-A"
+    localStorage.setItem(taskKey, "71")
+    // A generic transport drop is NOT in SHARE_ACCESS_DENIED_REASONS — the
+    // load-bearing guard must leave the live session untouched (a reconnect
+    // resumes it) rather than wiping the task like an access denial would.
+    app.connectionError = new Error(
+      "WebSocket connection failed. The backend WebSocket endpoint may not be available.",
+    )
+
+    renderSharePage()
+
+    // The session resumes and is never torn down by the recovery effect.
+    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    expect(app.setTaskId).not.toHaveBeenCalledWith(null, { navigate: false })
+    expect(localStorage.getItem(taskKey)).toBe("71")
+  })
 })
