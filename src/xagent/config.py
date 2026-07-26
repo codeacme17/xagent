@@ -775,9 +775,9 @@ def get_trigger_callback_base_url() -> str | None:
     callbacks must reach a different host than the advertised public API
     origin (e.g. a dedicated ingress).
     """
-    value = (os.getenv(TRIGGER_CALLBACK_BASE_URL) or "").strip()
-    if value:
-        return value.rstrip("/")
+    cleaned = (os.getenv(TRIGGER_CALLBACK_BASE_URL) or "").strip().rstrip("/")
+    if cleaned:
+        return cleaned
     return get_public_api_base_url()
 
 

@@ -1623,6 +1623,11 @@ class TestTriggerCallbackBaseUrlConfig:
         monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
         assert get_trigger_callback_base_url() == "https://api.example.com"
 
+    def test_slash_only_env_falls_back_to_public_api_base_url(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", " /// ")
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_trigger_callback_base_url() == "https://api.example.com"
+
     def test_both_unset_returns_none(self, monkeypatch):
         monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
         monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
