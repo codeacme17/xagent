@@ -271,10 +271,23 @@ def _sync_push_endpoint(
             "Could not inspect existing subscription %s: %s", subscription_path, exc
         )
         return
-    current_endpoint = str(
-        getattr(getattr(existing, "push_config", None), "push_endpoint", "") or ""
+    existing_push = getattr(existing, "push_config", None)
+    existing_oidc = getattr(existing_push, "oidc_token", None)
+    current = (
+        str(getattr(existing_push, "push_endpoint", "") or ""),
+        str(getattr(existing_oidc, "service_account_email", "") or ""),
+        str(getattr(existing_oidc, "audience", "") or ""),
     )
-    if current_endpoint == push_config["push_endpoint"]:
+    desired_oidc = push_config.get("oidc_token", {})
+    desired = (
+        str(push_config.get("push_endpoint", "")),
+        str(desired_oidc.get("service_account_email", "")),
+        str(desired_oidc.get("audience", "")),
+    )
+    # Compare the full push config, not just the endpoint: the OIDC service
+    # account can change (e.g. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT) while
+    # the endpoint/audience stay the same, and it still needs re-syncing.
+    if current == desired:
         return
     subscriber.modify_push_config(
         request={
