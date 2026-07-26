@@ -187,9 +187,16 @@ def test_agent_share_ws_connect_denies_foreign_guest() -> None:
     """The WS connect path routes through the same per-guest gate. A guest with
     a valid share JWT for the link still cannot open another guest's task over
     the socket, and the denial arrives as a 4003 close carrying the reason the
-    frontend recovery flow keys on (#973). The endpoint accepts the handshake
-    before its auth check, so this close is post-accept and its code/reason
-    survive on the wire (a pre-accept close would collapse to a bare 403)."""
+    frontend recovery flow keys on (#973).
+
+    This also pins the accept-before-auth ordering: the endpoint accepts the
+    handshake first, so the denial is a *post-accept* close and ``TestClient``
+    surfaces the ``WebSocketDisconnect`` at ``receive_text()`` (a *pre-accept*
+    close would instead raise at context-manager ``__enter__``, outside the
+    ``pytest.raises`` scope below, turning the test red). Keeping the ``raises``
+    narrowed to ``receive_text()`` is what makes a regression of the ordering
+    fail here rather than pass silently.
+    """
     _create_published_agent("WS Iso Agent", "ws-iso-tok")
     guest_a = _authenticate_share_guest("ws-iso-tok")
     guest_b = _authenticate_share_guest("ws-iso-tok")
@@ -203,10 +210,8 @@ def test_agent_share_ws_connect_denies_foreign_guest() -> None:
     task_b = int(created.json()["task_id"])
 
     token_a = guest_a["Authorization"].removeprefix("Bearer ")
-    with pytest.raises(WebSocketDisconnect) as denied:
-        with client.websocket_connect(
-            f"/api/share/chat/ws/{task_b}?token={token_a}"
-        ) as ws:
+    with client.websocket_connect(f"/api/share/chat/ws/{task_b}?token={token_a}") as ws:
+        with pytest.raises(WebSocketDisconnect) as denied:
             ws.receive_text()
     assert denied.value.code == 4003
     assert denied.value.reason == "Access denied for this guest"
@@ -324,6 +329,39 @@ def test_workforce_share_guest_cannot_touch_other_guests_task(
 
     assert _upload_to_task(guest_a, task_b).status_code == 403
     assert _upload_to_task(guest_b, task_b).status_code == 200
+
+
+def test_workforce_share_task_without_guest_id_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workforce-side mirror of ``test_agent_share_task_without_guest_id_is_denied``.
+    Both paths route through the same ``_require_share_guest_owns_task`` gate, so
+    a regression that lets a legacy task (stored ``agent_config`` missing
+    ``guest_id``) slip through must fail on this side too, not only agent-share."""
+    workforce_id = _create_workforce("PreMig WF")
+    token = _enable_workforce_share(workforce_id)
+    guest = _authenticate_share_guest(token)
+    _stub_begin_turn(monkeypatch)
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={"title": "wf", "description": "wf"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    # Simulate a pre-#973 task by dropping guest_id from its stored config.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        stripped = {k: v for k, v in task.agent_config.items() if k != "guest_id"}
+        task.agent_config = stripped
+        db.commit()
+    finally:
+        db.close()
+
+    assert _upload_to_task(guest, task_id).status_code == 403
 
 
 # ===== fail-closed on legacy tokens without a guest_id claim =====
