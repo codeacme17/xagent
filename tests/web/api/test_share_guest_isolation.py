@@ -214,7 +214,9 @@ def test_agent_share_ws_connect_denies_foreign_guest() -> None:
         with pytest.raises(WebSocketDisconnect) as denied:
             ws.receive_text()
     assert denied.value.code == 4003
-    assert denied.value.reason == "Access denied for this guest"
+    # Guest mismatch deliberately shares the not-found detail so probing can't
+    # enumerate task ids on a share link (#973).
+    assert denied.value.reason == "Task not found or access denied"
 
 
 def test_agent_share_task_without_guest_id_is_denied() -> None:

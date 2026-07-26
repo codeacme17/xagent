@@ -469,7 +469,7 @@ def _get_task_for_workforce_widget_context(
     if task.agent_config.get("auth_mode") != "widget":
         raise HTTPException(status_code=403, detail="Widget is unavailable")
     if task.agent_config.get("guest_id") != access_context.guest_id:
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     if int(task.agent_config.get("widget_workforce_id") or 0) != widget_workforce_id:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
     workforce_run_id = task.agent_config.get("workforce_run_id")
@@ -511,7 +511,7 @@ def get_task_for_public_context(
         not task.agent_config
         or task.agent_config.get("guest_id") != access_context.guest_id
     ):
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     if (
         access_context.widget_agent_id is not None
         and int(task.agent_id or 0) != access_context.widget_agent_id
@@ -532,9 +532,13 @@ def _require_share_guest_owns_task(
     guest_id (or a different one) fails this strict-inequality compare.
 
     Precondition: callers validate ``task.agent_config`` is a dict first.
+
+    The detail deliberately matches the callers' not-found branch: a
+    distinguishable guest-mismatch message would tell a probing visitor which
+    task ids exist on this share link (#973 enumeration oracle).
     """
     if task.agent_config.get("guest_id") != access_context.guest_id:
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
 
 
 def _get_task_for_workforce_share_context(
