@@ -31,7 +31,10 @@ from ..services.connector_runtime import (
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
-from ..services.share_rate_limit import get_share_rate_limiter
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
@@ -1110,6 +1113,25 @@ async def _authorize_share_chat_websocket(
     )
 
 
+_WS_CLOSE_REASON_MAX_BYTES = 123
+
+
+def _ws_close_reason(detail: object) -> str:
+    """Coerce an ``HTTPException.detail`` into a valid WS close reason.
+
+    ``detail`` is typed ``Any`` in FastAPI while the WS protocol caps close
+    reasons at 123 UTF-8 bytes — an over-long or non-string value would blow
+    up mid-close and swallow the denial the frontend recovery keys on. Every
+    detail reachable today is a short string literal; this is insurance for
+    the future one that isn't. Truncates on a codepoint boundary.
+    """
+    text = str(detail) if detail is not None else ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _WS_CLOSE_REASON_MAX_BYTES:
+        return text
+    return encoded[:_WS_CLOSE_REASON_MAX_BYTES].decode("utf-8", errors="ignore")
+
+
 async def public_chat_websocket_endpoint(
     *,
     websocket: WebSocket,
@@ -1144,7 +1166,7 @@ async def public_chat_websocket_endpoint(
                     expected_auth_mode=expected_auth_mode,
                 )
             except HTTPException as exc:
-                await websocket.close(code=4003, reason=exc.detail)
+                await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
                 return
 
             message_data["user_id"] = current_principal.id
@@ -1174,6 +1196,17 @@ async def share_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
+    # Handshake budget (#973): accept-before-auth (below) means every connect
+    # attempt — valid or garbage token — completes a full 101 upgrade before
+    # rejection, so the attempts themselves need a per-IP ceiling. Checked
+    # *pre-accept* on purpose: an over-limit probe is refused as a plain HTTP
+    # 403 with no upgrade performed at all, which is the cheapest rejection —
+    # unlike the auth denials below, a rate-limited connect carries no reason
+    # the frontend recovery flow needs to read.
+    if not get_share_rate_limiter().allow_ws_connect(remote_ip_from_request(websocket)):
+        await websocket.close(code=4008, reason="Too many connection attempts")
+        return
+
     # Accept the handshake *before* the auth/access checks. uvicorn only
     # preserves a close code + reason on the wire for a *post-accept* close: a
     # pre-accept ``websocket.close()`` is collapsed into a bare HTTP 403 with an
@@ -1191,7 +1224,7 @@ async def share_chat_websocket_endpoint(
             task_id=task_id,
         )
     except HTTPException as exc:
-        await websocket.close(code=4003, reason=exc.detail)
+        await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
         return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
@@ -1213,7 +1246,7 @@ async def share_chat_websocket_endpoint(
                     task_id=task_id,
                 )
             except HTTPException as exc:
-                await websocket.close(code=4003, reason=exc.detail)
+                await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
                 return
 
             message_data["user_id"] = current_principal.id

@@ -41,6 +41,7 @@ from ...config import (
     get_share_task_create_rate_limit,
     get_share_task_create_token_rate_limit,
     get_share_upload_rate_limit,
+    get_share_ws_connect_ip_rate_limit,
     get_share_ws_turn_rate_limit,
 )
 
@@ -62,6 +63,7 @@ _AUTH_IP_NAMESPACE = "share-auth-ip"
 _TASK_CREATE_GUEST_NAMESPACE = "share-task-create"
 _TASK_CREATE_TOKEN_NAMESPACE = "share-task-create-token"
 _WS_TURN_NAMESPACE = "share-ws-turn"
+_WS_CONNECT_IP_NAMESPACE = "share-ws-connect-ip"
 _UPLOAD_NAMESPACE = "share-upload"
 _RUN_SHARE_NAMESPACE = "share-run"
 _RUN_GUEST_NAMESPACE = "share-run-guest"
@@ -135,6 +137,9 @@ class ShareRateLimiter:
         self._ws_turn_limit = _parse_rate(
             get_share_ws_turn_rate_limit(), fallback="60/minute"
         )
+        self._ws_connect_ip_limit = _parse_rate(
+            get_share_ws_connect_ip_rate_limit(), fallback="120/minute"
+        )
         self._upload_limit = _parse_rate(
             get_share_upload_rate_limit(), fallback="60/minute"
         )
@@ -181,6 +186,19 @@ class ShareRateLimiter:
         """Count one websocket turn for a guest; False when exceeded."""
         return self._limiter.hit(
             self._ws_turn_limit, _WS_TURN_NAMESPACE, guest_id or "unknown"
+        )
+
+    @_fail_open
+    def allow_ws_connect(self, remote_ip: str | None) -> bool:
+        """Count one share websocket connection attempt for an IP.
+
+        Keyed per IP because this gate runs *pre-auth* (no guest_id or share
+        token exists yet): accept-before-auth means every attempt — valid or
+        garbage token — otherwise completes a full 101 upgrade before being
+        rejected, so the handshake itself needs a budget (#993 F5).
+        """
+        return self._limiter.hit(
+            self._ws_connect_ip_limit, _WS_CONNECT_IP_NAMESPACE, remote_ip or "unknown"
         )
 
     @_fail_open

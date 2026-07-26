@@ -114,6 +114,7 @@ SHARE_AUTH_IP_RATE_LIMIT = "XAGENT_SHARE_AUTH_IP_RATE_LIMIT"
 SHARE_TASK_CREATE_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_RATE_LIMIT"
 SHARE_TASK_CREATE_TOKEN_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT"
 SHARE_WS_TURN_RATE_LIMIT = "XAGENT_SHARE_WS_TURN_RATE_LIMIT"
+SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
 SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
@@ -756,6 +757,17 @@ def get_share_ws_turn_rate_limit() -> str:
     this caps the burst rate before a turn is enqueued.
     """
     return _get_rate_limit(SHARE_WS_TURN_RATE_LIMIT, "60/minute")
+
+
+def get_share_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on share websocket connection attempts (#973).
+
+    The share websocket accepts the handshake before auth so denial reasons
+    reach the client, which means even a garbage token completes a full 101
+    upgrade before rejection. This caps how many of those handshakes one IP
+    can open; over-limit attempts are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(SHARE_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
 
 
 def get_share_upload_rate_limit() -> str:

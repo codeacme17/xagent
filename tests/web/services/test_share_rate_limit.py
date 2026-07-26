@@ -90,6 +90,23 @@ def test_ws_turn_and_upload_are_per_guest(monkeypatch: pytest.MonkeyPatch) -> No
     assert limiter.allow_upload("g") is False
 
 
+def test_ws_connect_is_per_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-auth handshake budget is keyed per caller IP (#993 F5)."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_ws_connect("1.2.3.4") is True
+    assert limiter.allow_ws_connect("1.2.3.4") is True
+    assert limiter.allow_ws_connect("1.2.3.4") is False
+    # Another caller is unaffected; a missing IP degrades to a shared bucket
+    # rather than bypassing the gate.
+    assert limiter.allow_ws_connect("5.6.7.8") is True
+    assert limiter.allow_ws_connect(None) is True
+    assert limiter.allow_ws_connect(None) is True
+    assert limiter.allow_ws_connect(None) is False
+
+
 def test_run_quota_per_share_and_per_guest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

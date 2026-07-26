@@ -1621,6 +1621,11 @@ class TestShareRateLimitConfig:
             "XAGENT_SHARE_WS_TURN_RATE_LIMIT",
             "60/minute",
         ),
+        (
+            "get_share_ws_connect_ip_rate_limit",
+            "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT",
+            "120/minute",
+        ),
         ("get_share_upload_rate_limit", "XAGENT_SHARE_UPLOAD_RATE_LIMIT", "60/minute"),
         ("get_share_run_quota", "XAGENT_SHARE_RUN_QUOTA", "500/day"),
         ("get_share_run_guest_quota", "XAGENT_SHARE_RUN_GUEST_QUOTA", "60/hour"),

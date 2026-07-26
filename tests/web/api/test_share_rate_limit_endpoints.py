@@ -290,3 +290,49 @@ async def test_ws_turn_rate_limited_without_client_id_sends_error(
     ]
     assert len(error_frames) == 1
     assert "too quickly" in error_frames[0]["message"]
+
+
+def test_ws_connect_over_limit_is_refused_pre_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over-limit share WS connection attempts are refused before the
+    handshake is accepted (#993 F5): accept-before-auth means every admitted
+    attempt completes a 101 upgrade even with a garbage token, so the attempts
+    themselves carry a per-IP budget. TestClient surfaces a pre-accept close at
+    context-manager entry (post-accept denials raise at receive instead —
+    that asymmetry is what pins the ordering)."""
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.setenv("XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    url = "/api/share/chat/ws/1?token=garbage"
+    # First attempt is admitted: it upgrades, then auth rejects it post-accept.
+    with client.websocket_connect(url) as ws:
+        with pytest.raises(WebSocketDisconnect) as first:
+            ws.receive_text()
+    assert first.value.code == 4003
+
+    # Second attempt from the same caller trips the budget pre-accept.
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(url):
+            pass
+    assert denied.value.code == 4008
+
+
+def test_ws_close_reason_clamps_to_123_utf8_bytes() -> None:
+    """WS close reasons are capped at 123 UTF-8 bytes by the protocol;
+    ``exc.detail`` is ``Any`` in FastAPI, so the close path coerces and clamps
+    on a codepoint boundary instead of blowing up mid-close (#993 F6)."""
+    from xagent.web.api.public_chat_access import _ws_close_reason
+
+    assert _ws_close_reason("short reason") == "short reason"
+    assert _ws_close_reason(None) == ""
+    assert _ws_close_reason({"nested": "detail"}) == str({"nested": "detail"})
+
+    clamped = _ws_close_reason("б" * 200)  # 2-byte codepoint
+    encoded = clamped.encode("utf-8")
+    assert len(encoded) <= 123
+    # 123 is odd, so a naive byte slice would split the final 2-byte
+    # codepoint; the clamp must land on a boundary.
+    assert clamped == "б" * 61
