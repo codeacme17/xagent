@@ -31,7 +31,7 @@ from ...config import (
     get_gmail_pubsub_topic_prefix,
     get_gmail_pubsub_transport,
     get_gmail_registration_timeout_seconds,
-    get_public_api_base_url,
+    get_trigger_callback_base_url,
 )
 from ..models.gmail_watch import GmailWatchState
 from ..models.trigger import (
@@ -127,16 +127,17 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 def _validate_provisioning_config() -> tuple[str, str, str]:
-    """Return (project_id, public_base_url, push_service_account) or raise."""
+    """Return (project_id, callback_base_url, push_service_account) or raise."""
     project_id = get_gmail_pubsub_project_id()
     if not project_id:
         raise GmailProvisioningError(
             "XAGENT_GMAIL_PUBSUB_PROJECT_ID is required for Gmail provisioning"
         )
-    base_url = get_public_api_base_url()
+    base_url = get_trigger_callback_base_url()
     if not base_url:
         raise GmailProvisioningError(
-            "XAGENT_PUBLIC_API_BASE_URL is required for Gmail push registration"
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL as "
+            "fallback) is required for Gmail push registration"
         )
     push_service_account = get_gmail_pubsub_push_service_account()
     if not push_service_account:
@@ -246,7 +247,8 @@ def _ensure_push_subscription(
             raise
         # The deterministic name survives config changes; make sure an
         # existing subscription still pushes to the current audience
-        # (e.g. after XAGENT_PUBLIC_API_BASE_URL was changed).
+        # (e.g. after XAGENT_TRIGGER_CALLBACK_BASE_URL or
+        # XAGENT_PUBLIC_API_BASE_URL was changed).
         _sync_push_endpoint(
             subscriber,
             subscription_path=subscription_path,

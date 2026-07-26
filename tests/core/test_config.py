@@ -72,6 +72,7 @@ from xagent.config import (
     SMTP_USE_TLS,
     SMTP_USERNAME,
     STORAGE_ROOT,
+    TRIGGER_CALLBACK_BASE_URL,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -149,6 +150,7 @@ from xagent.config import (
     get_smtp_use_tls,
     get_smtp_username,
     get_storage_root,
+    get_trigger_callback_base_url,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -1596,6 +1598,35 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_transport() == "rest"
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "carrier-pigeon")
         assert get_gmail_pubsub_transport() == "grpc"
+
+
+class TestTriggerCallbackBaseUrlConfig:
+    """Dedicated base URL for inbound trigger callbacks (issue #1009)."""
+
+    def test_env_var_name(self):
+        assert TRIGGER_CALLBACK_BASE_URL == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+
+    def test_env_set_strips_whitespace_and_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL", " https://callbacks.example.com/ "
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_trigger_callback_base_url() == "https://callbacks.example.com"
+
+    def test_unset_falls_back_to_public_api_base_url(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
+        assert get_trigger_callback_base_url() == "https://api.example.com"
+
+    def test_blank_env_falls_back_to_public_api_base_url(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", "   ")
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_trigger_callback_base_url() == "https://api.example.com"
+
+    def test_both_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
+        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+        assert get_trigger_callback_base_url() is None
 
 
 class TestTrustedProxyHopsConfig:

@@ -135,6 +135,7 @@ def gmail_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX", "xagent-gmail")
     monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX", "xagent-gmail-push")
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
+    monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
     monkeypatch.setenv(
         "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
         "pubsub-push@demo-project.iam.gserviceaccount.com",
@@ -251,7 +252,35 @@ def test_provisioning_creates_deterministic_resources_and_active_state(
     ]
 
 
-def test_missing_public_api_base_records_failed_state_without_app_base_fallback(
+def test_dedicated_trigger_callback_base_url_overrides_public_api_base(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com/"
+    )
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    subscriber = FakeSubscriber()
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+
+    expected_audience = (
+        f"https://callbacks.example.com/api/triggers/callback/gmail/{state.callback_id}"
+    )
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    assert state.push_audience == expected_audience
+    stored = subscriber.subscriptions[str(state.subscription_name)]
+    assert stored["push_config"]["push_endpoint"] == expected_audience
+    assert stored["push_config"]["oidc_token"]["audience"] == expected_audience
+
+
+def test_missing_callback_base_urls_record_failed_state_without_app_base_fallback(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
@@ -268,6 +297,7 @@ def test_missing_public_api_base_records_failed_state_without_app_base_fallback(
     )
 
     assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert "XAGENT_TRIGGER_CALLBACK_BASE_URL" in str(state.last_error)
     assert "XAGENT_PUBLIC_API_BASE_URL" in str(state.last_error)
     assert state.push_audience is None
 
