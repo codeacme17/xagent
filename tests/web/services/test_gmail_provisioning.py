@@ -19,6 +19,7 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import (
+    GMAIL_PUSH_PUBLISHER,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
@@ -937,6 +938,38 @@ def test_iam_policy_failure_marks_failed_not_active(
     assert expected_error in str(state.last_error)
     # Provisioning must stop at the IAM failure: no watch was registered.
     assert gmail.watch_calls == []
+
+
+def test_iam_grant_appends_to_existing_publisher_binding(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    topic_path = gmail_topic_path("demo-project", "owner@gmail.example")
+    existing_policy = FakePolicy()
+    existing_policy.bindings.add(
+        role="roles/pubsub.publisher", members=["serviceAccount:other@example.iam"]
+    )
+    publisher.policies[topic_path] = existing_policy
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    # The Gmail push identity joins the existing roles/pubsub.publisher
+    # binding instead of creating a duplicate binding for the same role.
+    bindings = publisher.policies[topic_path].bindings
+    assert len(bindings) == 1
+    assert bindings[0].members == [
+        "serviceAccount:other@example.iam",
+        f"serviceAccount:{GMAIL_PUSH_PUBLISHER}",
+    ]
 
 
 def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(

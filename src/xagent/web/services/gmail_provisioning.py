@@ -220,9 +220,13 @@ def _ensure_topic(publisher: Any, topic_path: str) -> None:
     policy = publisher.get_iam_policy(request={"resource": topic_path})
     member = f"serviceAccount:{GMAIL_PUSH_PUBLISHER}"
     for binding in policy.bindings:
-        if binding.role == "roles/pubsub.publisher" and member in binding.members:
-            return
-    policy.bindings.add(role="roles/pubsub.publisher", members=[member])
+        if binding.role == "roles/pubsub.publisher":
+            if member in binding.members:
+                return
+            binding.members.append(member)
+            break
+    else:
+        policy.bindings.add(role="roles/pubsub.publisher", members=[member])
     publisher.set_iam_policy(request={"resource": topic_path, "policy": policy})
 
 
