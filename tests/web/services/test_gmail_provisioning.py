@@ -891,6 +891,54 @@ def test_patch_failure_marks_failed_not_active(
     assert "api-v2.example.com" not in str(second.push_audience)
 
 
+class GetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be read."""
+
+    def get_iam_policy(self, *, request: dict[str, str]) -> FakePolicy:
+        raise RuntimeError("pubsub get_iam_policy unavailable")
+
+
+class SetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be written."""
+
+    def set_iam_policy(self, *, request: dict[str, Any]) -> None:
+        raise RuntimeError("pubsub set_iam_policy unavailable")
+
+
+@pytest.mark.parametrize(
+    ("publisher_cls", "expected_error"),
+    [
+        (GetIamPolicyFailsFakePublisher, "pubsub get_iam_policy unavailable"),
+        (SetIamPolicyFailsFakePublisher, "pubsub set_iam_policy unavailable"),
+    ],
+)
+def test_iam_policy_failure_marks_failed_not_active(
+    db_session: Session,
+    publisher_cls: type[FakePublisher],
+    expected_error: str,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    gmail = FakeGmailService()
+
+    # If the roles/pubsub.publisher grant for the Gmail push identity cannot
+    # be verified or applied, Gmail may be unable to publish to the topic and
+    # the trigger would silently never fire. The failure must propagate so the
+    # watch lands FAILED for the retry sweep instead of recording ACTIVE.
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher_cls(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert expected_error in str(state.last_error)
+    # Provisioning must stop at the IAM failure: no watch was registered.
+    assert gmail.watch_calls == []
+
+
 def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
