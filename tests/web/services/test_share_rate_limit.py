@@ -168,5 +168,6 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_auth("tok", "1.1.1.1") is True
     assert limiter.allow_task_create("tok", "g") is True
     assert limiter.allow_ws_turn("g") is True
+    assert limiter.allow_ws_connect("1.1.1.1") is True
     assert limiter.allow_upload("g") is True
     assert limiter.allow_run("agent:1", "g") is True

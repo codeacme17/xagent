@@ -217,8 +217,11 @@ class ShareRateLimiter:
         per-guest window must admit. Unlike the request throttles, this bounds
         real billing, so both buckets are tested non-destructively first and
         only consumed when both admit — a denial by either never burns a slot
-        in the other. (The test→hit gap can let concurrent starts overshoot by
-        a hair; acceptable for a soft quota, and it fails toward allowing.)
+        in the other. (The test→hit gap is not atomic: every request that
+        passes ``test()`` before the racing ``hit()`` calls land is admitted,
+        so the overshoot bound is the number of requests racing within that
+        window across all workers, not a fixed margin. Acceptable for a soft
+        quota, and it fails toward allowing.)
         """
         share_key = share_key or "unknown"
         guest_id = guest_id or "unknown"
