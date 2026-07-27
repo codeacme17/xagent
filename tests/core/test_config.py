@@ -1704,6 +1704,15 @@ class TestTriggerCallbackBaseUrlConfig:
         monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
         assert get_trigger_callback_base_url() is None
 
+    def test_override_does_not_affect_public_api_base_url(self, monkeypatch):
+        # The isolation between the two getters is the whole reason MCP and A2A
+        # (which read get_public_api_base_url) are unaffected by the override.
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com"
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_public_api_base_url() == "https://api.example.com"
+
 
 class TestTrustedProxyHopsConfig:
     """Config for proxy-aware remote IP derivation."""

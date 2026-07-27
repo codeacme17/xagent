@@ -804,7 +804,14 @@ class InspectFailsFakeSubscriber(ResyncFakeSubscriber):
         raise RuntimeError("pubsub get_subscription unavailable")
 
 
-def test_existing_subscription_inspect_failure_marks_failed_not_active(
+class ModifyFailsFakeSubscriber(ResyncFakeSubscriber):
+    """Existing subscription whose push config cannot be patched."""
+
+    def modify_push_config(self, *, request: dict[str, Any]) -> None:
+        raise RuntimeError("pubsub modify_push_config unavailable")
+
+
+def test_inspect_failure_falls_through_to_unconditional_resync(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user = _create_user(db_session)
@@ -821,12 +828,53 @@ def test_existing_subscription_inspect_failure_marks_failed_not_active(
         subscriber_factory=lambda: subscriber,
     )
     assert first.status == TriggerProvisioningStatus.ACTIVE.value
-    old_audience = str(first.push_audience)
 
     # A base-URL change forces a resync, but inspecting the existing
-    # subscription fails. The failure must propagate so the watch lands
-    # FAILED rather than recording the new audience as ACTIVE against a
-    # subscription that was never updated.
+    # subscription fails. Inspection is only an optimization, so provisioning
+    # degrades to an unconditional (idempotent) modify_push_config rather than
+    # aborting: the watch still converges to ACTIVE with the new audience.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    new_audience = (
+        f"https://api-v2.example.com/api/triggers/callback/gmail/{second.callback_id}"
+    )
+    assert second.status == TriggerProvisioningStatus.ACTIVE.value
+    assert second.push_audience == new_audience
+    assert len(subscriber.modify_calls) == 1
+    stored = subscriber.subscriptions[str(second.subscription_name)]
+    assert stored["push_config"]["push_endpoint"] == new_audience
+
+
+def test_patch_failure_marks_failed_not_active(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = ModifyFailsFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    assert first.status == TriggerProvisioningStatus.ACTIVE.value
+    old_audience = str(first.push_audience)
+
+    # A base-URL change forces a resync, and the patch itself fails. Unlike an
+    # inspection failure, this must propagate so the watch lands FAILED rather
+    # than recording the new audience as ACTIVE against a subscription that was
+    # never updated.
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
     second = ensure_gmail_mailbox_provisioned(
         db_session,
@@ -837,11 +885,10 @@ def test_existing_subscription_inspect_failure_marks_failed_not_active(
     )
 
     assert second.status == TriggerProvisioningStatus.FAILED.value
-    assert "pubsub get_subscription unavailable" in str(second.last_error)
+    assert "pubsub modify_push_config unavailable" in str(second.last_error)
     # The persisted audience must not have advanced to the un-synced value.
     assert second.push_audience == old_audience
     assert "api-v2.example.com" not in str(second.push_audience)
-    assert subscriber.modify_calls == []
 
 
 def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(

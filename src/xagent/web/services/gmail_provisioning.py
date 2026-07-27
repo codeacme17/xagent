@@ -264,36 +264,51 @@ def _sync_push_config(
 ) -> None:
     """Reconcile an existing subscription's push config with the desired one.
 
-    Reads the live subscription, compares the full
-    ``(push_endpoint, service_account_email, audience)`` tuple against
-    ``push_config``, and patches via ``modify_push_config`` only when they
-    differ.
+    Inspecting the live subscription is only an optimization to skip a
+    redundant patch: on a successful read the full
+    ``(push_endpoint, service_account_email, audience)`` tuple is compared
+    against ``push_config`` and the patch is skipped when they already match.
+    A read failure (e.g. a narrower IAM role without
+    ``pubsub.subscriptions.get``, or a transient blip) is logged and falls
+    through to an unconditional, idempotent ``modify_push_config`` rather than
+    aborting.
 
-    Raises on inspection or patch failure: the caller persists the new
-    audience and marks the watch ``ACTIVE`` on return, so a swallowed error
-    here would record success on a subscription that was never inspected or
-    updated. Letting it propagate lands the watch in ``FAILED`` for the retry
-    sweep instead.
+    The patch itself is never swallowed. The caller persists the new audience
+    and marks the watch ``ACTIVE`` on return, so a swallowed patch failure
+    would record success on a subscription that was never updated. Letting it
+    propagate lands the watch in ``FAILED`` for the retry sweep instead.
     """
-    existing = subscriber.get_subscription(request={"subscription": subscription_path})
-    existing_push = getattr(existing, "push_config", None)
-    existing_oidc = getattr(existing_push, "oidc_token", None)
-    current = (
-        str(getattr(existing_push, "push_endpoint", "") or ""),
-        str(getattr(existing_oidc, "service_account_email", "") or ""),
-        str(getattr(existing_oidc, "audience", "") or ""),
-    )
-    desired_oidc = push_config.get("oidc_token", {})
-    desired = (
-        str(push_config.get("push_endpoint", "")),
-        str(desired_oidc.get("service_account_email", "")),
-        str(desired_oidc.get("audience", "")),
-    )
-    # Compare the full push config, not just the endpoint: the OIDC service
-    # account can change (e.g. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT) while
-    # the endpoint/audience stay the same, and it still needs re-syncing.
-    if current == desired:
-        return
+    try:
+        existing = subscriber.get_subscription(
+            request={"subscription": subscription_path}
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not inspect existing subscription %s; re-applying push "
+            "config unconditionally: %s",
+            subscription_path,
+            exc,
+        )
+    else:
+        existing_push = getattr(existing, "push_config", None)
+        existing_oidc = getattr(existing_push, "oidc_token", None)
+        current = (
+            str(getattr(existing_push, "push_endpoint", "") or ""),
+            str(getattr(existing_oidc, "service_account_email", "") or ""),
+            str(getattr(existing_oidc, "audience", "") or ""),
+        )
+        desired_oidc = push_config.get("oidc_token", {})
+        desired = (
+            str(push_config.get("push_endpoint", "")),
+            str(desired_oidc.get("service_account_email", "")),
+            str(desired_oidc.get("audience", "")),
+        )
+        # Compare the full push config, not just the endpoint: the OIDC service
+        # account can change (e.g. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT)
+        # while the endpoint/audience stay the same, and it still needs
+        # re-syncing.
+        if current == desired:
+            return
     subscriber.modify_push_config(
         request={
             "subscription": subscription_path,
