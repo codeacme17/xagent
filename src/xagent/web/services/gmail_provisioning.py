@@ -136,8 +136,8 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
     base_url = get_trigger_callback_base_url()
     if not base_url:
         raise GmailProvisioningError(
-            "XAGENT_TRIGGER_CALLBACK_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL as "
-            "fallback) is required for Gmail push registration"
+            "XAGENT_PUBLIC_API_BASE_URL (or XAGENT_TRIGGER_CALLBACK_BASE_URL to "
+            "override it) is required for Gmail push registration"
         )
     push_service_account = get_gmail_pubsub_push_service_account()
     if not push_service_account:
@@ -249,28 +249,33 @@ def _ensure_push_subscription(
         # existing subscription still pushes to the current audience
         # (e.g. after XAGENT_TRIGGER_CALLBACK_BASE_URL or
         # XAGENT_PUBLIC_API_BASE_URL was changed).
-        _sync_push_endpoint(
+        _sync_push_config(
             subscriber,
             subscription_path=subscription_path,
             push_config=push_config,
         )
 
 
-def _sync_push_endpoint(
+def _sync_push_config(
     subscriber: Any,
     *,
     subscription_path: str,
     push_config: dict[str, Any],
 ) -> None:
-    try:
-        existing = subscriber.get_subscription(
-            request={"subscription": subscription_path}
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not inspect existing subscription %s: %s", subscription_path, exc
-        )
-        return
+    """Reconcile an existing subscription's push config with the desired one.
+
+    Reads the live subscription, compares the full
+    ``(push_endpoint, service_account_email, audience)`` tuple against
+    ``push_config``, and patches via ``modify_push_config`` only when they
+    differ.
+
+    Raises on inspection or patch failure: the caller persists the new
+    audience and marks the watch ``ACTIVE`` on return, so a swallowed error
+    here would record success on a subscription that was never inspected or
+    updated. Letting it propagate lands the watch in ``FAILED`` for the retry
+    sweep instead.
+    """
+    existing = subscriber.get_subscription(request={"subscription": subscription_path})
     existing_push = getattr(existing, "push_config", None)
     existing_oidc = getattr(existing_push, "oidc_token", None)
     current = (

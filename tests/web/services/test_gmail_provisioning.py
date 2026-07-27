@@ -786,14 +786,61 @@ def test_existing_subscription_not_resynced_when_config_unchanged(
     subscriber = ResyncFakeSubscriber()
     gmail = FakeGmailService()
 
-    kwargs = dict(
+    kwargs = {
+        "service_factory": lambda _db, _account: gmail,
+        "publisher_factory": lambda: publisher,
+        "subscriber_factory": lambda: subscriber,
+    }
+    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
+    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
+
+    assert subscriber.modify_calls == []
+
+
+class InspectFailsFakeSubscriber(ResyncFakeSubscriber):
+    """Existing subscription whose push config cannot be inspected."""
+
+    def get_subscription(self, *, request: dict[str, str]) -> Any:
+        raise RuntimeError("pubsub get_subscription unavailable")
+
+
+def test_existing_subscription_inspect_failure_marks_failed_not_active(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = InspectFailsFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
         service_factory=lambda _db, _account: gmail,
         publisher_factory=lambda: publisher,
         subscriber_factory=lambda: subscriber,
     )
-    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
-    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
+    assert first.status == TriggerProvisioningStatus.ACTIVE.value
+    old_audience = str(first.push_audience)
 
+    # A base-URL change forces a resync, but inspecting the existing
+    # subscription fails. The failure must propagate so the watch lands
+    # FAILED rather than recording the new audience as ACTIVE against a
+    # subscription that was never updated.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert second.status == TriggerProvisioningStatus.FAILED.value
+    assert "pubsub get_subscription unavailable" in str(second.last_error)
+    # The persisted audience must not have advanced to the un-synced value.
+    assert second.push_audience == old_audience
+    assert "api-v2.example.com" not in str(second.push_audience)
     assert subscriber.modify_calls == []
 
 

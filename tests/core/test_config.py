@@ -1689,13 +1689,13 @@ class TestTriggerCallbackBaseUrlConfig:
         monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
         assert get_trigger_callback_base_url() == "https://api.example.com"
 
-    def test_blank_env_falls_back_to_public_api_base_url(self, monkeypatch):
-        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", "   ")
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_trigger_callback_base_url() == "https://api.example.com"
-
-    def test_slash_only_env_falls_back_to_public_api_base_url(self, monkeypatch):
-        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", " /// ")
+    @pytest.mark.parametrize("raw_value", ["   ", " /// "])
+    def test_empty_after_cleaning_falls_back_to_public_api_base_url(
+        self, monkeypatch, raw_value
+    ):
+        # "   " exercises .strip(); " /// " exercises .rstrip("/"). Either way
+        # the cleaned value is empty and must fall back rather than return "".
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raw_value)
         monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
         assert get_trigger_callback_base_url() == "https://api.example.com"
 

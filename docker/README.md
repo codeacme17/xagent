@@ -45,8 +45,9 @@ POSTGRES_PASSWORD="xagent_password"
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash
-# Backend public API base URL used for Pub/Sub push endpoints and OIDC audience.
-# Do not use the frontend APP_BASE_URL here.
+# Backend public API base URL. Pub/Sub push endpoints and OIDC audience use
+# XAGENT_TRIGGER_CALLBACK_BASE_URL when set, and fall back to this value
+# otherwise. Do not use the frontend APP_BASE_URL here.
 XAGENT_PUBLIC_API_BASE_URL="https://api.example.com"
 
 # Google Cloud project and deterministic per-mailbox resource prefixes.
