@@ -10,7 +10,13 @@ import pytest
 from sqlalchemy import inspect as sa_inspect
 
 import xagent.web.services.orphan_upload_gc as orphan_upload_gc
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.database import (
+    Base,
+    get_db,
+    get_engine,
+    get_session_local,
+    init_db,
+)
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -19,6 +25,7 @@ from xagent.web.services.orphan_upload_gc import (
     TASKLESS_SHARE_UPLOAD_SOURCE,
     _claim_orphan,
     _OrphanUploadCandidate,
+    _run_gc_tick,
     cleanup_orphaned_taskless_uploads,
 )
 from xagent.web.services.uploaded_file_recovery import (
@@ -391,6 +398,70 @@ def test_pages_thread_the_cursor_and_drain_the_backlog(
 
     assert total_deleted == 5
     assert pages == 3
+    assert db_session.query(UploadedFile).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_tick_drains_full_pages_before_sleeping(
+    db_session, owner, tmp_path
+) -> None:
+    """One tick keeps consuming FULL pages until a short page — the reaper's
+    per-tick capacity is pages × batch, not one page per long sleep, so
+    sustained task-less ingress cannot outrun it (#996 review). Exhausting
+    the page budget instead returns a live cursor for the next tick."""
+    for i in range(5):
+        _mk_upload(
+            db_session,
+            owner,
+            tmp_path,
+            name=f"tick-{i}.txt",
+            marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+            task_id=None,
+            age_days=5,
+        )
+
+    # Plenty of budget: a single tick drains the whole backlog (3 pages)
+    # and signals the drained state with a reset (None) cursor.
+    cursor = await _run_gc_tick(
+        ttl_seconds=2 * DAY,
+        batch_size=2,
+        max_pages=10,
+        after=None,
+        session_factory=get_session_local(),
+    )
+    assert cursor is None
+    assert db_session.query(UploadedFile).count() == 0
+
+    # Budget exhaustion on full pages: the tick stops early but hands the
+    # next tick a live cursor to resume from, preserving fairness.
+    for i in range(3):
+        _mk_upload(
+            db_session,
+            owner,
+            tmp_path,
+            name=f"budget-{i}.txt",
+            marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+            task_id=None,
+            age_days=5,
+        )
+    cursor = await _run_gc_tick(
+        ttl_seconds=2 * DAY,
+        batch_size=1,
+        max_pages=2,
+        after=None,
+        session_factory=get_session_local(),
+    )
+    assert cursor is not None
+    assert db_session.query(UploadedFile).count() == 1
+
+    cursor = await _run_gc_tick(
+        ttl_seconds=2 * DAY,
+        batch_size=1,
+        max_pages=2,
+        after=cursor,
+        session_factory=get_session_local(),
+    )
+    assert cursor is None
     assert db_session.query(UploadedFile).count() == 0
 
 

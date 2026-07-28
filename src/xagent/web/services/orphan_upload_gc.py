@@ -63,13 +63,17 @@ logger = logging.getLogger(__name__)
 # binding on the public share path — never any other path's unbound draft.
 TASKLESS_SHARE_UPLOAD_SOURCE = "taskless_share_upload"
 
-# Bounded sweep shape: one deterministic keyset page per scheduler tick, so
-# a large backlog can neither materialize wholesale into worker memory nor
-# run unbounded into the next tick. The GC loop carries the cursor ACROSS
-# ticks (mirroring ``run_uploaded_file_compensation_recovery_loop``), so a
-# repeatedly failing oldest page cannot starve newer orphans; a short page
-# resets the cursor for the next bounded pass over the whole backlog.
+# Bounded sweep shape: deterministic keyset pages, each in its own short
+# Session, so a large backlog never materializes wholesale into worker
+# memory. One tick drains up to GC_MAX_PAGES_PER_TICK full pages (10,000
+# rows at the defaults — sized to outpace the rate-limited task-less upload
+# ingress) and only then takes the long sleep, so a sustained producer
+# cannot outrun an hourly single-page reaper. The loop carries the cursor
+# ACROSS ticks (mirroring ``run_uploaded_file_compensation_recovery_loop``),
+# so a repeatedly failing oldest page cannot starve newer orphans; a short
+# page resets the cursor for the next bounded pass over the whole backlog.
 GC_BATCH_SIZE = 500
+GC_MAX_PAGES_PER_TICK = 20
 
 OrphanUploadSweepCursor = tuple[datetime, int]
 
@@ -313,36 +317,70 @@ def sweep_orphaned_taskless_uploads_isolated(
         )
 
 
+async def _run_gc_tick(
+    *,
+    ttl_seconds: int,
+    batch_size: int,
+    max_pages: int,
+    after: OrphanUploadSweepCursor | None,
+    session_factory: Callable[[], Session] | None = None,
+) -> OrphanUploadSweepCursor | None:
+    """Drain up to ``max_pages`` full pages; return where the next tick resumes.
+
+    Each page runs in its own short Session. A short page means the eligible
+    backlog is drained — the cursor resets (``None``) so the next tick starts
+    a fresh bounded pass. Exhausting the page budget on full pages returns
+    the live cursor so the next tick continues where this one stopped,
+    keeping per-tick work bounded without capping throughput at one page per
+    long sleep.
+    """
+    cursor = after
+    for _ in range(max_pages):
+        result = await run_db_io_cancellation_safe(
+            lambda: sweep_orphaned_taskless_uploads_isolated(
+                older_than_seconds=ttl_seconds,
+                batch_size=batch_size,
+                after=cursor,
+                session_factory=session_factory,
+            )
+        )
+        if result.scanned:
+            logger.info(
+                "Orphan task-less upload GC: scanned=%s deleted=%s",
+                result.scanned,
+                result.deleted,
+            )
+        if result.scanned < batch_size:
+            return None
+        cursor = result.next_cursor
+    return cursor
+
+
 async def run_orphan_upload_gc_loop(
     *,
     poll_interval_seconds: int,
     ttl_seconds: int,
     batch_size: int = GC_BATCH_SIZE,
+    max_pages_per_tick: int = GC_MAX_PAGES_PER_TICK,
 ) -> None:
-    """Reap at most one bounded page per tick while rotating fairly.
+    """Reap bounded batches of orphans on a fixed cadence, rotating fairly.
 
     In-process counterpart of ``run_uploaded_file_compensation_recovery_loop``
-    — it runs in every supported deployment (no Celery required). The cursor
-    advances across ticks so a repeatedly failing oldest page cannot starve
-    newer orphans; a short page resets the cursor for the next bounded pass.
+    — it runs in every supported deployment (no Celery required). Each tick
+    drains up to ``max_pages_per_tick`` full pages (so sustained task-less
+    ingress cannot outrun the reaper) and sleeps only after a short page or
+    that budget; the cursor carries across ticks so a repeatedly failing
+    oldest page cannot starve newer orphans.
     """
     cursor: OrphanUploadSweepCursor | None = None
     while True:
         try:
-            result = await run_db_io_cancellation_safe(
-                lambda: sweep_orphaned_taskless_uploads_isolated(
-                    older_than_seconds=ttl_seconds,
-                    batch_size=batch_size,
-                    after=cursor,
-                )
+            cursor = await _run_gc_tick(
+                ttl_seconds=ttl_seconds,
+                batch_size=batch_size,
+                max_pages=max_pages_per_tick,
+                after=cursor,
             )
-            cursor = result.next_cursor if result.scanned == batch_size else None
-            if result.scanned:
-                logger.info(
-                    "Orphan task-less upload GC: scanned=%s deleted=%s",
-                    result.scanned,
-                    result.deleted,
-                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
