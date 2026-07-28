@@ -17,9 +17,16 @@ from xagent.web.services.file_turn import bind_turn_files_no_commit
 from xagent.web.services.orphan_upload_gc import (
     TASKLESS_SHARE_UPLOAD_SOURCE,
     _claim_orphan,
+    _OrphanUploadCandidate,
     cleanup_orphaned_taskless_uploads,
 )
-from xagent.web.services.uploaded_file_store import UploadedFileStore
+from xagent.web.services.uploaded_file_recovery import (
+    get_stale_uploaded_file_compensation_candidates,
+)
+from xagent.web.services.workforce_runs import (
+    WorkforceRunError,
+    _bind_selected_files_to_task,
+)
 
 DAY = 24 * 60 * 60
 
@@ -53,24 +60,41 @@ def _mk_upload(
     task_id: int | None,
     age_days: float,
 ) -> tuple[UploadedFile, Path]:
+    """One registered upload in the exact shape the public path leaves it:
+    ``available`` with a durable storage key (the only state a marked row can
+    exist in — the registration pipeline never commits anything else)."""
     path = tmp_path / name
     path.write_bytes(b"payload")
     now = datetime.now(timezone.utc)
+    file_id = str(uuid4())
     row = UploadedFile(
-        file_id=str(uuid4()),
+        file_id=file_id,
         user_id=int(owner.id),
         task_id=task_id,
         filename=name,
         storage_path=str(path),
-        storage_status="legacy",
+        storage_key=f"users/{int(owner.id)}/uploads/{file_id}/{name}",
+        storage_status="available",
         file_size=path.stat().st_size,
         upload_source=marker,
         created_at=now - timedelta(days=age_days),
+        updated_at=now - timedelta(days=age_days),
     )
     db_session.add(row)
     db_session.commit()
     db_session.refresh(row)
     return row, path
+
+
+def _candidate(row: UploadedFile) -> _OrphanUploadCandidate:
+    return _OrphanUploadCandidate(
+        row_id=int(row.id),
+        user_id=int(row.user_id),
+        file_id=str(row.file_id),
+        storage_key=str(row.storage_key),
+        storage_path=str(row.storage_path),
+        created_at=row.created_at,
+    )
 
 
 def _make_task(db_session, owner: User) -> int:
@@ -166,11 +190,11 @@ def test_spares_marked_but_bound_upload(db_session, owner, tmp_path) -> None:
     assert path.exists()
 
 
-def test_claim_fails_on_bound_row_and_marks_unbound_row(
-    db_session, owner, tmp_path
-) -> None:
-    """The claim is a conditional UPDATE: False once ``task_id`` is set, and a
-    successful claim leaves the row ``compensating`` (unbindable)."""
+def test_claim_requires_exact_available_status(db_session, owner, tmp_path) -> None:
+    """The claim CAS demands the exact prior state: a bound row fails on
+    ``task_id IS NULL``; a second claim on the same row fails on
+    ``storage_status == 'available'`` — overlapping sweeps are mutually
+    exclusive, never co-owners."""
     task_id = _make_task(db_session, owner)
     bound, _ = _mk_upload(
         db_session,
@@ -191,28 +215,34 @@ def test_claim_fails_on_bound_row_and_marks_unbound_row(
         age_days=5,
     )
 
-    assert _claim_orphan(db_session, int(bound.id)) is False
-    assert _claim_orphan(db_session, int(unbound.id)) is True
+    assert _claim_orphan(db_session, _candidate(bound)) is None
+
+    token = _claim_orphan(db_session, _candidate(unbound))
+    assert token is not None
     db_session.refresh(unbound)
     assert unbound.storage_status == "compensating"
+    assert unbound.updated_at == token  # persisted generation token
+
+    # An overlapping sweep claiming the same row loses outright.
+    assert _claim_orphan(db_session, _candidate(unbound)) is None
 
 
-def test_claimed_row_is_excluded_from_run_start_binding(
+def test_claimed_row_is_excluded_from_ws_turn_binding(
     db_session, owner, tmp_path
 ) -> None:
-    """The other half of the interlock: once GC has claimed a row, the
-    run-start conditional bind must skip it rather than resurrect it."""
+    """The WS-turn binder's conditional update must skip a claimed row rather
+    than resurrect it."""
     task_id = _make_task(db_session, owner)
     row, _ = _mk_upload(
         db_session,
         owner,
         tmp_path,
-        name="claimed.txt",
+        name="claimed-ws.txt",
         marker=TASKLESS_SHARE_UPLOAD_SOURCE,
         task_id=None,
         age_days=5,
     )
-    assert _claim_orphan(db_session, int(row.id)) is True
+    assert _claim_orphan(db_session, _candidate(row)) is not None
 
     missing = bind_turn_files_no_commit(
         file_ids=[str(row.file_id)],
@@ -227,12 +257,64 @@ def test_claimed_row_is_excluded_from_run_start_binding(
     assert row.task_id is None
 
 
+def test_claimed_row_is_excluded_from_workforce_run_binding(
+    db_session, owner, tmp_path
+) -> None:
+    """The workforce run-start binder — the binder actually used by the
+    task-less share/widget path — must refuse a claimed row via its own
+    conditional update instead of overwriting the claim with a stale ORM
+    assignment (#996 review)."""
+    task = Task(
+        user_id=int(owner.id),
+        title="wf",
+        description="wf",
+        status=TaskStatus.PENDING,
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    claimed, _ = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="claimed-wf.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=5,
+    )
+    assert _claim_orphan(db_session, _candidate(claimed)) is not None
+
+    with pytest.raises(WorkforceRunError):
+        _bind_selected_files_to_task(db_session, owner, task, [str(claimed.file_id)])
+    db_session.rollback()
+    db_session.refresh(claimed)
+    assert claimed.task_id is None
+    assert claimed.storage_status == "compensating"  # claim intact
+
+    # And the healthy path still binds.
+    free, _ = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="free-wf.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=5,
+    )
+    _bind_selected_files_to_task(db_session, owner, task, [str(free.file_id)])
+    db_session.commit()
+    db_session.refresh(free)
+    assert free.task_id == int(task.id)
+
+
 def test_row_bound_between_fetch_and_claim_is_spared(
     db_session, owner, tmp_path, monkeypatch
 ) -> None:
     """A run-start bind that commits after the batch query but before the
-    claim must win: the claim's ``task_id IS NULL`` predicate no longer
-    matches, so the row (and its bytes) survive."""
+    claim must win: the claim's predicate no longer matches, so the metadata
+    row and durable object survive. (The local staging copy is deleted before
+    the claim by design — the bound consumer re-materializes it from the
+    durable object.)"""
     task_id = _make_task(db_session, owner)
     row, path = _mk_upload(
         db_session,
@@ -247,13 +329,13 @@ def test_row_bound_between_fetch_and_claim_is_spared(
 
     real_claim = orphan_upload_gc._claim_orphan
 
-    def bind_then_claim(db, claimed_row_id: int) -> bool:
+    def bind_then_claim(db, candidate) -> datetime | None:
         # Emulate the concurrent run-start committing its bind first.
-        db.query(UploadedFile).filter(UploadedFile.id == claimed_row_id).update(
+        db.query(UploadedFile).filter(UploadedFile.id == candidate.row_id).update(
             {UploadedFile.task_id: task_id}, synchronize_session=False
         )
         db.commit()
-        return real_claim(db, claimed_row_id)
+        return real_claim(db, candidate)
 
     monkeypatch.setattr(orphan_upload_gc, "_claim_orphan", bind_then_claim)
 
@@ -262,7 +344,8 @@ def test_row_bound_between_fetch_and_claim_is_spared(
     assert deleted == 0
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.task_id == task_id
-    assert path.exists()
+    assert survivor.storage_status == "available"  # never claimed
+    assert not path.exists()  # local copy gone; durable object is the source
 
 
 def test_sweep_is_batched_and_bounded(db_session, owner, tmp_path) -> None:
@@ -293,33 +376,123 @@ def test_sweep_is_batched_and_bounded(db_session, owner, tmp_path) -> None:
     assert db_session.query(UploadedFile).count() == 0
 
 
-def test_failed_delete_stays_claimed_and_is_retried(
+def test_failing_oldest_rows_do_not_starve_newer_orphans(
     db_session, owner, tmp_path, monkeypatch
 ) -> None:
-    """A row whose storage deletion fails is skipped (sweep continues), stays
-    ``compensating`` (unbindable), and is reaped by a later sweep."""
+    """The keyset cursor advances past rows whose reap fails, so a bad oldest
+    batch cannot permanently starve everything behind it (#996 review)."""
+    oldest, _ = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="poison.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=9,
+    )
+    newer, newer_path = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="newer.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=5,
+    )
+    poison_id = int(oldest.id)
+    newer_id = int(newer.id)
+
+    real_reap = orphan_upload_gc._reap_orphan
+
+    def poisoned_reap(db, candidate) -> bool:
+        if candidate.row_id == poison_id:
+            raise RuntimeError("undeletable row")
+        return real_reap(db, candidate)
+
+    monkeypatch.setattr(orphan_upload_gc, "_reap_orphan", poisoned_reap)
+
+    deleted = cleanup_orphaned_taskless_uploads(
+        db_session, older_than_seconds=2 * DAY, batch_size=1, max_batches=10
+    )
+
+    assert deleted == 1  # the newer orphan was reached despite the poison row
+    assert db_session.query(UploadedFile).filter_by(id=poison_id).first() is not None
+    assert db_session.query(UploadedFile).filter_by(id=newer_id).first() is None
+    assert not newer_path.exists()
+
+
+def test_unresolved_durable_delete_hands_off_to_stale_recovery(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    """When the durable delete cannot confirm ``absent``, GC must NOT settle
+    the metadata (that could strand a live object): the row stays claimed and
+    becomes a stale-compensation recovery candidate, which owns the retry."""
     row, path = _mk_upload(
         db_session,
         owner,
         tmp_path,
-        name="flaky.txt",
+        name="deferred.txt",
         marker=TASKLESS_SHARE_UPLOAD_SOURCE,
         task_id=None,
         age_days=5,
     )
     row_id = int(row.id)
 
-    def boom(self, file_record, **kwargs):
-        raise RuntimeError("storage backend down")
-
-    monkeypatch.setattr(UploadedFileStore, "delete", boom)
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        lambda **_kwargs: "unknown",
+    )
     deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+
     assert deleted == 0
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.storage_status == "compensating"
+    assert not path.exists()  # local copy already removed pre-claim
 
+    # The claimed row is exactly what the generic recovery loop scans for.
+    candidates = get_stale_uploaded_file_compensation_candidates(
+        db_session,
+        cutoff=datetime.now(timezone.utc) + timedelta(seconds=1),
+        limit=10,
+    )
+    assert [c.row_id for c in candidates] == [row_id]
+
+    # A later sweep does not fight the recovery loop for the claimed row.
     monkeypatch.undo()
+    assert (
+        cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY) == 0
+    )
+
+
+def test_reap_deletes_durable_object_via_compensation_helper(
+    db_session, owner, tmp_path, monkeypatch
+) -> None:
+    """The durable object is removed through the session-less compensation
+    delete (keyed by owner + exact storage key) — not via a status-gated path
+    that a claimed row would silently skip (#996 review)."""
+    row, _ = _mk_upload(
+        db_session,
+        owner,
+        tmp_path,
+        name="durable.txt",
+        marker=TASKLESS_SHARE_UPLOAD_SOURCE,
+        task_id=None,
+        age_days=5,
+    )
+    expected_key = str(row.storage_key)
+    seen: list[tuple[int, str]] = []
+
+    def recording_delete(*, user_id: int, storage_key: str) -> str:
+        seen.append((user_id, storage_key))
+        return "absent"
+
+    monkeypatch.setattr(
+        orphan_upload_gc,
+        "delete_uploaded_file_compensation_object",
+        recording_delete,
+    )
     deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+
     assert deleted == 1
-    assert db_session.query(UploadedFile).filter_by(id=row_id).first() is None
-    assert not path.exists()
+    assert seen == [(int(owner.id), expected_key)]
