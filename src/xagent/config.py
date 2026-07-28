@@ -118,6 +118,8 @@ SHARE_TASK_CREATE_TOKEN_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT"
 SHARE_WS_TURN_RATE_LIMIT = "XAGENT_SHARE_WS_TURN_RATE_LIMIT"
 SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
 SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
+WIDGET_UPLOAD_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_RATE_LIMIT"
+WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -815,6 +817,24 @@ def get_share_ws_connect_ip_rate_limit() -> str:
 def get_share_upload_rate_limit() -> str:
     """Per-guest limit on public share file uploads (#973)."""
     return _get_rate_limit(SHARE_UPLOAD_RATE_LIMIT, "60/minute")
+
+
+def get_widget_upload_rate_limit() -> str:
+    """Per-widget-entity limit on public widget file uploads (#973).
+
+    Keyed on the embedded agent/workforce (not the widget ``guest_id``,
+    which is client-supplied and rotatable at will). Loose: one widget
+    serves many legitimate guests.
+    """
+    return _get_rate_limit(WIDGET_UPLOAD_RATE_LIMIT, "240/minute")
+
+
+def get_widget_upload_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget file uploads (#973).
+
+    The tighter bucket: bounds one abuser without a trustworthy per-guest
+    key. Kept loose enough for enterprise NAT."""
+    return _get_rate_limit(WIDGET_UPLOAD_IP_RATE_LIMIT, "60/minute")
 
 
 def get_share_run_quota() -> str:
