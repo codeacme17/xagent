@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import inspect as sa_inspect
 
 import xagent.web.services.orphan_upload_gc as orphan_upload_gc
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -109,6 +110,16 @@ def _make_task(db_session, owner: User) -> int:
     return int(task.id)
 
 
+def test_create_all_declares_the_gc_index(db_session) -> None:
+    """Fresh installations stamp Alembic head BEFORE create_all(), so the
+    migration never runs there — the model metadata itself must produce the
+    GC index (#996 review)."""
+    indexes = {
+        ix["name"] for ix in sa_inspect(get_engine()).get_indexes("uploaded_files")
+    }
+    assert "ix_uploaded_files_orphan_gc" in indexes
+
+
 def test_reaps_aged_marked_unbound_upload(db_session, owner, tmp_path) -> None:
     row, path = _mk_upload(
         db_session,
@@ -121,9 +132,9 @@ def test_reaps_aged_marked_unbound_upload(db_session, owner, tmp_path) -> None:
     )
     row_id = int(row.id)
 
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 1
+    assert (result.scanned, result.deleted) == (1, 1)
     assert db_session.query(UploadedFile).filter_by(id=row_id).first() is None
     assert not path.exists()  # on-disk file removed too
 
@@ -140,9 +151,9 @@ def test_spares_marked_but_recent_upload(db_session, owner, tmp_path) -> None:
     )
     row_id = int(row.id)
 
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 0
+    assert (result.scanned, result.deleted) == (0, 0)
     assert db_session.query(UploadedFile).filter_by(id=row_id).first() is not None
     assert path.exists()
 
@@ -161,9 +172,9 @@ def test_spares_unmarked_unbound_upload(db_session, owner, tmp_path) -> None:
     )
     row_id = int(row.id)
 
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 0
+    assert result.deleted == 0
     assert db_session.query(UploadedFile).filter_by(id=row_id).first() is not None
     assert path.exists()
 
@@ -183,9 +194,9 @@ def test_spares_marked_but_bound_upload(db_session, owner, tmp_path) -> None:
     )
     row_id = int(row.id)
 
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 0
+    assert result.deleted == 0
     assert db_session.query(UploadedFile).filter_by(id=row_id).first() is not None
     assert path.exists()
 
@@ -261,9 +272,9 @@ def test_claimed_row_is_excluded_from_workforce_run_binding(
     db_session, owner, tmp_path
 ) -> None:
     """The workforce run-start binder — the binder actually used by the
-    task-less share/widget path — must refuse a claimed row via its own
-    conditional update instead of overwriting the claim with a stale ORM
-    assignment (#996 review)."""
+    task-less share/widget path — must refuse a claimed row via the shared
+    conditional-update binder instead of overwriting the claim with a stale
+    ORM assignment (#996 review)."""
     task = Task(
         user_id=int(owner.id),
         title="wf",
@@ -339,18 +350,20 @@ def test_row_bound_between_fetch_and_claim_is_spared(
 
     monkeypatch.setattr(orphan_upload_gc, "_claim_orphan", bind_then_claim)
 
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 0
+    assert result.deleted == 0
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.task_id == task_id
     assert survivor.storage_status == "available"  # never claimed
     assert not path.exists()  # local copy gone; durable object is the source
 
 
-def test_sweep_is_batched_and_bounded(db_session, owner, tmp_path) -> None:
-    """The sweep never materializes more than ``batch_size`` rows at once and
-    stops after ``max_batches``; the remainder is left for the next tick."""
+def test_pages_thread_the_cursor_and_drain_the_backlog(
+    db_session, owner, tmp_path
+) -> None:
+    """One bounded page per call; the caller (the GC loop) threads
+    ``next_cursor``, and a short page signals the end of the backlog."""
     for i in range(5):
         _mk_upload(
             db_session,
@@ -362,25 +375,31 @@ def test_sweep_is_batched_and_bounded(db_session, owner, tmp_path) -> None:
             age_days=5,
         )
 
-    deleted = cleanup_orphaned_taskless_uploads(
-        db_session, older_than_seconds=2 * DAY, batch_size=2, max_batches=2
-    )
-    assert deleted == 4
-    assert db_session.query(UploadedFile).count() == 1
+    total_deleted = 0
+    cursor = None
+    pages = 0
+    while True:
+        result = cleanup_orphaned_taskless_uploads(
+            db_session, older_than_seconds=2 * DAY, batch_size=2, after=cursor
+        )
+        total_deleted += result.deleted
+        pages += 1
+        assert result.scanned <= 2  # never more than one bounded page
+        if result.scanned < 2:
+            break
+        cursor = result.next_cursor
 
-    # The next sweep drains the remainder.
-    deleted = cleanup_orphaned_taskless_uploads(
-        db_session, older_than_seconds=2 * DAY, batch_size=2, max_batches=2
-    )
-    assert deleted == 1
+    assert total_deleted == 5
+    assert pages == 3
     assert db_session.query(UploadedFile).count() == 0
 
 
-def test_failing_oldest_rows_do_not_starve_newer_orphans(
+def test_cursor_advances_past_failing_rows(
     db_session, owner, tmp_path, monkeypatch
 ) -> None:
-    """The keyset cursor advances past rows whose reap fails, so a bad oldest
-    batch cannot permanently starve everything behind it (#996 review)."""
+    """``next_cursor`` points past spared AND failing rows, so a permanently
+    failing oldest page cannot starve newer orphans across ticks — the loop
+    resumes AFTER the poison row on its next page (#996 review)."""
     oldest, _ = _mk_upload(
         db_session,
         owner,
@@ -411,11 +430,17 @@ def test_failing_oldest_rows_do_not_starve_newer_orphans(
 
     monkeypatch.setattr(orphan_upload_gc, "_reap_orphan", poisoned_reap)
 
-    deleted = cleanup_orphaned_taskless_uploads(
-        db_session, older_than_seconds=2 * DAY, batch_size=1, max_batches=10
+    first = cleanup_orphaned_taskless_uploads(
+        db_session, older_than_seconds=2 * DAY, batch_size=1
     )
+    assert (first.scanned, first.deleted) == (1, 0)  # poison page, no progress
+    assert first.next_cursor is not None
 
-    assert deleted == 1  # the newer orphan was reached despite the poison row
+    second = cleanup_orphaned_taskless_uploads(
+        db_session, older_than_seconds=2 * DAY, batch_size=1, after=first.next_cursor
+    )
+    assert (second.scanned, second.deleted) == (1, 1)
+
     assert db_session.query(UploadedFile).filter_by(id=poison_id).first() is not None
     assert db_session.query(UploadedFile).filter_by(id=newer_id).first() is None
     assert not newer_path.exists()
@@ -443,9 +468,9 @@ def test_unresolved_durable_delete_hands_off_to_stale_recovery(
         "delete_uploaded_file_compensation_object",
         lambda **_kwargs: "unknown",
     )
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 0
+    assert result.deleted == 0
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.storage_status == "compensating"
     assert not path.exists()  # local copy already removed pre-claim
@@ -460,9 +485,8 @@ def test_unresolved_durable_delete_hands_off_to_stale_recovery(
 
     # A later sweep does not fight the recovery loop for the claimed row.
     monkeypatch.undo()
-    assert (
-        cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY) == 0
-    )
+    later = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    assert (later.scanned, later.deleted) == (0, 0)
 
 
 def test_reap_deletes_durable_object_via_compensation_helper(
@@ -492,7 +516,7 @@ def test_reap_deletes_durable_object_via_compensation_helper(
         "delete_uploaded_file_compensation_object",
         recording_delete,
     )
-    deleted = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
+    result = cleanup_orphaned_taskless_uploads(db_session, older_than_seconds=2 * DAY)
 
-    assert deleted == 1
+    assert result.deleted == 1
     assert seen == [(int(owner.id), expected_key)]

@@ -16,6 +16,16 @@ class UploadedFile(Base):  # type: ignore
             "updated_at",
             "id",
         ),
+        # Serves the orphan-GC sweep predicate (#973). Declared here as well
+        # as in the migration because fresh installations stamp Alembic head
+        # BEFORE Base.metadata.create_all() — the migration never runs there,
+        # so create_all() must produce the index itself.
+        Index(
+            "ix_uploaded_files_orphan_gc",
+            "upload_source",
+            "task_id",
+            "created_at",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)

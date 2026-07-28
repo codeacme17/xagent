@@ -37,17 +37,20 @@ a bespoke one, so every crash window is already owned by shipped machinery:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ..models.uploaded_file import UploadedFile
+from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .uploaded_file_store import (
+    _load_uploaded_file_compensation_token_no_commit,
     delete_registered_preview_caches,
     delete_uploaded_file_compensation_object,
     settle_uploaded_file_compensation_no_commit,
@@ -60,14 +63,24 @@ logger = logging.getLogger(__name__)
 # binding on the public share path — never any other path's unbound draft.
 TASKLESS_SHARE_UPLOAD_SOURCE = "taskless_share_upload"
 
-# Bounded sweep shape: rows are reaped in deterministic keyset-paged batches
-# so a large backlog can neither materialize wholesale into worker memory nor
-# run unbounded into the next scheduled sweep. Whatever a capped sweep leaves
-# behind still matches the predicate and is picked up by the next tick.
+# Bounded sweep shape: one deterministic keyset page per scheduler tick, so
+# a large backlog can neither materialize wholesale into worker memory nor
+# run unbounded into the next tick. The GC loop carries the cursor ACROSS
+# ticks (mirroring ``run_uploaded_file_compensation_recovery_loop``), so a
+# repeatedly failing oldest page cannot starve newer orphans; a short page
+# resets the cursor for the next bounded pass over the whole backlog.
 GC_BATCH_SIZE = 500
-GC_MAX_BATCHES = 20
 
-_OrphanCursor = tuple[datetime, int]
+OrphanUploadSweepCursor = tuple[datetime, int]
+
+
+@dataclass(frozen=True)
+class OrphanUploadSweepResult:
+    """Outcome of one bounded orphan-GC page."""
+
+    scanned: int = 0
+    deleted: int = 0
+    next_cursor: OrphanUploadSweepCursor | None = None
 
 
 @dataclass(frozen=True)
@@ -87,7 +100,7 @@ class _OrphanUploadCandidate:
     created_at: datetime
 
     @property
-    def cursor(self) -> _OrphanCursor:
+    def cursor(self) -> OrphanUploadSweepCursor:
         return self.created_at, self.row_id
 
 
@@ -96,7 +109,7 @@ def _orphan_candidates(
     *,
     cutoff: datetime,
     limit: int,
-    after: _OrphanCursor | None,
+    after: OrphanUploadSweepCursor | None,
 ) -> tuple[_OrphanUploadCandidate, ...]:
     """One keyset page of reap-eligible rows, oldest first.
 
@@ -185,14 +198,8 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
         return None
     # Read the token back as persisted: the database may round the datetime,
     # and the settlement fences on exact equality.
-    token = cast(
-        "datetime | None",
-        db.query(UploadedFile.updated_at)
-        .filter(
-            UploadedFile.id == candidate.row_id,
-            UploadedFile.storage_status == "compensating",
-        )
-        .scalar(),
+    token = _load_uploaded_file_compensation_token_no_commit(
+        db, row_id=candidate.row_id
     )
     if token is None:
         db.rollback()
@@ -252,40 +259,97 @@ def cleanup_orphaned_taskless_uploads(
     older_than_seconds: int,
     now: datetime | None = None,
     batch_size: int = GC_BATCH_SIZE,
-    max_batches: int = GC_MAX_BATCHES,
-) -> int:
-    """Delete task-less public-share uploads that were never bound to a task.
+    after: OrphanUploadSweepCursor | None = None,
+) -> OrphanUploadSweepResult:
+    """Reap one bounded page of task-less public uploads never bound to a task.
 
-    Reaps rows that (a) carry the task-less-share marker, (b) still have no
-    ``task_id``, and (c) are older than the TTL, in oldest-first keyset pages
-    of ``batch_size`` (at most ``max_batches`` per sweep). The cursor always
-    advances past spared or failing rows, so a bad oldest page can never
-    starve newer orphans; whatever one sweep defers is retried by the next.
-    Per-row failures are logged and skipped so one bad row does not abort the
-    sweep. Returns the number of metadata rows deleted.
+    Processes the oldest ``batch_size`` rows past ``after`` that (a) carry
+    the task-less-share marker, (b) still have no ``task_id``, and (c) are
+    older than the TTL. Per-row failures are logged and skipped so one bad
+    row does not abort the page. The returned ``next_cursor`` always points
+    past every processed row (spared and failing included); the GC loop
+    threads it across ticks so a bad oldest page cannot starve newer orphans.
     """
     reference = now or datetime.now(timezone.utc)
     cutoff = reference - timedelta(seconds=older_than_seconds)
+    candidates = _orphan_candidates(db, cutoff=cutoff, limit=batch_size, after=after)
     deleted = 0
-    cursor: _OrphanCursor | None = None
-    for _ in range(max_batches):
-        candidates = _orphan_candidates(
-            db, cutoff=cutoff, limit=batch_size, after=cursor
+    for candidate in candidates:
+        try:
+            if _reap_orphan(db, candidate):
+                deleted += 1
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "Failed to GC orphaned task-less upload id=%s",
+                candidate.row_id,
+                exc_info=True,
+            )
+    return OrphanUploadSweepResult(
+        scanned=len(candidates),
+        deleted=deleted,
+        next_cursor=candidates[-1].cursor if candidates else None,
+    )
+
+
+def sweep_orphaned_taskless_uploads_isolated(
+    *,
+    older_than_seconds: int,
+    batch_size: int = GC_BATCH_SIZE,
+    after: OrphanUploadSweepCursor | None = None,
+    session_factory: Callable[[], Session] | None = None,
+) -> OrphanUploadSweepResult:
+    """Run one GC page in its own short-lived Session."""
+    if session_factory is None:
+        from ..models.database import get_session_local
+
+        session_factory = get_session_local()
+    with session_factory() as db:
+        return cleanup_orphaned_taskless_uploads(
+            db,
+            older_than_seconds=older_than_seconds,
+            batch_size=batch_size,
+            after=after,
         )
-        if not candidates:
-            break
-        cursor = candidates[-1].cursor
-        for candidate in candidates:
-            try:
-                if _reap_orphan(db, candidate):
-                    deleted += 1
-            except Exception:
-                db.rollback()
-                logger.warning(
-                    "Failed to GC orphaned task-less upload id=%s",
-                    candidate.row_id,
-                    exc_info=True,
+
+
+async def run_orphan_upload_gc_loop(
+    *,
+    poll_interval_seconds: int,
+    ttl_seconds: int,
+    batch_size: int = GC_BATCH_SIZE,
+) -> None:
+    """Reap at most one bounded page per tick while rotating fairly.
+
+    In-process counterpart of ``run_uploaded_file_compensation_recovery_loop``
+    — it runs in every supported deployment (no Celery required). The cursor
+    advances across ticks so a repeatedly failing oldest page cannot starve
+    newer orphans; a short page resets the cursor for the next bounded pass.
+    """
+    cursor: OrphanUploadSweepCursor | None = None
+    while True:
+        try:
+            result = await run_db_io_cancellation_safe(
+                lambda: sweep_orphaned_taskless_uploads_isolated(
+                    older_than_seconds=ttl_seconds,
+                    batch_size=batch_size,
+                    after=cursor,
                 )
-        if len(candidates) < batch_size:
-            break
-    return deleted
+            )
+            cursor = result.next_cursor if result.scanned == batch_size else None
+            if result.scanned:
+                logger.info(
+                    "Orphan task-less upload GC: scanned=%s deleted=%s",
+                    result.scanned,
+                    result.deleted,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if is_database_pool_timeout(exc):
+                logger.warning(
+                    "Orphan task-less upload GC skipped after database pool timeout"
+                )
+            else:
+                logger.exception("Orphan task-less upload GC tick failed")
+        await asyncio.sleep(poll_interval_seconds)

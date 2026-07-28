@@ -14,7 +14,6 @@ from xagent.web.models.database import (
     release_db_connection_if_clean,
 )
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
-from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
@@ -26,6 +25,7 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from .file_turn import bind_turn_files_no_commit
 from .task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
@@ -234,37 +234,18 @@ def _bind_selected_files_to_task(
     if not selected_file_ids:
         return
 
-    # Claim every currently-unbound row with a conditional UPDATE (the same
-    # protocol as ``bind_turn_files_no_commit``), NOT a read-then-assign: a
-    # stale ORM assignment would overwrite a compensation/GC claim that
-    # committed between the SELECT and the flush, binding a row whose bytes
-    # are already being deleted (#973). The database serializes this against
-    # the claimers' own conditional updates, so whichever commits first wins.
-    db.query(UploadedFile).filter(
-        UploadedFile.file_id.in_(selected_file_ids),
-        UploadedFile.user_id == int(user.id),
-        UploadedFile.task_id.is_(None),
-        UploadedFile.storage_status != "compensating",
-    ).update({UploadedFile.task_id: int(task.id)}, synchronize_session=False)
-
-    # Verify ownership after the UPDATE so a request that lost a race cannot
-    # report a successful bind from an earlier snapshot. Rows already bound
-    # to THIS task (idempotent re-bind) pass; rows bound elsewhere, claimed
-    # (``compensating``), or nonexistent surface as missing.
-    bound_rows = (
-        db.query(UploadedFile.file_id)
-        .filter(
-            UploadedFile.file_id.in_(selected_file_ids),
-            UploadedFile.user_id == int(user.id),
-            UploadedFile.task_id == int(task.id),
-            UploadedFile.storage_status != "compensating",
-        )
-        .all()
+    # Bind through the shared conditional-update binder, NOT a
+    # read-then-assign: a stale ORM assignment would overwrite a
+    # compensation/GC claim that committed between the SELECT and the flush,
+    # binding a row whose bytes are already being deleted (#973). Rows bound
+    # elsewhere, claimed (``compensating``), or nonexistent come back as
+    # missing; rows already bound to THIS task pass idempotently.
+    missing_file_ids = bind_turn_files_no_commit(
+        file_ids=selected_file_ids,
+        task_id=int(task.id),
+        owner_user_id=int(user.id),
+        db=db,
     )
-    bound_file_ids = {str(row.file_id) for row in bound_rows}
-    missing_file_ids = [
-        file_id for file_id in selected_file_ids if file_id not in bound_file_ids
-    ]
     if missing_file_ids:
         raise WorkforceRunError(
             status_code=404,

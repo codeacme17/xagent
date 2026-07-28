@@ -110,6 +110,23 @@ def _create_index_postgresql() -> None:
 def upgrade() -> None:
     from alembic import context
 
+    if context.is_offline_mode():
+        # Offline (--sql) supplies a MockConnection that cannot be
+        # reflected/inspected: emit deterministic DDL unconditionally.
+        op.add_column(TABLE, sa.Column(COLUMN, sa.String(length=64), nullable=True))
+        if op.get_context().dialect.name == "postgresql":
+            with op.get_context().autocommit_block():
+                op.create_index(
+                    INDEX,
+                    TABLE,
+                    list(INDEX_COLUMNS),
+                    if_not_exists=True,
+                    postgresql_concurrently=True,
+                )
+        else:
+            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS))
+        return
+
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
     if TABLE not in inspector.get_table_names():
@@ -128,6 +145,21 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     from alembic import context
+
+    if context.is_offline_mode():
+        # Deterministic offline DDL, no inspection (see upgrade()).
+        if op.get_context().dialect.name == "postgresql":
+            with op.get_context().autocommit_block():
+                op.drop_index(
+                    INDEX,
+                    table_name=TABLE,
+                    if_exists=True,
+                    postgresql_concurrently=True,
+                )
+        else:
+            op.drop_index(INDEX, table_name=TABLE)
+        op.drop_column(TABLE, COLUMN)
+        return
 
     bind = context.get_bind()
     inspector = Inspector.from_engine(bind)
