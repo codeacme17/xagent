@@ -286,7 +286,16 @@ def get_public_chat_user(
         if auth_mode != "widget":
             raise ValueError("Invalid token payload")
 
-        if not user_id or not guest_id:
+        # Defense in depth (#992): the same type guard get_share_chat_user
+        # applies (deliberately the same shape, so tightening one is an obvious
+        # prompt to tighten the other). These tokens are server-minted, so a
+        # non-int user_id is not reachable today — but without the guard the two
+        # widget branches below disagreed about a string one: the agent branch
+        # failed closed on an int/str owner comparison, while the workforce
+        # branch coerced it and admitted the request. Establishing the type here
+        # is what lets both branches pass ``user_id`` straight to their
+        # ``ensure_widget_*_available`` helper.
+        if not isinstance(user_id, int) or not user_id or not guest_id:
             raise ValueError("Invalid token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -300,7 +309,7 @@ def get_public_chat_user(
             ensure_widget_workforce_available(
                 db,
                 widget_workforce_id,
-                int(user_id),
+                user_id,
                 expected_widget_key=widget_key
                 if isinstance(widget_key, str) and widget_key
                 else None,
