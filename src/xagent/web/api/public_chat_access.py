@@ -296,11 +296,16 @@ def get_public_chat_user(
         # type here is what lets both branches pass ``user_id`` straight to their
         # ``ensure_widget_*_available`` helper.
         #
-        # ``type(...) is not int`` rather than ``isinstance``: ``bool`` is an
-        # ``int`` subclass, so a ``true`` claim would pass isinstance, resolve as
+        # ``bool`` is excluded explicitly because it is an ``int`` subclass: a
+        # ``true`` claim would otherwise pass the isinstance check, resolve as
         # ``User.id = 1``, and then satisfy the owner check against id 1 as well
         # (``1 == True``) — admitting a guest as the first user.
-        if type(user_id) is not int or not user_id or not guest_id:
+        if (
+            not isinstance(user_id, int)
+            or isinstance(user_id, bool)
+            or not user_id
+            or not guest_id
+        ):
             raise ValueError("Invalid token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -376,9 +381,9 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
-        # Exact type, not isinstance: see the matching guard in
-        # get_public_chat_user for why a ``bool`` claim must not pass here.
-        if type(user_id) is not int:
+        # ``bool`` excluded for the reason spelled out on the matching guard in
+        # get_public_chat_user: it is an ``int`` subclass that resolves as user 1.
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
             raise ValueError("Invalid share token payload")
