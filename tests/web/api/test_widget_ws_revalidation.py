@@ -16,6 +16,14 @@ next inbound message must drop the connection with ``4003``. Unlike
 stubbed on the auth path here, so the revocation checks in
 ``ensure_widget_agent_available`` / ``ensure_widget_workforce_available`` are
 what the assertions actually depend on.
+
+Boundary of that guarantee, so it is explicit for the next reader: revalidation
+fires only on *inbound* messages. A revoked guest that simply stops sending
+keeps receiving outbound and broadcast frames on its open socket — "dropped on
+the next message" is the whole contract, not "dropped when revoked". Nor does
+this cover connect-time revocation, which the endpoint reports as a generic
+``4001`` (pre-accept, so uvicorn discards the real code and reason) and which an
+existing test in ``test_public_chat_websocket_db_boundary.py`` pins.
 """
 
 from __future__ import annotations
@@ -142,14 +150,24 @@ def _authenticate_widget_guest(widget_key: str) -> str:
     return str(response.json()["access_token"])
 
 
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Let ``create_workforce_run`` build its task/run rows without executing."""
+def _stub_workforce_turn_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let ``create_workforce_run`` build its task/run rows without executing.
+
+    Patches ``schedule_claimed_create_turn`` specifically: that is what
+    ``create_workforce_run`` reaches (via ``_start_normalized_workforce_run``),
+    *not* ``begin_turn``. Stubbing ``begin_turn`` — as the sibling widget and
+    share-link suites do — is inert: the real turn still starts and its
+    background task then races test-DB teardown. The caller only reads
+    ``background_task`` off the result, so a bare namespace is enough.
+    """
 
     async def _stub(**_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(background_task=None)
 
     monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
+        workforce_runs_service.TaskTurnOrchestrator,
+        "schedule_claimed_create_turn",
+        _stub,
     )
 
 
@@ -201,7 +219,7 @@ def _agent_widget_guest() -> _WidgetGuest:
 def _workforce_widget_guest(monkeypatch: pytest.MonkeyPatch) -> _WidgetGuest:
     workforce_id = _create_workforce("WS Revalidation Widget Workforce")
     token = _authenticate_widget_guest(_enable_workforce_widget(workforce_id))
-    _stub_begin_turn(monkeypatch)
+    _stub_workforce_turn_start(monkeypatch)
 
     created = client.post(
         "/api/widget/chat/task/create",
@@ -337,7 +355,7 @@ def test_widget_guest_token_with_non_int_user_id_is_rejected(
     """
     # A regression that admits the token would otherwise start a real workforce
     # run before reaching the assertion below.
-    _stub_begin_turn(monkeypatch)
+    _stub_workforce_turn_start(monkeypatch)
     owner_id = _owner_id()
     payload: dict[str, Any] = {
         "sub": "admin",
@@ -359,6 +377,42 @@ def test_widget_guest_token_with_non_int_user_id_is_rejected(
         payload["widget_key"] = _enable_workforce_widget(workforce_id)
 
     token = create_public_chat_access_token(payload)
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"title": "hello", "description": "hello"},
+    )
+
+    assert response.status_code == 401, response.text
+    assert response.json()["detail"] == "Invalid widget token"
+
+
+def test_widget_guest_token_with_bool_entity_id_claim_is_rejected() -> None:
+    """The entity-id claims get the same exact-int treatment as ``user_id``.
+
+    ``widget_agent_id`` / ``widget_workforce_id`` select *which* entity the guest
+    is scoped to, so a ``bool`` there is an entity substitution rather than an
+    identity one: SQLAlchemy renders ``true`` as ``= 1``, resolving whichever
+    agent happens to hold id 1. The agent below is created first precisely so it
+    *is* id 1 — with a plain isinstance guard the forged claim resolves to it and
+    the request succeeds, which is what makes this more than a smoke test.
+    """
+    owner_id = _owner_id()
+    agent_id = _create_published_agent(owner_id, "Bool Id Claim Widget Agent")
+    assert agent_id == 1, "test relies on this agent holding the id `true` resolves to"
+    widget_key = _enable_agent_widget(agent_id)
+
+    token = create_public_chat_access_token(
+        {
+            "sub": "admin",
+            "user_id": owner_id,
+            "channel_id": None,
+            "guest_id": GUEST_ID,
+            "auth_mode": "widget",
+            "widget_agent_id": True,
+            "widget_key": widget_key,
+        }
+    )
     response = client.post(
         "/api/widget/chat/task/create",
         headers={"Authorization": f"Bearer {token}"},
