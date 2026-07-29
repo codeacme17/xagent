@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 import pytest
 from starlette.testclient import WebSocketTestSession
@@ -178,11 +178,12 @@ class _WidgetGuest:
 
     token: str
     task_id: int
-    # Owner-side revocation levers keyed by the ``revocation`` parametrize id,
-    # each of which must invalidate ``token``. A mapping rather than one field
-    # per lever so adding a lever touches the two builders and the parametrize
-    # list, not every call site in between.
-    revocations: Mapping[str, Callable[[], None]]
+    # Owner-side revocations, each of which must invalidate ``token``. Field
+    # names match the ``revocation`` parametrize ids so the test can dispatch
+    # by id without a lookup table.
+    disable: Callable[[], None]
+    rotate: Callable[[], None]
+    unpublish: Callable[[], None]
 
 
 def _agent_widget_guest() -> _WidgetGuest:
@@ -220,7 +221,9 @@ def _agent_widget_guest() -> _WidgetGuest:
     return _WidgetGuest(
         token=token,
         task_id=int(created.json()["task_id"]),
-        revocations={"disable": disable, "rotate": rotate, "unpublish": unpublish},
+        disable=disable,
+        rotate=rotate,
+        unpublish=unpublish,
     )
 
 
@@ -260,7 +263,9 @@ def _workforce_widget_guest(monkeypatch: pytest.MonkeyPatch) -> _WidgetGuest:
     return _WidgetGuest(
         token=token,
         task_id=int(created.json()["task_id"]),
-        revocations={"disable": disable, "rotate": rotate, "unpublish": unpublish},
+        disable=disable,
+        rotate=rotate,
+        unpublish=unpublish,
     )
 
 
@@ -331,7 +336,8 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
         ws.send_text(json.dumps({"type": "intervention", "action": "noop"}))
         assert _receive_until(ws, "intervention_processed")
 
-        guest.revocations[revocation]()
+        revoke: Callable[[], None] = getattr(guest, revocation)
+        revoke()
 
         ws.send_text(json.dumps({"type": "chat", "message": "still there?"}))
         denied = _drain_until_disconnect(ws)

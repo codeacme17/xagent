@@ -210,6 +210,22 @@ def _widget_key_for(agent_id: int) -> str:
         db.close()
 
 
+def _set_agent_status(agent_id: int, status: AgentStatus) -> None:
+    """Write a status straight to the row.
+
+    Only needed for ``ARCHIVED``: no web API route assigns it, so the
+    ``!= PUBLISHED`` shape of the widget gates cannot be exercised through the
+    real ``/unpublish`` endpoint, which hardcodes ``DRAFT``.
+    """
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.status = status
+        db.commit()
+    finally:
+        db.close()
+
+
 def _user_id(username: str) -> int:
     db = _direct_db_session()
     try:
@@ -1369,6 +1385,148 @@ def test_embed_ticket_stops_authenticating_once_agent_is_unpublished() -> None:
     )
     assert response.status_code == 403, response.text
     assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_widget_guest_token_rejected_when_agent_is_archived() -> None:
+    """``ensure_widget_agent_available`` gates on ``!= PUBLISHED``, not
+    ``== DRAFT``.
+
+    ``test_unpublishing_agent_invalidates_existing_widget_guest_tokens`` covers
+    the DRAFT half, but only through the real ``/unpublish`` endpoint, which
+    hardcodes ``AgentStatus.DRAFT`` and can never produce ``ARCHIVED`` — so a
+    narrowed gate would still pass it. Hence the direct status write."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Archived Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    _set_agent_status(agent_id, AgentStatus.ARCHIVED)
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_embed_ticket_rejects_widget_enabled_agent_with_no_widget_key() -> None:
+    """``_get_live_widget_agent`` also requires a live ``widget_key``, matching
+    its three sibling gates.
+
+    Nothing produces ``widget_enabled=True, widget_key=None`` today — creation
+    always mints a key, the update path re-mints one if the flag is toggled on
+    without it, and rotation never nulls it — but no schema constraint forbids
+    the row either. Written directly so the check is pinned: such an agent must
+    fail here rather than redeem the ticket into a guest token that 403s on its
+    first real request."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Keyless Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.widget_key = None
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_embed_ticket_stops_authenticating_once_agent_is_archived() -> None:
+    """``_get_live_widget_agent`` gates on ``!= PUBLISHED``, not ``== DRAFT``.
+
+    Same reasoning as ``test_widget_guest_token_rejected_when_agent_is_archived``
+    one gate over: the sibling unpublish test can only reach DRAFT."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Archived Ticket Redemption Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    _set_agent_status(agent_id, AgentStatus.ARCHIVED)
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_unpublishing_agent_revokes_widget_guest_access_to_task_files() -> None:
+    """The publication gate reaches further than the chat/WS routes: the public
+    file endpoints resolve a guest token through ``get_public_chat_user``
+    (``_validate_public_task_file_access``), which calls the same
+    ``ensure_widget_agent_available``. So unpublishing also cuts a widget guest
+    off from its own task's attachments — part of the shipped blast radius of
+    #1055, and the only widget/guest file-access assertion in the suite."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Widget File Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    access_token = guest_headers["Authorization"].removeprefix("Bearer ")
+
+    created = _create_widget_task(guest_headers, agent_id)
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task_id"]
+
+    uploaded = client.post(
+        "/api/widget/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task", "task_id": str(task_id)},
+        files={"file": ("widget-note.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["file_id"]
+
+    allowed = client.get(
+        f"/api/files/public/download/{file_id}", params={"token": access_token}
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.content == b"hello"
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    denied = client.get(
+        f"/api/files/public/download/{file_id}", params={"token": access_token}
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"] == "Widget is unavailable"
 
 
 def test_widget_guest_token_rejected_when_agent_becomes_generated_manager() -> None:

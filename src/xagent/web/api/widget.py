@@ -121,21 +121,34 @@ def _get_live_widget_agent(db: Session, agent_id: int) -> Agent:
     """Load an agent whose widget is actually serving, or raise the matching
     HTTP error.
 
-    "Live" is three conditions, not just ``widget_enabled``: a real non-manager
-    agent, its widget enabled, and the agent still published.
+    "Live" is four conditions, not just ``widget_enabled``: a real non-manager
+    agent, its widget enabled, a widget key still minted, and the agent still
+    published.
 
     External access requires the agent to still be published, mirroring
     ``_workforce_owner_from_ticket``'s ``status == "active"`` check: a ticket
     minted before an unpublish must not still redeem inside its TTL (#1055).
     Unpublished collapses into the same "disabled" 403 so the ticket path does
     not leak an agent's publication state.
+
+    ``widget_key`` is checked for parity with the three sibling gates
+    (:func:`_resolve_widget_agent_by_key`, ``ensure_widget_agent_available``,
+    :func:`_workforce_owner_from_ticket`). No path produces
+    ``widget_enabled=True`` with no key today, but nothing at the schema level
+    forbids it either; without this check such a row would redeem a ticket into
+    a guest token that then 403s on its first real request instead of failing
+    here.
     """
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if agent is None or is_workforce_generated_manager_agent(agent):
         raise HTTPException(
             status_code=401, detail="Widget owner not found or invalid agent_id"
         )
-    if not agent.widget_enabled or agent.status != AgentStatus.PUBLISHED:
+    if (
+        not agent.widget_enabled
+        or not agent.widget_key
+        or agent.status != AgentStatus.PUBLISHED
+    ):
         raise HTTPException(status_code=403, detail="Widget is disabled for this agent")
     return agent
 
