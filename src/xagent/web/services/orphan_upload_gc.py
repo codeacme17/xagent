@@ -65,15 +65,22 @@ TASKLESS_SHARE_UPLOAD_SOURCE = "taskless_share_upload"
 
 # Bounded sweep shape: deterministic keyset pages, each in its own short
 # Session, so a large backlog never materializes wholesale into worker
-# memory. One tick drains up to GC_MAX_PAGES_PER_TICK full pages (10,000
-# rows at the defaults — sized to outpace the rate-limited task-less upload
-# ingress) and only then takes the long sleep, so a sustained producer
-# cannot outrun an hourly single-page reaper. The loop carries the cursor
-# ACROSS ticks (mirroring ``run_uploaded_file_compensation_recovery_loop``),
-# so a repeatedly failing oldest page cannot starve newer orphans; a short
-# page resets the cursor for the next bounded pass over the whole backlog.
+# memory. A tick drains up to GC_MAX_PAGES_PER_TICK full pages and then
+# yields; the long poll sleep is taken ONLY once a short page proves the
+# eligible backlog is drained. That decoupling is what keeps GC throughput
+# independent of the poll interval: the rate-limited task-less upload
+# surfaces admit far more rows per hour than any single fixed-interval
+# page budget could reclaim, so a live cursor must be followed promptly
+# rather than parked until the next tick. The cursor also carries ACROSS
+# ticks (mirroring ``run_uploaded_file_compensation_recovery_loop``), so a
+# repeatedly failing oldest page cannot starve newer orphans.
 GC_BATCH_SIZE = 500
 GC_MAX_PAGES_PER_TICK = 20
+# Breather between page budgets while a backlog remains: bounds sustained
+# database/storage-delete load (~GC_BATCH_SIZE rows per this interval in the
+# worst case) and keeps the loop responsive to cancellation, without letting
+# the long poll interval throttle drain throughput.
+GC_BACKLOG_CONTINUE_DELAY_SECONDS = 1.0
 
 OrphanUploadSweepCursor = tuple[datetime, int]
 
@@ -362,18 +369,25 @@ async def run_orphan_upload_gc_loop(
     ttl_seconds: int,
     batch_size: int = GC_BATCH_SIZE,
     max_pages_per_tick: int = GC_MAX_PAGES_PER_TICK,
+    backlog_continue_delay_seconds: float = GC_BACKLOG_CONTINUE_DELAY_SECONDS,
 ) -> None:
-    """Reap bounded batches of orphans on a fixed cadence, rotating fairly.
+    """Reap orphans continuously while a backlog remains, rotating fairly.
 
     In-process counterpart of ``run_uploaded_file_compensation_recovery_loop``
     — it runs in every supported deployment (no Celery required). Each tick
-    drains up to ``max_pages_per_tick`` full pages (so sustained task-less
-    ingress cannot outrun the reaper) and sleeps only after a short page or
-    that budget; the cursor carries across ticks so a repeatedly failing
-    oldest page cannot starve newer orphans.
+    drains up to ``max_pages_per_tick`` full pages; while the returned cursor
+    is still live (backlog not drained) the next budget follows after only a
+    short breather, so drain throughput is set by page cost rather than by
+    the poll interval — the task-less upload surfaces can admit far more rows
+    per hour than one page budget reclaims. The long ``poll_interval_seconds``
+    sleep is taken only once a short page proves the eligible backlog is
+    drained, or after a failed tick (so a persistent error cannot hot-loop).
+    The cursor carries across ticks so a repeatedly failing oldest page
+    cannot starve newer orphans.
     """
     cursor: OrphanUploadSweepCursor | None = None
     while True:
+        backlog_remaining = False
         try:
             cursor = await _run_gc_tick(
                 ttl_seconds=ttl_seconds,
@@ -381,6 +395,7 @@ async def run_orphan_upload_gc_loop(
                 max_pages=max_pages_per_tick,
                 after=cursor,
             )
+            backlog_remaining = cursor is not None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -390,4 +405,8 @@ async def run_orphan_upload_gc_loop(
                 )
             else:
                 logger.exception("Orphan task-less upload GC tick failed")
-        await asyncio.sleep(poll_interval_seconds)
+        await asyncio.sleep(
+            backlog_continue_delay_seconds
+            if backlog_remaining
+            else poll_interval_seconds
+        )

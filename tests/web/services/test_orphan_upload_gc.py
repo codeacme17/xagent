@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +24,7 @@ from xagent.web.models.user import User
 from xagent.web.services.file_turn import bind_turn_files_no_commit
 from xagent.web.services.orphan_upload_gc import (
     TASKLESS_SHARE_UPLOAD_SOURCE,
+    OrphanUploadSweepCursor,
     _claim_orphan,
     _OrphanUploadCandidate,
     _run_gc_tick,
@@ -463,6 +465,53 @@ async def test_tick_drains_full_pages_before_sleeping(
     )
     assert cursor is None
     assert db_session.query(UploadedFile).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_defers_long_sleep_until_backlog_is_drained(monkeypatch) -> None:
+    """The long poll sleep is reserved for a drained backlog: while the tick
+    returns a live cursor the loop continues after only a short breather, so
+    drain throughput is not throttled by the poll interval (#996 review). A
+    failed tick also takes the long sleep, so a persistent error cannot
+    hot-loop."""
+    ticks = iter(
+        [
+            (datetime.now(timezone.utc), 11),  # budget exhausted, backlog left
+            (datetime.now(timezone.utc), 22),  # still draining
+            RuntimeError("tick blew up"),  # failure -> long sleep
+            None,  # short page -> drained -> long sleep
+        ]
+    )
+    seen_cursors: list[OrphanUploadSweepCursor | None] = []
+
+    async def fake_tick(*, after, **_kwargs):
+        seen_cursors.append(after)
+        outcome = next(ticks)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(orphan_upload_gc, "_run_gc_tick", fake_tick)
+    monkeypatch.setattr(orphan_upload_gc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await orphan_upload_gc.run_orphan_upload_gc_loop(
+            poll_interval_seconds=3600,
+            ttl_seconds=2 * DAY,
+            backlog_continue_delay_seconds=0.5,
+        )
+
+    assert sleeps == [0.5, 0.5, 3600, 3600]
+    # The live cursor is threaded into the immediately following tick.
+    assert seen_cursors[1] == (seen_cursors[1][0], 11)
+    assert seen_cursors[2] == (seen_cursors[2][0], 22)
 
 
 def test_cursor_advances_past_failing_rows(
