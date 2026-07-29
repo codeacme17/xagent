@@ -77,9 +77,10 @@ TASKLESS_SHARE_UPLOAD_SOURCE = "taskless_share_upload"
 GC_BATCH_SIZE = 500
 GC_MAX_PAGES_PER_TICK = 20
 # Breather between page budgets while a backlog remains: bounds sustained
-# database/storage-delete load (~GC_BATCH_SIZE rows per this interval in the
-# worst case) and keeps the loop responsive to cancellation, without letting
-# the long poll interval throttle drain throughput.
+# database/storage-delete load to at most GC_MAX_PAGES_PER_TICK *
+# GC_BATCH_SIZE rows (10,000 at the defaults) per this interval, and keeps
+# the loop responsive to cancellation — without letting the long poll
+# interval throttle drain throughput.
 GC_BACKLOG_CONTINUE_DELAY_SECONDS = 1.0
 
 OrphanUploadSweepCursor = tuple[datetime, int]
