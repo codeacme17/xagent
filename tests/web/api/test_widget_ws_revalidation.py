@@ -312,13 +312,13 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
     "user_id_claim",
     [
         # A string that would coerce cleanly -- the interesting string case,
-        # since an unparseable one fails everywhere anyway.
+        # since one that is not a number fails everywhere anyway.
         pytest.param("{owner_id}", id="numeric_string"),
         # ``bool`` is an ``int`` subclass, so ``isinstance(True, int)`` passes
-        # and ``not True`` is False: a bare isinstance guard admits ``true``,
-        # which SQLAlchemy renders as ``User.id = 1`` and which then compares
-        # equal to owner id 1 in the ownership check (``1 == True``). Only an
-        # exact-type check rejects it.
+        # and ``not True`` is False: a guard that does not exclude ``bool``
+        # admits ``true``, which SQLAlchemy renders as ``User.id = 1`` and which
+        # then compares equal to owner id 1 in the ownership check
+        # (``1 == True``).
         pytest.param(True, id="bool_true"),
     ],
 )
