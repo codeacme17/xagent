@@ -289,13 +289,18 @@ def get_public_chat_user(
         # Defense in depth (#992): the same type guard get_share_chat_user
         # applies (deliberately the same shape, so tightening one is an obvious
         # prompt to tighten the other). These tokens are server-minted, so a
-        # non-int user_id is not reachable today — but without the guard the two
-        # widget branches below disagreed about a string one: the agent branch
-        # failed closed on an int/str owner comparison, while the workforce
-        # branch coerced it and admitted the request. Establishing the type here
-        # is what lets both branches pass ``user_id`` straight to their
+        # malformed user_id is not reachable today — but without the guard the
+        # two widget branches below disagreed about a string one: the agent
+        # branch failed closed on an int/str owner comparison, while the
+        # workforce branch coerced it and admitted the request. Establishing the
+        # type here is what lets both branches pass ``user_id`` straight to their
         # ``ensure_widget_*_available`` helper.
-        if not isinstance(user_id, int) or not user_id or not guest_id:
+        #
+        # ``type(...) is not int`` rather than ``isinstance``: ``bool`` is an
+        # ``int`` subclass, so a ``true`` claim would pass isinstance, resolve as
+        # ``User.id = 1``, and then satisfy the owner check against id 1 as well
+        # (``1 == True``) — admitting a guest as the first user.
+        if type(user_id) is not int or not user_id or not guest_id:
             raise ValueError("Invalid token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -371,7 +376,9 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
-        if not isinstance(user_id, int):
+        # Exact type, not isinstance: see the matching guard in
+        # get_public_chat_user for why a ``bool`` claim must not pass here.
+        if type(user_id) is not int:
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
             raise ValueError("Invalid share token payload")

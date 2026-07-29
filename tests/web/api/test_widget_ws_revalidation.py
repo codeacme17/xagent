@@ -308,18 +308,32 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
 
 
 @pytest.mark.parametrize("channel", ["agent", "workforce"])
+@pytest.mark.parametrize(
+    "user_id_claim",
+    [
+        # A string that would coerce cleanly -- the interesting string case,
+        # since an unparseable one fails everywhere anyway.
+        pytest.param("{owner_id}", id="numeric_string"),
+        # ``bool`` is an ``int`` subclass, so ``isinstance(True, int)`` passes
+        # and ``not True`` is False: a bare isinstance guard admits ``true``,
+        # which SQLAlchemy renders as ``User.id = 1`` and which then compares
+        # equal to owner id 1 in the ownership check (``1 == True``). Only an
+        # exact-type check rejects it.
+        pytest.param(True, id="bool_true"),
+    ],
+)
 def test_widget_guest_token_with_non_int_user_id_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
     channel: str,
+    user_id_claim: object,
 ) -> None:
-    """``user_id`` must be an int, as ``get_share_chat_user`` already requires.
+    """``user_id`` must be exactly an int, mirroring ``get_share_chat_user``.
 
-    Widget guest tokens are server-minted, so this is defense in depth rather
-    than a live hole — but without the type guard the two widget branches
-    disagree about a string ``user_id``: the agent branch happens to fail closed
-    on an int/str owner comparison, while the workforce branch coerced it to
-    compare at all and so admitted the request. Both must now reject the
-    malformed payload rather than depend on that accident.
+    Widget guest tokens are server-minted, so no caller can produce these
+    payloads without the signing key — this is defense in depth. But untyped,
+    the two widget branches disagree about a string ``user_id`` (the agent
+    branch fails closed on an int/str owner comparison; the workforce branch
+    coerced it and admitted the request), and both admit ``true`` as user 1.
     """
     # A regression that admits the token would otherwise start a real workforce
     # run before reaching the assertion below.
@@ -327,9 +341,9 @@ def test_widget_guest_token_with_non_int_user_id_is_rejected(
     owner_id = _owner_id()
     payload: dict[str, Any] = {
         "sub": "admin",
-        # A string that would coerce cleanly -- the interesting case, since an
-        # unparseable value fails everywhere anyway.
-        "user_id": str(owner_id),
+        "user_id": user_id_claim.format(owner_id=owner_id)
+        if isinstance(user_id_claim, str)
+        else user_id_claim,
         "channel_id": None,
         "guest_id": GUEST_ID,
         "auth_mode": "widget",
