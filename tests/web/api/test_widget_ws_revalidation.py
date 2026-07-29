@@ -9,8 +9,9 @@ the socket, and no test in the suite even reached
 ``/api/widget/chat/ws/{task_id}``.
 
 These tests drive the real endpoint end to end: a guest with a valid token holds
-a live socket, the owner revokes the widget (disable or key rotation), and the
-next inbound message must drop the connection with ``4003``. Unlike
+a live socket, the owner revokes the widget (disable, key rotation, or
+unpublishing the owner — #1055), and the next inbound message must drop the
+connection with ``4003``. Unlike
 ``test_public_chat_websocket_db_boundary.py`` — which mocks
 ``_authorize_public_chat_websocket`` to prove the close *plumbing* — nothing is
 stubbed on the auth path here, so the revocation checks in
@@ -31,7 +32,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import pytest
 from starlette.testclient import WebSocketTestSession
@@ -177,9 +178,11 @@ class _WidgetGuest:
 
     token: str
     task_id: int
-    # Owner-side revocations, each of which must invalidate ``token``.
-    disable: Callable[[], None]
-    rotate: Callable[[], None]
+    # Owner-side revocation levers keyed by the ``revocation`` parametrize id,
+    # each of which must invalidate ``token``. A mapping rather than one field
+    # per lever so adding a lever touches the two builders and the parametrize
+    # list, not every call site in between.
+    revocations: Mapping[str, Callable[[], None]]
 
 
 def _agent_widget_guest() -> _WidgetGuest:
@@ -208,11 +211,16 @@ def _agent_widget_guest() -> _WidgetGuest:
         )
         assert response.status_code == 200, response.text
 
+    def unpublish() -> None:
+        response = client.post(
+            f"/api/agents/{agent_id}/unpublish", headers=_admin_headers()
+        )
+        assert response.status_code == 200, response.text
+
     return _WidgetGuest(
         token=token,
         task_id=int(created.json()["task_id"]),
-        disable=disable,
-        rotate=rotate,
+        revocations={"disable": disable, "rotate": rotate, "unpublish": unpublish},
     )
 
 
@@ -243,11 +251,16 @@ def _workforce_widget_guest(monkeypatch: pytest.MonkeyPatch) -> _WidgetGuest:
         )
         assert response.status_code == 200, response.text
 
+    def unpublish() -> None:
+        response = client.post(
+            f"/api/workforces/{workforce_id}/unpublish", headers=_admin_headers()
+        )
+        assert response.status_code == 200, response.text
+
     return _WidgetGuest(
         token=token,
         task_id=int(created.json()["task_id"]),
-        disable=disable,
-        rotate=rotate,
+        revocations={"disable": disable, "rotate": rotate, "unpublish": unpublish},
     )
 
 
@@ -289,7 +302,7 @@ def _drain_until_disconnect(ws: WebSocketTestSession) -> WebSocketDisconnect:
 # instead of failing it (there is no global pytest timeout).
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("channel", ["agent", "workforce"])
-@pytest.mark.parametrize("revocation", ["disable", "rotate"])
+@pytest.mark.parametrize("revocation", ["disable", "rotate", "unpublish"])
 def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
     monkeypatch: pytest.MonkeyPatch,
     channel: str,
@@ -299,8 +312,11 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
 
     The guest JWT has a 30-day TTL and the socket outlives any single request,
     so the receive loop — not the token — is what enforces revocation here.
-    Both revocation levers are covered: disabling the widget, and rotating its
-    key (which the guest token pins via its ``widget_key`` claim).
+    All three revocation levers are covered: disabling the widget, rotating its
+    key (which the guest token pins via its ``widget_key`` claim), and
+    unpublishing the owner — taking an agent/workforce out of service must stop
+    its embedded widget from serving, not just hide it from the product surfaces
+    (#1055).
     """
     guest = _build_guest(channel, monkeypatch)
     url = f"/api/widget/chat/ws/{guest.task_id}?token={guest.token}"
@@ -315,8 +331,7 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
         ws.send_text(json.dumps({"type": "intervention", "action": "noop"}))
         assert _receive_until(ws, "intervention_processed")
 
-        revoke = guest.disable if revocation == "disable" else guest.rotate
-        revoke()
+        guest.revocations[revocation]()
 
         ws.send_text(json.dumps({"type": "chat", "message": "still there?"}))
         denied = _drain_until_disconnect(ws)

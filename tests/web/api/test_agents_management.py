@@ -1203,6 +1203,174 @@ def test_rotated_widget_key_invalidates_existing_guest_tokens() -> None:
     assert response.json()["detail"] == "Widget is unavailable"
 
 
+def test_unpublishing_agent_invalidates_existing_widget_guest_tokens() -> None:
+    """Unpublishing an agent must invalidate already-issued guest JWTs on their
+    next request — the third revocation lever alongside disable and rotate.
+
+    ``unpublish_agent`` only flips ``status``; it leaves ``widget_enabled`` and
+    ``widget_key`` intact on purpose, so that re-publishing restores the same
+    embed snippet. That makes the per-request check in
+    ``ensure_widget_agent_available`` the thing that has to enforce this (#1055).
+    """
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    # Sanity: the guest token works while the agent is published.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_republishing_agent_restores_widget_access_for_existing_tokens() -> None:
+    """Unpublish is a reversible lever: re-publishing revives the same guest
+    token, because the widget key it pins was never rotated. Locks in why the
+    status check lives in the availability helper rather than in
+    ``unpublish_agent`` clearing ``widget_enabled`` (#1055)."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Republish Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    key_before = _widget_key_for(agent_id)
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+    assert _create_widget_task(guest_headers, agent_id).status_code == 403
+
+    republished = client.post(f"/api/agents/{agent_id}/publish", headers=headers)
+    assert republished.status_code == 200, republished.text
+
+    assert _widget_key_for(agent_id) == key_before
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+
+def test_widget_auth_rejects_unpublished_agent_key() -> None:
+    """An unpublished agent's widget key must stop minting guest tokens at all,
+    rather than handing out a token that dies on its first real request. Mirrors
+    the workforce branch, which resolves keys only for ``status == 'active'``."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Auth Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    widget_key = _widget_key_for(agent_id)
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": widget_key, "guest_id": "guest-1"},
+    )
+    assert response.status_code == 403, response.text
+    # Same detail as an unknown key: publication state must not be probeable.
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.ARCHIVED])
+def test_widget_auth_rejects_agent_that_is_not_published(status: AgentStatus) -> None:
+    """Agents are created ``widget_enabled=True`` with a key already minted, so
+    a never-published draft carries a live widget credential. External access
+    requires publication, so that key must not authenticate either (#1055).
+
+    Parametrized over both non-published states to pin the gate as
+    ``!= PUBLISHED`` rather than ``== DRAFT``; ``ARCHIVED`` is not reachable
+    through the web API today, so nothing else would catch a narrowing."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name=f"Unpublished Widget Agent ({status.value})",
+        status=status,
+        widget_enabled=True,
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": "guest-1"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+def test_embed_ticket_rejects_unpublished_agent_like_an_unknown_key() -> None:
+    """The embedding page cannot obtain a fresh ticket for an unpublished agent;
+    unpublished and unknown-key collapse to the same 403."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    widget_key = _widget_key_for(agent_id)
+    assert _issue_embed_ticket(agent_id, "https://trusted-site.com").status_code == 200
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": widget_key},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+def test_embed_ticket_stops_authenticating_once_agent_is_unpublished() -> None:
+    """A ticket minted while the agent was published must not survive an
+    unpublish inside its 60s TTL: redemption re-derives the agent from live
+    state, mirroring ``_workforce_owner_from_ticket``'s ``active`` check.
+
+    The denial reuses the disabled-widget detail so a caller holding a valid
+    ticket cannot tell the two revocation levers apart."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Ticket Redemption Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
 def test_widget_guest_token_rejected_when_agent_becomes_generated_manager() -> None:
     """``ensure_widget_agent_available`` must reject a live guest token once the
     backing agent is a workforce-generated manager, tripping the check at the
