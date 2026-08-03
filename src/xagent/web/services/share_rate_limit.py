@@ -58,10 +58,29 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ShareRateLimiter",
+    "entity_rate_limit_key",
     "get_share_rate_limiter",
     "reset_share_rate_limiter",
     "remote_ip_from_request",
 ]
+
+
+def entity_rate_limit_key(agent_id: int | None, workforce_id: int | None) -> str | None:
+    """Rate-limit/quota key for an agent or workforce entity.
+
+    The single formatter behind every entity-keyed bucket (``"agent:<id>"``
+    / ``"workforce:<id>"``), shared by the widget upload/turn gates and the
+    share run quota so the shape can never drift between call sites.
+    Workforce wins when both ids are set (callers guarantee at most one is).
+    Returns ``None`` when neither id is set; the ``allow_*`` gates degrade
+    that to their shared ``"unknown"`` bucket rather than admitting freely.
+    """
+    if workforce_id is not None:
+        return f"workforce:{workforce_id}"
+    if agent_id is not None:
+        return f"agent:{agent_id}"
+    return None
+
 
 _AUTH_TOKEN_NAMESPACE = "share-auth"
 _AUTH_IP_NAMESPACE = "share-auth-ip"
@@ -226,6 +245,36 @@ class ShareRateLimiter:
             self._ws_connect_ip_limit, _WS_CONNECT_IP_NAMESPACE, remote_ip or "unknown"
         )
 
+    def _admit_ip_and_entity(
+        self,
+        ip_limit: RateLimitItem,
+        ip_namespace: str,
+        remote_ip: str | None,
+        entity_limit: RateLimitItem,
+        entity_namespace: str,
+        entity_key: str | None,
+    ) -> bool:
+        """Admit one request through a paired IP (tight) + entity (loose) gate.
+
+        The shared shape behind the widget gates: per-IP bounds one abuser
+        (the widget ``guest_id`` is client-supplied, so IP is the only
+        per-abuser key available), per-entity is the loose backstop across
+        all callers of one widget. Both buckets are tested non-destructively
+        and only consumed when both admit — a denial by either never burns a
+        slot in the other (the :meth:`allow_run` shape). The test→hit gap is
+        not atomic, so requests racing within it can overshoot slightly;
+        acceptable for soft throttles, and it fails toward allowing.
+        """
+        ip_key = remote_ip or "unknown"
+        entity = entity_key or "unknown"
+        if not self._limiter.test(ip_limit, ip_namespace, ip_key):
+            return False
+        if not self._limiter.test(entity_limit, entity_namespace, entity):
+            return False
+        self._limiter.hit(ip_limit, ip_namespace, ip_key)
+        self._limiter.hit(entity_limit, entity_namespace, entity)
+        return True
+
     @_fail_open
     def allow_widget_ws_connect(self, remote_ip: str | None) -> bool:
         """Count one widget websocket connection attempt for an IP (#1056).
@@ -242,26 +291,23 @@ class ShareRateLimiter:
         )
 
     @_fail_open
-    def allow_widget_ws_turn(self, entity_key: str, remote_ip: str | None) -> bool:
+    def allow_widget_ws_turn(
+        self, entity_key: str | None, remote_ip: str | None
+    ) -> bool:
         """Count one widget websocket turn; False when a bucket is exceeded.
 
         Keyed on the widget entity (``agent:<id>`` / ``workforce:<id>``) plus
         the caller IP — NOT the widget ``guest_id``, which unlike the share
         path is client-supplied and therefore rotatable at will (the same
-        reasoning as :meth:`allow_widget_upload`). Per-IP is the tighter
-        bucket (bounds one abuser); per-entity is the loose backstop bounding
-        total owner-billed turn volume through one widget.
+        reasoning as :meth:`allow_widget_upload`).
         """
-        if not self._limiter.hit(
+        return self._admit_ip_and_entity(
             self._widget_ws_turn_ip_limit,
             _WIDGET_WS_TURN_IP_NAMESPACE,
-            remote_ip or "unknown",
-        ):
-            return False
-        return self._limiter.hit(
+            remote_ip,
             self._widget_ws_turn_entity_limit,
             _WIDGET_WS_TURN_ENTITY_NAMESPACE,
-            entity_key or "unknown",
+            entity_key,
         )
 
     @_fail_open
@@ -272,25 +318,22 @@ class ShareRateLimiter:
         )
 
     @_fail_open
-    def allow_widget_upload(self, entity_key: str, remote_ip: str | None) -> bool:
+    def allow_widget_upload(
+        self, entity_key: str | None, remote_ip: str | None
+    ) -> bool:
         """Count one widget upload; False when a bucket is exceeded.
 
         Keyed on the widget entity (``agent:<id>`` / ``workforce:<id>``) plus
         the caller IP — NOT the widget ``guest_id``, which unlike the share
-        path is client-supplied and therefore rotatable at will. Per-IP is
-        the tighter bucket (bounds one abuser); per-entity is the loose
-        backstop bounding total orphan/storage production through one widget.
+        path is client-supplied and therefore rotatable at will.
         """
-        if not self._limiter.hit(
+        return self._admit_ip_and_entity(
             self._widget_upload_ip_limit,
             _WIDGET_UPLOAD_IP_NAMESPACE,
-            remote_ip or "unknown",
-        ):
-            return False
-        return self._limiter.hit(
+            remote_ip,
             self._widget_upload_entity_limit,
             _WIDGET_UPLOAD_ENTITY_NAMESPACE,
-            entity_key or "unknown",
+            entity_key,
         )
 
     @_fail_open

@@ -33,6 +33,7 @@ from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.orphan_upload_gc import TASKLESS_SHARE_UPLOAD_SOURCE
 from ..services.share_rate_limit import (
+    entity_rate_limit_key,
     get_share_rate_limiter,
     remote_ip_from_request,
 )
@@ -1126,11 +1127,7 @@ def _widget_entity_key(context: PublicChatAccessContext) -> str | None:
     client-supplied (rotatable at will), so widget throttles key on the
     embedded agent/workforce instead.
     """
-    if context.widget_workforce_id is not None:
-        return f"workforce:{context.widget_workforce_id}"
-    if context.widget_agent_id is not None:
-        return f"agent:{context.widget_agent_id}"
-    return None
+    return entity_rate_limit_key(context.widget_agent_id, context.widget_workforce_id)
 
 
 def _authorize_chat_websocket_sync(
@@ -1323,7 +1320,7 @@ async def public_chat_websocket_endpoint(
                 "chat",
                 "execute_task",
             ) and not get_share_rate_limiter().allow_widget_ws_turn(
-                current_principal.widget_entity_key or "", remote_ip
+                current_principal.widget_entity_key, remote_ip
             ):
                 await _reject_rate_limited_turn(websocket, message_data)
                 continue

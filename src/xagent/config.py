@@ -932,8 +932,13 @@ def get_widget_ws_turn_ip_rate_limit() -> str:
 
     The tighter turn bucket. Unlike the share turn gate this cannot key on
     the guest: the widget ``guest_id`` is client-supplied and rotatable at
-    will, so the caller IP is the only per-abuser key available. Kept loose
-    enough for enterprise NAT (matches the share per-guest turn rate).
+    will, so the caller IP is the only per-abuser key available. The default
+    numerically matches the share per-guest turn rate, but this bucket is
+    per-IP: N guests behind one NAT egress share a single 60/minute budget
+    here, where the share path gives each guest its own. Raise it for
+    deployments with large shared-egress populations — and behind a reverse
+    proxy, set XAGENT_TRUSTED_PROXY_HOPS so all traffic does not collapse
+    onto the proxy's IP.
     """
     return _get_rate_limit(WIDGET_WS_TURN_IP_RATE_LIMIT, "60/minute")
 
