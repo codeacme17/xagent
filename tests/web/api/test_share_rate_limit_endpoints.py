@@ -1,9 +1,11 @@
-"""Rate-limit enforcement on the public share endpoints (#973, PR2).
+"""Rate-limit enforcement on the public share endpoints (#973, PR2) and the
+widget websocket (#1056).
 
-Each anonymous share surface returns 429 once its bucket is exhausted. The
-autouse conftest fixture resets the share limiter before every test; each test
-tightens the relevant limit to 1/minute via env and resets again so the new
-limiter reads it.
+Each anonymous share surface returns 429 once its bucket is exhausted; the
+websocket gates close pre-accept (connect) or reject the turn in-band (turn).
+The autouse conftest fixture resets the share limiter before every test; each
+test tightens the relevant limit to 1/minute via env and resets again so the
+new limiter reads it.
 """
 
 from __future__ import annotations
@@ -315,6 +317,132 @@ def test_ws_connect_over_limit_is_refused_pre_accept(
     assert first.value.code == 4003
 
     # Second attempt from the same caller trips the budget pre-accept.
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(url):
+            pass
+    assert denied.value.code == 4008
+
+
+@pytest.mark.asyncio
+async def test_widget_ws_turn_rate_limited_rejects_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited widget websocket turn is rejected (message_rejected) and
+    never dispatched; the connection stays open (#1056). Keyed on entity + IP,
+    not the client-supplied widget guest_id."""
+    from xagent.web.api import public_chat_access as pca
+
+    monkeypatch.setenv("XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    ctx = pca.PublicChatAccessContext(
+        user=MagicMock(id=1, is_admin=False),
+        channel_id=None,
+        guest_id="widget-guest",
+        auth_mode="widget",
+        widget_agent_id=7,
+    )
+    monkeypatch.setattr(pca, "get_public_chat_user", lambda *a, **k: ctx)
+    monkeypatch.setattr(pca, "get_task_for_public_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(pca, "remote_ip_from_request", lambda ws: "9.9.9.9")
+    monkeypatch.setattr(
+        pca, "manager", MagicMock(connect=AsyncMock(), disconnect=MagicMock())
+    )
+    monkeypatch.setattr(pca, "handle_status_request", AsyncMock())
+    dispatch = AsyncMock()
+    monkeypatch.setattr(pca, "handle_chat_message", dispatch)
+    delivery = AsyncMock()
+    monkeypatch.setattr(pca, "send_message_delivery", delivery)
+
+    # Two chat turns: the first is admitted (dispatched), the second trips the
+    # 1/minute per-IP bucket and is rejected.
+    frames = [
+        json.dumps({"type": "chat", "client_message_id": "m1", "message": "hi"}),
+        json.dumps({"type": "chat", "client_message_id": "m2", "message": "again"}),
+    ]
+    await pca.public_chat_websocket_endpoint(
+        websocket=_FakeWebSocket(frames),
+        task_id=1,
+        token="jwt",
+        expected_auth_mode="widget",
+    )
+
+    assert dispatch.await_count == 1  # only the admitted turn dispatched
+    assert delivery.await_count == 1  # the rejected turn got a delivery ack
+    _, kwargs = delivery.await_args
+    assert kwargs["accepted"] is False
+    assert kwargs["client_message_id"] == "m2"
+    assert kwargs["rejection_outcome"] == "not_accepted"
+
+
+@pytest.mark.asyncio
+async def test_widget_ws_turn_gate_does_not_gate_interventions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interventions are control messages, not new runs: they pass even when
+    the turn budget is exhausted (mirrors the share endpoint's contract)."""
+    from xagent.web.api import public_chat_access as pca
+
+    monkeypatch.setenv("XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    ctx = pca.PublicChatAccessContext(
+        user=MagicMock(id=1, is_admin=False),
+        channel_id=None,
+        guest_id="widget-guest",
+        auth_mode="widget",
+        widget_workforce_id=3,
+    )
+    monkeypatch.setattr(pca, "get_public_chat_user", lambda *a, **k: ctx)
+    monkeypatch.setattr(pca, "get_task_for_public_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(pca, "remote_ip_from_request", lambda ws: "7.7.7.7")
+    monkeypatch.setattr(
+        pca, "manager", MagicMock(connect=AsyncMock(), disconnect=MagicMock())
+    )
+    monkeypatch.setattr(pca, "handle_status_request", AsyncMock())
+    chat_dispatch = AsyncMock()
+    monkeypatch.setattr(pca, "handle_chat_message", chat_dispatch)
+    intervention_dispatch = AsyncMock()
+    monkeypatch.setattr(pca, "handle_intervention", intervention_dispatch)
+    monkeypatch.setattr(pca, "send_message_delivery", AsyncMock())
+
+    # Exhaust the turn budget with the first chat, then send an intervention:
+    # it must still dispatch.
+    frames = [
+        json.dumps({"type": "chat", "client_message_id": "m1", "message": "hi"}),
+        json.dumps({"type": "intervention", "action": "noop"}),
+    ]
+    await pca.public_chat_websocket_endpoint(
+        websocket=_FakeWebSocket(frames),
+        task_id=1,
+        token="jwt",
+        expected_auth_mode="widget",
+    )
+
+    assert chat_dispatch.await_count == 1
+    assert intervention_dispatch.await_count == 1
+
+
+def test_widget_ws_connect_over_limit_is_refused_pre_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over-limit widget WS connection attempts are refused pre-accept with
+    4008 (#1056), mirroring the share gate. The widget endpoint already closes
+    pre-accept on auth failure, so a garbage token distinguishes the two
+    refusals by close code: 4001 while the budget admits, 4008 once it trips."""
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.setenv("XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    url = "/api/widget/chat/ws/1?token=garbage"
+    # First attempt is admitted by the connect gate, then auth rejects it.
+    with pytest.raises(WebSocketDisconnect) as first:
+        with client.websocket_connect(url):
+            pass
+    assert first.value.code == 4001
+
+    # Second attempt from the same caller trips the budget.
     with pytest.raises(WebSocketDisconnect) as denied:
         with client.websocket_connect(url):
             pass

@@ -1119,10 +1119,25 @@ async def create_share_chat_task(
     )
 
 
+def _widget_entity_key(context: PublicChatAccessContext) -> str | None:
+    """Rate-limit key for the widget entity a guest is scoped to (#1056).
+
+    Matches the ``allow_widget_upload`` keying: the widget ``guest_id`` is
+    client-supplied (rotatable at will), so widget throttles key on the
+    embedded agent/workforce instead.
+    """
+    if context.widget_workforce_id is not None:
+        return f"workforce:{context.widget_workforce_id}"
+    if context.widget_agent_id is not None:
+        return f"agent:{context.widget_agent_id}"
+    return None
+
+
 def _authorize_chat_websocket_sync(
     *,
     load_access_context: Callable[[Session], _ChatAccessContextT],
     authorize_task: Callable[[Session, _ChatAccessContextT], object],
+    widget_entity_key: Callable[[_ChatAccessContextT], str | None] | None = None,
 ) -> WebSocketPrincipal:
     """Authorize one public WebSocket operation in a worker-owned Session."""
 
@@ -1137,6 +1152,9 @@ def _authorize_chat_websocket_sync(
             id=int(user_id),
             is_admin=bool(access_context.user.is_admin),
             guest_id=access_context.guest_id,
+            widget_entity_key=widget_entity_key(access_context)
+            if widget_entity_key is not None
+            else None,
         )
 
 
@@ -1162,6 +1180,7 @@ async def _authorize_public_chat_websocket(
         lambda: _authorize_chat_websocket_sync(
             load_access_context=load_access_context,
             authorize_task=authorize_task,
+            widget_entity_key=_widget_entity_key,
         )
     )
 
@@ -1206,6 +1225,35 @@ def _ws_close_reason(detail: object) -> str:
     return encoded[:_WS_CLOSE_REASON_MAX_BYTES].decode("utf-8", errors="ignore")
 
 
+async def _reject_rate_limited_turn(websocket: WebSocket, message_data: dict) -> None:
+    """Reject one rate-limited run-starting turn, keeping the socket open.
+
+    A rate limit is transient, so the turn is refused in-band (the client
+    surfaces it and can retry) rather than closing the connection.
+    """
+    client_message_id = message_data.get("client_message_id")
+    rate_limited_message = (
+        "You're sending messages too quickly. Please wait a moment and try again."
+    )
+    await send_message_delivery(
+        websocket,
+        client_message_id=client_message_id,
+        turn_id=str(client_message_id or ""),
+        accepted=False,
+        message=rate_limited_message,
+        rejection_outcome="not_accepted",
+    )
+    # send_message_delivery no-ops without a client_message_id, so a client
+    # that didn't tag the turn would otherwise get zero feedback and see the
+    # message silently dropped. Fall back to a generic error so the throttle
+    # is always surfaced.
+    if client_message_id is None:
+        await manager.send_personal_message(
+            {"type": "error", "message": rate_limited_message},
+            websocket,
+        )
+
+
 async def public_chat_websocket_endpoint(
     *,
     websocket: WebSocket,
@@ -1213,7 +1261,20 @@ async def public_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
     expected_auth_mode: str,
 ) -> None:
-    """Serve widget/share websocket chat with per-message revalidation."""
+    """Serve widget websocket chat with per-message revalidation."""
+    # Handshake budget (#1056): mirror of the share connect gate — a widget
+    # key is embedded in a public page, so connection attempts are anonymous
+    # and need a per-IP ceiling. This endpoint closes pre-accept on auth
+    # failure below (uvicorn collapses that into a plain HTTP 403), so the
+    # pre-accept refusal here is consistent with its existing behaviour and
+    # is the cheapest rejection: no upgrade is performed at all. The IP is
+    # captured once — it cannot change for the lifetime of the socket — and
+    # reused by the per-turn gate in the loop below.
+    remote_ip = remote_ip_from_request(websocket)
+    if not get_share_rate_limiter().allow_widget_ws_connect(remote_ip):
+        await websocket.close(code=4008, reason="Too many connection attempts")
+        return
+
     try:
         principal = await _authorize_public_chat_websocket(
             token=token,
@@ -1246,11 +1307,32 @@ async def public_chat_websocket_endpoint(
             message_data["user_id"] = current_principal.id
             message_data["user"] = current_principal
 
-            if message_data.get("type") == "chat":
+            message_type = message_data.get("type")
+            # Abuse control (#1056): follow-up turns bypass any HTTP throttle
+            # and each starts an owner-billed run, so rate-limit the
+            # run-starting turn types here — the widget mirror of the share
+            # turn gate. Keyed on the widget entity + caller IP, NOT the
+            # guest: the widget guest_id is client-supplied (rotatable at
+            # will). Interventions are control messages, not new runs, so
+            # they are not gated. A missing entity key (unreachable for a
+            # validated widget token, which always carries exactly one entity
+            # id) degrades to the limiter's shared "unknown" bucket rather
+            # than skipping the gate — the per-IP bucket needs no entity, so
+            # the throttle must not fail open on the key.
+            if message_type in (
+                "chat",
+                "execute_task",
+            ) and not get_share_rate_limiter().allow_widget_ws_turn(
+                current_principal.widget_entity_key or "", remote_ip
+            ):
+                await _reject_rate_limited_turn(websocket, message_data)
+                continue
+
+            if message_type == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
-            elif message_data.get("type") == "execute_task":
+            elif message_type == "execute_task":
                 await handle_execute_task(websocket, task_id, message_data)
-            elif message_data.get("type") == "intervention":
+            elif message_type == "intervention":
                 await handle_intervention(websocket, task_id, message_data)
     except Exception as exc:
         from fastapi import WebSocketDisconnect
@@ -1340,28 +1422,7 @@ async def share_chat_websocket_endpoint(
                     current_principal.guest_id
                 )
             ):
-                client_message_id = message_data.get("client_message_id")
-                rate_limited_message = (
-                    "You're sending messages too quickly. "
-                    "Please wait a moment and try again."
-                )
-                await send_message_delivery(
-                    websocket,
-                    client_message_id=client_message_id,
-                    turn_id=str(client_message_id or ""),
-                    accepted=False,
-                    message=rate_limited_message,
-                    rejection_outcome="not_accepted",
-                )
-                # send_message_delivery no-ops without a client_message_id, so
-                # a client that didn't tag the turn would otherwise get zero
-                # feedback and see the message silently dropped. Fall back to a
-                # generic error so the throttle is always surfaced.
-                if client_message_id is None:
-                    await manager.send_personal_message(
-                        {"type": "error", "message": rate_limited_message},
-                        websocket,
-                    )
+                await _reject_rate_limited_turn(websocket, message_data)
                 continue
 
             if message_type == "chat":
