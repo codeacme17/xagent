@@ -188,8 +188,8 @@ async def test_agent_service_refreshes_runtime_prompt_and_modalities_with_tools(
     }
     tool_config = ToolConfig({})
     tool_config.get_task_runtime_contribution = lambda: contribution_holder["value"]
-    tool_config.set_task_runtime_contribution = lambda value: (
-        contribution_holder.update(value=value)
+    tool_config.set_task_runtime_contribution = (
+        lambda value: contribution_holder.update(value=value)
     )
 
     async def create_all_tools(config: Any) -> list[Any]:
