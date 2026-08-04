@@ -2957,19 +2957,22 @@ def test_reconcile_finalized_delivery_completes_orphaned_pending_on_success(
         task_id=int(task.id),
         turn_id="turn-ok",
         settlement_error=None,
+        execution_started=True,
     )
 
     assert _delivery_status(db_session, "turn-ok") == DELIVERY_COMPLETED
 
 
-def test_reconcile_finalized_delivery_fails_orphaned_pending_on_error(
+def test_reconcile_finalized_delivery_fails_orphaned_pending_when_never_ran(
     db_session,
 ) -> None:
-    """A failed settlement advances an orphaned ``pending`` row to ``failed``.
+    """A turn that provably never executed advances ``pending`` to ``failed``.
 
-    This is the row a same-``client_message_id`` retry needs: the session-WS
-    probe classifies ``failed`` as a usable terminal ack (retry with a new id)
-    instead of an in-flight ``PENDING`` that is rejected forever.
+    ``failed`` invites a fresh-id retry downstream, so it is only written with
+    positive evidence the message was never consumed
+    (``execution_started=False``). That is the row a same-``client_message_id``
+    retry needs: a usable terminal ack instead of an in-flight ``PENDING``
+    that is rejected forever.
     """
     user = _create_user(db_session)
     task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
@@ -2981,6 +2984,7 @@ def test_reconcile_finalized_delivery_fails_orphaned_pending_on_error(
         task_id=int(task.id),
         turn_id="turn-boom",
         settlement_error="setup/run error: RuntimeError: boom",
+        execution_started=False,
     )
 
     assert _delivery_status(db_session, "turn-boom") == DELIVERY_FAILED
@@ -2998,6 +3002,32 @@ def test_reconcile_finalized_delivery_fails_orphaned_pending_on_error(
     assert inspected.failed is True
 
 
+def test_reconcile_finalized_delivery_marks_dispatched_when_run_failed_after_start(
+    db_session,
+) -> None:
+    """A failure after execution began closes ``pending`` as ``dispatched``.
+
+    The run may have consumed the message (and produced side effects) before
+    failing, so writing ``failed`` would invite a fresh-id retry and a double
+    execution. ``dispatched`` converges the client without a resend; the
+    turn's failure is surfaced through task status.
+    """
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
+    _claim_pending_delivery(
+        db_session, task_id=int(task.id), user_id=int(user.id), turn_id="turn-late"
+    )
+
+    _reconcile_finalized_turn_delivery(
+        task_id=int(task.id),
+        turn_id="turn-late",
+        settlement_error="setup/run error: RuntimeError: late boom",
+        execution_started=True,
+    )
+
+    assert _delivery_status(db_session, "turn-late") == DELIVERY_DISPATCHED
+
+
 def test_reconcile_finalized_delivery_noop_without_turn_id(db_session) -> None:
     """A turn with no durable delivery row (no turn id) is a safe no-op."""
     user = _create_user(db_session)
@@ -3008,18 +3038,22 @@ def test_reconcile_finalized_delivery_noop_without_turn_id(db_session) -> None:
         task_id=int(task.id),
         turn_id=None,
         settlement_error=None,
+        execution_started=True,
     )
 
 
+@pytest.mark.parametrize("execution_started", [True, False])
 def test_reconcile_finalized_delivery_does_not_regress_dispatched_on_error(
     db_session,
+    execution_started,
 ) -> None:
     """``dispatched`` is terminal for dedup; a later failure must not regress it.
 
-    A normally dispatched turn already gave the client a usable ack. The
-    monotonic state machine rejects ``dispatched -> failed``, so the row stays
-    ``dispatched`` and the turn's failure is surfaced through task status, not
-    by reopening delivery.
+    A normally dispatched turn already gave the client a usable ack. With
+    ``execution_started=True`` the ``dispatched`` target is idempotent; with
+    ``False`` the monotonic state machine rejects ``dispatched -> failed``.
+    Either way the row stays ``dispatched`` and the turn's failure is surfaced
+    through task status, not by reopening delivery.
     """
     user = _create_user(db_session)
     task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
@@ -3034,11 +3068,13 @@ def test_reconcile_finalized_delivery_does_not_regress_dispatched_on_error(
     )
     assert transition.outcome == "updated"
     db_session.commit()
+    db_session.expire_all()
 
     _reconcile_finalized_turn_delivery(
         task_id=int(task.id),
         turn_id="turn-disp",
         settlement_error="boom",
+        execution_started=execution_started,
     )
 
     assert _delivery_status(db_session, "turn-disp") == DELIVERY_DISPATCHED
@@ -3069,6 +3105,7 @@ def test_reconcile_finalized_delivery_completes_dispatched_on_success(
         task_id=int(task.id),
         turn_id="turn-done",
         settlement_error=None,
+        execution_started=True,
     )
 
     assert _delivery_status(db_session, "turn-done") == DELIVERY_COMPLETED
@@ -3094,6 +3131,7 @@ def test_reconcile_finalized_delivery_swallows_pool_timeout_leaving_pending(
             task_id=int(task.id),
             turn_id="turn-pool",
             settlement_error=None,
+            execution_started=True,
         )
 
     assert _delivery_status(db_session, "turn-pool") == DELIVERY_PENDING
@@ -3128,6 +3166,7 @@ def _finalize_runner_patches(
     settle=None,
     mark_delivery=None,
     validate=None,
+    snapshot=None,
 ):
     """Patch scaffolding for driving ``_schedule_bg``'s ``_runner`` end-to-end.
 
@@ -3147,7 +3186,9 @@ def _finalize_runner_patches(
         ),
         patch(
             "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
-            return_value=MagicMock(),
+            new=snapshot
+            if snapshot is not None
+            else MagicMock(return_value=MagicMock()),
         ),
         patch(
             "xagent.web.api.websocket.execute_task_background",
@@ -3300,12 +3341,12 @@ async def test_runner_finalize_skips_reconcile_on_settlement_ready_short_circuit
 
 
 @pytest.mark.asyncio
-async def test_runner_finalize_marks_failed_for_cancelled_turn(
+async def test_runner_finalize_marks_dispatched_for_cancelled_turn(
     db_session,
 ) -> None:
-    """A cancelled turn settles as failed and closes its delivery row to
-    ``failed`` — the message never dispatched, so the client may retry with a
-    new id."""
+    """A turn cancelled during execution closes its delivery row to
+    ``dispatched``, not ``failed`` — execution had begun, so the message may
+    already have been consumed and a fresh-id retry could double-execute it."""
     user, task, payload, lease = _finalize_turn_fixture(
         db_session, turn_id="turn-e2e-cancelled"
     )
@@ -3317,7 +3358,56 @@ async def test_runner_finalize_marks_failed_for_cancelled_turn(
         with pytest.raises(asyncio.CancelledError):
             await bg_task
 
-    assert _delivery_status(db_session, "turn-e2e-cancelled") == DELIVERY_FAILED
+    assert _delivery_status(db_session, "turn-e2e-cancelled") == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_marks_dispatched_when_run_fails_after_start(
+    db_session,
+) -> None:
+    """The double-execution hazard: a run that failed *after* execution began
+    must close the orphaned ``pending`` row as ``dispatched`` (probe answers
+    MATCHES, no retry), never ``failed`` (probe would invite a fresh-id resend
+    of a message that already ran). This also pins the symmetry with the
+    post-schedule projection: whichever best-effort write lands, the row
+    converges on ``dispatched``."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-late-fail"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        execute=AsyncMock(side_effect=RuntimeError("late boom after side effects")),
+    ):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-late-fail") == DELIVERY_DISPATCHED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_runner_finalize_marks_failed_when_setup_fails_before_execute(
+    db_session,
+) -> None:
+    """A failure before ``execute_task_background`` is ever invoked is positive
+    evidence the message was never consumed, so the row closes as ``failed``
+    and a fresh-id retry is safe."""
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-pre-exec"
+    )
+
+    with _finalize_runner_patches(
+        lease,
+        snapshot=MagicMock(side_effect=RuntimeError("snapshot load exploded")),
+    ):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-pre-exec") == DELIVERY_FAILED
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == task.id).one()
     assert stored.status == TaskStatus.FAILED
@@ -3350,22 +3440,25 @@ async def test_runner_finalize_preserves_cancellation_from_reconcile(
 
 
 @pytest.mark.parametrize(
-    "seeded_status, settlement_error",
+    "seeded_status, settlement_error, execution_started",
     [
-        (DELIVERY_COMPLETED, None),
-        (DELIVERY_COMPLETED, "boom"),
-        (DELIVERY_FAILED, None),
+        (DELIVERY_COMPLETED, None, True),
+        (DELIVERY_COMPLETED, "boom", True),
+        (DELIVERY_COMPLETED, "boom", False),
+        (DELIVERY_FAILED, None, True),
     ],
 )
 def test_reconcile_finalized_delivery_noop_on_already_terminal_row(
     db_session,
     seeded_status,
     settlement_error,
+    execution_started,
 ) -> None:
     """An already-terminal delivery row is never rewritten by reconciliation.
 
     ``completed`` and ``failed`` are terminal in the monotonic state machine;
-    a later reconcile — idempotent or conflicting — must leave them as-is."""
+    a later reconcile — idempotent or conflicting, under any target — must
+    leave them as-is."""
     user = _create_user(db_session)
     task = _create_task(db_session, int(user.id), status=TaskStatus.RUNNING)
     _claim_pending_delivery(
@@ -3382,6 +3475,7 @@ def test_reconcile_finalized_delivery_noop_on_already_terminal_row(
         task_id=int(task.id),
         turn_id="turn-term",
         settlement_error=settlement_error,
+        execution_started=execution_started,
     )
 
     assert _delivery_status(db_session, "turn-term") == seeded_status

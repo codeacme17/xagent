@@ -751,6 +751,7 @@ def _reconcile_finalized_turn_delivery(
     task_id: int,
     turn_id: str | None,
     settlement_error: str | None,
+    execution_started: bool,
 ) -> None:
     """Close a terminally settled turn's delivery row (xorbitsai/xagent-saas#332).
 
@@ -775,18 +776,42 @@ def _reconcile_finalized_turn_delivery(
     remain a narrower instance of the stuck-``pending`` window, not a solved
     one.
 
-    The transition is monotonic: ``completed`` on a clean settlement, ``failed``
-    otherwise; an already-terminal row — or a normally ``dispatched`` row on a
-    later failure — is left untouched rather than regressed. Because both
-    projections are best-effort, the final delivery state is NOT a reliable
-    proxy for the turn's outcome: a failed turn may rest at ``dispatched`` or
-    ``failed`` depending on which projection landed. The delivery state answers
-    "may this client_message_id be retried?", never "did the turn succeed?".
+    Target selection is driven by what finalize actually knows, because the
+    downstream contract is asymmetric: the session WS probe answers a
+    ``failed`` row with ``retry_with_new_id`` — an invitation to re-send the
+    same content — so ``failed`` is only safe with positive evidence the
+    message was never consumed.
+
+    - ``settlement_error is None`` → ``completed``: the turn ran to a clean
+      settlement.
+    - error and ``execution_started`` → ``dispatched``: the run may have
+      consumed the message (and produced side effects) before failing, so the
+      one certain fact is "no longer in flight". A retry invitation here would
+      double-execute the turn. The probe treats ``dispatched`` as delivered;
+      the turn's failure is surfaced through task status, not by reopening
+      delivery. This also removes the timing asymmetry with the post-schedule
+      projection: whichever best-effort write lands, the row converges on
+      ``dispatched``.
+    - error and not ``execution_started`` → ``failed``:
+      ``execute_task_background`` was never invoked (setup failed, or the run
+      was cancelled first), so the message was provably never consumed and a
+      fresh-id retry is safe.
+
+    The transition is monotonic; an already-terminal row — or a normally
+    ``dispatched`` row on a later failure — is left untouched rather than
+    regressed. The final delivery state is NOT a proxy for the turn's outcome:
+    it answers "may this client_message_id be retried?", never "did the turn
+    succeed?".
     """
 
     if turn_id is None:
         return
-    target = DELIVERY_COMPLETED if settlement_error is None else DELIVERY_FAILED
+    if settlement_error is None:
+        target = DELIVERY_COMPLETED
+    elif execution_started:
+        target = DELIVERY_DISPATCHED
+    else:
+        target = DELIVERY_FAILED
     try:
         mark_user_message_delivery_sync(task_id, turn_id, target)
     except Exception as delivery_error:
@@ -1623,6 +1648,11 @@ def _schedule_bg(
         broadcast_error_message: str | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
+        # Positive evidence for finalize's delivery target: once
+        # ``execute_task_background`` has been invoked, the run may have
+        # consumed the user message, so a failure must not be projected as a
+        # retryable ``failed`` delivery (it would invite a double execution).
+        execution_started = False
         cleanup_cancellation: asyncio.CancelledError | None = None
         try:
             # A cancellation can land after the worker commits but before the
@@ -1702,6 +1732,8 @@ def _schedule_bg(
                     scope = await run_db_io_cancellation_safe(
                         lambda: resolve_execution_scope(task_id)
                     )
+                    nonlocal execution_started
+                    execution_started = True
                     await execute_task_background(
                         task_id=task_id,
                         user_message=payload.transcript_message,
@@ -1857,6 +1889,12 @@ def _schedule_bg(
                     # (returned ``False``), settlement was deferred, or the
                     # pre-execution SETTLEMENT_READY short-circuit fired (the
                     # turn body never ran, so ``completed`` would be a lie).
+                    # KNOWN GAP: rows skipped here stay ``pending`` permanently —
+                    # lease TTL recovery terminalizes the *task* only and nothing
+                    # in this tree redrives delivery rows. The skip is still
+                    # correct (a non-authoritative close is worse); the residual
+                    # window is tracked as a follow-up to
+                    # xorbitsai/xagent-saas#332.
                     if lease_settled and not skip_delivery_reconciliation:
                         try:
                             await run_db_io_cancellation_safe(
@@ -1864,6 +1902,7 @@ def _schedule_bg(
                                     task_id=task_id,
                                     turn_id=turn_id,
                                     settlement_error=settlement_error,
+                                    execution_started=execution_started,
                                 )
                             )
                         except asyncio.CancelledError as exc:
