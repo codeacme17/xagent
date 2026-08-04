@@ -939,8 +939,14 @@ async def create_public_chat_task(
     # Server-observed creator IP (#1108): the per-abuser key for the widget
     # run quota. Stamped by the backend, never client-supplied.
     agent_config["widget_client_ip"] = client_ip
-    if access_context.widget_agent_id is not None:
-        agent_config["widget_agent_id"] = access_context.widget_agent_id
+    # Stamp BOTH entity markers from the validated access context, writing the
+    # inapplicable one as None (#1108). The run quota keys off these and
+    # entity_rate_limit_key prefers workforce, so a client-injected
+    # widget_workforce_id must never survive to redirect the bucket. The
+    # sanitizer already strips both, but stamping explicitly keeps this correct
+    # independent of the sanitizer's reserved-key set.
+    agent_config["widget_agent_id"] = access_context.widget_agent_id
+    agent_config["widget_workforce_id"] = access_context.widget_workforce_id
 
     agent_id = request.agent_id
     if agent_id is None and channel and channel.config:

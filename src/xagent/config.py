@@ -986,23 +986,27 @@ def get_widget_ws_turn_rate_limit() -> str:
 
 
 def get_widget_auth_rate_limit() -> str:
-    """Per-credential limit on ``POST /api/widget/auth`` (#1108).
+    """Per-widget-entity limit on widget auth + embed-ticket minting (#1108).
 
-    The widget mirror of :func:`get_share_auth_rate_limit`, in its own bucket
-    so probes against one public channel cannot consume the other's budget.
-    Keyed on the presented credential (embed ticket or widget key) rather than
-    a resolved entity, because the gate runs before any DB lookup; the per-IP
-    ceiling below bounds a single client across credentials.
+    The loose aggregate backstop bounding total auth/ticket volume through one
+    embedded agent/workforce across all callers. Deliberately loose: both
+    endpoints fire on every widget page load and the entity key is shared by
+    all of a widget's visitors, so a tight per-entity bucket would 429
+    ordinary visitors on a busy embed. The per-IP limit below is the tight
+    per-visitor / per-abuser bound. Raise this for very high-traffic embeds.
     """
-    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "60/minute")
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "600/minute")
 
 
 def get_widget_auth_ip_rate_limit() -> str:
-    """Per-IP ceiling on ``POST /api/widget/auth`` across all widget keys (#1108).
+    """Per-caller-IP limit on widget auth + embed-ticket minting (#1108).
 
-    The widget mirror of :func:`get_share_auth_ip_rate_limit`. Bounds one
-    caller minting guest tokens (each call does DB lookups and signs a JWT)
-    regardless of how many widget keys they cycle through.
+    The tight per-visitor / per-abuser bound (visitors have distinct IPs):
+    bounds one caller minting guest tokens / embed tickets (each call does DB
+    lookups and signs a JWT) regardless of how many widget keys or tickets
+    they cycle through, since the IP is not cheaply rotatable. N guests behind
+    one NAT egress share this budget — set XAGENT_TRUSTED_PROXY_HOPS behind a
+    reverse proxy so all traffic does not collapse onto the proxy's IP.
     """
     return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
 

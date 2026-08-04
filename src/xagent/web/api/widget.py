@@ -245,9 +245,12 @@ async def issue_widget_embed_ticket(
         raise HTTPException(status_code=403, detail=WIDGET_KEY_REQUIRED_DETAIL)
     # Abuse control (#1108): ticket minting does DB lookups plus a JWT
     # signature per call, and an ungated mint loop would also let a caller
-    # refresh their auth credential for free. Same buckets as /auth — the
-    # widget key is the stable credential here — so the two halves of one
-    # page-load handshake draw from one budget.
+    # refresh their auth entity bucket for free. Same buckets as /auth — the
+    # widget key is the stable entity key here — so the two halves of one
+    # page-load handshake draw from one budget. The tight-IP / loose-entity
+    # shape is what keeps this from 429ing ordinary visitors on a busy embed:
+    # widget.js mints a ticket on every page load, and the entity key is shared
+    # by all of a widget's visitors, so the per-visitor bound must be the IP.
     if not get_share_rate_limiter().allow_widget_auth(
         f"key:{request.widget_key}", remote_ip_from_request(req)
     ):
@@ -393,26 +396,29 @@ def _resolve_widget_auth_owner(
     raise HTTPException(status_code=403, detail=WIDGET_CREDENTIAL_REQUIRED_DETAIL)
 
 
-def _widget_auth_rate_limit_credential(
+def _widget_auth_rate_limit_entity_key(
     embed_ticket: str | None, widget_key: str | None
 ) -> str:
-    """Stable rate-limit credential for a widget auth attempt (#1108).
+    """Stable per-widget key for the auth gate's loose-entity backstop (#1108).
 
-    The per-credential bucket must key on something one caller cannot rotate
-    for free. The raw embed ticket is NOT that: the embedded flow mints a
-    fresh ticket on every page load (no ``jti``, second-resolution ``exp``),
-    so raw-ticket buckets would never accumulate. Instead, decode the ticket's
-    *signed* claims — pure HMAC verification, no DB work — and key on the
-    owner entity they name; forging a different entity requires forging the
+    The entity backstop must key on something one caller cannot rotate for
+    free. The raw embed ticket is NOT that: the embedded flow mints a fresh
+    ticket on every page load (no ``jti``, second-resolution ``exp``), so
+    raw-ticket buckets would never accumulate. Instead, decode the ticket's
+    *signed* claims — pure HMAC verification, no DB work — and key on the owner
+    entity they name; forging a different entity requires forging the
     signature. Expiry is deliberately not checked here: an expired ticket
     should still land in its stable bucket, and redemption enforces ``exp``.
 
     Tickets that fail signature/shape checks collapse into one shared
-    ``invalid-ticket`` bucket: they are attacker-only traffic (every legit
-    ticket decodes), so throttling them collectively is a feature. The direct
-    widget-key flow keys on the key string itself, which is already stable;
-    the prefix keeps it from colliding with ticket-derived entity keys.
-    Mirrors :func:`_resolve_widget_auth_owner`'s precedence (ticket first).
+    ``invalid-ticket`` bucket. The direct widget-key flow keys on the key
+    string itself (already stable; the prefix avoids colliding with
+    ticket-derived entity keys). A bogus/nonexistent key does NOT collapse —
+    that would need a pre-gate DB lookup — so an attacker rotating fake keys
+    gets a fresh *entity* bucket per key; that is acceptable because the entity
+    bucket is only the loose aggregate backstop, and the tight per-IP bucket
+    (which this key does not affect) is the real per-abuser bound. Mirrors
+    :func:`_resolve_widget_auth_owner`'s precedence (ticket first).
     """
     if embed_ticket:
         try:
@@ -453,11 +459,11 @@ async def authenticate_widget(
     # Abuse control (#1108): the widget key is public by design, so this
     # unauthenticated endpoint — every call does DB lookups and mints a JWT —
     # is reachable by anyone who can view the hosting page. Bucket per caller
-    # IP + per stable credential before any DB work, mirroring the share
-    # /auth gate. Deriving the credential costs one signature check at most;
-    # the DB resolution this gate protects happens below.
+    # IP (tight per-visitor bound) + per widget entity (loose aggregate
+    # backstop) before any DB work. Deriving the entity key costs one signature
+    # check at most; the DB resolution this gate protects happens below.
     if not get_share_rate_limiter().allow_widget_auth(
-        _widget_auth_rate_limit_credential(request.embed_ticket, request.widget_key),
+        _widget_auth_rate_limit_entity_key(request.embed_ticket, request.widget_key),
         remote_ip_from_request(http_request),
     ):
         raise HTTPException(status_code=429, detail="Too many requests")

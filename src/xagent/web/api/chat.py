@@ -1017,6 +1017,23 @@ def _load_task_public_run_quota_config_isolated(
         return None
 
 
+def _coerce_optional_entity_id(value: Any) -> int | None:
+    """Coerce an agent_config entity marker to ``int``, or ``None`` if it can't.
+
+    A malformed marker (non-numeric, injected junk) must degrade to "unkeyable"
+    — the caller then admits that one task — rather than raising into the
+    chokepoint's broad ``except``, which would log a scary "failed open" and
+    disable the gate outright. ``bool`` is rejected explicitly: ``True`` is an
+    ``int`` subclass that would otherwise coerce to ``1``.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
     """Apply the per-entity run quota for a public (share/widget) task.
 
@@ -1032,6 +1049,11 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
     rolling entity quota and lock every other visitor out. Tasks created
     before the IP marker existed carry ``None`` and are bounded by the entity
     quota alone.
+
+    Entity markers are coerced defensively: the widget-create path stamps them
+    server-side and the sanitizer strips the client copies, but a malformed
+    value must degrade to "unkeyable → admit this task" here rather than take
+    the gate down.
     """
     from ..services.share_rate_limit import (
         entity_rate_limit_key,
@@ -1042,11 +1064,9 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
     limiter = get_share_rate_limiter()
 
     if auth_mode == "widget":
-        widget_agent_id = quota_config.get("widget_agent_id")
-        widget_workforce_id = quota_config.get("widget_workforce_id")
         entity_key = entity_rate_limit_key(
-            int(widget_agent_id) if widget_agent_id is not None else None,
-            int(widget_workforce_id) if widget_workforce_id is not None else None,
+            _coerce_optional_entity_id(quota_config.get("widget_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("widget_workforce_id")),
         )
         if entity_key is None:
             return True
@@ -1057,11 +1077,9 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
 
     if auth_mode == "share":
         guest_id = quota_config.get("guest_id")
-        agent_share_id = quota_config.get("share_agent_id")
-        workforce_id = quota_config.get("share_workforce_id")
         share_key = entity_rate_limit_key(
-            int(agent_share_id) if agent_share_id is not None else None,
-            int(workforce_id) if workforce_id is not None else None,
+            _coerce_optional_entity_id(quota_config.get("share_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("share_workforce_id")),
         )
         if not share_key or not isinstance(guest_id, str) or not guest_id:
             return True

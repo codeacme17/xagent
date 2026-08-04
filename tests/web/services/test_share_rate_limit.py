@@ -200,33 +200,56 @@ def test_widget_ws_turn_entity_ceiling_trips_across_ips(
     assert limiter.allow_widget_ws_turn("workforce:8", "4.4.4.4") is True
 
 
-def test_widget_auth_per_credential_bucket_trips(
+def test_widget_auth_per_ip_bucket_trips_across_entities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    limiter = _limiter_with(
-        monkeypatch,
-        XAGENT_WIDGET_AUTH_RATE_LIMIT="2/minute",
-        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="100/minute",
-    )
-    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is True
-    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is True
-    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is False
-    # A different credential on the same IP has an independent bucket.
-    assert limiter.allow_widget_auth("key-b", "1.1.1.1") is True
-
-
-def test_widget_auth_per_ip_ceiling_trips_across_credentials(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rotating the widget key/ticket must not escape the per-IP ceiling."""
+    """Per-IP is the tight per-visitor/per-abuser bound (#1108 F2): rotating
+    the entity key (fake widget keys, forged tickets) must not escape it."""
     limiter = _limiter_with(
         monkeypatch,
         XAGENT_WIDGET_AUTH_RATE_LIMIT="100/minute",
         XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="2/minute",
     )
-    assert limiter.allow_widget_auth("key-a", "9.9.9.9") is True
-    assert limiter.allow_widget_auth("key-b", "9.9.9.9") is True
-    assert limiter.allow_widget_auth("key-c", "9.9.9.9") is False
+    assert limiter.allow_widget_auth("agent:1", "9.9.9.9") is True
+    assert limiter.allow_widget_auth("key:rotated", "9.9.9.9") is True
+    assert limiter.allow_widget_auth("agent:2", "9.9.9.9") is False
+    # A different caller is unaffected.
+    assert limiter.allow_widget_auth("agent:1", "8.8.8.8") is True
+
+
+def test_widget_auth_entity_ceiling_is_loose_across_ips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-entity is the loose aggregate backstop across a widget's visitors:
+    distinct-IP visitors of one widget share it, so it must not 429 them until
+    the loose cap — the F2 fix that keeps busy embeds working."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="2/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_auth("agent:7", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("agent:7", "2.2.2.2") is True
+    assert limiter.allow_widget_auth("agent:7", "3.3.3.3") is False
+    # A different widget entity has its own backstop.
+    assert limiter.allow_widget_auth("agent:8", "4.4.4.4") is True
+
+
+def test_widget_auth_entity_denial_does_not_burn_ip_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4: a per-entity denial must not consume the caller's per-IP allowance,
+    so the same IP can still reach *other* widgets (non-destructive test→hit)."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="3/minute",
+    )
+    assert limiter.allow_widget_auth("agent:1", "9.9.9.9") is True  # entity=1, ip=1
+    assert limiter.allow_widget_auth("agent:1", "9.9.9.9") is False  # entity backstop
+    # The denial didn't burn the IP budget: the same IP reaches other widgets.
+    assert limiter.allow_widget_auth("agent:2", "9.9.9.9") is True
+    assert limiter.allow_widget_auth("agent:3", "9.9.9.9") is True
 
 
 def test_widget_auth_is_isolated_from_share_auth(
@@ -240,8 +263,8 @@ def test_widget_auth_is_isolated_from_share_auth(
         XAGENT_SHARE_AUTH_RATE_LIMIT="5/minute",
         XAGENT_SHARE_AUTH_IP_RATE_LIMIT="5/minute",
     )
-    assert limiter.allow_widget_auth("tok", "1.1.1.1") is True
-    assert limiter.allow_widget_auth("tok", "1.1.1.1") is False
+    assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is False
     # Same IP + token on the share endpoint still admits from its own budget.
     assert limiter.allow_auth("tok", "1.1.1.1") is True
 

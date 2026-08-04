@@ -62,12 +62,27 @@ TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # wholesale, so anything the server later reads back as authoritative has to be
 # stripped from that copy first -- otherwise a client can pre-seed it.
 #
-# Only the binding record is listed today. Other reserved keys on this column
-# (``execution_scope``, ``a2a_context_id``, ``auth_mode``, ``guest_id``) are
-# pass-through by long-standing behavior and are tracked separately; add them
-# here once that change is in scope and every boundary picks it up at once.
+# The public-channel identity/quota markers are stripped here because the run
+# quota (#1108) now reads them back as authoritative at the ``execute_task``
+# chokepoint: an anonymous widget/share guest must not be able to inject an
+# ``auth_mode`` or an entity id (which selects the run-quota bucket) into their
+# own task-create body. Every seeding boundary re-stamps the markers it owns
+# *after* calling this helper, so stripping can never drop a server value. The
+# widget-create path additionally writes both entity markers explicitly (one as
+# ``None``) as belt-and-suspenders. ``execution_scope`` / ``a2a_context_id``
+# remain pass-through by long-standing behavior and are tracked separately.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
-    {TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY}
+    {
+        TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+        "auth_mode",
+        "guest_id",
+        "widget_agent_id",
+        "widget_workforce_id",
+        "widget_client_ip",
+        "share_agent_id",
+        "share_workforce_id",
+        "share_token",
+    }
 )
 logger = logging.getLogger(__name__)
 

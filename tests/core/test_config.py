@@ -1742,7 +1742,7 @@ class TestShareRateLimitConfig:
         (
             "get_widget_auth_rate_limit",
             "XAGENT_WIDGET_AUTH_RATE_LIMIT",
-            "60/minute",
+            "600/minute",
         ),
         (
             "get_widget_auth_ip_rate_limit",

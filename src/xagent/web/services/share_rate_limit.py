@@ -103,7 +103,7 @@ _WIDGET_UPLOAD_IP_NAMESPACE = "widget-upload-ip"
 _WIDGET_WS_TURN_ENTITY_NAMESPACE = "widget-ws-turn"
 _WIDGET_WS_TURN_IP_NAMESPACE = "widget-ws-turn-ip"
 _WIDGET_WS_CONNECT_IP_NAMESPACE = "widget-ws-connect-ip"
-_WIDGET_AUTH_CREDENTIAL_NAMESPACE = "widget-auth"
+_WIDGET_AUTH_ENTITY_NAMESPACE = "widget-auth"
 _WIDGET_AUTH_IP_NAMESPACE = "widget-auth-ip"
 _WIDGET_TASK_CREATE_ENTITY_NAMESPACE = "widget-task-create"
 _WIDGET_TASK_CREATE_IP_NAMESPACE = "widget-task-create-ip"
@@ -202,8 +202,8 @@ class ShareRateLimiter:
         self._widget_ws_turn_entity_limit = _parse_rate(
             get_widget_ws_turn_rate_limit(), fallback="240/minute"
         )
-        self._widget_auth_credential_limit = _parse_rate(
-            get_widget_auth_rate_limit(), fallback="60/minute"
+        self._widget_auth_entity_limit = _parse_rate(
+            get_widget_auth_rate_limit(), fallback="600/minute"
         )
         self._widget_auth_ip_limit = _parse_rate(
             get_widget_auth_ip_rate_limit(), fallback="300/minute"
@@ -342,29 +342,33 @@ class ShareRateLimiter:
         )
 
     @_fail_open
-    def allow_widget_auth(self, credential: str, remote_ip: str | None) -> bool:
-        """Count one widget auth attempt; False when a bucket is exceeded (#1108).
+    def allow_widget_auth(self, entity_key: str, remote_ip: str | None) -> bool:
+        """Count one widget auth / embed-ticket attempt; False when exceeded (#1108).
 
-        The widget mirror of :meth:`allow_auth`, in its own buckets so probes
-        against one public channel cannot consume the other's budget. Two
-        buckets must both admit: per caller IP (across all widget keys) and per
-        presented credential. The credential must be a *stable* key derived
-        without DB work — the widget key itself, or the owner entity decoded
-        from the embed ticket's signed claims (pure crypto) — NOT the raw
-        ticket string: the embedded flow mints a fresh ticket on every page
-        load, so a raw-ticket bucket would never accumulate hits from one
-        caller. Per caller IP first (like :meth:`allow_auth`), so credential
-        rotation cannot escape the per-IP ceiling.
+        Uses the tight-IP / loose-entity pairing every other widget gate uses,
+        NOT the share-``auth`` loose-IP / tight-credential shape. The auth and
+        embed-ticket endpoints fire on *every* widget page load, and the entity
+        key is shared by all of one widget's visitors, so a tight per-entity
+        bucket would 429 ordinary visitors on a busy embed. Instead the per-IP
+        bucket is the per-visitor / per-abuser bound (visitors have distinct
+        IPs), and the per-entity bucket is a loose aggregate backstop across
+        all callers of one widget.
+
+        ``entity_key`` must be *stable*, derived without DB work — the widget
+        key, or the owner entity decoded from the embed ticket's signed claims
+        (pure crypto) — NOT the raw ticket, which the embedded flow mints fresh
+        per page load (a raw-ticket bucket would never accumulate). Both buckets
+        are tested non-destructively and only consumed when both admit, so an
+        entity-backstop denial never burns the caller's per-IP allowance for
+        *other* widgets (the :meth:`allow_widget_upload` shape).
         """
-        ip_key = remote_ip or "unknown"
-        if not self._limiter.hit(
-            self._widget_auth_ip_limit, _WIDGET_AUTH_IP_NAMESPACE, ip_key
-        ):
-            return False
-        return self._limiter.hit(
-            self._widget_auth_credential_limit,
-            _WIDGET_AUTH_CREDENTIAL_NAMESPACE,
-            credential or "unknown",
+        return self._admit_ip_and_entity(
+            self._widget_auth_ip_limit,
+            _WIDGET_AUTH_IP_NAMESPACE,
+            remote_ip,
+            self._widget_auth_entity_limit,
+            _WIDGET_AUTH_ENTITY_NAMESPACE,
+            entity_key,
         )
 
     @_fail_open

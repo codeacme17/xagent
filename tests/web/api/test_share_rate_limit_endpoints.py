@@ -213,8 +213,8 @@ def test_widget_auth_returns_429_over_limit(
 ) -> None:
     key = _widget_agent_key("RL Widget Auth Agent")
 
-    # Tighten the per-credential bucket only after the key exists; the IP
-    # ceiling (300/min default) stays clear so this proves the credential gate.
+    # Tighten the loose per-entity backstop only after the key exists; the IP
+    # bound (300/min default) stays clear so this proves the entity gate.
     monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
@@ -252,13 +252,58 @@ def test_widget_task_create_returns_429_over_limit(
         db.close()
 
 
+def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
+    """#1108 F1: a widget guest must not be able to inject entity/identity
+    markers into their own task-create body — they select the run-quota bucket
+    (entity_rate_limit_key prefers workforce), so a client-controlled value
+    would fully bypass or misdirect the quota. The server stamps them."""
+    key = _widget_agent_key("RL Widget Inject Agent")
+    guest = _widget_guest_headers(key)
+
+    forged = {
+        "title": "hi",
+        "description": "hi",
+        "agent_config": {
+            # A forged workforce id would win over the real agent entity.
+            "widget_workforce_id": 999999,
+            "widget_agent_id": 888888,
+            "widget_client_ip": "1.2.3.4",
+            "auth_mode": "share",
+            "guest_id": "injected-guest",
+            "share_agent_id": 777777,
+            "share_token": "forged",
+        },
+    }
+    resp = client.post("/api/widget/chat/task/create", headers=guest, json=forged)
+    assert resp.status_code == 200, resp.text
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(resp.json()["task_id"])).one()
+        cfg = task.agent_config
+        # Entity markers: server-stamped, workforce cleared to None on the agent
+        # path, agent id is the real one — never the injected values.
+        assert cfg.get("widget_workforce_id") is None
+        assert cfg.get("widget_agent_id") != 888888
+        assert cfg.get("widget_agent_id") is not None
+        # Identity/quota markers: server values win, injected copies stripped.
+        assert cfg.get("auth_mode") == "widget"
+        assert cfg.get("guest_id") == "rl-widget-guest"
+        assert cfg.get("widget_client_ip") == "testclient"
+        assert "share_agent_id" not in cfg
+        assert "share_token" not in cfg
+    finally:
+        db.close()
+
+
 def test_widget_auth_rate_limits_invalid_credentials_before_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The auth gate must run BEFORE credential resolution: repeated attempts
     with an *invalid* key get 429 once the bucket trips, not an endless
-    sequence of DB-backed 403s."""
-    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    sequence of DB-backed 403s. Tightened on the per-IP bound since one client
+    (one IP) is the abuser here."""
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_IP_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
     body = {"guest_id": "g", "widget_key": "no-such-widget-key"}
@@ -268,12 +313,12 @@ def test_widget_auth_rate_limits_invalid_credentials_before_resolution(
     assert second.status_code == 429, second.text
 
 
-def test_widget_auth_ticket_rotation_shares_one_credential_bucket(
+def test_widget_auth_ticket_rotation_shares_one_entity_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The per-credential bucket keys on the ticket's signed owner claims, not
-    the raw ticket string: the embedded flow mints a fresh ticket per page
-    load, so rotating tickets for one agent must land in one bucket."""
+    """The per-entity backstop keys on the ticket's signed owner claims, not the
+    raw ticket string: the embedded flow mints a fresh ticket per page load, so
+    rotating tickets for one agent must land in one bucket."""
     key = _widget_agent_key("RL Widget Ticket Agent")
 
     def _mint_ticket() -> str:
@@ -286,11 +331,13 @@ def test_widget_auth_ticket_rotation_shares_one_credential_bucket(
         return str(resp.json()["ticket"])
 
     # Mint both tickets before tightening: /embed-ticket shares the auth
-    # buckets (its credential is the widget key, distinct from the ticket's
-    # agent entity, but the per-IP ceiling is common).
+    # buckets (its entity key is the widget key, distinct from the ticket's
+    # agent entity, but they share the bucket family).
     ticket_a = _mint_ticket()
     ticket_b = _mint_ticket()
 
+    # Tighten the loose per-entity backstop; the ticket flow keys it on the
+    # agent entity, so two distinct tickets for one agent collide there.
     monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
@@ -309,10 +356,11 @@ def test_widget_embed_ticket_returns_429_over_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ticket minting is gated too (#1108): an ungated mint loop would do free
-    DB work + JWT signatures and refresh the caller's auth credential."""
+    DB work + JWT signatures and refresh the caller's auth budget. One IP mints
+    repeatedly, so the per-IP bound is what trips."""
     key = _widget_agent_key("RL Widget Ticket Mint Agent")
 
-    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_IP_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
     def _mint():
