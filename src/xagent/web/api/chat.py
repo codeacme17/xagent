@@ -1022,14 +1022,16 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
 
     Returns ``True`` when the run is admitted (or cannot be keyed, matching the
     original share behaviour of falling through rather than blocking a run it
-    cannot attribute), ``False`` when the rolling quota is exhausted.
+    cannot attribute), ``False`` when a rolling quota is exhausted.
 
     Share tasks carry a server-minted ``guest_id`` and are gated per link +
-    per guest (#973). Widget tasks are gated per entity only (#1108): their
-    ``guest_id`` is client-supplied (rotatable at will) and the caller IP is
-    unavailable at this async chokepoint, so a per-guest sub-quota would be a
-    no-op against a deliberate abuser — the per-IP widget task-create / turn
-    gates carry that dimension instead.
+    per guest (#973). Widget tasks are gated per entity plus the creator IP
+    the backend stamped into ``agent_config`` at task creation (#1108) — their
+    ``guest_id`` is client-supplied (rotatable at will), so the stamped IP is
+    the per-abuser dimension; without it one caller could drain the whole
+    rolling entity quota and lock every other visitor out. Tasks created
+    before the IP marker existed carry ``None`` and are bounded by the entity
+    quota alone.
     """
     from ..services.share_rate_limit import (
         entity_rate_limit_key,
@@ -1048,18 +1050,30 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
         )
         if entity_key is None:
             return True
-        return limiter.allow_widget_run(entity_key)
+        client_ip = quota_config.get("widget_client_ip")
+        return limiter.allow_widget_run(
+            entity_key, client_ip if isinstance(client_ip, str) and client_ip else None
+        )
 
-    guest_id = quota_config.get("guest_id")
-    agent_share_id = quota_config.get("share_agent_id")
-    workforce_id = quota_config.get("share_workforce_id")
-    share_key = entity_rate_limit_key(
-        int(agent_share_id) if agent_share_id is not None else None,
-        int(workforce_id) if workforce_id is not None else None,
+    if auth_mode == "share":
+        guest_id = quota_config.get("guest_id")
+        agent_share_id = quota_config.get("share_agent_id")
+        workforce_id = quota_config.get("share_workforce_id")
+        share_key = entity_rate_limit_key(
+            int(agent_share_id) if agent_share_id is not None else None,
+            int(workforce_id) if workforce_id is not None else None,
+        )
+        if not share_key or not isinstance(guest_id, str) or not guest_id:
+            return True
+        return limiter.allow_run(share_key, guest_id)
+
+    # The loader only returns share/widget configs; admit anything else so a
+    # future auth mode fails open here (visibly unmetered) rather than
+    # silently borrowing another channel's buckets.
+    logger.warning(
+        "Public run quota gate saw unexpected auth_mode %r; admitting", auth_mode
     )
-    if not share_key or not isinstance(guest_id, str) or not guest_id:
-        return True
-    return limiter.allow_run(share_key, guest_id)
+    return True
 
 
 def _check_task_run_gate_on_event_loop(
@@ -2949,37 +2963,56 @@ class AgentServiceManager:
         # gated; fails open (availability) like the run gate above, with the
         # same pool-timeout escalation so a stalled pool doesn't cascade.
         if tracker_task_id:
+            quota_auth_mode: str | None = None
             try:
                 quota_config = await run_db_io_cancellation_safe(
                     lambda: _load_task_public_run_quota_config_isolated(
                         int(tracker_task_id)
                     )
                 )
+                if quota_config is not None:
+                    raw_mode = quota_config.get("auth_mode")
+                    quota_auth_mode = raw_mode if isinstance(raw_mode, str) else None
                 if quota_config is not None and not _admit_public_run(quota_config):
-                    reason_message = (
-                        "This shared link has reached its usage limit. "
-                        "Please try again later."
-                    )
+                    # Channel-specific copy + error_code: a widget visitor on a
+                    # third-party page has no "shared link", and analytics need
+                    # to tell which public channel was throttled.
+                    if quota_auth_mode == "widget":
+                        reason_message = (
+                            "This widget has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "widget_run_quota_exceeded"
+                    else:
+                        reason_message = (
+                            "This shared link has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "share_run_quota_exceeded"
                     return {
                         "success": False,
                         "status": "quota_exceeded",
                         "output": reason_message,
                         "error": reason_message,
-                        "error_code": "share_run_quota_exceeded",
+                        "error_code": quota_error_code,
                         "error_details": None,
                     }
             except Exception as exc:
                 if is_database_pool_timeout(exc):
                     logger.error(
-                        "task_id=%s component=share-quota-gate database pool "
-                        "checkout timed out; terminating before further runtime "
-                        "database work: %s",
+                        "task_id=%s component=public-run-quota-gate database "
+                        "pool checkout timed out; terminating before further "
+                        "runtime database work: %s",
                         tracker_task_id,
                         exc,
                         exc_info=True,
                     )
                     raise
-                logger.warning("Share run quota check failed open", exc_info=True)
+                logger.warning(
+                    "Public run quota check failed open (auth_mode=%s)",
+                    quota_auth_mode,
+                    exc_info=True,
+                )
 
         if manage_task_lease and tracker_task_id:
             from ..services.task_execution_controller import (

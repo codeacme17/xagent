@@ -45,6 +45,7 @@ from ...config import (
     get_share_ws_turn_rate_limit,
     get_widget_auth_ip_rate_limit,
     get_widget_auth_rate_limit,
+    get_widget_run_ip_quota,
     get_widget_run_quota,
     get_widget_task_create_ip_rate_limit,
     get_widget_task_create_rate_limit,
@@ -77,8 +78,11 @@ def entity_rate_limit_key(agent_id: int | None, workforce_id: int | None) -> str
     / ``"workforce:<id>"``), shared by the widget upload/turn gates and the
     share run quota so the shape can never drift between call sites.
     Workforce wins when both ids are set (callers guarantee at most one is).
-    Returns ``None`` when neither id is set; the ``allow_*`` gates degrade
-    that to their shared ``"unknown"`` bucket rather than admitting freely.
+    Returns ``None`` when neither id is set; the request-throttle ``allow_*``
+    gates degrade that to their shared ``"unknown"`` bucket rather than
+    admitting freely, while the run-quota chokepoint (chat.py) instead admits
+    a task it cannot attribute — matching the original share-gate behaviour of
+    never blocking a run on a missing marker.
     """
     if workforce_id is not None:
         return f"workforce:{workforce_id}"
@@ -106,6 +110,7 @@ _WIDGET_TASK_CREATE_IP_NAMESPACE = "widget-task-create-ip"
 _RUN_SHARE_NAMESPACE = "share-run"
 _RUN_GUEST_NAMESPACE = "share-run-guest"
 _WIDGET_RUN_NAMESPACE = "widget-run"
+_WIDGET_RUN_IP_NAMESPACE = "widget-run-ip"
 
 
 def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
@@ -214,6 +219,9 @@ class ShareRateLimiter:
             get_share_run_guest_quota(), fallback="60/hour"
         )
         self._widget_run_limit = _parse_rate(get_widget_run_quota(), fallback="500/day")
+        self._widget_run_ip_limit = _parse_rate(
+            get_widget_run_ip_quota(), fallback="60/hour"
+        )
 
     @_fail_open
     def allow_auth(self, share_token: str, remote_ip: str | None) -> bool:
@@ -334,16 +342,18 @@ class ShareRateLimiter:
         )
 
     @_fail_open
-    def allow_widget_auth(self, remote_ip: str | None, credential: str) -> bool:
+    def allow_widget_auth(self, credential: str, remote_ip: str | None) -> bool:
         """Count one widget auth attempt; False when a bucket is exceeded (#1108).
 
         The widget mirror of :meth:`allow_auth`, in its own buckets so probes
         against one public channel cannot consume the other's budget. Two
         buckets must both admit: per caller IP (across all widget keys) and per
-        presented credential. The credential is the raw embed ticket / widget
-        key string, not a resolved entity, because this gate runs *before* the
-        DB lookups and JWT mint it is meant to throttle — the entity is not
-        known yet. Per caller IP first (like :meth:`allow_auth`), so credential
+        presented credential. The credential must be a *stable* key derived
+        without DB work — the widget key itself, or the owner entity decoded
+        from the embed ticket's signed claims (pure crypto) — NOT the raw
+        ticket string: the embedded flow mints a fresh ticket on every page
+        load, so a raw-ticket bucket would never accumulate hits from one
+        caller. Per caller IP first (like :meth:`allow_auth`), so credential
         rotation cannot escape the per-IP ceiling.
         """
         ip_key = remote_ip or "unknown"
@@ -436,21 +446,41 @@ class ShareRateLimiter:
         return True
 
     @_fail_open
-    def allow_widget_run(self, entity_key: str | None) -> bool:
-        """Count one owner-billed widget run; False when the quota is exceeded.
+    def allow_widget_run(self, entity_key: str | None, client_ip: str | None) -> bool:
+        """Count one owner-billed widget run; False when a quota is exceeded.
 
-        The widget mirror of :meth:`allow_run`, in its own bucket so a
+        The widget mirror of :meth:`allow_run`, in its own buckets so a
         popular/abused widget cannot drain the owner's whole team quota. Keyed
-        on the widget entity (``agent:<id>`` / ``workforce:<id>``) only: unlike
-        the share path there is no per-guest sub-quota, because the widget
-        ``guest_id`` is client-supplied (rotatable at will) and the caller IP
-        is not available at the async ``execute_task`` chokepoint where this
-        gate runs. Per-abuser bursts are bounded instead by the per-IP widget
-        task-create and websocket-turn gates. Rolling, not cumulative, so a
-        busy-but-legitimate widget self-clears rather than being bricked.
+        on the widget entity (``agent:<id>`` / ``workforce:<id>``) plus the IP
+        the server observed when the task was created (stamped into
+        ``agent_config``; never client-supplied) — NOT the widget ``guest_id``,
+        which is client-supplied and rotatable at will. The IP sub-quota is the
+        per-abuser dimension: without it, one caller could drain the whole
+        rolling entity quota (e.g. 60 turns/min against 500/day ≈ nine
+        minutes) and lock every other visitor out for a day. Both buckets use
+        the non-destructive test→hit pairing, so an IP-window denial never
+        burns an entity slot.
+
+        ``client_ip`` is ``None`` for tasks created before the marker existed;
+        those are bounded by the entity quota alone rather than collapsing
+        every legacy task into one shared IP bucket. Rolling, not cumulative,
+        so a busy-but-legitimate widget self-clears rather than being bricked.
         """
-        return self._limiter.hit(
-            self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key or "unknown"
+        # entity_key is None only if a caller bypasses the chokepoint's
+        # short-circuit (chat.py admits unkeyable widget tasks before calling
+        # this); the "unknown" degradation is defense-in-depth for any future
+        # direct caller, not a path production reaches today.
+        if client_ip is None:
+            return self._limiter.hit(
+                self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key or "unknown"
+            )
+        return self._admit_ip_and_entity(
+            self._widget_run_ip_limit,
+            _WIDGET_RUN_IP_NAMESPACE,
+            client_ip,
+            self._widget_run_limit,
+            _WIDGET_RUN_NAMESPACE,
+            entity_key,
         )
 
 

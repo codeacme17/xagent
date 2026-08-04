@@ -133,6 +133,7 @@ WIDGET_AUTH_IP_RATE_LIMIT = "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT"
 WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
 WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
 WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
+WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -1036,13 +1037,31 @@ def get_widget_run_quota() -> str:
 
     The widget mirror of :func:`get_share_run_quota`, in its own bucket so a
     popular/abused widget cannot drain the owner's whole team quota. Keyed on
-    the embedded agent/workforce only: unlike the share path there is no
-    per-guest sub-quota, because the widget ``guest_id`` is client-supplied
-    and rotatable at will, and the caller IP is not available at the async
-    ``execute_task`` chokepoint where this gate runs. Per-abuser bursts are
-    bounded instead by the per-IP widget task-create and websocket-turn gates.
+    the embedded agent/workforce, with a per-creating-IP sub-quota
+    (:func:`get_widget_run_ip_quota`) as the per-abuser dimension — the widget
+    ``guest_id`` is client-supplied (rotatable at will), so unlike the share
+    path there is no per-guest sub-quota. NOTE: this quota applies to
+    already-live widget tasks as soon as it deploys (their ``agent_config``
+    carries the widget markers); the only opt-out is raising the env var.
     """
     return _get_rate_limit(WIDGET_RUN_QUOTA, "500/day")
+
+
+def get_widget_run_ip_quota() -> str:
+    """Per-creating-IP rolling run quota within a widget (#1108).
+
+    The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
+    share path's per-guest window: bounds the owner-billed runs attributable
+    to one caller IP so a single abuser cannot drain the whole widget quota
+    and lock out every other visitor for a rolling day. The IP is the one the
+    server observed at task creation (stamped into ``agent_config``, never
+    client-supplied); tasks created before this deploy carry no marker and are
+    bounded by the entity quota alone. As with the other per-IP widget
+    buckets, N guests behind one NAT egress share this budget — raise it for
+    large shared-egress populations, and set XAGENT_TRUSTED_PROXY_HOPS behind
+    a reverse proxy.
+    """
+    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "60/hour")
 
 
 def get_share_run_quota() -> str:

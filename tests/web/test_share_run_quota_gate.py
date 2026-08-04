@@ -118,9 +118,11 @@ async def test_share_run_quota_skips_non_share_task(
 async def test_widget_run_quota_blocks_widget_task(
     db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The widget run quota (#1108) is keyed on the entity only; "0/day" leaves
-    # no room, so the very first widget run is refused. The share quota stays
-    # wide open, proving the widget bucket gates independently.
+    # "0/day" on the widget entity quota leaves no room, so the very first
+    # widget run is refused — with widget-specific copy and error_code, not
+    # the share wording. The share quota stays wide open, proving the widget
+    # bucket gates independently. No widget_client_ip marker: this is the
+    # legacy-task path, bounded by the entity quota alone.
     monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
     monkeypatch.setenv("XAGENT_SHARE_RUN_QUOTA", "500/day")
     reset_share_rate_limiter()
@@ -145,8 +147,105 @@ async def test_widget_run_quota_blocks_widget_task(
 
     assert result["success"] is False
     assert result["status"] == "quota_exceeded"
-    assert result["error_code"] == "share_run_quota_exceeded"
-    assert "usage limit" in result["output"]
+    assert result["error_code"] == "widget_run_quota_exceeded"
+    assert "widget has reached its usage limit" in result["output"]
+
+
+@pytest.mark.asyncio
+async def test_widget_run_ip_quota_blocks_one_creator(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-creating-IP sub-quota (#1108) gates a task whose agent_config
+    carries the server-stamped widget_client_ip, even with the entity quota
+    wide open — one caller cannot drain the widget for everyone else."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "500/day")
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_IP_QUOTA", "0/hour")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "rotatable-guest",
+            "widget_agent_id": 4242,
+            "widget_client_ip": "203.0.113.9",
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "widget_run_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_blocks_workforce_widget_task(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workforce widget marker keys the quota too (entity_rate_limit_key
+    prefers workforce over agent)."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "rotatable-guest",
+            "widget_workforce_id": 77,
+            "widget_client_ip": "203.0.113.10",
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "widget_run_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_fails_open_on_malformed_marker(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed (non-integer) widget entity marker must fail open — the
+    int() coercion raises, the chokepoint's broad except admits the run —
+    rather than 500ing or blocking."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g",
+            "widget_agent_id": "not-an-int",
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result.get("error_code") not in (
+        "widget_run_quota_exceeded",
+        "share_run_quota_exceeded",
+    )
 
 
 @pytest.mark.asyncio

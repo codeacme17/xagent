@@ -208,11 +208,11 @@ def test_widget_auth_per_credential_bucket_trips(
         XAGENT_WIDGET_AUTH_RATE_LIMIT="2/minute",
         XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="100/minute",
     )
-    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is True
-    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is True
-    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is False
+    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("key-a", "1.1.1.1") is False
     # A different credential on the same IP has an independent bucket.
-    assert limiter.allow_widget_auth("1.1.1.1", "key-b") is True
+    assert limiter.allow_widget_auth("key-b", "1.1.1.1") is True
 
 
 def test_widget_auth_per_ip_ceiling_trips_across_credentials(
@@ -224,9 +224,9 @@ def test_widget_auth_per_ip_ceiling_trips_across_credentials(
         XAGENT_WIDGET_AUTH_RATE_LIMIT="100/minute",
         XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="2/minute",
     )
-    assert limiter.allow_widget_auth("9.9.9.9", "key-a") is True
-    assert limiter.allow_widget_auth("9.9.9.9", "key-b") is True
-    assert limiter.allow_widget_auth("9.9.9.9", "key-c") is False
+    assert limiter.allow_widget_auth("key-a", "9.9.9.9") is True
+    assert limiter.allow_widget_auth("key-b", "9.9.9.9") is True
+    assert limiter.allow_widget_auth("key-c", "9.9.9.9") is False
 
 
 def test_widget_auth_is_isolated_from_share_auth(
@@ -240,8 +240,8 @@ def test_widget_auth_is_isolated_from_share_auth(
         XAGENT_SHARE_AUTH_RATE_LIMIT="5/minute",
         XAGENT_SHARE_AUTH_IP_RATE_LIMIT="5/minute",
     )
-    assert limiter.allow_widget_auth("1.1.1.1", "tok") is True
-    assert limiter.allow_widget_auth("1.1.1.1", "tok") is False
+    assert limiter.allow_widget_auth("tok", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("tok", "1.1.1.1") is False
     # Same IP + token on the share endpoint still admits from its own budget.
     assert limiter.allow_auth("tok", "1.1.1.1") is True
 
@@ -300,12 +300,52 @@ def test_widget_task_create_ip_denial_does_not_consume_entity_slot(
 def test_widget_run_quota_per_entity_trips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    limiter = _limiter_with(monkeypatch, XAGENT_WIDGET_RUN_QUOTA="2/day")
-    assert limiter.allow_widget_run("agent:1") is True
-    assert limiter.allow_widget_run("agent:1") is True
-    assert limiter.allow_widget_run("agent:1") is False
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_RUN_QUOTA="2/day",
+        XAGENT_WIDGET_RUN_IP_QUOTA="100/hour",
+    )
+    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_run("agent:1", "2.2.2.2") is True
+    assert limiter.allow_widget_run("agent:1", "3.3.3.3") is False
     # A different widget entity has its own rolling quota.
-    assert limiter.allow_widget_run("workforce:2") is True
+    assert limiter.allow_widget_run("workforce:2", "4.4.4.4") is True
+
+
+def test_widget_run_ip_quota_bounds_one_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-creating-IP window trips before the entity quota for one
+    caller — a single IP can no longer drain a widget's whole rolling quota
+    and lock other visitors out."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_RUN_QUOTA="3/day",
+        XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
+    )
+    assert limiter.allow_widget_run("agent:1", "9.9.9.9") is True  # entity=1, ip=1
+    assert limiter.allow_widget_run("agent:1", "9.9.9.9") is False  # ip window blocks
+    # The denial didn't consume entity slots: two other visitors still fit.
+    assert limiter.allow_widget_run("agent:1", "8.8.8.8") is True  # entity=2
+    assert limiter.allow_widget_run("agent:1", "7.7.7.7") is True  # entity=3
+    assert limiter.allow_widget_run("agent:1", "6.6.6.6") is False  # entity quota hit
+
+
+def test_widget_run_quota_without_ip_marker_is_entity_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tasks created before the IP marker existed (client_ip=None) are bounded
+    by the entity quota alone — they must not collapse into one shared IP
+    bucket."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_RUN_QUOTA="2/day",
+        XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
+    )
+    # Two legacy runs pass despite the 1/hour IP window (no IP → no IP bucket).
+    assert limiter.allow_widget_run("agent:1", None) is True
+    assert limiter.allow_widget_run("agent:1", None) is True
+    assert limiter.allow_widget_run("agent:1", None) is False  # entity quota (2)
 
 
 def test_widget_run_quota_is_isolated_from_share_run(
@@ -319,8 +359,8 @@ def test_widget_run_quota_is_isolated_from_share_run(
         XAGENT_SHARE_RUN_QUOTA="5/day",
         XAGENT_SHARE_RUN_GUEST_QUOTA="5/hour",
     )
-    assert limiter.allow_widget_run("agent:1") is True
-    assert limiter.allow_widget_run("agent:1") is False
+    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_run("agent:1", "2.2.2.2") is False
     # The share run quota under the same entity key still admits.
     assert limiter.allow_run("agent:1", "g1") is True
 
@@ -392,6 +432,7 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_widget_ws_connect("1.1.1.1") is True
     assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is True
     assert limiter.allow_run("agent:1", "g") is True
-    assert limiter.allow_widget_auth("1.1.1.1", "key") is True
+    assert limiter.allow_widget_auth("key", "1.1.1.1") is True
     assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1") is True
+    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_run("agent:1", None) is True

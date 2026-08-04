@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services.share_rate_limit import reset_share_rate_limiter
 
@@ -240,6 +241,89 @@ def test_widget_task_create_returns_429_over_limit(
     assert first.status_code == 200, first.text
     second = client.post("/api/widget/chat/task/create", headers=guest, json=body)
     assert second.status_code == 429, second.text
+
+    # The admitted task carries the server-observed creator IP (#1108): the
+    # per-abuser key the run-quota gate reads back at the async chokepoint.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(first.json()["task_id"])).one()
+        assert task.agent_config.get("widget_client_ip") == "testclient"
+    finally:
+        db.close()
+
+
+def test_widget_auth_rate_limits_invalid_credentials_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The auth gate must run BEFORE credential resolution: repeated attempts
+    with an *invalid* key get 429 once the bucket trips, not an endless
+    sequence of DB-backed 403s."""
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"guest_id": "g", "widget_key": "no-such-widget-key"}
+    first = client.post("/api/widget/auth", json=body)
+    assert first.status_code == 403, first.text
+    second = client.post("/api/widget/auth", json=body)
+    assert second.status_code == 429, second.text
+
+
+def test_widget_auth_ticket_rotation_shares_one_credential_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-credential bucket keys on the ticket's signed owner claims, not
+    the raw ticket string: the embedded flow mints a fresh ticket per page
+    load, so rotating tickets for one agent must land in one bucket."""
+    key = _widget_agent_key("RL Widget Ticket Agent")
+
+    def _mint_ticket() -> str:
+        resp = client.post(
+            "/api/widget/embed-ticket",
+            json={"widget_key": key},
+            headers={"origin": "https://any-site.example"},
+        )
+        assert resp.status_code == 200, resp.text
+        return str(resp.json()["ticket"])
+
+    # Mint both tickets before tightening: /embed-ticket shares the auth
+    # buckets (its credential is the widget key, distinct from the ticket's
+    # agent entity, but the per-IP ceiling is common).
+    ticket_a = _mint_ticket()
+    ticket_b = _mint_ticket()
+
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    first = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "embed_ticket": ticket_a}
+    )
+    assert first.status_code == 200, first.text
+    # A *different* ticket for the same agent must hit the same bucket.
+    second = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "embed_ticket": ticket_b}
+    )
+    assert second.status_code == 429, second.text
+
+
+def test_widget_embed_ticket_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ticket minting is gated too (#1108): an ungated mint loop would do free
+    DB work + JWT signatures and refresh the caller's auth credential."""
+    key = _widget_agent_key("RL Widget Ticket Mint Agent")
+
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    def _mint():
+        return client.post(
+            "/api/widget/embed-ticket",
+            json={"widget_key": key},
+            headers={"origin": "https://any-site.example"},
+        )
+
+    assert _mint().status_code == 200
+    assert _mint().status_code == 429
 
 
 class _FakeWebSocket:
