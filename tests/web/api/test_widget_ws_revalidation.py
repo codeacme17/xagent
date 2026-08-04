@@ -358,19 +358,11 @@ def test_widget_ws_reconnect_after_revocation_reports_4003(
     channel: str,
     revocation: str,
 ) -> None:
-    """A guest reconnecting after revocation is rejected at connect with 4003.
-
-    This is the connect-time counterpart of the mid-session test above and the
-    far more common sequence: a revoked guest reloads the page, so the socket is
-    re-established from scratch and the denial happens during connect-time auth,
-    not on a live socket's next inbound message. Since #1057 the widget endpoint
-    accepts the handshake before auth, so the ``ensure_widget_*_available``
-    denial surfaces as a post-accept ``4003`` carrying the real reason — the
-    same recovery signal the mid-session and share paths already emit. Before
-    #1057 this close was pre-accept, so uvicorn collapsed it into a bare HTTP
-    403 (browser: ``1006``/``""``) and the guest could not tell a revoked widget
-    from a dropped network. All three revocation levers are covered, mirroring
-    the mid-session case.
+    """Connect-time counterpart of the mid-session test above: a revoked guest
+    reloads the page and reconnects, so the ``ensure_widget_*_available`` denial
+    happens at connect-time auth and surfaces as a post-accept ``4003`` (see the
+    module docstring for the accept-first rationale). All three revocation levers
+    are covered, mirroring the mid-session case.
     """
     guest = _build_guest(channel, monkeypatch)
     revoke: Callable[[], None] = getattr(guest, revocation)

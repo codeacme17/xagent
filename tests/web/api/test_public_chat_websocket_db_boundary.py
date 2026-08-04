@@ -285,12 +285,10 @@ async def test_public_access_websocket_initial_http_auth_failure_maps_to_4003(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
 ) -> None:
-    # Both endpoints now accept the handshake before auth and map an auth-time
-    # HTTPException to a 4003 close carrying the real reason, so the frontend
-    # recovery flow can act on it (#973 for share, #1057 for widget). This is
-    # the connect-time analogue of the per-message revalidation 4003 — the far
-    # more common sequence for a revoked widget guest, who reloads the page and
-    # reconnects rather than staying on a live socket.
+    # Both endpoints map an auth-time HTTPException to a 4003 (#973 for share,
+    # #1057 for widget): the connect-time analogue of the per-message
+    # revalidation 4003, and the common sequence for a revoked widget guest who
+    # reloads the page and reconnects rather than staying on a live socket.
     websocket = _SingleMessageWebSocket({"type": "chat", "message": "hello"})
     authorize = AsyncMock(
         side_effect=HTTPException(status_code=403, detail="Widget is unavailable")
@@ -327,8 +325,6 @@ async def test_public_access_websocket_initial_http_auth_failure_maps_to_4003(
             token="share-token",
         )
 
-    # Accept-first is what lets the 4003 reason survive the handshake instead of
-    # collapsing into a bare HTTP 403 (browser sees 1006/"").
     websocket.accept.assert_awaited_once()
     websocket.close.assert_awaited_once_with(
         code=4003,
@@ -384,6 +380,10 @@ async def test_public_access_websocket_initial_non_http_failure_stays_4001(
             token="share-token",
         )
 
+    # accept() runs unconditionally before the try/except that yields both the
+    # 4003 and 4001 outcomes, so pin it here too: a regression moving accept into
+    # only the HTTPException branch would slip past a 4001-only assertion.
+    websocket.accept.assert_awaited_once()
     websocket.close.assert_awaited_once_with(
         code=4001,
         reason="Authentication required",

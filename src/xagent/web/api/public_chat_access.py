@@ -1273,15 +1273,12 @@ async def public_chat_websocket_endpoint(
         return
 
     # Accept the handshake *before* the auth/access checks (#1057), matching the
-    # share path. uvicorn only preserves a close code + reason on the wire for a
-    # *post-accept* close: a pre-accept ``websocket.close()`` collapses into a
-    # bare HTTP 403 with an empty body, so the browser sees a rejected Upgrade
-    # (onclose code=1006, reason="") and the real code/reason never arrive.
-    # Accepting first makes the 4003 below a real close whose reason reaches the
-    # widget client — the same post-accept behavior the per-message revalidation
-    # loop already relies on — so a returning guest whose widget was revoked can
-    # tell an access denial apart from a transport failure and recover, instead
-    # of the generic 4001 the pre-accept close used to flatten it into.
+    # share path. uvicorn only preserves a close code + reason for a *post-accept*
+    # close; a pre-accept ``websocket.close()`` collapses into a bare HTTP 403
+    # (browser sees onclose code=1006, reason=""), discarding the denial. Accepting
+    # first makes the 4003 below a real close whose reason reaches the widget
+    # client, so a returning guest whose widget was revoked can tell an access
+    # denial apart from a transport failure and recover.
     await websocket.accept()
     try:
         principal = await _authorize_public_chat_websocket(
