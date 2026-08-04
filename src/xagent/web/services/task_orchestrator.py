@@ -62,6 +62,7 @@ from ..models.task import Task, TaskStatus
 from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
     DELIVERY_PENDING,
     mark_user_message_delivery_sync,
 )
@@ -718,6 +719,61 @@ async def _schedule_committed_turn(
                 task_id,
             )
     return handle
+
+
+def _reconcile_finalized_turn_delivery(
+    *,
+    task_id: int,
+    turn_id: str | None,
+    settlement_error: str | None,
+) -> None:
+    """Close a settled turn's delivery row so it can never orphan at ``pending``.
+
+    A user-message delivery row is written ``pending`` with the turn claim and
+    projected to ``dispatched`` right after scheduling. That projection is
+    best-effort: a pool timeout or a transient DB error leaves the row
+    ``pending`` even though the turn ran. Nothing else on the orchestrator path
+    advances it, so the session WS dedup probe classifies every
+    same-``client_message_id`` retry as an in-flight ``PENDING`` and rejects it
+    forever (#332).
+
+    Reconciling at finalize closes that window for every turn whose ``_runner``
+    reaches its ``finally`` (a hard process crash before then still orphans the
+    row and remains the job of TTL/durable recovery). Once the background run
+    has terminally settled its lease the turn is no longer in flight, so its
+    delivery is safe to close monotonically: ``completed`` on a clean
+    settlement, ``failed`` otherwise. The transition is monotonic, so an
+    already-terminal row — or a normally ``dispatched`` row on a later failure —
+    is left untouched rather than regressed. Callers MUST gate this on a
+    terminal settlement: a run deferred to TTL recovery may re-run and must keep
+    its ``pending`` row for that path to redrive.
+    """
+
+    if turn_id is None:
+        return
+    target = DELIVERY_COMPLETED if settlement_error is None else DELIVERY_FAILED
+    try:
+        mark_user_message_delivery_sync(task_id, turn_id, target)
+    except Exception as delivery_error:
+        # Best-effort projection. Leaving the row for durable recovery is strictly
+        # better than amplifying pool exhaustion or masking the turn's outcome.
+        if is_database_pool_timeout(delivery_error):
+            logger.error(
+                "task_id=%s component=turn-finalize-delivery database pool "
+                "checkout timed out; leaving delivery pending for durable "
+                "recovery: %s",
+                task_id,
+                delivery_error,
+                exc_info=True,
+            )
+        else:
+            logger.warning(
+                "task_id=%s component=turn-finalize-delivery projection to %s "
+                "failed; leaving delivery for durable recovery",
+                task_id,
+                target,
+                exc_info=True,
+            )
 
 
 def _turn_started_snapshot(
@@ -1683,6 +1739,7 @@ def _schedule_bg(
                         exc_info=True,
                     )
         finally:
+            turn_id = getattr(payload, "turn_id", None)
             if lease is not None:
                 try:
                     heartbeat_outcome = await stop_task_lease_heartbeat(
@@ -1712,6 +1769,7 @@ def _schedule_bg(
                     )
 
                 if not defer_settlement_to_ttl_recovery:
+                    lease_settled = False
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
@@ -1719,6 +1777,9 @@ def _schedule_bg(
                                 error_message=settlement_error,
                             )
                         )
+                        # Settle returned without raising, so the task reached a
+                        # terminal decision and this runner will not re-run it.
+                        lease_settled = True
                         if settled and broadcast_error_message is not None:
                             try:
                                 await websocket_manager.broadcast_to_task(
@@ -1748,7 +1809,32 @@ def _schedule_bg(
                             settle_err,
                             exc_info=True,
                         )
-            turn_id = getattr(payload, "turn_id", None)
+
+                    # Only once the lease is terminally settled is this turn
+                    # guaranteed not to re-run, so close its delivery row (#332):
+                    # a projection that never reached ``dispatched`` would
+                    # otherwise orphan the row at ``pending`` and reject every
+                    # same-id retry forever. If settle raised, the lease is
+                    # retained for TTL recovery, which may redrive the turn — the
+                    # ``pending`` row must survive for that path, exactly as it
+                    # does for the ``defer_settlement_to_ttl_recovery`` branch.
+                    if lease_settled:
+                        try:
+                            await run_db_io_cancellation_safe(
+                                lambda: _reconcile_finalized_turn_delivery(
+                                    task_id=task_id,
+                                    turn_id=turn_id,
+                                    settlement_error=settlement_error,
+                                )
+                            )
+                        except asyncio.CancelledError as exc:
+                            cleanup_cancellation = cleanup_cancellation or exc
+                        except Exception:
+                            logger.warning(
+                                "task %s finalize delivery reconciliation failed",
+                                task_id,
+                                exc_info=True,
+                            )
             try:
                 from .connector_runtime import pop_ephemeral_runtime_values
 
