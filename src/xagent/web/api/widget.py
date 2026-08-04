@@ -387,9 +387,22 @@ def _resolve_widget_auth_owner(
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
 async def authenticate_widget(
     request: WidgetAuthRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
 ) -> Any:
     """Authenticate widget and issue a guest token"""
+    # Abuse control (#1108): the widget key is public by design, so this
+    # unauthenticated endpoint — every call does DB lookups and mints a JWT —
+    # is reachable by anyone who can view the hosting page. Bucket per caller
+    # IP + per presented credential before any DB work, mirroring the share
+    # /auth gate. The credential is the raw embed ticket / widget key: the
+    # owning entity is not resolved until below, and the point is to throttle
+    # ahead of that resolution.
+    if not get_share_rate_limiter().allow_widget_auth(
+        remote_ip_from_request(http_request),
+        request.embed_ticket or request.widget_key or "",
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     owner = _resolve_widget_auth_owner(db, request)
 
     if owner.workforce is not None:
@@ -492,10 +505,22 @@ async def upload_widget_file(
 @widget_router.post("/chat/task/create", response_model=TaskCreateResponse)
 async def create_widget_task(
     request: TaskCreateRequest,
+    http_request: Request,
     widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
     """Create new chat task for widget guest."""
+    # Abuse control (#1108): task-create is the costly surface (each spawns an
+    # owner-billed run). Mirror of the share task-create throttle, but keyed on
+    # the widget entity + caller IP, NOT the client-supplied (rotatable) widget
+    # guest_id — the same keying as the widget upload / ws-turn gates.
+    entity_key = entity_rate_limit_key(
+        widget_info.widget_agent_id, widget_info.widget_workforce_id
+    )
+    if not get_share_rate_limiter().allow_widget_task_create(
+        entity_key, remote_ip_from_request(http_request)
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     return await create_public_chat_task(
         request=request,
         access_context=widget_info,

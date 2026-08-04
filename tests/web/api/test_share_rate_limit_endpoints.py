@@ -165,6 +165,83 @@ def test_share_upload_returns_429_over_limit(
     assert _upload().status_code == 429
 
 
+def _widget_agent_key(name: str) -> str:
+    """Create a published agent, enable its widget, and return the widget key."""
+    db = _direct_db_session()
+    try:
+        agent = Agent(
+            user_id=_user_id(),
+            name=name,
+            description="d",
+            instructions="i",
+            execution_mode="balanced",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+    resp = client.put(
+        f"/api/agents/{agent_id}",
+        headers=_admin_headers(),
+        json={"widget_enabled": True, "allowed_domains": ["*"]},
+    )
+    assert resp.status_code == 200, resp.text
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        assert agent.widget_key
+        return str(agent.widget_key)
+    finally:
+        db.close()
+
+
+def _widget_guest_headers(widget_key: str) -> dict[str, str]:
+    resp = client.post(
+        "/api/widget/auth",
+        json={"guest_id": "rl-widget-guest", "widget_key": widget_key},
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def test_widget_auth_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _widget_agent_key("RL Widget Auth Agent")
+
+    # Tighten the per-credential bucket only after the key exists; the IP
+    # ceiling (300/min default) stays clear so this proves the credential gate.
+    monkeypatch.setenv("XAGENT_WIDGET_AUTH_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"guest_id": "g", "widget_key": key}
+    first = client.post("/api/widget/auth", json=body)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/widget/auth", json=body)
+    assert second.status_code == 429, second.text
+
+
+def test_widget_task_create_returns_429_over_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _widget_agent_key("RL Widget Create Agent")
+    guest = _widget_guest_headers(key)
+
+    # Tighten the per-caller-IP bucket (the tight abuser gate) after the guest
+    # token is minted, since auth has its own separate bucket.
+    monkeypatch.setenv("XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    body = {"title": "hi", "description": "hi"}
+    first = client.post("/api/widget/chat/task/create", headers=guest, json=body)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/widget/chat/task/create", headers=guest, json=body)
+    assert second.status_code == 429, second.text
+
+
 class _FakeWebSocket:
     """Minimal websocket double: yields queued frames, then disconnects."""
 

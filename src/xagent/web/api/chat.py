@@ -990,28 +990,76 @@ def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
         return int(user_id) if user_id is not None else None
 
 
-def _load_task_share_quota_config_isolated(task_id: int) -> dict[str, Any] | None:
-    """Load the share-quota markers (#973) in a worker-owned short Session.
+def _load_task_public_run_quota_config_isolated(
+    task_id: int,
+) -> dict[str, Any] | None:
+    """Load the public-run-quota markers in a worker-owned short Session.
 
-    Returns the task's ``agent_config`` only when it marks a share task
-    (``auth_mode == "share"``); ``None`` skips the share quota gate. Kept
-    separate from :func:`_load_task_run_gate_user_id_isolated` so the owner
-    gate's return contract (an ``int | None`` that tests monkeypatch) stays
-    untouched.
+    Returns the task's ``agent_config`` only when it marks a public run that
+    bills the owner — a share task (``auth_mode == "share"``, #973) or a widget
+    task (``auth_mode == "widget"``, #1108); ``None`` skips the quota gate for
+    everything else. Kept separate from
+    :func:`_load_task_run_gate_user_id_isolated` so the owner gate's return
+    contract (an ``int | None`` that tests monkeypatch) stays untouched.
     """
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
-    with SessionLocal() as share_db:
+    with SessionLocal() as quota_db:
         agent_config = (
-            share_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
+            quota_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
         )
-        if (
-            isinstance(agent_config, Mapping)
-            and agent_config.get("auth_mode") == "share"
+        if isinstance(agent_config, Mapping) and agent_config.get("auth_mode") in (
+            "share",
+            "widget",
         ):
             return dict(agent_config)
         return None
+
+
+def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
+    """Apply the per-entity run quota for a public (share/widget) task.
+
+    Returns ``True`` when the run is admitted (or cannot be keyed, matching the
+    original share behaviour of falling through rather than blocking a run it
+    cannot attribute), ``False`` when the rolling quota is exhausted.
+
+    Share tasks carry a server-minted ``guest_id`` and are gated per link +
+    per guest (#973). Widget tasks are gated per entity only (#1108): their
+    ``guest_id`` is client-supplied (rotatable at will) and the caller IP is
+    unavailable at this async chokepoint, so a per-guest sub-quota would be a
+    no-op against a deliberate abuser — the per-IP widget task-create / turn
+    gates carry that dimension instead.
+    """
+    from ..services.share_rate_limit import (
+        entity_rate_limit_key,
+        get_share_rate_limiter,
+    )
+
+    auth_mode = quota_config.get("auth_mode")
+    limiter = get_share_rate_limiter()
+
+    if auth_mode == "widget":
+        widget_agent_id = quota_config.get("widget_agent_id")
+        widget_workforce_id = quota_config.get("widget_workforce_id")
+        entity_key = entity_rate_limit_key(
+            int(widget_agent_id) if widget_agent_id is not None else None,
+            int(widget_workforce_id) if widget_workforce_id is not None else None,
+        )
+        if entity_key is None:
+            return True
+        return limiter.allow_widget_run(entity_key)
+
+    guest_id = quota_config.get("guest_id")
+    agent_share_id = quota_config.get("share_agent_id")
+    workforce_id = quota_config.get("share_workforce_id")
+    share_key = entity_rate_limit_key(
+        int(agent_share_id) if agent_share_id is not None else None,
+        int(workforce_id) if workforce_id is not None else None,
+    )
+    if not share_key or not isinstance(guest_id, str) or not guest_id:
+        return True
+    return limiter.allow_run(share_key, guest_id)
 
 
 def _check_task_run_gate_on_event_loop(
@@ -2893,45 +2941,33 @@ class AgentServiceManager:
                     raise
                 logger.warning("Quota gate check failed open", exc_info=True)
 
-        # Per-share run quota (#973): the run gate above bounds the OWNER's
-        # team quota, but every anonymous share run bills the owner, so one
-        # public link could still drain the whole team quota. This adds a
-        # per-link + per-guest rolling ceiling on top, keyed off the share
-        # markers PR1 stamped into agent_config. Only share tasks are gated;
-        # fails open (availability) like the run gate above, with the same
-        # pool-timeout escalation so a stalled pool doesn't cascade.
+        # Per-link run quota (#973 share, #1108 widget): the run gate above
+        # bounds the OWNER's team quota, but every anonymous public run bills
+        # the owner, so one public link could still drain the whole team quota.
+        # This adds a rolling per-entity ceiling on top, keyed off the markers
+        # stamped into agent_config at task creation. Only public tasks are
+        # gated; fails open (availability) like the run gate above, with the
+        # same pool-timeout escalation so a stalled pool doesn't cascade.
         if tracker_task_id:
             try:
-                share_config = await run_db_io_cancellation_safe(
-                    lambda: _load_task_share_quota_config_isolated(int(tracker_task_id))
+                quota_config = await run_db_io_cancellation_safe(
+                    lambda: _load_task_public_run_quota_config_isolated(
+                        int(tracker_task_id)
+                    )
                 )
-                if share_config is not None:
-                    from ..services.share_rate_limit import (
-                        entity_rate_limit_key,
-                        get_share_rate_limiter,
+                if quota_config is not None and not _admit_public_run(quota_config):
+                    reason_message = (
+                        "This shared link has reached its usage limit. "
+                        "Please try again later."
                     )
-
-                    guest_id = share_config.get("guest_id")
-                    workforce_id = share_config.get("share_workforce_id")
-                    agent_share_id = share_config.get("share_agent_id")
-                    share_key = entity_rate_limit_key(
-                        int(agent_share_id) if agent_share_id is not None else None,
-                        int(workforce_id) if workforce_id is not None else None,
-                    )
-                    if share_key and isinstance(guest_id, str) and guest_id:
-                        if not get_share_rate_limiter().allow_run(share_key, guest_id):
-                            reason_message = (
-                                "This shared link has reached its usage limit. "
-                                "Please try again later."
-                            )
-                            return {
-                                "success": False,
-                                "status": "quota_exceeded",
-                                "output": reason_message,
-                                "error": reason_message,
-                                "error_code": "share_run_quota_exceeded",
-                                "error_details": None,
-                            }
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": reason_message,
+                        "error": reason_message,
+                        "error_code": "share_run_quota_exceeded",
+                        "error_details": None,
+                    }
             except Exception as exc:
                 if is_database_pool_timeout(exc):
                     logger.error(

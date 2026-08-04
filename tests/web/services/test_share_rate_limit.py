@@ -200,6 +200,131 @@ def test_widget_ws_turn_entity_ceiling_trips_across_ips(
     assert limiter.allow_widget_ws_turn("workforce:8", "4.4.4.4") is True
 
 
+def test_widget_auth_per_credential_bucket_trips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="2/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is True
+    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is True
+    assert limiter.allow_widget_auth("1.1.1.1", "key-a") is False
+    # A different credential on the same IP has an independent bucket.
+    assert limiter.allow_widget_auth("1.1.1.1", "key-b") is True
+
+
+def test_widget_auth_per_ip_ceiling_trips_across_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rotating the widget key/ticket must not escape the per-IP ceiling."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="100/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_widget_auth("9.9.9.9", "key-a") is True
+    assert limiter.allow_widget_auth("9.9.9.9", "key-b") is True
+    assert limiter.allow_widget_auth("9.9.9.9", "key-c") is False
+
+
+def test_widget_auth_is_isolated_from_share_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget auth buckets must not consume the share auth budget."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="1/minute",
+        XAGENT_SHARE_AUTH_RATE_LIMIT="5/minute",
+        XAGENT_SHARE_AUTH_IP_RATE_LIMIT="5/minute",
+    )
+    assert limiter.allow_widget_auth("1.1.1.1", "tok") is True
+    assert limiter.allow_widget_auth("1.1.1.1", "tok") is False
+    # Same IP + token on the share endpoint still admits from its own budget.
+    assert limiter.allow_auth("tok", "1.1.1.1") is True
+
+
+def test_widget_task_create_per_ip_bucket_trips_across_entities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-IP is the tight abuser bucket: the widget guest_id is client-supplied
+    (rotatable), so rotating the entity must not escape the per-caller gate."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT="100/minute",
+        XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_widget_task_create("agent:1", "9.9.9.9") is True
+    assert limiter.allow_widget_task_create("workforce:2", "9.9.9.9") is True
+    assert limiter.allow_widget_task_create("agent:3", "9.9.9.9") is False
+    # A different caller is unaffected.
+    assert limiter.allow_widget_task_create("agent:1", "8.8.8.8") is True
+
+
+def test_widget_task_create_entity_ceiling_trips_across_ips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-entity is the loose backstop bounding total task-create volume through
+    one widget, across many callers."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT="2/minute",
+        XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_task_create("workforce:7", "1.1.1.1") is True
+    assert limiter.allow_widget_task_create("workforce:7", "2.2.2.2") is True
+    assert limiter.allow_widget_task_create("workforce:7", "3.3.3.3") is False
+    # A different widget entity has its own bucket.
+    assert limiter.allow_widget_task_create("workforce:8", "4.4.4.4") is True
+
+
+def test_widget_task_create_ip_denial_does_not_consume_entity_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-IP denial must not burn an entity slot (paired non-destructive
+    test→hit), so other callers of the same widget still fit."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT="3/minute",
+        XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT="1/minute",
+    )
+    assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is False  # IP trips
+    # The denials above didn't consume the entity budget: two fresh callers fit.
+    assert limiter.allow_widget_task_create("agent:1", "2.2.2.2") is True
+    assert limiter.allow_widget_task_create("agent:1", "3.3.3.3") is True
+
+
+def test_widget_run_quota_per_entity_trips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limiter = _limiter_with(monkeypatch, XAGENT_WIDGET_RUN_QUOTA="2/day")
+    assert limiter.allow_widget_run("agent:1") is True
+    assert limiter.allow_widget_run("agent:1") is True
+    assert limiter.allow_widget_run("agent:1") is False
+    # A different widget entity has its own rolling quota.
+    assert limiter.allow_widget_run("workforce:2") is True
+
+
+def test_widget_run_quota_is_isolated_from_share_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget run quota must not consume the share run budget (same key
+    string is a different namespace)."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_RUN_QUOTA="1/day",
+        XAGENT_SHARE_RUN_QUOTA="5/day",
+        XAGENT_SHARE_RUN_GUEST_QUOTA="5/hour",
+    )
+    assert limiter.allow_widget_run("agent:1") is True
+    assert limiter.allow_widget_run("agent:1") is False
+    # The share run quota under the same entity key still admits.
+    assert limiter.allow_run("agent:1", "g1") is True
+
+
 def test_run_quota_per_share_and_per_guest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -267,3 +392,6 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_widget_ws_connect("1.1.1.1") is True
     assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is True
     assert limiter.allow_run("agent:1", "g") is True
+    assert limiter.allow_widget_auth("1.1.1.1", "key") is True
+    assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_run("agent:1") is True

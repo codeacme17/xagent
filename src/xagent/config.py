@@ -128,6 +128,11 @@ WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
 WIDGET_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT"
 WIDGET_WS_TURN_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT"
 WIDGET_WS_TURN_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_RATE_LIMIT"
+WIDGET_AUTH_RATE_LIMIT = "XAGENT_WIDGET_AUTH_RATE_LIMIT"
+WIDGET_AUTH_IP_RATE_LIMIT = "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT"
+WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
+WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
+WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -977,6 +982,67 @@ def get_widget_ws_turn_rate_limit() -> str:
     legitimate guests).
     """
     return _get_rate_limit(WIDGET_WS_TURN_RATE_LIMIT, "240/minute")
+
+
+def get_widget_auth_rate_limit() -> str:
+    """Per-credential limit on ``POST /api/widget/auth`` (#1108).
+
+    The widget mirror of :func:`get_share_auth_rate_limit`, in its own bucket
+    so probes against one public channel cannot consume the other's budget.
+    Keyed on the presented credential (embed ticket or widget key) rather than
+    a resolved entity, because the gate runs before any DB lookup; the per-IP
+    ceiling below bounds a single client across credentials.
+    """
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "60/minute")
+
+
+def get_widget_auth_ip_rate_limit() -> str:
+    """Per-IP ceiling on ``POST /api/widget/auth`` across all widget keys (#1108).
+
+    The widget mirror of :func:`get_share_auth_ip_rate_limit`. Bounds one
+    caller minting guest tokens (each call does DB lookups and signs a JWT)
+    regardless of how many widget keys they cycle through.
+    """
+    return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_widget_task_create_rate_limit() -> str:
+    """Per-widget-entity limit on public widget task creation (#1108).
+
+    The loose backstop bounding total task-create volume through one embedded
+    agent/workforce across all callers (one widget serves many legitimate
+    guests). The per-IP bucket below is the tighter per-abuser gate; unlike the
+    share path this cannot key on the guest, whose id is client-supplied and
+    rotatable at will.
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "120/minute")
+
+
+def get_widget_task_create_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget task creation (#1108).
+
+    The tighter bucket: task creation is the costly surface (each spawns an
+    owner-billed run), and the caller IP is the only trustworthy per-abuser
+    key on the widget path. Numerically matches the widget upload/turn IP
+    default; N guests behind one NAT egress share this budget, so raise it for
+    deployments with large shared-egress populations (and set
+    XAGENT_TRUSTED_PROXY_HOPS behind a reverse proxy).
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_run_quota() -> str:
+    """Per-widget-entity rolling run quota (#1108).
+
+    The widget mirror of :func:`get_share_run_quota`, in its own bucket so a
+    popular/abused widget cannot drain the owner's whole team quota. Keyed on
+    the embedded agent/workforce only: unlike the share path there is no
+    per-guest sub-quota, because the widget ``guest_id`` is client-supplied
+    and rotatable at will, and the caller IP is not available at the async
+    ``execute_task`` chokepoint where this gate runs. Per-abuser bursts are
+    bounded instead by the per-IP widget task-create and websocket-turn gates.
+    """
+    return _get_rate_limit(WIDGET_RUN_QUOTA, "500/day")
 
 
 def get_share_run_quota() -> str:

@@ -43,6 +43,11 @@ from ...config import (
     get_share_upload_rate_limit,
     get_share_ws_connect_ip_rate_limit,
     get_share_ws_turn_rate_limit,
+    get_widget_auth_ip_rate_limit,
+    get_widget_auth_rate_limit,
+    get_widget_run_quota,
+    get_widget_task_create_ip_rate_limit,
+    get_widget_task_create_rate_limit,
     get_widget_upload_ip_rate_limit,
     get_widget_upload_rate_limit,
     get_widget_ws_connect_ip_rate_limit,
@@ -94,8 +99,13 @@ _WIDGET_UPLOAD_IP_NAMESPACE = "widget-upload-ip"
 _WIDGET_WS_TURN_ENTITY_NAMESPACE = "widget-ws-turn"
 _WIDGET_WS_TURN_IP_NAMESPACE = "widget-ws-turn-ip"
 _WIDGET_WS_CONNECT_IP_NAMESPACE = "widget-ws-connect-ip"
+_WIDGET_AUTH_CREDENTIAL_NAMESPACE = "widget-auth"
+_WIDGET_AUTH_IP_NAMESPACE = "widget-auth-ip"
+_WIDGET_TASK_CREATE_ENTITY_NAMESPACE = "widget-task-create"
+_WIDGET_TASK_CREATE_IP_NAMESPACE = "widget-task-create-ip"
 _RUN_SHARE_NAMESPACE = "share-run"
 _RUN_GUEST_NAMESPACE = "share-run-guest"
+_WIDGET_RUN_NAMESPACE = "widget-run"
 
 
 def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
@@ -187,10 +197,23 @@ class ShareRateLimiter:
         self._widget_ws_turn_entity_limit = _parse_rate(
             get_widget_ws_turn_rate_limit(), fallback="240/minute"
         )
+        self._widget_auth_credential_limit = _parse_rate(
+            get_widget_auth_rate_limit(), fallback="60/minute"
+        )
+        self._widget_auth_ip_limit = _parse_rate(
+            get_widget_auth_ip_rate_limit(), fallback="300/minute"
+        )
+        self._widget_task_create_entity_limit = _parse_rate(
+            get_widget_task_create_rate_limit(), fallback="120/minute"
+        )
+        self._widget_task_create_ip_limit = _parse_rate(
+            get_widget_task_create_ip_rate_limit(), fallback="60/minute"
+        )
         self._run_share_limit = _parse_rate(get_share_run_quota(), fallback="500/day")
         self._run_guest_limit = _parse_rate(
             get_share_run_guest_quota(), fallback="60/hour"
         )
+        self._widget_run_limit = _parse_rate(get_widget_run_quota(), fallback="500/day")
 
     @_fail_open
     def allow_auth(self, share_token: str, remote_ip: str | None) -> bool:
@@ -311,6 +334,30 @@ class ShareRateLimiter:
         )
 
     @_fail_open
+    def allow_widget_auth(self, remote_ip: str | None, credential: str) -> bool:
+        """Count one widget auth attempt; False when a bucket is exceeded (#1108).
+
+        The widget mirror of :meth:`allow_auth`, in its own buckets so probes
+        against one public channel cannot consume the other's budget. Two
+        buckets must both admit: per caller IP (across all widget keys) and per
+        presented credential. The credential is the raw embed ticket / widget
+        key string, not a resolved entity, because this gate runs *before* the
+        DB lookups and JWT mint it is meant to throttle — the entity is not
+        known yet. Per caller IP first (like :meth:`allow_auth`), so credential
+        rotation cannot escape the per-IP ceiling.
+        """
+        ip_key = remote_ip or "unknown"
+        if not self._limiter.hit(
+            self._widget_auth_ip_limit, _WIDGET_AUTH_IP_NAMESPACE, ip_key
+        ):
+            return False
+        return self._limiter.hit(
+            self._widget_auth_credential_limit,
+            _WIDGET_AUTH_CREDENTIAL_NAMESPACE,
+            credential or "unknown",
+        )
+
+    @_fail_open
     def allow_upload(self, guest_id: str) -> bool:
         """Count one share upload for a guest; False when exceeded."""
         return self._limiter.hit(
@@ -333,6 +380,29 @@ class ShareRateLimiter:
             remote_ip,
             self._widget_upload_entity_limit,
             _WIDGET_UPLOAD_ENTITY_NAMESPACE,
+            entity_key,
+        )
+
+    @_fail_open
+    def allow_widget_task_create(
+        self, entity_key: str | None, remote_ip: str | None
+    ) -> bool:
+        """Count one widget task-create; False when a bucket is exceeded (#1108).
+
+        The widget mirror of :meth:`allow_task_create`. Keyed on the widget
+        entity (``agent:<id>`` / ``workforce:<id>``) plus the caller IP — NOT
+        the widget ``guest_id``, which unlike the share path is client-supplied
+        and therefore rotatable at will (the same reasoning as
+        :meth:`allow_widget_upload`). Task-create is the costly surface (each
+        spawns an owner-billed run), so the per-IP bucket is the tight
+        per-abuser gate and the per-entity bucket the loose backstop.
+        """
+        return self._admit_ip_and_entity(
+            self._widget_task_create_ip_limit,
+            _WIDGET_TASK_CREATE_IP_NAMESPACE,
+            remote_ip,
+            self._widget_task_create_entity_limit,
+            _WIDGET_TASK_CREATE_ENTITY_NAMESPACE,
             entity_key,
         )
 
@@ -364,6 +434,24 @@ class ShareRateLimiter:
         self._limiter.hit(self._run_share_limit, _RUN_SHARE_NAMESPACE, share_key)
         self._limiter.hit(self._run_guest_limit, _RUN_GUEST_NAMESPACE, guest_id)
         return True
+
+    @_fail_open
+    def allow_widget_run(self, entity_key: str | None) -> bool:
+        """Count one owner-billed widget run; False when the quota is exceeded.
+
+        The widget mirror of :meth:`allow_run`, in its own bucket so a
+        popular/abused widget cannot drain the owner's whole team quota. Keyed
+        on the widget entity (``agent:<id>`` / ``workforce:<id>``) only: unlike
+        the share path there is no per-guest sub-quota, because the widget
+        ``guest_id`` is client-supplied (rotatable at will) and the caller IP
+        is not available at the async ``execute_task`` chokepoint where this
+        gate runs. Per-abuser bursts are bounded instead by the per-IP widget
+        task-create and websocket-turn gates. Rolling, not cumulative, so a
+        busy-but-legitimate widget self-clears rather than being bricked.
+        """
+        return self._limiter.hit(
+            self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key or "unknown"
+        )
 
 
 _lock = threading.Lock()

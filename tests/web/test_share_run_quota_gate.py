@@ -112,3 +112,63 @@ async def test_share_run_quota_skips_non_share_task(
     )
 
     assert result.get("error_code") != "share_run_quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_blocks_widget_task(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The widget run quota (#1108) is keyed on the entity only; "0/day" leaves
+    # no room, so the very first widget run is refused. The share quota stays
+    # wide open, proving the widget bucket gates independently.
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
+    monkeypatch.setenv("XAGENT_SHARE_RUN_QUOTA", "500/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            # Client-supplied guest_id must NOT be what gates the run.
+            "guest_id": "rotatable-guest",
+            "widget_agent_id": 4242,
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "quota_exceeded"
+    assert result["error_code"] == "share_run_quota_exceeded"
+    assert "usage limit" in result["output"]
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_admits_when_entity_unkeyable(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A widget task with no entity marker cannot be attributed, so it falls
+    through rather than being blocked (matches the share fall-through)."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={"auth_mode": "widget", "guest_id": "g"},
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result.get("error_code") != "share_run_quota_exceeded"
