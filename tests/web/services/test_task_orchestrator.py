@@ -3257,6 +3257,51 @@ async def test_runner_finalize_reconciles_orphaned_pending_delivery(
 
 
 @pytest.mark.asyncio
+async def test_runner_finalize_reconciles_alongside_a_genuinely_completed_turn(
+    db_session,
+) -> None:
+    """A real success settles through ``finish_turn``'s COMPLETED branch and
+    closes the orphaned delivery row in the same finalize.
+
+    The sibling success test reaches ``completed`` delivery via
+    ``settlement_error is None`` while the task itself lands FAILED (its mocked
+    runtime never signals success), so it cannot catch a regression in
+    ``finish_turn``'s COMPLETED branch. Here the fake runtime commits
+    COMPLETED plus an assistant message — what that branch reads to write
+    ``output`` — so task terminalization and delivery reconciliation are
+    asserted together.
+    """
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-real-success"
+    )
+
+    async def succeeding_execute(*args, **kwargs):
+        with sessionmaker(bind=get_engine())() as inner:
+            row = inner.query(Task).filter(Task.id == task.id).one()
+            row.status = TaskStatus.COMPLETED
+            inner.add(
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=int(user.id),
+                    role="assistant",
+                    content="here is your answer",
+                    message_type="chat_response",
+                )
+            )
+            inner.commit()
+
+    with _finalize_runner_patches(lease, execute=succeeding_execute):
+        await _spawn_finalize_runner(task, user, payload)
+
+    assert _delivery_status(db_session, "turn-e2e-real-success") == DELIVERY_COMPLETED
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.COMPLETED
+    assert stored.output == "here is your answer"
+    assert stored.runner_id is None
+
+
+@pytest.mark.asyncio
 async def test_runner_finalize_leaves_pending_when_deferred_to_ttl_recovery(
     db_session,
 ) -> None:

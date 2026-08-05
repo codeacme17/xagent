@@ -782,8 +782,12 @@ def _reconcile_finalized_turn_delivery(
     same content — so ``failed`` is only safe with positive evidence the
     message was never consumed.
 
-    - ``settlement_error is None`` → ``completed``: the turn ran to a clean
-      settlement.
+    - ``settlement_error is None`` → ``completed``: the run returned without
+      raising. Note this does not certify success — ``execute_task_background``
+      may set ``task.status = FAILED`` internally and return normally, leaving
+      ``settlement_error`` unset — but both ``completed`` and ``dispatched``
+      read identically downstream ("delivered, do not retry"), so the
+      distinction has no client-visible effect.
     - error and ``execution_started`` → ``dispatched``: the run may have
       consumed the message (and produced side effects) before failing, so the
       one certain fact is "no longer in flight". A retry invitation here would
@@ -795,13 +799,20 @@ def _reconcile_finalized_turn_delivery(
     - error and not ``execution_started`` → ``failed``:
       ``execute_task_background`` was never invoked (setup failed, or the run
       was cancelled first), so the message was provably never consumed and a
-      fresh-id retry is safe.
+      fresh-id retry is safe. The accepted cost is that the ``failed`` row
+      remains visible in the transcript (no history-loading path filters on
+      ``delivery_status``), so a fresh-id resend can show the user's message
+      twice — a pre-existing property of every ``failed`` writer, tracked in
+      xorbitsai/xagent-saas#417, and strictly better than wedging the client
+      on a ``pending`` row forever.
 
-    The transition is monotonic; an already-terminal row — or a normally
-    ``dispatched`` row on a later failure — is left untouched rather than
-    regressed. The final delivery state is NOT a proxy for the turn's outcome:
-    it answers "may this client_message_id be retried?", never "did the turn
-    succeed?".
+    The transition is monotonic — it never regresses — but only ``completed``
+    and ``failed`` are terminal: ``dispatched`` still has an outgoing edge to
+    ``completed``, which is how a turn that failed its projection but later
+    settles cleanly still closes. An already-terminal row, or a ``dispatched``
+    row on a later failure, is left untouched. The final delivery state is NOT
+    a proxy for the turn's outcome: it answers "may this client_message_id be
+    retried?", never "did the turn succeed?".
     """
 
     if turn_id is None:
@@ -1892,9 +1903,12 @@ def _schedule_bg(
                     # KNOWN GAP: rows skipped here stay ``pending`` permanently —
                     # lease TTL recovery terminalizes the *task* only and nothing
                     # in this tree redrives delivery rows. The skip is still
-                    # correct (a non-authoritative close is worse); the residual
-                    # window is tracked as a follow-up to
-                    # xorbitsai/xagent-saas#332.
+                    # correct (a non-authoritative close is worse). Note the
+                    # deferral triggers correlate with this bug's own trigger:
+                    # post-schedule dispatch, setup/run and settle all draw from
+                    # the same DB pool, so one exhaustion event can both orphan
+                    # the row and defer the settlement that would have closed it.
+                    # Tracked in xorbitsai/xagent-saas#409.
                     if lease_settled and not skip_delivery_reconciliation:
                         try:
                             await run_db_io_cancellation_safe(
