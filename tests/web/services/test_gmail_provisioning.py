@@ -1545,7 +1545,9 @@ def test_reconcile_bounds_gmail_trigger_lookup_to_each_watch_page(
     assert result.changed == 2
     assert len(trigger_selects) == 2
     assert all(" IN (" in statement for statement in trigger_selects)
-    assert all("SELECT DISTINCT" in statement for statement in trigger_selects)
+    # The projection includes the ``json`` config column, which PostgreSQL
+    # cannot compare, so the lookup must never be a SELECT DISTINCT.
+    assert not any("DISTINCT" in statement.upper() for statement in trigger_selects)
     assert len(watch_selects) == 3
     assert all("LIMIT" in statement for statement in watch_selects)
 
@@ -2339,6 +2341,33 @@ def test_concurrent_first_time_creations_race_on_the_unique_constraint(
     assert str(rows[0].callback_id) == results["a"]
     assert rows[0].status == TriggerProvisioningStatus.PENDING.value
     assert rows[0].email == "owner@gmail.example"
+
+
+def test_postgresql_gmail_trigger_lookup_selects_the_json_config(
+    pg_session: Session,
+) -> None:
+    """Resolve trigger bindings on the engine that rejects ``json`` equality.
+
+    The lookup projects ``agent_triggers.config``, a ``JSON`` column. SQLite
+    compares it happily, so only PostgreSQL can prove the query never asks for
+    an equality operator the type does not have: a SELECT DISTINCT here fails
+    with "could not identify an equality operator for type json", which broke
+    every Gmail OAuth (re)connect, the retry sweep, and push reconciliation.
+    Two triggers share one binding so deduplication is still covered.
+    """
+    db = pg_session
+    user = _create_user(db)
+    agent = _create_agent(db, user)
+    account = _create_oauth(db, user)
+    _create_gmail_trigger(db, user, agent, account)
+    _create_gmail_trigger(db, user, agent, account)
+
+    referenced = gmail_provisioning._referenced_gmail_oauth_account_ids(
+        db,
+        [(int(account.id), str(account.email or ""))],
+    )
+
+    assert referenced == {int(account.id)}
 
 
 def test_provisioning_requires_account_email(db_session: Session) -> None:
