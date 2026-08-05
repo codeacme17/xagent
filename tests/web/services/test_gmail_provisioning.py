@@ -2068,6 +2068,7 @@ def pg_session():
         Base.metadata.drop_all(bind=engine)
 
 
+@pytest.mark.postgresql
 def test_postgresql_transition_lock_contends_per_oauth_account(
     pg_session: Session,
 ) -> None:
@@ -2131,6 +2132,7 @@ def test_postgresql_transition_lock_contends_per_oauth_account(
     assert errors == []
 
 
+@pytest.mark.postgresql
 def test_release_and_reprovision_contend_on_the_watch_state_lock(
     pg_session: Session,
 ) -> None:
@@ -2277,6 +2279,7 @@ def test_first_time_creation_race_adopts_winner_row(
     assert db_session.query(GmailWatchState).count() == 1
 
 
+@pytest.mark.postgresql
 def test_concurrent_first_time_creations_race_on_the_unique_constraint(
     pg_session: Session,
 ) -> None:
@@ -2343,7 +2346,8 @@ def test_concurrent_first_time_creations_race_on_the_unique_constraint(
     assert rows[0].email == "owner@gmail.example"
 
 
-def test_postgresql_gmail_trigger_lookup_selects_the_json_config(
+@pytest.mark.postgresql
+def test_gmail_trigger_lookup_resolves_bindings_on_postgresql(
     pg_session: Session,
 ) -> None:
     """Resolve trigger bindings on the engine that rejects ``json`` equality.
