@@ -22,6 +22,7 @@ from ...config import (
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
 )
+from ...core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     MAX_TASK_RUNTIME_EXTENSIONS,
@@ -57,23 +58,117 @@ _PUBLIC_METADATA_STATUS_RESERVE_BYTES = 2 * 1024
 # extension names one task actually bound to. Reusing the existing JSON column
 # keeps the per-task binding record migration-free.
 TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
+# Reserved ``tasks.agent_config`` key holding the server-validated list of
+# uploaded file ids bound to one task. Two writers own the value they
+# substitute here -- ``chat.py``'s ``_build_task_agent_config`` and
+# ``workforce_snapshot.py``'s ``build_workforce_task_config`` -- this
+# constant names the key so the sanitizer and both boundaries refer to the
+# same string.
+SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
-# wholesale, so anything the server later reads back as authoritative has to be
-# stripped from that copy first -- otherwise a client can pre-seed it.
+# wholesale, so anything the server later reads back as authoritative has to
+# be stripped from that copy first -- otherwise a client can pre-seed it.
+# Refusal has to happen at that copy, not afterwards: a value already sitting
+# in this column cannot be judged trustworthy after the fact, because any
+# provenance marker vouching for it would live in the same client-writable
+# field as the value itself -- the copy point is the only place the
+# distinction between client-seeded and server-written still exists.
 #
-# The public-channel identity/quota markers are stripped here because the run
-# quota (#1108) now reads them back as authoritative at the ``execute_task``
-# chokepoint: an anonymous widget/share guest must not be able to inject an
-# ``auth_mode`` or an entity id (which selects the run-quota bucket) into their
-# own task-create body. Every seeding boundary re-stamps the markers it owns
-# *after* calling this helper, so stripping can never drop a server value. The
-# widget-create path additionally writes both entity markers explicitly (one as
-# ``None``) as belt-and-suspenders. ``execution_scope`` / ``a2a_context_id``
-# remain pass-through by long-standing behavior and are tracked separately.
+# This column's key space is not closed inside this repo: closed-source
+# distributions register providers at startup (see this module's docstring
+# above), and those providers get a ``session_factory``
+# (``xagent.core.task_runtime.TaskRuntimeContext.session_factory``) they can
+# use to write this column directly. An inventory of every reserved key here
+# would only be a claim a future reader trusts instead of re-deriving, so this
+# comment holds none -- the enumeration is #1095's job.
+#
+# Most server writers layer on top of an already-sanitized dict (all three
+# ``sanitize_client_agent_config`` call sites -- ``public_chat_access.py``'s
+# ``create_public_chat_task`` and ``create_share_chat_task``, and ``chat.py``'s
+# ``_build_task_agent_config`` -- sanitize then layer) or build ``agent_config``
+# off this path entirely -- e.g. ``build_workforce_task_config``
+# (``workforce_snapshot.py``) and ``_attach_workforce_task_to_trigger_run``
+# (``services/triggers.py``, via ``_trigger_execution_context``). An
+# enumeration of every off-path writer here would go stale the same way an
+# inventory of reserved keys would (see above), so this comment names
+# examples rather than claiming completeness. Exactly one writer passes
+# *through* the sanitizer instead: ``websocket.py``'s
+# ``handle_build_preview_execution`` assembles a config from the WS message
+# (``instructions``, ``knowledge_bases``, ``skills``, ``tool_categories``, and
+# ``preview_agent_id`` all come from ``message_data.get(...)``; only
+# ``is_preview: True`` is a handler-set literal) and hands it to
+# ``TaskCreateRequest(agent_config=...)`` passed into ``create_task``, layered
+# below the sanitizer rather than above it. ``chat.py``'s ``create_task`` only
+# re-layers ``is_preview`` onto the sanitized dict when ``request.is_preview``
+# is ``True``; the WS handler never sets that field on ``TaskCreateRequest``
+# (``websocket.py``'s ``handle_build_preview_execution``), so it defaults to
+# ``False`` (:data:`xagent.web.schemas.chat.TaskCreateRequest.is_preview`) and
+# the re-layer never fires here. So reserving ``is_preview`` or
+# ``preview_agent_id`` would still silently strip them from this config with
+# nothing to restore them, breaking agent-builder preview. That it cannot be
+# reserved is not a statement that it is safe: three of its readers resolve it
+# through an ownership-scoped query, but the SSH tools' ``_agent_id_from_task``
+# reads it with no such check and uses it to pick which targets a task may
+# reach, so the answer for that key has to be reader-side (issue #1136).
+#
+# Before adding a key here: (1) confirm no server writer reaches this column
+# *through* the sanitizer (the preview path above is the only known case);
+# (2) confirm no out-of-repo caller legitimately sends it in a request body
+# (#1095 tracks this); (3) confirm no ``extra_agent_config=`` caller can win a
+# collision against this key through ``_merge_agent_config``
+# (``services/workforce_runs.py``), which returns
+# ``{**extra_agent_config, **task_config}`` with no sanitizing of its own --
+# safe today only because every ``extra_agent_config=`` caller passes a
+# server literal, and the built config wins only where it actually sets the
+# key, which for the two keys below is conditional
+# (``workforce_snapshot.py``'s ``build_workforce_task_config``). That the
+# strip is call-site opt-in rather than structural is #1134.
+#
+# ``execution_scope`` qualifies today: it is read back as the authority over
+# where a task's bytes land -- sandbox mount, durable storage prefix,
+# workspace directory, memory dimensions -- and its one server-side writer,
+# ``build_workforce_task_config``, is off the sanitizer path entirely.
+# ``tests/web/test_workforce_run_service.py::
+# test_create_workforce_run_propagates_execution_scope_to_worker`` demonstrates
+# that writer's scope reaching the column on that path -- a demonstration,
+# not a guard: the path is off the sanitizer by construction, so this test
+# cannot regress if this set changes.
+#
+# ``selected_file_ids`` qualifies for the same reason and passes the checks above.
+# It was declared server-owned when it was introduced -- ``chat.py``'s
+# ``_build_task_agent_config`` drops the client value and substitutes a list
+# validated against ``UploadedFile.user_id`` and ``task_id IS NULL`` -- but
+# that enforcement was local to one boundary, so the widget and share
+# task-create paths, which never set the key themselves, persisted whatever a
+# request body carried. Both readers (``chat.py``'s turn file materialization
+# and ``websocket.py``'s file-ref echo) re-check ownership in the query, so a
+# forged id could only name a file the publisher already owns and only if the
+# caller knew its uuid4 -- narrower than ``execution_scope``, where naming a
+# namespace is enough. Reserving it moves one invariant to one owner. The
+# ``pop`` in ``_build_task_agent_config`` stays: that boundary substitutes a
+# recomputed list rather than only dropping the client's, and keeping it means
+# the substitution does not depend on this set's contents.
+#
+# The public-channel identity/quota markers (#1108) qualify under the same
+# three checks. The widget/share run quota reads ``auth_mode`` and the entity
+# ids back as authoritative at the ``execute_task`` chokepoint (the id selects
+# which quota bucket the run bills), and ``guest_id`` is the per-guest quota
+# key, so an anonymous widget/share guest must not pre-seed any of them. (1) No
+# server writer reaches this column *through* the sanitizer for these keys --
+# the public agent paths sanitize then stamp what they own, and the preview
+# path sets only ``is_preview``/``preview_agent_id``; (2) they are
+# server-minted identity/routing values no request body legitimately carries;
+# (3) the widget/share workforce paths pass them as ``extra_agent_config=``
+# server literals, which ``_merge_agent_config`` places *under* the built
+# config, and the snapshot never sets these keys, so no client can win a
+# collision. The widget agent-create path additionally stamps both entity
+# markers explicitly (one as ``None``) as belt-and-suspenders.
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+        EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+        SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
         "auth_mode",
         "guest_id",
         "widget_agent_id",
