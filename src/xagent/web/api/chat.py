@@ -1019,20 +1019,27 @@ def _load_task_public_run_quota_config_isolated(
 
 
 def _coerce_optional_entity_id(value: Any) -> int | None:
-    """Coerce an agent_config entity marker to ``int``, or ``None`` if it can't.
+    """Coerce an agent_config entity marker to a positive ``int``, else ``None``.
 
-    A malformed marker (non-numeric, injected junk) must degrade to "unkeyable"
-    — the caller then admits that one task — rather than raising into the
-    chokepoint's broad ``except``, which would log a scary "failed open" and
-    disable the gate outright. ``bool`` is rejected explicitly: ``True`` is an
-    ``int`` subclass that would otherwise coerce to ``1``.
+    Entity markers are database primary keys — always positive integers — so
+    this accepts only a non-``bool`` ``int`` or an all-digits string, both
+    ``> 0``. Anything else (a float like ``1.9`` that would silently truncate
+    onto a real entity's bucket, ``0`` / negatives that mint impossible
+    buckets, ``inf`` whose ``int()`` raises ``OverflowError``, or injected
+    junk) degrades to "unkeyable" — the caller then admits that one task —
+    rather than keying the wrong bucket or raising into the chokepoint's broad
+    ``except``, which would log a scary "failed open" and disable the gate.
+    ``bool`` is rejected explicitly: ``True`` is an ``int`` subclass that would
+    otherwise coerce to ``1``.
     """
-    if value is None or isinstance(value, bool):
+    if isinstance(value, bool):
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
 
 
 def _deny_public_run(quota_config: Mapping[str, Any]) -> str | None:

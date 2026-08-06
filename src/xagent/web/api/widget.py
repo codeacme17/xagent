@@ -253,8 +253,12 @@ async def issue_widget_embed_ticket(
     # visitors on a busy embed: widget.js mints a ticket on every page load and
     # the entity key is shared by all of a widget's visitors, so the
     # per-visitor bound must be the IP.
+    # Derive the entity key through the same helper /auth uses (widget-key
+    # branch), rather than re-inlining the "key:<...>" scheme; the 403 above
+    # guarantees a non-empty key, so this is identical.
     if not get_share_rate_limiter().allow_widget_auth(
-        f"key:{request.widget_key}", remote_ip_from_request(req)
+        _widget_auth_rate_limit_entity_key(None, request.widget_key),
+        remote_ip_from_request(req),
     ):
         raise HTTPException(status_code=429, detail="Too many requests")
     owner = _resolve_widget_owner_by_key(db, request.widget_key)

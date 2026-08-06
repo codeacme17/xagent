@@ -308,4 +308,42 @@ async def test_widget_run_quota_admits_when_entity_unkeyable(
         manage_task_lease=False,
     )
 
-    assert result.get("error_code") != "share_run_quota_exceeded"
+    # N15: assert the run actually ran, not merely that it dodged the (widget-
+    # unreachable) share error code — otherwise a wrong widget_run_quota_exceeded
+    # would still pass.
+    assert result["success"] is True
+    assert result.get("error_code") not in (
+        "widget_run_quota_exceeded",
+        "share_run_quota_exceeded",
+    )
+
+
+def test_coerce_optional_entity_id_rejects_non_positive_int_inputs() -> None:
+    """N14: entity markers are positive DB primary keys, so floats (which would
+    truncate onto a real entity's bucket), 0/negatives (impossible buckets),
+    inf (whose int() raises OverflowError, escaping the narrow except), and
+    junk all degrade to None ("unkeyable → admit") rather than keying a wrong
+    bucket or crashing. Genuine positive ints and digit strings pass through."""
+    from xagent.web.api.chat import _coerce_optional_entity_id
+
+    assert _coerce_optional_entity_id(42) == 42
+    assert _coerce_optional_entity_id("42") == 42
+    # Rejected: float (no silent truncation onto agent:1), zero, negatives,
+    # bool, inf/nan, signed or decimal strings, and outright junk.
+    for bad in (
+        1.9,
+        0,
+        -5,
+        True,
+        False,
+        float("inf"),
+        float("nan"),
+        "1.9",
+        "-5",
+        "0",
+        "",
+        "abc",
+        None,
+        ["1"],
+    ):
+        assert _coerce_optional_entity_id(bad) is None, bad

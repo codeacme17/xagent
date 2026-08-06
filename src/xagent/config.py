@@ -1008,9 +1008,9 @@ def get_widget_auth_ip_rate_limit() -> str:
     The tight per-visitor / per-abuser bound (visitors have distinct IPs):
     bounds one caller minting guest tokens / embed tickets (each call does DB
     lookups and signs a JWT) regardless of how many widget keys or tickets
-    they cycle through, since the IP is not cheaply rotatable. N guests behind
-    one NAT egress share this budget — set XAGENT_TRUSTED_PROXY_HOPS behind a
-    reverse proxy so all traffic does not collapse onto the proxy's IP.
+    they cycle through, since the IP is not cheaply rotatable. (Every per-IP
+    widget bucket shares the NAT / XAGENT_TRUSTED_PROXY_HOPS caveat documented
+    once in example.env.)
     """
     return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
 
@@ -1036,9 +1036,7 @@ def get_widget_task_create_ip_rate_limit() -> str:
     The tighter bucket: task creation is the costly surface (each spawns an
     owner-billed run), and the caller IP is the only trustworthy per-abuser
     key on the widget path. Numerically matches the widget upload/turn IP
-    default; N guests behind one NAT egress share this budget, so raise it for
-    deployments with large shared-egress populations (and set
-    XAGENT_TRUSTED_PROXY_HOPS behind a reverse proxy).
+    default. (Shared NAT / proxy-hops caveat: see example.env.)
     """
     return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
 
@@ -1059,21 +1057,21 @@ def get_widget_run_quota() -> str:
 
 
 def get_widget_run_ip_quota() -> str:
-    """Per-creating-IP rolling run quota within a widget (#1108).
+    """Per-creating-IP rolling run quota (#1108).
 
     The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
-    share path's per-guest window: bounds the owner-billed runs attributable
-    to one caller IP so a single-IP abuser cannot drain the whole widget quota
-    and lock out every other visitor for a rolling day. It does NOT stop a
+    share path's per-guest window. Its bucket is keyed on the creating IP
+    alone, so it is platform-level — one IP's budget spans every widget on the
+    instance, not one widget — which is what bounds a single-IP abuser from
+    draining any one widget's entity quota and locking out its other visitors
+    for a rolling day. It does NOT stop a
     multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each staying
     under its own window, still exhaust the shared entity quota — structurally
     the same limit as the share path's per-guest quota. The IP is the one the
     server observed at task creation (stamped into ``agent_config``, never
     client-supplied); tasks created before this deploy carry no marker and are
-    bounded by the entity quota alone. As with the other per-IP widget
-    buckets, N guests behind one NAT egress share this budget — raise it for
-    large shared-egress populations, and set XAGENT_TRUSTED_PROXY_HOPS behind
-    a reverse proxy.
+    bounded by the entity quota alone. (Shared NAT / proxy-hops caveat: see
+    example.env.)
     """
     return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "60/hour")
 

@@ -160,8 +160,28 @@ class ShareRateLimiter:
     def __init__(self) -> None:
         redis_url = get_redis_url()
         if redis_url:
-            self.storage = storage_from_string(redis_url)
-            self.backend = "redis"
+            # Degrade to in-process memory if the Redis URL is unusable
+            # (invalid scheme, unreachable at build time) rather than letting
+            # storage_from_string raise: this constructor runs lazily on the
+            # first request to a public endpoint, outside the per-call
+            # @_fail_open boundary, so an exception here would 500 the auth /
+            # task-create / embed-ticket surfaces instead of failing open. A
+            # process-local limiter still throttles (per-worker, not shared),
+            # which is strictly better than no gate. Mirrors the hot-path
+            # cache's degrade-to-memory fallback.
+            try:
+                self.storage = storage_from_string(redis_url)
+                self.backend = "redis"
+            except Exception as exc:
+                logger.warning(
+                    "Share rate limiter: Redis storage %r unusable (%s); "
+                    "falling back to in-process memory",
+                    redis_url,
+                    exc,
+                    exc_info=True,
+                )
+                self.storage = MemoryStorage()
+                self.backend = "memory"
         else:
             self.storage = MemoryStorage()
             self.backend = "memory"
@@ -209,7 +229,7 @@ class ShareRateLimiter:
             get_widget_auth_ip_rate_limit(), fallback="300/minute"
         )
         self._widget_task_create_entity_limit = _parse_rate(
-            get_widget_task_create_rate_limit(), fallback="120/minute"
+            get_widget_task_create_rate_limit(), fallback="240/minute"
         )
         self._widget_task_create_ip_limit = _parse_rate(
             get_widget_task_create_ip_rate_limit(), fallback="60/minute"

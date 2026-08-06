@@ -25,6 +25,19 @@ def _limiter_with(monkeypatch: pytest.MonkeyPatch, **env: str) -> ShareRateLimit
     return get_share_rate_limiter()
 
 
+def test_construction_degrades_to_memory_on_unusable_redis_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N12: an invalid XAGENT_REDIS_URL must not 500 the public endpoints.
+    Construction runs lazily on first request, outside the per-call fail-open
+    boundary, so a raising storage backend has to degrade to in-process memory
+    here instead of propagating."""
+    limiter = _limiter_with(monkeypatch, XAGENT_REDIS_URL="not-a-valid-scheme://x")
+    assert limiter.backend == "memory"
+    # And the gates still function on the fallback storage.
+    assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is True
+
+
 def test_auth_per_token_bucket_trips(monkeypatch: pytest.MonkeyPatch) -> None:
     limiter = _limiter_with(
         monkeypatch,
@@ -248,6 +261,18 @@ def test_widget_auth_malformed_env_falls_back_to_1200_not_600(
     assert limiter._widget_auth_entity_limit.amount == 1200
 
 
+def test_widget_task_create_malformed_env_falls_back_to_240_not_120(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N13: the task-create entity fallback must match the getter's 240/min
+    default (4:1), not the old 120 — otherwise a malformed env var silently
+    runs the highest-value gate at 2:1, the same drift N1 fixed for auth."""
+    limiter = _limiter_with(
+        monkeypatch, XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT="not-a-valid-rate"
+    )
+    assert limiter._widget_task_create_entity_limit.amount == 240
+
+
 def test_widget_auth_entity_denial_does_not_burn_ip_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -287,8 +312,12 @@ def test_widget_gates_use_disjoint_namespaces(
 ) -> None:
     """Exhausting one widget gate must not block the others for the same
     entity+IP (a copy-paste typo collapsing two widget namespaces would
-    otherwise pass CI). Every widget limit is 1 so each gate trips on its
-    second call in isolation."""
+    otherwise pass CI). N6: every widget limit — including the run and WS
+    gates — is set to the SAME 1/minute shape, because ``limits``' MemoryStorage
+    key encodes the rate-limit item, so two gates with different shapes never
+    collide observably even under a merged namespace; only same-shape gates can.
+    Production defaults already make ws-turn-ip / task-create-ip / upload-ip all
+    60/min, so a real merge there would take effect."""
     limiter = _limiter_with(
         monkeypatch,
         XAGENT_WIDGET_AUTH_RATE_LIMIT="1/minute",
@@ -297,20 +326,28 @@ def test_widget_gates_use_disjoint_namespaces(
         XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT="1/minute",
         XAGENT_WIDGET_UPLOAD_RATE_LIMIT="1/minute",
         XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT="1/minute",
-        XAGENT_WIDGET_RUN_QUOTA="1/day",
-        XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
+        XAGENT_WIDGET_WS_TURN_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_RUN_QUOTA="1/minute",
+        XAGENT_WIDGET_RUN_IP_QUOTA="1/minute",
     )
     # Exhaust the auth gate for one entity + IP.
     assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is True
     assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is False
     # The other widget gates for the SAME entity + IP still admit once each —
-    # they live in their own namespaces, unconsumed by the auth gate.
+    # they live in their own namespaces, unconsumed by the auth gate. All are
+    # 1/minute now, so a namespace merged onto auth's would be observable here.
     assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
     assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_ws_connect("1.1.1.1") is True
     assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
     # And each is now independently exhausted, confirming they are distinct.
     assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is False
     assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is False
+    assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is False
+    assert limiter.allow_widget_ws_connect("1.1.1.1") is False
     assert limiter.allow_widget_run("agent:1", "1.1.1.1") is False
 
 

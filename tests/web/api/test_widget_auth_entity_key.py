@@ -25,6 +25,9 @@ def _mint(claims: dict) -> str:
 
 
 def test_agent_ticket_keys_on_agent_entity() -> None:
+    # No owner_type is the agent branch, which is also the legacy shape: tickets
+    # minted before workforce support carried only agent_id and no owner_type,
+    # so this covers both (missing and agent owner_type take the same branch).
     ticket = _mint({"type": EMBED_TICKET_TYPE, "agent_id": 42})
     assert _widget_auth_rate_limit_entity_key(ticket, None) == "agent:42"
 
@@ -38,12 +41,6 @@ def test_workforce_ticket_keys_on_workforce_entity() -> None:
         }
     )
     assert _widget_auth_rate_limit_entity_key(ticket, None) == "workforce:7"
-
-
-def test_legacy_ticket_without_owner_type_is_treated_as_agent() -> None:
-    # Tickets minted before workforce support carried only agent_id.
-    ticket = _mint({"type": EMBED_TICKET_TYPE, "agent_id": 5})
-    assert _widget_auth_rate_limit_entity_key(ticket, None) == "agent:5"
 
 
 def test_tampered_ticket_collapses_to_invalid_bucket() -> None:
