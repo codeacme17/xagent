@@ -245,12 +245,14 @@ async def issue_widget_embed_ticket(
         raise HTTPException(status_code=403, detail=WIDGET_KEY_REQUIRED_DETAIL)
     # Abuse control (#1108): ticket minting does DB lookups plus a JWT
     # signature per call, and an ungated mint loop would also let a caller
-    # refresh their auth entity bucket for free. Same buckets as /auth — the
-    # widget key is the stable entity key here — so the two halves of one
-    # page-load handshake draw from one budget. The tight-IP / loose-entity
-    # shape is what keeps this from 429ing ordinary visitors on a busy embed:
-    # widget.js mints a ticket on every page load, and the entity key is shared
-    # by all of a widget's visitors, so the per-visitor bound must be the IP.
+    # refresh their per-IP auth budget for free. Same limiter as /auth: the
+    # per-IP counter IS shared with /auth (one budget across both halves of a
+    # page-load handshake), while the per-entity counter is separate — here it
+    # keys on the widget key, whereas /auth keys on the ticket's owner entity.
+    # The tight-IP / loose-entity shape is what keeps this from 429ing ordinary
+    # visitors on a busy embed: widget.js mints a ticket on every page load and
+    # the entity key is shared by all of a widget's visitors, so the
+    # per-visitor bound must be the IP.
     if not get_share_rate_limiter().allow_widget_auth(
         f"key:{request.widget_key}", remote_ip_from_request(req)
     ):
@@ -419,6 +421,10 @@ def _widget_auth_rate_limit_entity_key(
     bucket is only the loose aggregate backstop, and the tight per-IP bucket
     (which this key does not affect) is the real per-abuser bound. Mirrors
     :func:`_resolve_widget_auth_owner`'s precedence (ticket first).
+
+    A wholly credential-less request returns ``""`` and lets
+    :meth:`ShareRateLimiter._admit_ip_and_entity`'s own falsy-key fallback
+    bucket it (the request 403s right after the gate anyway).
     """
     if embed_ticket:
         try:
@@ -444,9 +450,7 @@ def _widget_auth_rate_limit_entity_key(
         return "invalid-ticket"
     if widget_key:
         return f"key:{widget_key}"
-    # No credential at all: the request 403s right after the gate; bucket the
-    # attempts together so credential-less spam still pays a shared budget.
-    return "missing-credential"
+    return ""
 
 
 @widget_router.post("/auth", response_model=WidgetAuthResponse)

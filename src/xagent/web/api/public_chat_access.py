@@ -909,7 +909,11 @@ async def create_public_chat_task(
     access_context: PublicChatAccessContext,
     db: Session,
     default_channel_name: str,
-    client_ip: str | None = None,
+    # Required (no default): the server-observed creator IP is the widget run
+    # quota's per-abuser key (#1108), so a caller must consciously pass it —
+    # ``None`` only for a genuinely IP-less path, never by omission. A silent
+    # default would degrade the quota to entity-only without anything failing.
+    client_ip: str | None,
 ) -> TaskCreateResponse:
     if request.runtime_extensions:
         raise HTTPException(

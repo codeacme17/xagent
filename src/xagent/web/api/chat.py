@@ -1035,12 +1035,14 @@ def _coerce_optional_entity_id(value: Any) -> int | None:
         return None
 
 
-def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
+def _deny_public_run(quota_config: Mapping[str, Any]) -> str | None:
     """Apply the per-entity run quota for a public (share/widget) task.
 
-    Returns ``True`` when the run is admitted (or cannot be keyed, matching the
+    Returns the channel whose quota refused the run (``"widget"`` / ``"share"``)
+    so the caller can pick the matching message and error code from one value,
+    or ``None`` when the run is admitted (or cannot be keyed, matching the
     original share behaviour of falling through rather than blocking a run it
-    cannot attribute), ``False`` when a rolling quota is exhausted.
+    cannot attribute).
 
     Share tasks carry a server-minted ``guest_id`` and are gated per link +
     per guest (#973). Widget tasks are gated per entity plus the creator IP
@@ -1070,11 +1072,12 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
             _coerce_optional_entity_id(quota_config.get("widget_workforce_id")),
         )
         if entity_key is None:
-            return True
+            return None
         client_ip = quota_config.get("widget_client_ip")
-        return limiter.allow_widget_run(
+        admitted = limiter.allow_widget_run(
             entity_key, client_ip if isinstance(client_ip, str) and client_ip else None
         )
+        return None if admitted else "widget"
 
     if auth_mode == "share":
         guest_id = quota_config.get("guest_id")
@@ -1083,8 +1086,8 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
             _coerce_optional_entity_id(quota_config.get("share_workforce_id")),
         )
         if not share_key or not isinstance(guest_id, str) or not guest_id:
-            return True
-        return limiter.allow_run(share_key, guest_id)
+            return None
+        return None if limiter.allow_run(share_key, guest_id) else "share"
 
     # The loader only returns share/widget configs; admit anything else so a
     # future auth mode fails open here (visibly unmetered) rather than
@@ -1092,7 +1095,7 @@ def _admit_public_run(quota_config: Mapping[str, Any]) -> bool:
     logger.warning(
         "Public run quota gate saw unexpected auth_mode %r; admitting", auth_mode
     )
-    return True
+    return None
 
 
 def _check_task_run_gate_on_event_loop(
@@ -2982,21 +2985,21 @@ class AgentServiceManager:
         # gated; fails open (availability) like the run gate above, with the
         # same pool-timeout escalation so a stalled pool doesn't cascade.
         if tracker_task_id:
-            quota_auth_mode: str | None = None
+            quota_config: Mapping[str, Any] | None = None
             try:
                 quota_config = await run_db_io_cancellation_safe(
                     lambda: _load_task_public_run_quota_config_isolated(
                         int(tracker_task_id)
                     )
                 )
-                if quota_config is not None:
-                    raw_mode = quota_config.get("auth_mode")
-                    quota_auth_mode = raw_mode if isinstance(raw_mode, str) else None
-                if quota_config is not None and not _admit_public_run(quota_config):
+                denied_channel = (
+                    _deny_public_run(quota_config) if quota_config is not None else None
+                )
+                if denied_channel is not None:
                     # Channel-specific copy + error_code: a widget visitor on a
                     # third-party page has no "shared link", and analytics need
                     # to tell which public channel was throttled.
-                    if quota_auth_mode == "widget":
+                    if denied_channel == "widget":
                         reason_message = (
                             "This widget has reached its usage limit. "
                             "Please try again later."
@@ -3027,9 +3030,14 @@ class AgentServiceManager:
                         exc_info=True,
                     )
                     raise
+                failed_mode = (
+                    quota_config.get("auth_mode")
+                    if isinstance(quota_config, Mapping)
+                    else None
+                )
                 logger.warning(
                     "Public run quota check failed open (auth_mode=%s)",
-                    quota_auth_mode,
+                    failed_mode,
                     exc_info=True,
                 )
 

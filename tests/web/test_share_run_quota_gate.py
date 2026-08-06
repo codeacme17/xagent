@@ -219,9 +219,11 @@ async def test_widget_run_quota_blocks_workforce_widget_task(
 async def test_widget_run_quota_fails_open_on_malformed_marker(
     db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A malformed (non-integer) widget entity marker must fail open — the
-    int() coercion raises, the chokepoint's broad except admits the run —
-    rather than 500ing or blocking."""
+    """A malformed (non-integer) widget entity marker must admit the run rather
+    than 500 or block: _coerce_optional_entity_id catches the coercion error
+    and returns None, so the entity is unkeyable and _deny_public_run takes
+    its "unkeyable -> admit this task" branch — without falling through to the
+    chokepoint's broad except."""
     monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
     reset_share_rate_limiter()
 

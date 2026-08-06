@@ -993,9 +993,13 @@ def get_widget_auth_rate_limit() -> str:
     endpoints fire on every widget page load and the entity key is shared by
     all of a widget's visitors, so a tight per-entity bucket would 429
     ordinary visitors on a busy embed. The per-IP limit below is the tight
-    per-visitor / per-abuser bound. Raise this for very high-traffic embeds.
+    per-visitor / per-abuser bound. Kept at the same 4:1 entity:IP ratio as
+    the sibling widget upload / ws-turn gates — and auth is the one gate whose
+    denial is fail-closed client-side (the widget never loads), so its
+    aggregate backstop is deliberately the most tolerant, not the tightest.
+    Raise this for very high-traffic embeds.
     """
-    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "600/minute")
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "1200/minute")
 
 
 def get_widget_auth_ip_rate_limit() -> str:

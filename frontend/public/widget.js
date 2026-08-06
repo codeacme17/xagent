@@ -380,7 +380,7 @@
                 // rate limiting (transient, high traffic), distinct from the
                 // domain-allowlist / stale-snippet causes behind a 403.
                 if (res.status === 429) {
-                  console.error('Xagent Widget: embed authorization rate-limited (HTTP 429). This is usually transient under high traffic; the widget will load on a later retry.');
+                  console.error('Xagent Widget: embed authorization rate-limited (HTTP 429), usually transient under high traffic. Reload the page to try again.');
                 } else {
                   console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
                 }

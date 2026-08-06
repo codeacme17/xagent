@@ -450,7 +450,7 @@ class ShareRateLimiter:
         return True
 
     @_fail_open
-    def allow_widget_run(self, entity_key: str | None, client_ip: str | None) -> bool:
+    def allow_widget_run(self, entity_key: str, client_ip: str | None) -> bool:
         """Count one owner-billed widget run; False when a quota is exceeded.
 
         The widget mirror of :meth:`allow_run`, in its own buckets so a
@@ -465,18 +465,17 @@ class ShareRateLimiter:
         the non-destructive test→hit pairing, so an IP-window denial never
         burns an entity slot.
 
-        ``client_ip`` is ``None`` for tasks created before the marker existed;
-        those are bounded by the entity quota alone rather than collapsing
-        every legacy task into one shared IP bucket. Rolling, not cumulative,
-        so a busy-but-legitimate widget self-clears rather than being bricked.
+        The sole caller (the ``chat.py`` chokepoint) short-circuits before
+        calling when it cannot form an ``entity_key``, so this takes a
+        non-empty ``str`` — no ``"unknown"`` fallback. ``client_ip`` is
+        ``None`` for tasks created before the marker existed; those are bounded
+        by the entity quota alone rather than collapsing every legacy task into
+        one shared IP bucket. Rolling, not cumulative, so a busy-but-legitimate
+        widget self-clears rather than being bricked.
         """
-        # entity_key is None only if a caller bypasses the chokepoint's
-        # short-circuit (chat.py admits unkeyable widget tasks before calling
-        # this); the "unknown" degradation is defense-in-depth for any future
-        # direct caller, not a path production reaches today.
         if client_ip is None:
             return self._limiter.hit(
-                self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key or "unknown"
+                self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key
             )
         return self._admit_ip_and_entity(
             self._widget_run_ip_limit,
