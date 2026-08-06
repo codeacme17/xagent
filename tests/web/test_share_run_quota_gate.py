@@ -248,6 +248,42 @@ async def test_widget_run_quota_fails_open_on_malformed_marker(
         "widget_run_quota_exceeded",
         "share_run_quota_exceeded",
     )
+    # Positive assertion (F4): the run was actually admitted and executed —
+    # this fails if the malformed-marker handling were removed and the run
+    # blocked, which the negative error_code check alone would not catch.
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_admits_bool_entity_marker(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``bool`` widget entity marker must be rejected by
+    _coerce_optional_entity_id (``isinstance(True, int)`` is True and would
+    otherwise coerce to ``agent:1``), so the entity is unkeyable and the run is
+    admitted rather than billed to a wrong bucket."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g",
+            "widget_agent_id": True,
+        },
+    )
+
+    result = await AgentServiceManager().execute_task(
+        agent_service=_FakeAgentService(),
+        task="hello",
+        tracking_task_id=str(task.id),
+        db_session=db_session,
+        manage_task_lease=False,
+    )
+
+    assert result["success"] is True
+    assert result.get("error_code") != "widget_run_quota_exceeded"
 
 
 @pytest.mark.asyncio

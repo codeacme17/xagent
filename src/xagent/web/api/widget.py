@@ -425,6 +425,14 @@ def _widget_auth_rate_limit_entity_key(
     A wholly credential-less request returns ``""`` and lets
     :meth:`ShareRateLimiter._admit_ip_and_entity`'s own falsy-key fallback
     bucket it (the request 403s right after the gate anyway).
+
+    NOTE: one widget therefore accumulates its auth backstop into up to two
+    distinct buckets — ``key:<widget_key>`` (direct-visit ``/auth`` and every
+    ``/embed-ticket`` call) and ``agent:<id>``/``workforce:<id>`` (embedded
+    ``/auth`` via ticket) — so the effective aggregate ceiling for one widget
+    is roughly double the single per-entity limit. Resolving both to one key
+    would need a pre-gate DB lookup, which is exactly what this gate runs ahead
+    of. The tight per-IP bound (the real per-abuser control) is unaffected.
     """
     if embed_ticket:
         try:

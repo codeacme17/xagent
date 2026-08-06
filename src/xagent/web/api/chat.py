@@ -1048,10 +1048,11 @@ def _deny_public_run(quota_config: Mapping[str, Any]) -> str | None:
     per guest (#973). Widget tasks are gated per entity plus the creator IP
     the backend stamped into ``agent_config`` at task creation (#1108) — their
     ``guest_id`` is client-supplied (rotatable at will), so the stamped IP is
-    the per-abuser dimension; without it one caller could drain the whole
-    rolling entity quota and lock every other visitor out. Tasks created
-    before the IP marker existed carry ``None`` and are bounded by the entity
-    quota alone.
+    the per-abuser dimension; without it a single-IP caller could drain the
+    whole rolling entity quota and lock every other visitor out (a multi-IP
+    abuser rotating ~entity/ip addresses still can, same as the share path's
+    per-guest quota). Tasks created before the IP marker existed carry ``None``
+    and are bounded by the entity quota alone.
 
     Entity markers are coerced defensively: the widget-create path stamps them
     server-side and the sanitizer strips the client copies, but a malformed

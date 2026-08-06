@@ -884,6 +884,11 @@ async def _create_workforce_widget_chat_task(
         extra_agent_config={
             "auth_mode": "widget",
             "widget_workforce_id": int(workforce.id),
+            # Null the agent marker for symmetry with the agent path (#1108):
+            # entity_rate_limit_key prefers workforce, so a stray agent id
+            # would be ignored anyway, but stamping both keeps the run-quota
+            # key unambiguous and independent of merge ordering.
+            "widget_agent_id": None,
             "guest_id": access_context.guest_id,
             # Server-observed creator IP (#1108): the per-abuser key for the
             # widget run quota. Stamped by the backend, never client-supplied.

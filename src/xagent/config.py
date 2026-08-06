@@ -1022,9 +1022,12 @@ def get_widget_task_create_rate_limit() -> str:
     agent/workforce across all callers (one widget serves many legitimate
     guests). The per-IP bucket below is the tighter per-abuser gate; unlike the
     share path this cannot key on the guest, whose id is client-supplied and
-    rotatable at will.
+    rotatable at will. Kept at the 4:1 entity:IP ratio shared by every widget
+    gate: the entity bucket only accumulates on admitted requests, so ``ratio``
+    cooperating under-cap IPs are needed to saturate it — 4 here, not 2, on the
+    surface where each admitted request spawns an owner-billed run.
     """
-    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "120/minute")
+    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "240/minute")
 
 
 def get_widget_task_create_ip_rate_limit() -> str:
@@ -1060,8 +1063,11 @@ def get_widget_run_ip_quota() -> str:
 
     The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
     share path's per-guest window: bounds the owner-billed runs attributable
-    to one caller IP so a single abuser cannot drain the whole widget quota
-    and lock out every other visitor for a rolling day. The IP is the one the
+    to one caller IP so a single-IP abuser cannot drain the whole widget quota
+    and lock out every other visitor for a rolling day. It does NOT stop a
+    multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each staying
+    under its own window, still exhaust the shared entity quota — structurally
+    the same limit as the share path's per-guest quota. The IP is the one the
     server observed at task creation (stamped into ``agent_config``, never
     client-supplied); tasks created before this deploy carry no marker and are
     bounded by the entity quota alone. As with the other per-IP widget

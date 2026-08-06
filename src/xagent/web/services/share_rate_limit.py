@@ -203,7 +203,7 @@ class ShareRateLimiter:
             get_widget_ws_turn_rate_limit(), fallback="240/minute"
         )
         self._widget_auth_entity_limit = _parse_rate(
-            get_widget_auth_rate_limit(), fallback="600/minute"
+            get_widget_auth_rate_limit(), fallback="1200/minute"
         )
         self._widget_auth_ip_limit = _parse_rate(
             get_widget_auth_ip_rate_limit(), fallback="300/minute"

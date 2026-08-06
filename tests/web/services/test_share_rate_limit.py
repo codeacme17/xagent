@@ -235,6 +235,19 @@ def test_widget_auth_entity_ceiling_is_loose_across_ips(
     assert limiter.allow_widget_auth("agent:8", "4.4.4.4") is True
 
 
+def test_widget_auth_malformed_env_falls_back_to_1200_not_600(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N1: a malformed XAGENT_WIDGET_AUTH_RATE_LIMIT must fall back to the same
+    1200/min default the getter uses (the 4:1 ratio F1 set), not the old 600 —
+    otherwise the degraded path silently halves the backstop, reintroducing
+    the exact ratio problem F1 fixed."""
+    limiter = _limiter_with(
+        monkeypatch, XAGENT_WIDGET_AUTH_RATE_LIMIT="not-a-valid-rate"
+    )
+    assert limiter._widget_auth_entity_limit.amount == 1200
+
+
 def test_widget_auth_entity_denial_does_not_burn_ip_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -267,6 +280,38 @@ def test_widget_auth_is_isolated_from_share_auth(
     assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is False
     # Same IP + token on the share endpoint still admits from its own budget.
     assert limiter.allow_auth("tok", "1.1.1.1") is True
+
+
+def test_widget_gates_use_disjoint_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausting one widget gate must not block the others for the same
+    entity+IP (a copy-paste typo collapsing two widget namespaces would
+    otherwise pass CI). Every widget limit is 1 so each gate trips on its
+    second call in isolation."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_AUTH_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_AUTH_IP_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_UPLOAD_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT="1/minute",
+        XAGENT_WIDGET_RUN_QUOTA="1/day",
+        XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
+    )
+    # Exhaust the auth gate for one entity + IP.
+    assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_auth("agent:1", "1.1.1.1") is False
+    # The other widget gates for the SAME entity + IP still admit once each —
+    # they live in their own namespaces, unconsumed by the auth gate.
+    assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
+    # And each is now independently exhausted, confirming they are distinct.
+    assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is False
+    assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is False
+    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is False
 
 
 def test_widget_task_create_per_ip_bucket_trips_across_entities(

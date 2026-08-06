@@ -1752,7 +1752,7 @@ class TestShareRateLimitConfig:
         (
             "get_widget_task_create_rate_limit",
             "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT",
-            "120/minute",
+            "240/minute",
         ),
         (
             "get_widget_task_create_ip_rate_limit",
