@@ -104,10 +104,11 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
 # Anti-hang bounds, not latency assertions. Nothing here is measuring speed:
 # these handlers finish in milliseconds, and the budgets only exist so a
 # deadlock fails as a test error instead of hanging the run. They are therefore
-# set far above any plausible runtime on a contended CI runner, and a
-# cross-thread handshake must expire *before* the handler deadline so the
-# failure is reported by the specific assertion rather than a bare TimeoutError.
-_HANDSHAKE_DEADLINE_SECONDS = 10.0
+# set far above any plausible runtime on a contended CI runner. A wait on a
+# signal crossing the loop/worker-thread boundary must expire *before* the
+# handler deadline, so a stall is reported by the specific assertion that owns
+# the signal rather than by a bare TimeoutError on the whole handler.
+_THREAD_SIGNAL_DEADLINE_SECONDS = 10.0
 _HANDLER_DEADLINE_SECONDS = 30.0
 
 
@@ -116,10 +117,13 @@ class _EventLoopLivenessProbe:
 
     Wrapping a synchronous step in :meth:`gate` makes that step block until the
     event loop answers back. If the step runs off the loop (in a worker thread)
-    the probe task answers immediately and ``loop_ran_during_step`` is True. If
-    the step runs *on* the loop thread, nothing can answer, the handshake
-    expires and the flag stays False. The verdict therefore depends on where
-    the work ran, not on how fast the machine is.
+    the probe task is scheduled on the next loop pass and answers, leaving
+    ``loop_ran_during_step`` True. If the step runs *on* the loop thread,
+    nothing can answer, the wait expires and the flag stays False. The verdict
+    therefore depends on where the work ran, not on how fast the machine is.
+
+    The gate is entered once per test. Both events latch, so a second gated
+    call is answered from the first handshake rather than probed again.
     """
 
     def __init__(self) -> None:
@@ -153,7 +157,7 @@ class _EventLoopLivenessProbe:
             self.step_ran = True
             self._step_entered.set()
             self.loop_ran_during_step = self._loop_answered.wait(
-                timeout=_HANDSHAKE_DEADLINE_SECONDS
+                timeout=_THREAD_SIGNAL_DEADLINE_SECONDS
             )
             return step(*args, **kwargs)
 
@@ -472,9 +476,9 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
         begin_turn,
     )
 
-    # The gate replaces the artificial sleep that used to make loop blocking
-    # observable. Overlap detection is separate and unchanged: the one-slot
-    # pool raises on a task-info checkout that collides with preparation.
+    # The gate holds preparation open long enough for loop blocking to be
+    # observable. Overlap detection is a separate mechanism: the one-slot pool
+    # raises on a task-info checkout that collides with preparation.
     async with _EventLoopLivenessProbe() as probe:
         monkeypatch.setattr(
             websocket_api,
@@ -948,7 +952,7 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
     def blocked_prepare_turn(**kwargs):
         preparation = prepare_turn(**kwargs)
         worker_finished.set()
-        assert release_worker.wait(timeout=_HANDSHAKE_DEADLINE_SECONDS)
+        assert release_worker.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
         return preparation
 
     schedule = AsyncMock()
@@ -978,7 +982,7 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
     )
     try:
         assert await asyncio.to_thread(
-            worker_finished.wait, _HANDSHAKE_DEADLINE_SECONDS
+            worker_finished.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
         )
         handler.cancel()
         release_worker.set()
@@ -1819,7 +1823,7 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
 
     def mark_delivery(*_args, **_kwargs) -> None:
         marker_started.set()
-        assert marker_release.wait(timeout=_HANDSHAKE_DEADLINE_SECONDS)
+        assert marker_release.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
 
     async def resume_forever(*_args, **_kwargs) -> None:
         try:
@@ -1860,7 +1864,9 @@ async def test_live_marker_cancellation_does_not_cancel_registered_handoff(
                 },
             )
         )
-        assert await asyncio.to_thread(marker_started.wait, 5)
+        assert await asyncio.to_thread(
+            marker_started.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
+        )
         handling.cancel()
         marker_release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -2179,7 +2185,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
 
     def blocking_mark_delivery(*_args, **_kwargs) -> None:
         persistence_started.set()
-        assert allow_persistence.wait(timeout=_HANDSHAKE_DEADLINE_SECONDS)
+        assert allow_persistence.wait(timeout=_THREAD_SIGNAL_DEADLINE_SECONDS)
         persistence_finished.set()
 
     with (
@@ -2206,7 +2212,7 @@ async def test_delivery_failure_persistence_drains_before_cancellation(
         # Without the assert a slow runner silently proceeds to cancel before
         # persistence started, which changes what the rest of the test proves.
         assert await asyncio.to_thread(
-            persistence_started.wait, _HANDSHAKE_DEADLINE_SECONDS
+            persistence_started.wait, _THREAD_SIGNAL_DEADLINE_SECONDS
         )
         handling.cancel()
         await asyncio.sleep(0)
