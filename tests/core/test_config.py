@@ -1760,7 +1760,7 @@ class TestShareRateLimitConfig:
             "60/minute",
         ),
         ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
-        ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "60/hour"),
+        ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)

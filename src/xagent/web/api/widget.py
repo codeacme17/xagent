@@ -591,6 +591,13 @@ async def create_widget_task(
     # owner-billed run). Mirror of the share task-create throttle, but keyed on
     # the widget entity + caller IP, NOT the client-supplied (rotatable) widget
     # guest_id — the same keying as the widget upload / ws-turn gates.
+    #
+    # Unlike /auth, this gate cannot be the first thing that runs: the entity
+    # key comes from the access context, which FastAPI resolves (JWT + DB
+    # lookups) before the handler body. So a throttled caller still pays for
+    # that resolution. Accepted: reaching here at all requires a valid guest
+    # token, and /auth — the surface reachable with no credential — does gate
+    # ahead of every DB touch.
     client_ip = remote_ip_from_request(http_request)
     if not get_share_rate_limiter().allow_widget_task_create(
         widget_entity_key(widget_info), client_ip

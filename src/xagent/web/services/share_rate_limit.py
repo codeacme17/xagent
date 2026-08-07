@@ -154,6 +154,35 @@ def _fail_open(method: _F) -> _F:
     return wrapper  # type: ignore[return-value]
 
 
+_D = TypeVar("_D", bound=Callable[..., "str | None"])
+
+
+def _fail_open_denial(method: _D) -> _D:
+    """:func:`_fail_open` for gates that return a denial reason, not a bool.
+
+    Same contract — a raising storage backend must admit rather than 500 a
+    public surface — expressed as ``None`` ("no bucket refused") instead of
+    ``True``.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self: "ShareRateLimiter", *args: object, **kwargs: object
+    ) -> str | None:
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            logger.warning(
+                "Share rate limiter (%s) failed open: %s",
+                method.__name__,
+                exc,
+                exc_info=True,
+            )
+            return None
+
+    return wrapper  # type: ignore[return-value]
+
+
 class ShareRateLimiter:
     """Moving-window limiter over Redis or in-process memory for share channels."""
 
@@ -240,7 +269,7 @@ class ShareRateLimiter:
         )
         self._widget_run_limit = _parse_rate(get_widget_run_quota(), fallback="500/day")
         self._widget_run_ip_limit = _parse_rate(
-            get_widget_run_ip_quota(), fallback="60/hour"
+            get_widget_run_ip_quota(), fallback="120/hour"
         )
 
     @_fail_open
@@ -295,6 +324,31 @@ class ShareRateLimiter:
         return self._limiter.hit(
             self._ws_connect_ip_limit, _WS_CONNECT_IP_NAMESPACE, remote_ip or "unknown"
         )
+
+    def _denial_from_ip_and_entity(
+        self,
+        ip_limit: RateLimitItem,
+        ip_namespace: str,
+        ip_key: str,
+        entity_limit: RateLimitItem,
+        entity_namespace: str,
+        entity_key: str,
+    ) -> str | None:
+        """Paired-bucket admission reporting *which* bucket refused.
+
+        ``None`` admits; ``"ip"`` / ``"entity"`` name the bucket that refused,
+        so a caller can tell a per-caller throttle (the visitor should retry)
+        apart from an owner-budget exhaustion (the visitor cannot act on it).
+        Keys arrive pre-normalized. See :meth:`_admit_ip_and_entity` for the
+        non-destructive test→hit contract this implements.
+        """
+        if not self._limiter.test(ip_limit, ip_namespace, ip_key):
+            return "ip"
+        if not self._limiter.test(entity_limit, entity_namespace, entity_key):
+            return "entity"
+        self._limiter.hit(ip_limit, ip_namespace, ip_key)
+        self._limiter.hit(entity_limit, entity_namespace, entity_key)
+        return None
 
     def _admit_ip_and_entity(
         self,
@@ -469,38 +523,54 @@ class ShareRateLimiter:
         self._limiter.hit(self._run_guest_limit, _RUN_GUEST_NAMESPACE, guest_id)
         return True
 
-    @_fail_open
-    def allow_widget_run(self, entity_key: str, client_ip: str | None) -> bool:
-        """Count one owner-billed widget run; False when a quota is exceeded.
+    @_fail_open_denial
+    def widget_run_denial_reason(
+        self, entity_key: str, client_ip: str | None
+    ) -> str | None:
+        """Count one owner-billed widget run; name the bucket that refused it.
+
+        Returns ``None`` when admitted, ``"ip"`` when the per-caller sub-quota
+        refused (the visitor can retry later), or ``"entity"`` when the
+        widget's own budget is exhausted (only the owner can act) — the caller
+        needs the distinction to show copy the reader can act on.
 
         The widget mirror of :meth:`allow_run`, in its own buckets so a
         popular/abused widget cannot drain the owner's whole team quota. Keyed
         on the widget entity (``agent:<id>`` / ``workforce:<id>``) plus the IP
         the server observed when the task was created (stamped into
         ``agent_config``; never client-supplied) — NOT the widget ``guest_id``,
-        which is client-supplied and rotatable at will. The IP sub-quota is the
-        per-abuser dimension: without it, one caller could drain the whole
-        rolling entity quota (e.g. 60 turns/min against 500/day ≈ nine
-        minutes) and lock every other visitor out for a day. Both buckets use
-        the non-destructive test→hit pairing, so an IP-window denial never
-        burns an entity slot.
+        which is client-supplied and rotatable at will.
 
-        The sole caller (the ``chat.py`` chokepoint) short-circuits before
-        calling when it cannot form an ``entity_key``, so this takes a
-        non-empty ``str`` — no ``"unknown"`` fallback. ``client_ip`` is
-        ``None`` for tasks created before the marker existed; those are bounded
-        by the entity quota alone rather than collapsing every legacy task into
-        one shared IP bucket. Rolling, not cumulative, so a busy-but-legitimate
-        widget self-clears rather than being bricked.
+        The IP sub-quota is scoped ``entity|ip``, NOT bare IP: this gate is
+        charged per *turn*, so a bare-IP bucket would make one NAT/CGNAT egress
+        share a single budget across every widget on the instance, and one busy
+        embed would lock that whole network out of unrelated widgets. Scoping
+        to the widget keeps the per-abuser bound while confining its blast
+        radius to the entity whose budget it protects. Its window is
+        deliberately far tighter than the per-minute burst gates (widget WS
+        turn / task-create, both 60/minute per IP): those bound *rate*, this
+        bounds one caller's share of a rolling owner-billed *budget*, so it is
+        sized as a fraction of the entity quota rather than to match them.
+
+        Both buckets use the non-destructive test→hit pairing, so an IP-window
+        denial never burns an entity slot. The sole caller (the ``chat.py``
+        chokepoint) short-circuits before calling when it cannot form an
+        ``entity_key``, so this takes a non-empty ``str`` — no ``"unknown"``
+        fallback. ``client_ip`` is ``None`` for tasks created before the marker
+        existed; those are bounded by the entity quota alone rather than
+        collapsing every legacy task into one shared IP bucket. Rolling, not
+        cumulative, so a busy-but-legitimate widget self-clears rather than
+        being bricked.
         """
         if client_ip is None:
-            return self._limiter.hit(
+            admitted = self._limiter.hit(
                 self._widget_run_limit, _WIDGET_RUN_NAMESPACE, entity_key
             )
-        return self._admit_ip_and_entity(
+            return None if admitted else "entity"
+        return self._denial_from_ip_and_entity(
             self._widget_run_ip_limit,
             _WIDGET_RUN_IP_NAMESPACE,
-            client_ip,
+            f"{entity_key}|{client_ip}",
             self._widget_run_limit,
             _WIDGET_RUN_NAMESPACE,
             entity_key,

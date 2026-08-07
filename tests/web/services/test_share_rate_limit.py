@@ -342,13 +342,13 @@ def test_widget_gates_use_disjoint_namespaces(
     assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is True
     assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is True
     assert limiter.allow_widget_ws_connect("1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
+    assert limiter.widget_run_denial_reason("agent:1", "1.1.1.1") is None
     # And each is now independently exhausted, confirming they are distinct.
     assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is False
     assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is False
     assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is False
     assert limiter.allow_widget_ws_connect("1.1.1.1") is False
-    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is False
+    assert limiter.widget_run_denial_reason("agent:1", "1.1.1.1") is not None
 
 
 def test_widget_task_create_per_ip_bucket_trips_across_entities(
@@ -410,11 +410,11 @@ def test_widget_run_quota_per_entity_trips(
         XAGENT_WIDGET_RUN_QUOTA="2/day",
         XAGENT_WIDGET_RUN_IP_QUOTA="100/hour",
     )
-    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1", "2.2.2.2") is True
-    assert limiter.allow_widget_run("agent:1", "3.3.3.3") is False
+    assert limiter.widget_run_denial_reason("agent:1", "1.1.1.1") is None
+    assert limiter.widget_run_denial_reason("agent:1", "2.2.2.2") is None
+    assert limiter.widget_run_denial_reason("agent:1", "3.3.3.3") == "entity"
     # A different widget entity has its own rolling quota.
-    assert limiter.allow_widget_run("workforce:2", "4.4.4.4") is True
+    assert limiter.widget_run_denial_reason("workforce:2", "4.4.4.4") is None
 
 
 def test_widget_run_ip_quota_bounds_one_caller(
@@ -428,12 +428,34 @@ def test_widget_run_ip_quota_bounds_one_caller(
         XAGENT_WIDGET_RUN_QUOTA="3/day",
         XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
     )
-    assert limiter.allow_widget_run("agent:1", "9.9.9.9") is True  # entity=1, ip=1
-    assert limiter.allow_widget_run("agent:1", "9.9.9.9") is False  # ip window blocks
+    assert limiter.widget_run_denial_reason("agent:1", "9.9.9.9") is None
+    # The IP window refuses, and says so — the caller needs "ip" vs "entity" to
+    # tell a retryable per-caller throttle from an exhausted owner budget.
+    assert limiter.widget_run_denial_reason("agent:1", "9.9.9.9") == "ip"
     # The denial didn't consume entity slots: two other visitors still fit.
-    assert limiter.allow_widget_run("agent:1", "8.8.8.8") is True  # entity=2
-    assert limiter.allow_widget_run("agent:1", "7.7.7.7") is True  # entity=3
-    assert limiter.allow_widget_run("agent:1", "6.6.6.6") is False  # entity quota hit
+    assert limiter.widget_run_denial_reason("agent:1", "8.8.8.8") is None  # entity=2
+    assert limiter.widget_run_denial_reason("agent:1", "7.7.7.7") is None  # entity=3
+    assert limiter.widget_run_denial_reason("agent:1", "6.6.6.6") == "entity"
+
+
+def test_widget_run_ip_quota_is_scoped_per_widget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D1/F1: the IP sub-quota bucket is keyed ``entity|ip``, not bare IP, so
+    one caller exhausting their budget on one widget must not lock that whole
+    network (NAT/CGNAT egress) out of every *other* widget on the instance.
+    This gate is charged per turn, so a platform-wide bucket would be
+    collateral damage on ordinary shared-egress traffic."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_RUN_QUOTA="100/day",
+        XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
+    )
+    assert limiter.widget_run_denial_reason("agent:1", "9.9.9.9") is None
+    assert limiter.widget_run_denial_reason("agent:1", "9.9.9.9") == "ip"
+    # Same IP, different widgets: unaffected by the exhausted agent:1 bucket.
+    assert limiter.widget_run_denial_reason("agent:2", "9.9.9.9") is None
+    assert limiter.widget_run_denial_reason("workforce:3", "9.9.9.9") is None
 
 
 def test_widget_run_quota_without_ip_marker_is_entity_only(
@@ -448,9 +470,9 @@ def test_widget_run_quota_without_ip_marker_is_entity_only(
         XAGENT_WIDGET_RUN_IP_QUOTA="1/hour",
     )
     # Two legacy runs pass despite the 1/hour IP window (no IP → no IP bucket).
-    assert limiter.allow_widget_run("agent:1", None) is True
-    assert limiter.allow_widget_run("agent:1", None) is True
-    assert limiter.allow_widget_run("agent:1", None) is False  # entity quota (2)
+    assert limiter.widget_run_denial_reason("agent:1", None) is None
+    assert limiter.widget_run_denial_reason("agent:1", None) is None
+    assert limiter.widget_run_denial_reason("agent:1", None) == "entity"
 
 
 def test_widget_run_quota_is_isolated_from_share_run(
@@ -464,8 +486,8 @@ def test_widget_run_quota_is_isolated_from_share_run(
         XAGENT_SHARE_RUN_QUOTA="5/day",
         XAGENT_SHARE_RUN_GUEST_QUOTA="5/hour",
     )
-    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1", "2.2.2.2") is False
+    assert limiter.widget_run_denial_reason("agent:1", "1.1.1.1") is None
+    assert limiter.widget_run_denial_reason("agent:1", "2.2.2.2") == "entity"
     # The share run quota under the same entity key still admits.
     assert limiter.allow_run("agent:1", "g1") is True
 
@@ -539,5 +561,5 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_run("agent:1", "g") is True
     assert limiter.allow_widget_auth("key", "1.1.1.1") is True
     assert limiter.allow_widget_task_create("agent:1", "1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1", "1.1.1.1") is True
-    assert limiter.allow_widget_run("agent:1", None) is True
+    assert limiter.widget_run_denial_reason("agent:1", "1.1.1.1") is None
+    assert limiter.widget_run_denial_reason("agent:1", None) is None

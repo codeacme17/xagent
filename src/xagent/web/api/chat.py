@@ -1042,14 +1042,15 @@ def _coerce_optional_entity_id(value: Any) -> int | None:
     return None
 
 
-def _deny_public_run(quota_config: Mapping[str, Any]) -> str | None:
+def _public_run_denial_channel(quota_config: Mapping[str, Any]) -> str | None:
     """Apply the per-entity run quota for a public (share/widget) task.
 
-    Returns the channel whose quota refused the run (``"widget"`` / ``"share"``)
-    so the caller can pick the matching message and error code from one value,
-    or ``None`` when the run is admitted (or cannot be keyed, matching the
-    original share behaviour of falling through rather than blocking a run it
-    cannot attribute).
+    Returns the quota that refused the run — ``"share"``, ``"widget"`` (the
+    owner's budget for that embed), or ``"widget-ip"`` (the per-caller
+    sub-quota within one widget) — so the caller can pick a message the reader
+    can actually act on, or ``None`` when the run is admitted (or cannot be
+    keyed, matching the original share behaviour of falling through rather
+    than blocking a run it cannot attribute).
 
     Share tasks carry a server-minted ``guest_id`` and are gated per link +
     per guest (#973). Widget tasks are gated per entity plus the creator IP
@@ -1082,10 +1083,12 @@ def _deny_public_run(quota_config: Mapping[str, Any]) -> str | None:
         if entity_key is None:
             return None
         client_ip = quota_config.get("widget_client_ip")
-        admitted = limiter.allow_widget_run(
+        reason = limiter.widget_run_denial_reason(
             entity_key, client_ip if isinstance(client_ip, str) and client_ip else None
         )
-        return None if admitted else "widget"
+        if reason is None:
+            return None
+        return "widget-ip" if reason == "ip" else "widget"
 
     if auth_mode == "share":
         guest_id = quota_config.get("guest_id")
@@ -3001,13 +3004,24 @@ class AgentServiceManager:
                     )
                 )
                 denied_channel = (
-                    _deny_public_run(quota_config) if quota_config is not None else None
+                    _public_run_denial_channel(quota_config)
+                    if quota_config is not None
+                    else None
                 )
                 if denied_channel is not None:
                     # Channel-specific copy + error_code: a widget visitor on a
                     # third-party page has no "shared link", and analytics need
-                    # to tell which public channel was throttled.
-                    if denied_channel == "widget":
+                    # to tell which public channel was throttled. The per-caller
+                    # sub-quota gets its own copy because it is the one refusal
+                    # the reader can act on — waiting clears it, whereas an
+                    # exhausted owner budget does not.
+                    if denied_channel == "widget-ip":
+                        reason_message = (
+                            "Too many requests from your network. "
+                            "Please wait a little while and try again."
+                        )
+                        quota_error_code = "widget_run_ip_quota_exceeded"
+                    elif denied_channel == "widget":
                         reason_message = (
                             "This widget has reached its usage limit. "
                             "Please try again later."

@@ -252,6 +252,28 @@ def test_widget_task_create_returns_429_over_limit(
         db.close()
 
 
+def test_widget_task_create_ignores_spoofed_forwarded_for() -> None:
+    """#1108 F3: the stamped creator IP is a durable quota key, so a client
+    must not be able to choose it. Under the default XAGENT_TRUSTED_PROXY_HOPS=0
+    the header is ignored entirely and the peer address is stamped."""
+    key = _widget_agent_key("RL Widget XFF Agent")
+    guest = _widget_guest_headers(key)
+
+    resp = client.post(
+        "/api/widget/chat/task/create",
+        headers={**guest, "X-Forwarded-For": "9.9.9.9"},
+        json={"title": "hi", "description": "hi"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == int(resp.json()["task_id"])).one()
+        assert task.agent_config.get("widget_client_ip") == "testclient"
+    finally:
+        db.close()
+
+
 def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
     """#1108 F1: a widget guest must not be able to inject entity/identity
     markers into their own task-create body — they select the run-quota bucket

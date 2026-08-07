@@ -1057,23 +1057,32 @@ def get_widget_run_quota() -> str:
 
 
 def get_widget_run_ip_quota() -> str:
-    """Per-creating-IP rolling run quota (#1108).
+    """Per-creating-IP, per-widget rolling run sub-quota (#1108).
 
     The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
-    share path's per-guest window. Its bucket is keyed on the creating IP
-    alone, so it is platform-level — one IP's budget spans every widget on the
-    instance, not one widget — which is what bounds a single-IP abuser from
-    draining any one widget's entity quota and locking out its other visitors
-    for a rolling day. It does NOT stop a
-    multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each staying
-    under its own window, still exhaust the shared entity quota — structurally
-    the same limit as the share path's per-guest quota. The IP is the one the
-    server observed at task creation (stamped into ``agent_config``, never
-    client-supplied); tasks created before this deploy carry no marker and are
-    bounded by the entity quota alone. (Shared NAT / proxy-hops caveat: see
-    example.env.)
+    share path's per-guest window. Its bucket is keyed ``entity|ip``, i.e.
+    scoped to one widget: a caller's budget on one embedded agent/workforce is
+    independent of every other widget on the instance. That scoping matters
+    because this quota is charged per *turn* — a bare-IP bucket would make one
+    NAT/CGNAT egress share a single turn budget across unrelated widgets.
+
+    Sizing: this is a share of a rolling owner-billed budget, not a burst
+    throttle, so it is deliberately far below the per-minute burst gates
+    (widget WS turn / task-create, both 60/minute per IP) and instead sized as
+    a fraction of :func:`get_widget_run_quota` — at the defaults one caller
+    needs several sustained hours to drain a widget's daily budget. It does
+    NOT stop a multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each
+    staying under its own window, still exhaust the entity quota —
+    structurally the same limit as the share path's per-guest quota.
+
+    The IP is the one the server observed at task creation (stamped into
+    ``agent_config``, never client-supplied); tasks created before this deploy
+    carry no marker and are bounded by the entity quota alone. Raise it for
+    deployments fronted by large shared egress (corporate NAT, carrier CGNAT),
+    where many genuine visitors present one address. (Shared NAT / proxy-hops
+    caveat: see example.env.)
     """
-    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "60/hour")
+    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
 
 
 def get_share_run_quota() -> str:

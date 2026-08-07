@@ -157,7 +157,11 @@ async def test_widget_run_ip_quota_blocks_one_creator(
 ) -> None:
     """The per-creating-IP sub-quota (#1108) gates a task whose agent_config
     carries the server-stamped widget_client_ip, even with the entity quota
-    wide open — one caller cannot drain the widget for everyone else."""
+    wide open — one caller cannot drain the widget for everyone else.
+
+    The refusal must be reported as the per-caller sub-quota, NOT the owner's
+    budget: waiting clears this one, so the visitor gets copy they can act on
+    instead of being told the widget owner is out of quota (D1/F1)."""
     monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "500/day")
     monkeypatch.setenv("XAGENT_WIDGET_RUN_IP_QUOTA", "0/hour")
     reset_share_rate_limiter()
@@ -181,7 +185,10 @@ async def test_widget_run_ip_quota_blocks_one_creator(
     )
 
     assert result["success"] is False
-    assert result["error_code"] == "widget_run_quota_exceeded"
+    assert result["error_code"] == "widget_run_ip_quota_exceeded"
+    assert "your network" in result["output"]
+    # Not the owner-budget copy, which the visitor cannot act on.
+    assert "widget has reached its usage limit" not in result["output"]
 
 
 @pytest.mark.asyncio
@@ -221,7 +228,7 @@ async def test_widget_run_quota_fails_open_on_malformed_marker(
 ) -> None:
     """A malformed (non-integer) widget entity marker must admit the run rather
     than 500 or block: _coerce_optional_entity_id catches the coercion error
-    and returns None, so the entity is unkeyable and _deny_public_run takes
+    and returns None, so the entity is unkeyable and _public_run_denial_channel takes
     its "unkeyable -> admit this task" branch — without falling through to the
     chokepoint's broad except."""
     monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "0/day")
@@ -347,3 +354,44 @@ def test_coerce_optional_entity_id_rejects_non_positive_int_inputs() -> None:
         ["1"],
     ):
         assert _coerce_optional_entity_id(bad) is None, bad
+
+
+@pytest.mark.asyncio
+async def test_widget_run_quota_is_charged_per_turn_not_per_task(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the accounting semantics (D1/F1): the gate sits in execute_task,
+    which runs once per conversation turn, so a second turn on the SAME task
+    consumes another slot. With a 1/day entity quota the first turn is admitted
+    and the second is refused — this is deliberate (the quota bounds
+    owner-billed runs, and every turn is one), and the per-IP sub-quota is
+    sized against it accordingly."""
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_QUOTA", "1/day")
+    monkeypatch.setenv("XAGENT_WIDGET_RUN_IP_QUOTA", "100/hour")
+    reset_share_rate_limiter()
+
+    task = _make_task(
+        db_session,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g",
+            "widget_agent_id": 4242,
+            "widget_client_ip": "203.0.113.11",
+        },
+    )
+
+    async def _run_one_turn():
+        return await AgentServiceManager().execute_task(
+            agent_service=_FakeAgentService(),
+            task="hello",
+            tracking_task_id=str(task.id),
+            db_session=db_session,
+            manage_task_lease=False,
+        )
+
+    first = await _run_one_turn()
+    assert first["success"] is True
+
+    second = await _run_one_turn()
+    assert second["success"] is False
+    assert second["error_code"] == "widget_run_quota_exceeded"
