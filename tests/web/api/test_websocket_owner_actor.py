@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from dataclasses import is_dataclass
 from types import SimpleNamespace
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -111,52 +113,36 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
 _THREAD_SIGNAL_DEADLINE_SECONDS = 10.0
 _HANDLER_DEADLINE_SECONDS = 30.0
 
+_T = TypeVar("_T")
+
 
 class _EventLoopLivenessProbe:
     """Deterministic replacement for counting event-loop ticks.
 
-    Wrapping a synchronous step in :meth:`gate` makes that step block until the
-    event loop answers back. If the step runs off the loop (in a worker thread)
-    the probe task is scheduled on the next loop pass and answers, leaving
-    ``loop_ran_during_step`` True. If the step runs *on* the loop thread,
-    nothing can answer, the wait expires and the flag stays False. The verdict
-    therefore depends on where the work ran, not on how fast the machine is.
-
-    The gate is entered once per test. Both events latch, so a second gated
-    call is answered from the first handshake rather than probed again.
+    Wrapping a synchronous step in :meth:`gate` makes that step queue an answer
+    on the event loop and then block until the loop delivers it. Off the loop
+    (in a worker thread) the loop runs the callback on its next pass. On the
+    loop thread the queued callback cannot run, because the loop thread is the
+    one blocking, so the wait expires. The verdict therefore depends on where
+    the work ran, not on how fast the machine is.
     """
 
     def __init__(self) -> None:
-        self._step_entered = threading.Event()
-        self._loop_answered = threading.Event()
-        self._task: asyncio.Task[None] | None = None
+        # Captured here rather than inside the gate: the gated step may run in
+        # a worker thread, where get_running_loop() raises.
+        self._loop = asyncio.get_running_loop()
+        self._answered = threading.Event()
         self.step_ran = False
         self.loop_ran_during_step = False
 
-    async def __aenter__(self) -> _EventLoopLivenessProbe:
-        async def _answer() -> None:
-            while not self._step_entered.is_set():
-                await asyncio.sleep(0.001)
-            self._loop_answered.set()
+    def gate(self, step: Callable[..., _T]) -> Callable[..., _T]:
+        """Wrap ``step`` so it holds until the event loop answers."""
 
-        self._task = asyncio.create_task(_answer())
-        return self
-
-    async def __aexit__(self, *_exc_info: object) -> None:
-        assert self._task is not None
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-
-    def gate(self, step):
-        """Wrap ``step`` so it holds until the loop answers the handshake."""
-
-        def gated(*args, **kwargs):
+        def gated(*args: Any, **kwargs: Any) -> _T:
+            assert not self.step_ran, "the probe gates a single call"
             self.step_ran = True
-            self._step_entered.set()
-            self.loop_ran_during_step = self._loop_answered.wait(
+            self._loop.call_soon_threadsafe(self._answered.set)
+            self.loop_ran_during_step = self._answered.wait(
                 timeout=_THREAD_SIGNAL_DEADLINE_SECONDS
             )
             return step(*args, **kwargs)
@@ -479,28 +465,28 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
     # The gate holds preparation open long enough for loop blocking to be
     # observable. Overlap detection is a separate mechanism: the one-slot pool
     # raises on a task-info checkout that collides with preparation.
-    async with _EventLoopLivenessProbe() as probe:
-        monkeypatch.setattr(
-            websocket_api,
-            "_prepare_websocket_turn_sync",
-            probe.gate(prepare_turn),
+    probe = _EventLoopLivenessProbe()
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        probe.gate(prepare_turn),
+    )
+    try:
+        await asyncio.wait_for(
+            _handle_chat_message_unserialized(
+                websocket,  # type: ignore[arg-type]
+                task_id,
+                {
+                    "message": "follow-up",
+                    "client_message_id": "broadcast-pool-turn",
+                    "user": SimpleNamespace(id=actor_user_id, is_admin=False),
+                    "files": [],
+                },
+            ),
+            timeout=_HANDLER_DEADLINE_SECONDS,
         )
-        try:
-            await asyncio.wait_for(
-                _handle_chat_message_unserialized(
-                    websocket,  # type: ignore[arg-type]
-                    task_id,
-                    {
-                        "message": "follow-up",
-                        "client_message_id": "broadcast-pool-turn",
-                        "user": SimpleNamespace(id=actor_user_id, is_admin=False),
-                        "files": [],
-                    },
-                ),
-                timeout=_HANDLER_DEADLINE_SECONDS,
-            )
-        finally:
-            engine.dispose()
+    finally:
+        engine.dispose()
 
     probe.assert_loop_stayed_responsive("WebSocket preparation")
     begin_turn.assert_awaited_once()
@@ -590,29 +576,29 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     )
 
     websocket_api._mark_task_pause_accepted(task_id)
-    async with _EventLoopLivenessProbe() as probe:
-        monkeypatch.setattr(
-            websocket_api,
-            "_prepare_websocket_turn_sync",
-            probe.gate(prepare_turn),
+    probe = _EventLoopLivenessProbe()
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        probe.gate(prepare_turn),
+    )
+    try:
+        await asyncio.wait_for(
+            _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "continue after pause",
+                    "client_message_id": "pause-pool-turn",
+                    "user": SimpleNamespace(id=actor_user_id, is_admin=False),
+                    "files": [],
+                },
+            ),
+            timeout=_HANDLER_DEADLINE_SECONDS,
         )
-        try:
-            await asyncio.wait_for(
-                _handle_chat_message_unserialized(
-                    MagicMock(),
-                    task_id,
-                    {
-                        "message": "continue after pause",
-                        "client_message_id": "pause-pool-turn",
-                        "user": SimpleNamespace(id=actor_user_id, is_admin=False),
-                        "files": [],
-                    },
-                ),
-                timeout=_HANDLER_DEADLINE_SECONDS,
-            )
-        finally:
-            websocket_api._clear_task_pause_accepted(task_id)
-            engine.dispose()
+    finally:
+        websocket_api._clear_task_pause_accepted(task_id)
+        engine.dispose()
 
     probe.assert_loop_stayed_responsive("pause settlement preparation")
     # The settlement itself is guarded by the one-slot pool: it opens its own
