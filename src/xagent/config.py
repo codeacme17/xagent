@@ -1008,9 +1008,11 @@ def get_widget_auth_ip_rate_limit() -> str:
     The tight per-visitor / per-abuser bound (visitors have distinct IPs):
     bounds one caller minting guest tokens / embed tickets (each call does DB
     lookups and signs a JWT) regardless of how many widget keys or tickets
-    they cycle through, since the IP is not cheaply rotatable. (Every per-IP
-    widget bucket shares the NAT / XAGENT_TRUSTED_PROXY_HOPS caveat documented
-    once in example.env.)
+    they cycle through, since the IP is not cheaply rotatable. Raise this
+    where many genuine visitors share one address (corporate NAT, carrier
+    CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy
+    — otherwise every caller resolves to the proxy's IP and this becomes one
+    global cap. (example.env carries the same caveat for all per-IP buckets.)
     """
     return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
 
@@ -1036,7 +1038,11 @@ def get_widget_task_create_ip_rate_limit() -> str:
     The tighter bucket: task creation is the costly surface (each spawns an
     owner-billed run), and the caller IP is the only trustworthy per-abuser
     key on the widget path. Numerically matches the widget upload/turn IP
-    default. (Shared NAT / proxy-hops caveat: see example.env.)
+    default. Raise this where many genuine visitors share one address
+    (corporate NAT, carrier CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly
+    behind a reverse proxy — otherwise every caller resolves to the proxy's IP
+    and this becomes one global cap. (example.env carries the same caveat for
+    all per-IP buckets.)
     """
     return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
 
@@ -1079,8 +1085,10 @@ def get_widget_run_ip_quota() -> str:
     ``agent_config``, never client-supplied); tasks created before this deploy
     carry no marker and are bounded by the entity quota alone. Raise it for
     deployments fronted by large shared egress (corporate NAT, carrier CGNAT),
-    where many genuine visitors present one address. (Shared NAT / proxy-hops
-    caveat: see example.env.)
+    where many genuine visitors present one address, and set
+    XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy — otherwise
+    every caller resolves to the proxy's IP and this becomes one global cap.
+    (example.env carries the same caveat for all per-IP buckets.)
     """
     return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
 

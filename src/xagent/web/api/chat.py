@@ -1043,7 +1043,11 @@ def _coerce_optional_entity_id(value: Any) -> int | None:
 
 
 def _public_run_denial_channel(quota_config: Mapping[str, Any]) -> str | None:
-    """Apply the per-entity run quota for a public (share/widget) task.
+    """Charge the run quota for a public (share/widget) task; name any refusal.
+
+    NOT a speculative query despite the name: admitting consumes a slot in
+    every bucket consulted (``allow_run`` / ``widget_run_denial_reason`` hit
+    them on the admit path), so calling this twice charges twice.
 
     Returns the quota that refused the run — ``"share"``, ``"widget"`` (the
     owner's budget for that embed), or ``"widget-ip"`` (the per-caller
