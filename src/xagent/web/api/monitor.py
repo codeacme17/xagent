@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Text
+from sqlalchemy import cast as sql_cast
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import expression
@@ -19,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 # Create router
 monitor_router = APIRouter(prefix="/api/monitor", tags=["monitor"])
+
+# POSIX regex matching the six-character JSON escape for NUL (a backslash
+# followed by "u0000") in a payload's text form. The backslash is doubled
+# because this is a regex pattern, not a Python escape.
+PG_NUL_ESCAPE_PATTERN = r"\\u0000"
 
 
 def is_admin_user(user: User) -> bool:
@@ -61,13 +68,25 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
     dialect_name = db_session.bind.dialect.name
 
     if dialect_name == "postgresql":
-        # PostgreSQL uses ->> operator to extract JSON field as text
-        # First filter out records containing binary data, then safely extract
+        # PostgreSQL extracts a JSON field as text with ->>. A json value may
+        # legally carry a NUL escape, but converting such a value to text
+        # raises "unsupported Unicode escape sequence", so null the payload out
+        # before extracting and let the whole row drop instead of failing the
+        # query. Matching runs on the column's text form because valid JSON
+        # never holds a raw control character (RFC 8259 requires escaping) --
+        # the escape sequence is what has to be found. ~ is the regex-match
+        # operator and applies to text; the ~? used here before does not exist
+        # in PostgreSQL at all, so every query through this branch failed.
+        #
+        # The MySQL/SQLite branches strip the escape and keep the row. Doing
+        # that here would mean casting the edited text back to json, which
+        # raises whenever the edit leaves invalid JSON -- one bad row would
+        # again fail the request.
         valid_data = expression.case(
             (
-                column.op("~?")(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F]"),
-                None,
-            ),  # Filter control characters
+                sql_cast(column, Text).op("~")(PG_NUL_ESCAPE_PATTERN),
+                expression.null(),
+            ),
             else_=column,
         )
         return valid_data.op("->>")(field_name)

@@ -6,9 +6,10 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 from sqlalchemy import JSON, Column, Integer
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.declarative import declarative_base
 
-from xagent.web.api.monitor import get_json_field_expression
+from xagent.web.api.monitor import PG_NUL_ESCAPE_PATTERN, get_json_field_expression
 
 Base = declarative_base()
 
@@ -41,6 +42,33 @@ class TestMonitorDatabaseCompatibility:
         result_str = str(result)
         assert "->>" in result_str
         assert "trace_events.data" in result_str
+
+    def test_postgresql_guard_compiles_to_operators_postgresql_has(self):
+        """The control-character guard must use operators that exist.
+
+        ``~?`` is not a PostgreSQL operator for ``json``, ``jsonb`` or
+        ``text``, so the guard failed every monitoring query on PostgreSQL
+        while this SQLite-oriented suite stayed green (#1149). The real
+        regex-match operator is ``~`` and it takes a text operand, hence the
+        cast. Compiling for the PostgreSQL dialect is what makes this a guard
+        rather than a restatement -- ``str(expr)`` renders the same either way.
+        """
+        mock_session = MagicMock()
+        mock_engine = Mock()
+        mock_engine.dialect.name = "postgresql"
+        mock_session.bind = mock_engine
+
+        column = MockTraceEvent.data
+        compiled = get_json_field_expression(column, "tool_name", mock_session).compile(
+            dialect=postgresql.dialect()
+        )
+
+        statement = str(compiled)
+        assert "~?" not in statement
+        assert "CAST(trace_events.data AS TEXT) ~ " in statement
+        assert "->>" in statement
+        # The pattern travels as a bind parameter, not as inlined SQL.
+        assert PG_NUL_ESCAPE_PATTERN in compiled.params.values()
 
     def test_mysql_json_extraction(self):
         """测试 MySQL 的 JSON 字段提取"""
