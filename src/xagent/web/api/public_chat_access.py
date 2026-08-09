@@ -1118,10 +1118,15 @@ async def create_share_chat_task(
     # independent of the sanitizer's reserved-key set.
     #
     # The workforce marker is a literal None rather than a context read because
-    # this branch is unreachable with a workforce: create_share_chat_task
-    # early-returns into _create_workforce_share_chat_task whenever
-    # access_context.workforce is set. If that dispatch is ever restructured,
-    # this literal becomes a lie — derive it from the context instead.
+    # the dispatch above already guarantees it: this branch is reached only
+    # after the early return into _create_workforce_share_chat_task, so
+    # access_context.workforce is None here. That guard is what keeps the
+    # literal honest — preserve it rather than re-deriving the value here.
+    # Reading the id off the context instead would be actively wrong: this
+    # branch builds an *agent* task (agent_id=share_agent_id below), and
+    # entity_rate_limit_key prefers workforce whenever both markers are set,
+    # so a non-None workforce id would charge an agent-share run to a
+    # workforce bucket — the exact misattribution this stamping prevents.
     agent_config["share_agent_id"] = share_agent_id
     agent_config["share_workforce_id"] = None
 
