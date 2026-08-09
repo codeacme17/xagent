@@ -1218,17 +1218,38 @@ def best_effort_provision_gmail_watches_for_user(
 
     Used after OAuth (re)connects a Gmail account: any enabled Gmail trigger
     already bound to that mailbox gets its delivery resources re-ensured.
-    Failures are recorded on the watch state, never raised.
+    Failures are recorded on the watch state, never raised; a failure before
+    any account resolves has no watch state to land on and is only logged.
     """
-    accounts = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
-        .all()
-    )
-    referenced_account_ids = _referenced_gmail_oauth_account_ids(
-        db,
-        [(int(account.id), str(account.email or "")) for account in accounts],
-    )
+    # The account lookup and the binding resolution are inside the guard, not
+    # just the per-account loop: the caller runs this after committing the
+    # OAuth token, so a raise here would turn an already-successful connect
+    # into an error page. A mailbox missed here is picked up by
+    # ``scan_due_gmail_watch_renewals``, which selects Gmail accounts owned by
+    # users with an enabled Gmail trigger and no watch state row at all.
+    # ``sweep_gmail_provisioning`` cannot cover this: it only retries mailboxes
+    # that already have a watch state row.
+    try:
+        accounts = (
+            db.query(UserOAuth)
+            .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
+            .all()
+        )
+        referenced_account_ids = _referenced_gmail_oauth_account_ids(
+            db,
+            [(int(account.id), str(account.email or "")) for account in accounts],
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Failed to resolve Gmail accounts for user %s %s: %s",
+            user_id,
+            context,
+            exc,
+            exc_info=True,
+        )
+        return
+
     for account in accounts:
         email = str(account.email or "").strip().lower()
         if not email:

@@ -46,15 +46,31 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from ..services.gmail_provisioning import (
-        best_effort_provision_gmail_watches_for_user,
-    )
+    """Provision Gmail watches without letting the outcome reach the caller.
 
-    best_effort_provision_gmail_watches_for_user(
-        db,
-        user_id=user_id,
-        context="after OAuth callback",
-    )
+    This runs after the OAuth token is committed, so the connect has already
+    succeeded. Anything raised here would be rendered by the callback's outer
+    handler as an ``Authentication Failed`` 500, telling the user a connector
+    failed while it is in fact connected. A best-effort side effect must not
+    be able to change what the callback returns.
+    """
+    try:
+        from ..services.gmail_provisioning import (
+            best_effort_provision_gmail_watches_for_user,
+        )
+
+        best_effort_provision_gmail_watches_for_user(
+            db,
+            user_id=user_id,
+            context="after OAuth callback",
+        )
+    except Exception:
+        logger.warning(
+            "Best-effort Gmail watch provisioning failed for user %s "
+            "after OAuth callback",
+            user_id,
+            exc_info=True,
+        )
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
