@@ -453,6 +453,77 @@ def test_workforce_share_task_without_guest_id_is_denied(
     assert _upload_to_task(guest, task_id).status_code == 403
 
 
+def test_agent_share_task_create_ignores_client_injected_entity_markers() -> None:
+    """Share-path counterpart of
+    ``test_share_rate_limit_endpoints.py::
+    test_widget_task_create_ignores_client_injected_entity_markers`` (#1132).
+
+    An anonymous share guest must not be able to seed the identity/entity
+    markers of their own task: the share run quota reads them back as
+    authoritative at the ``execute_task`` chokepoint, and
+    ``entity_rate_limit_key`` prefers workforce over agent — so a forged
+    ``share_workforce_id`` on an agent-share task would redirect the bucket
+    onto an unrelated workforce. The server stamps both entity markers from
+    the validated access context, writing the inapplicable one as ``None``.
+    """
+    agent_id = _create_published_agent("Forged Marker Agent", "forged-marker-tok")
+    guest = _authenticate_share_guest("forged-marker-tok")
+
+    created = client.post(
+        "/api/share/chat/task/create",
+        headers=guest,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {
+                # A forged workforce id would win over the real agent entity.
+                "share_workforce_id": 999999,
+                "share_agent_id": 888888,
+                "share_token": "forged",
+                "auth_mode": "widget",
+                "guest_id": "injected-guest",
+                # Widget-channel markers have no business on a share task
+                # either: they select the *widget* quota branch.
+                "widget_agent_id": 777777,
+                "widget_workforce_id": 666666,
+                "widget_client_ip": "1.2.3.4",
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        cfg = task.agent_config
+        # Entity markers: server-stamped from the access context. Workforce is
+        # cleared to None on the agent path, so the forged id can never key the
+        # quota bucket; the agent id is the shared agent, not the injected one.
+        #
+        # Assert the key is *present and None*, not merely `.get(...) is None`:
+        # the sanitizer alone would leave it absent, which `.get` cannot
+        # distinguish from the stamp. Only membership pins the layer-2 stamp
+        # (#1132) — without it this test would pass on the sanitizer alone and
+        # silently stop guarding what it is named for.
+        assert "share_workforce_id" in cfg
+        assert cfg["share_workforce_id"] is None
+        assert cfg.get("share_agent_id") == agent_id
+        # Identity/quota markers: server values win, injected copies stripped.
+        assert cfg.get("auth_mode") == "share"
+        assert cfg.get("guest_id") == _share_guest_id(guest["Authorization"])
+        assert "share_token" not in cfg
+        assert "widget_agent_id" not in cfg
+        assert "widget_workforce_id" not in cfg
+        assert "widget_client_ip" not in cfg
+        # Non-reserved client keys still ride through this path (unlike the
+        # workforce branch below, which never reads the client body at all).
+        assert cfg.get("keep_me") == "client value"
+    finally:
+        db.close()
+
+
 def test_workforce_share_task_create_discards_forged_agent_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -481,6 +552,14 @@ def test_workforce_share_task_create_discards_forged_agent_config(
                     "memory_dimensions": {"tenant": "victim"},
                 },
                 SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                # Entity/identity markers select the run-quota bucket at the
+                # execute_task chokepoint (#1132): a forged agent id would move
+                # this workforce run's charge onto an unrelated agent bucket.
+                "share_workforce_id": 999999,
+                "share_agent_id": 888888,
+                "share_token": "forged",
+                "auth_mode": "widget",
+                "guest_id": "injected-guest",
                 "keep_me": "client value",
             },
         },
@@ -498,6 +577,16 @@ def test_workforce_share_task_create_discards_forged_agent_config(
         assert task.agent_config.get("guest_id") == _share_guest_id(
             guest["Authorization"]
         )
+        # The handler's own extra_agent_config is the only source of the entity
+        # markers; the snapshot-built config never sets them, so nothing from
+        # the request body can win the merge. Both are stamped (the
+        # inapplicable one as None), so assert presence rather than absence —
+        # `not in` would pin the pre-#1132 asymmetric shape and break the day
+        # this branch reaches parity with the widget one.
+        assert task.agent_config.get("share_workforce_id") == workforce_id
+        assert "share_agent_id" in task.agent_config
+        assert task.agent_config["share_agent_id"] is None
+        assert "share_token" not in task.agent_config
     finally:
         db.close()
 
