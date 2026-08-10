@@ -43,6 +43,11 @@ PG_SURROGATE_PAIR_PATTERN = (
 # What PostgreSQL stores happily in a json column but refuses to convert to
 # text: the NUL escape, and either half of an unpaired surrogate. Matched
 # against the normalized, pair-stripped text produced above.
+#
+# This assumes a UTF8 server encoding, which is what the shipped compose file
+# runs. On a server in another encoding ->> also rejects any escape naming a
+# character outside that charset -- including a valid surrogate pair, which
+# the step above deliberately strips -- so the list is not exhaustive there.
 PG_UNSAFE_ESCAPE_PATTERN = (
     r"\\u0000"
     r"|\\u[dD][89abAB][0-9a-fA-F]{2}"
@@ -148,15 +153,7 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
 
 
 def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> Any:
-    """
-    JSON field extraction expression for the session's dialect.
-
-    This used to wrap the extraction in ``CASE WHEN expr IS NOT NULL THEN expr
-    ELSE NULL END``, which is an identity -- it returned ``expr`` when non-NULL
-    and NULL otherwise, i.e. ``expr``. It was not free, though: call sites
-    reference the expression in SELECT, WHERE and GROUP BY, and neither
-    SQLAlchemy nor the PostgreSQL planner collapses the repeats, so the wrapper
-    doubled the guard from three occurrences per query to six.
+    """JSON field extraction expression for the session's dialect.
 
     Args:
         column: SQLAlchemy column object

@@ -141,22 +141,26 @@ NON_BMP = chr(0x1F600)  # json.dumps writes this as a valid surrogate pair
 BACKSLASH = chr(92)
 
 
-def guard_would_drop(value: object) -> bool:
-    """Run the PostgreSQL guard's matching rules in pure Python.
+def matches_unsafe_escape(payload_text: str) -> bool:
+    """Run the PostgreSQL guard's matching rules over a payload's text form.
 
-    Mirrors what the SQL does to a payload, in the same order: neutralize
-    escaped backslashes, delete valid surrogate pairs, then look for an escape
+    Mirrors what the SQL does, in the same order: neutralize escaped
+    backslashes, delete valid surrogate pairs, then look for an escape
     PostgreSQL will not convert to text. Python's ``re`` and PostgreSQL's ARE
     agree on this pattern -- character classes, bounded repeats and plain
     alternation only, no lookaround -- so this is a faithful stand-in that runs
     without a database.
     """
-    payload_text = json.dumps({"a": value})
     normalized = payload_text.replace(
         PG_ESCAPED_BACKSLASH, PG_ESCAPED_BACKSLASH_STANDIN
     )
     unpaired_only = re.sub(PG_SURROGATE_PAIR_PATTERN, "", normalized)
     return re.search(PG_UNSAFE_ESCAPE_PATTERN, unpaired_only) is not None
+
+
+def guard_would_drop(value: object) -> bool:
+    """Whether the guard drops a payload holding ``value``, as json.dumps writes it."""
+    return matches_unsafe_escape(json.dumps({"a": value}))
 
 
 class TestUnsafeEscapePattern:
@@ -177,6 +181,11 @@ class TestUnsafeEscapePattern:
             ("lone surrogate after a pair", NON_BMP + LONE_LOW),
             ("lone surrogate before a pair", LONE_HIGH + NON_BMP),
             ("escape buried in text", "before" + NUL + "after"),
+            # Text mimicking a high surrogate must not shield a real lone low.
+            # Without the escaped-backslash normalization this reads as a valid
+            # pair, slips past the guard and fails the whole request -- the
+            # failure the guard exists to prevent, in its worst direction.
+            ("real low behind a literal escape", BACKSLASH + "ud83d" + LONE_LOW),
         ],
     )
     def test_drops_payloads_postgresql_cannot_convert(self, label, value):
@@ -201,15 +210,6 @@ class TestUnsafeEscapePattern:
         """Nothing here raises in PostgreSQL, so nothing here may be dropped."""
         assert guard_would_drop(value) is False, label
 
-    def test_drops_a_real_surrogate_hidden_behind_a_literal_escape(self):
-        """Text that mimics a high surrogate must not shield a real lone low.
-
-        Without the escaped-backslash normalization this payload reads as a
-        valid pair, slips past the guard, and fails the whole request -- the
-        exact failure the guard exists to prevent, in its worst direction.
-        """
-        assert guard_would_drop(BACKSLASH + "ud83d" + LONE_LOW) is True
-
     @pytest.mark.parametrize(
         "label,payload_text,expected",
         [
@@ -230,12 +230,7 @@ class TestUnsafeEscapePattern:
         accept either case; narrowing them would silently start dropping valid
         pairs and keeping fatal lone surrogates.
         """
-        normalized = payload_text.replace(
-            PG_ESCAPED_BACKSLASH, PG_ESCAPED_BACKSLASH_STANDIN
-        )
-        unpaired_only = re.sub(PG_SURROGATE_PAIR_PATTERN, "", normalized)
-        matched = re.search(PG_UNSAFE_ESCAPE_PATTERN, unpaired_only) is not None
-        assert matched is expected, label
+        assert matches_unsafe_escape(payload_text) is expected, label
 
 
 def test_admin_user_permissions():
