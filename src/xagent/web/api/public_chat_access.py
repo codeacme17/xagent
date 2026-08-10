@@ -1050,8 +1050,11 @@ async def _create_workforce_share_chat_task(
             # Null the agent marker for symmetry with the agent path (#1132),
             # mirroring the widget workforce branch: entity_rate_limit_key
             # prefers workforce, so a stray agent id would be ignored anyway,
-            # but stamping both keeps the run-quota key unambiguous and
-            # independent of merge ordering.
+            # but stamping both keeps the run-quota key unambiguous. Safe
+            # because the snapshot-built config never sets either marker --
+            # not because merge order is irrelevant: _merge_agent_config
+            # returns {**extra_agent_config, **task_config}, so the built
+            # config wins every collision and this dict loses.
             "share_agent_id": None,
             # Per-guest isolation (#973). extra_agent_config is overlaid under
             # the snapshot-built config, which never sets guest_id, so this is
@@ -1117,16 +1120,16 @@ async def create_share_chat_task(
     # already strips both, but stamping explicitly keeps this correct
     # independent of the sanitizer's reserved-key set.
     #
-    # The workforce marker is a literal None rather than a context read because
-    # the dispatch above already guarantees it: this branch is reached only
-    # after the early return into _create_workforce_share_chat_task, so
-    # access_context.workforce is None here. That guard is what keeps the
-    # literal honest — preserve it rather than re-deriving the value here.
-    # Reading the id off the context instead would be actively wrong: this
-    # branch builds an *agent* task (agent_id=share_agent_id below), and
-    # entity_rate_limit_key prefers workforce whenever both markers are set,
-    # so a non-None workforce id would charge an agent-share run to a
-    # workforce bucket — the exact misattribution this stamping prevents.
+    # The workforce marker is a literal None because the dispatch above forces
+    # it: this branch runs only after the early return into
+    # _create_workforce_share_chat_task, so access_context.workforce is None
+    # here and a context read would yield the same value today. Preserving that
+    # guard is what keeps the literal honest. If it were ever removed, a
+    # context read would not be the safe fallback it looks like: this branch
+    # builds an *agent* task (agent_id=share_agent_id below), and
+    # entity_rate_limit_key prefers workforce whenever both markers are set, so
+    # a non-None workforce id here would charge an agent-share run to a
+    # workforce bucket — the misattribution this stamping exists to prevent.
     agent_config["share_agent_id"] = share_agent_id
     agent_config["share_workforce_id"] = None
 

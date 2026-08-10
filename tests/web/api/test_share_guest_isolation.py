@@ -531,9 +531,9 @@ def test_workforce_share_task_create_discards_forged_agent_config(
     ``_create_workforce_share_chat_task`` never reads
     ``TaskCreateRequest.agent_config`` -- ``create_workforce_run`` only sees
     the handler's own ``extra_agent_config`` (``auth_mode``,
-    ``share_workforce_id``, ``guest_id``). A forged reserved key in the
-    request body must not survive into the persisted config, and neither
-    should an ordinary client key."""
+    ``share_workforce_id``, ``share_agent_id``, ``guest_id``). A forged
+    reserved key in the request body must not survive into the persisted
+    config, and neither should an ordinary client key."""
     workforce_id = _create_workforce("Forged Config Share WF")
     token = _enable_workforce_share(workforce_id)
     guest = _authenticate_share_guest(token)
@@ -553,8 +553,11 @@ def test_workforce_share_task_create_discards_forged_agent_config(
                 },
                 SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
                 # Entity/identity markers select the run-quota bucket at the
-                # execute_task chokepoint (#1132): a forged agent id would move
-                # this workforce run's charge onto an unrelated agent bucket.
+                # execute_task chokepoint (#1132). Two layers make a forged one
+                # inert here and both are worth pinning: this handler never
+                # reads the request body at all, and entity_rate_limit_key
+                # prefers workforce regardless, so a stray agent id could not
+                # move the charge even if it did land in the config.
                 "share_workforce_id": 999999,
                 "share_agent_id": 888888,
                 "share_token": "forged",
@@ -581,8 +584,8 @@ def test_workforce_share_task_create_discards_forged_agent_config(
         # markers; the snapshot-built config never sets them, so nothing from
         # the request body can win the merge. Both are stamped (the
         # inapplicable one as None), so assert presence rather than absence —
-        # `not in` would pin the pre-#1132 asymmetric shape and break the day
-        # this branch reaches parity with the widget one.
+        # `not in` would pin the pre-#1132 asymmetric shape this commit
+        # replaced when it brought the branch to parity with the widget one.
         assert task.agent_config.get("share_workforce_id") == workforce_id
         assert "share_agent_id" in task.agent_config
         assert task.agent_config["share_agent_id"] is None
