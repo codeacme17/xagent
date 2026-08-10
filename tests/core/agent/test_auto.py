@@ -1091,7 +1091,11 @@ async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert "quantitative data" in decision_prompt
     assert "illustrative placeholders" in decision_prompt
-    assert "choose react instead" in decision_prompt
+    assert "invented values" in decision_prompt
+    # Routes through the classification field so _normalize_decision's
+    # deterministic fallback catches it, not just the model's routing choice.
+    assert "set existing_context_sufficient=false and choose react" in decision_prompt
+    assert "use an appropriate tool" not in decision_prompt
 
 
 @pytest.mark.asyncio

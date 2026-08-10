@@ -1,7 +1,14 @@
 """Shared anti-fabrication rules for prompts that emit user-facing answers.
 
-Every prompt that produces a final user-facing answer must carry this rule;
-paths without it have produced fabricated report data (issue #1235).
+Every prompt that produces a final user-facing answer should carry this rule.
+That is a design goal, not an enforced invariant: nothing walks the prompt
+builders to verify it, and ReAct's no-tool branch still lacks it.
+
+This is the proposal-A mitigation from issue #1235. It reduces how often
+unsourced figures are emitted and makes disclosure the instructed default, but
+it cannot repair a session whose evidence compaction already discarded.
+Proposals B (evidence-preserving compaction) and C (provenance tracking and a
+data-source gate) remain open.
 """
 
 from __future__ import annotations
@@ -12,9 +19,10 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
 
     Args:
         can_call_tools: Whether the receiving LLM call may invoke work tools.
-            When ``False`` (forced final answers, DAG completion assessment),
-            the rule tells the model to state the gap instead of suggesting a
-            tool call it cannot make.
+            ``False`` at the three forced-answer sites -- ReAct's forced final
+            answer, the DAG completion assessment, and the Auto routing
+            decision -- where the rule must tell the model to state the gap
+            instead of suggesting a tool call it cannot make.
 
     Returns:
         A prompt fragment forbidding unsupported claims and unsourced
@@ -36,8 +44,11 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "statistics, percentages, table rows, or time series) that are not "
         "supported by the conversation, retrieved context, or tool results. "
         f"{insufficient_context_rule}"
-        "If the answer includes figures that no tool result or provided "
-        "context supports, disclose up front, before presenting them, that "
-        "the figures are illustrative placeholders not drawn from any data "
-        "source; never present invented numbers as real data."
+        "Never invent figures to fill a gap, and never present invented numbers "
+        "as real data; produce unsupported figures only when the user explicitly "
+        "asked for a template, mockup, or illustrative example. Labeling is "
+        "required either way: if the answer ends up containing any figure that no "
+        "tool result or provided context supports, whether or not the user asked "
+        "for one, say so up front, before presenting it, and state that those "
+        "figures are illustrative placeholders not drawn from any data source."
     )

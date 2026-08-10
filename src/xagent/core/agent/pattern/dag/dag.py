@@ -1402,7 +1402,13 @@ class DAGPattern(AgentPattern):
                     "missing, choose status=incomplete, leave answer empty, and "
                     "state the missing work plus concise replan instructions. Put "
                     "status before answer in the tool arguments. "
+                    "When writing the answer field, including any content carried "
+                    "over from candidate_output or step_results: "
                     f"{grounding_rule(can_call_tools=False)} "
+                    "If the answer presents any figure as an illustrative "
+                    "placeholder because no step produced the underlying data, "
+                    "name that unsourced data in reason even when you choose "
+                    "status=completed. "
                     f"{final_answer_language_rule(subject='output language policy')}"
                 ),
             },

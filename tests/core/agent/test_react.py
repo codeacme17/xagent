@@ -1124,6 +1124,13 @@ async def test_react_recovers_unavailable_forced_final_with_full_tool_set() -> N
         "Re-decide this turn using the complete current tool set"
         in llm.stream_calls[2]["messages"][0]["content"]
     )
+    # stream_calls[1] is the forced final-answer turn. Assert the no-tools
+    # grounding variant specifically: both branches carry the rule, so only the
+    # can_call_tools=False wording proves run() reached the forced branch.
+    forced_final_prompt = llm.stream_calls[1]["messages"][0]["content"]
+    assert "quantitative data" in forced_final_prompt
+    assert "invented values" in forced_final_prompt
+    assert "use an appropriate tool" not in forced_final_prompt
     recovery_starts = [
         event
         for event in tracer.events

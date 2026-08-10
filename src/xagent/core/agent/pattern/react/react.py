@@ -802,6 +802,9 @@ class ReActPattern(AgentPattern):
                 "Never call a tool name that is not in this list."
             )
         else:
+            # Reachable only with tool_choice="none", which no production
+            # construction site sets. If that ever changes, this branch needs
+            # grounding_rule() too -- it emits a final answer without it today.
             return messages
         completion_instruction = self._completion_evidence_instruction(context)
         if completion_instruction:
