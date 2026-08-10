@@ -25,6 +25,7 @@ from ...context.skill_tool import (
     build_load_skill_tool,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...grounding import grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     final_answer_language_rule,
@@ -1305,7 +1306,11 @@ class AutoPattern(AgentPattern):
             "Use final_answer for simple conversational replies that need no tools; "
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
-            "tool arguments. You must also classify whether "
+            "tool arguments. "
+            f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
+            "If the answer would need such unsupported specifics, choose react "
+            "instead so the agent can verify them with tools. "
+            "You must also classify whether "
             "the latest request requires current or external facts, and whether "
             "the existing context is sufficient evidence for those facts. "
             "Set response_language to the natural language that user-facing prose "
