@@ -43,6 +43,7 @@ COMPACT_SUMMARY_MAX_TOKENS = 1024
 COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
+COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 
 
 def _utcnow() -> datetime:
@@ -997,14 +998,28 @@ class ExecutionContext:
         original_count = len(self.messages)
         if self.compact_config.strategy == "truncate":
             keep_count = min(max(0, self.compact_config.max_messages), original_count)
-            self.messages = self._tail_window_preserving_tool_pairs(keep_count)
-            removed = max(0, original_count - len(self.messages))
+            retained = self._tail_window_preserving_tool_pairs(keep_count)
+            removed = max(0, original_count - len(retained))
+            # The window is a suffix minus any interior tool fragments sanitized
+            # out of it, so diff by object identity rather than slicing a prefix.
+            retained_ids = {id(message) for message in retained}
+            dropped_tool_counts = self._dropped_tool_result_counts(
+                [
+                    message
+                    for message in self.messages
+                    if id(message) not in retained_ids
+                ]
+            )
+            self.messages = retained
             return CompactResult(
                 compacted=True,
                 original_count=original_count,
                 final_count=len(self.messages),
                 strategy="truncate",
-                metadata={"removed_count": removed},
+                metadata={
+                    "removed_count": removed,
+                    "dropped_tool_result_count": sum(dropped_tool_counts.values()),
+                },
             )
 
         return CompactResult(
@@ -1049,18 +1064,27 @@ class ExecutionContext:
             self._context_refs_removed_by_compaction(latest_user)
         )
         dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
+        dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
+        dropped_tools_notice = self._dropped_tool_results_notice(dropped_tool_counts)
         summary_content = (
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
             "Use this summary as the current execution state. Continue from the "
             "remaining work described here; do not repeat completed tool calls or "
             "regenerate completed artifacts unless the latest user request "
-            "explicitly asks to restart, revise, or regenerate them. Current system "
-            "instructions still take precedence, and the latest user request remains "
-            "the overall goal."
+            "explicitly asks to restart, revise, or regenerate them, or the detail "
+            "you need was lost in compaction. This summary is a lossy paraphrase of "
+            "the raw history, not the history itself: when the answer needs an exact "
+            "value, figure, statistic, table row, quotation, or identifier that this "
+            "summary does not literally contain, re-run the tool that produced it "
+            "instead of reconstructing the value from this summary or from memory. "
+            "Current system instructions still take precedence, and the latest user "
+            "request remains the overall goal."
         )
         if dropped_refs_notice:
             summary_content = f"{summary_content}\n\n{dropped_refs_notice}"
+        if dropped_tools_notice:
+            summary_content = f"{summary_content}\n\n{dropped_tools_notice}"
         summary_message = Message.role_system(
             summary_content,
             metadata={"compacted_context": True},
@@ -1081,6 +1105,7 @@ class ExecutionContext:
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
                 "dropped_context_ref_count": len(dropped_context_refs),
+                "dropped_tool_result_count": sum(dropped_tool_counts.values()),
             },
         )
         if original_tokens is not None:
@@ -1151,6 +1176,49 @@ class ExecutionContext:
             current_chars += len(line) + 1
         if omitted:
             lines.append(f"- ... {omitted} additional older reference(s) omitted")
+        return prefix + "\n".join(lines)
+
+    @staticmethod
+    def _dropped_tool_result_counts(messages: list[Message]) -> dict[str, int]:
+        """Count visible tool observations, keyed by tool name.
+
+        Hidden messages are excluded: they were already absent from the prompt
+        before compaction, so reporting them as newly dropped would be wrong.
+        """
+        counts: dict[str, int] = {}
+        for message in messages:
+            if message.hidden or message.role != "tool":
+                continue
+            metadata = message.metadata or {}
+            name = str(metadata.get("tool_name") or "").strip() or "unnamed tool"
+            counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    @staticmethod
+    def _dropped_tool_results_notice(counts: dict[str, int]) -> str:
+        """Describe the tool observations this compaction removes from context.
+
+        Without this, the summary silently replaces every retrieved value and
+        the agent cannot tell a remembered figure from an invented one.
+        """
+        if not counts:
+            return ""
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
+        lines = [
+            f"- {name} x{count}" if count > 1 else f"- {name}" for name, count in listed
+        ]
+        omitted = len(ordered) - len(listed)
+        if omitted:
+            lines.append(f"- ... {omitted} additional tool(s) omitted")
+        total = sum(counts.values())
+        prefix = (
+            f"Raw observations from {total} completed tool call(s) were dropped by "
+            "this compaction. Their exact values are no longer in context; only the "
+            "summary above describes them. Treat any figure not literally present in "
+            "that summary as unavailable rather than recalled. Tools whose results "
+            "were dropped:\n"
+        )
         return prefix + "\n".join(lines)
 
     def _latest_visible_user_message(self) -> Message | None:

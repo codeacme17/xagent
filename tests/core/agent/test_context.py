@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -757,8 +758,98 @@ def test_compact_with_llm_summarizes_history_and_preserves_current_user() -> Non
     assert "Used read_file" in ctx.messages[0].content
     assert "current execution state" in ctx.messages[0].content
     assert "do not repeat completed tool calls" in ctx.messages[0].content
+    assert "lost in compaction" in ctx.messages[0].content
+    assert "re-run the tool that produced it" in ctx.messages[0].content
+    assert "- read_file" in ctx.messages[0].content
+    assert result.metadata["dropped_tool_result_count"] == 1
     assert ctx.messages[1].role == "user"
     assert ctx.messages[1].content == "current request"
+
+
+def test_compact_with_llm_reports_dropped_tool_results_by_name() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Build a KPI report")
+    for index in range(3):
+        call_id = f"call-search-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search"},
+                }
+            ],
+        )
+        ctx.add_tool_result("web_search", {"output": f"rows {index}"}, call_id)
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-read", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "revenue 1234"}, "call-read")
+
+    result = ctx.compact_with_llm_response({"content": "Collected KPI inputs."})
+
+    notice = ctx.messages[0].content
+    assert "3 completed tool call(s) were dropped" not in notice
+    assert "4 completed tool call(s) were dropped" in notice
+    assert "- web_search x3" in notice
+    assert "- read_file" in notice
+    assert "unavailable rather than recalled" in notice
+    assert result.metadata["dropped_tool_result_count"] == 4
+
+
+def test_compact_with_llm_omits_tool_notice_without_tool_results() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Say hello")
+    ctx.add_assistant_message("Hello.")
+
+    ctx.compact_with_llm_response({"content": "Greeted the user."})
+
+    assert "were dropped by this compaction" not in ctx.messages[0].content
+
+
+def test_compact_with_llm_ignores_hidden_tool_results_in_notice() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Check the file twice")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    superseded = ctx.add_tool_result("read_file", {"output": "stale"}, "call-1")
+    ctx.messages[ctx.messages.index(superseded)] = replace(superseded, hidden=True)
+
+    result = ctx.compact_with_llm_response({"content": "Read the file."})
+
+    assert "were dropped by this compaction" not in ctx.messages[0].content
+    assert result.metadata["dropped_tool_result_count"] == 0
+
+
+def test_compact_truncate_counts_dropped_tool_results() -> None:
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.compact_config.max_messages = 4
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}}
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "dropped rows"}, "call-1")
+    for index in range(6):
+        ctx.add_user_message(f"tail-{index}")
+
+    result = ctx.compact_if_needed()
+
+    assert result.strategy == "truncate"
+    assert result.metadata["dropped_tool_result_count"] == 1
 
 
 def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
