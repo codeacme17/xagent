@@ -61,6 +61,17 @@ LONE_LOW_SURROGATE = chr(0xDC00)  # same, from the other side of the pair
 # pair. It must NOT be dropped: emoji in an LLM payload are ordinary.
 NON_BMP_CHAR = chr(0x1F600)
 
+# Text that merely looks like an escape: the JSON carries a doubled backslash,
+# so ``->>`` reads it back without complaint. Dropping it would cost a real
+# monitoring row for nothing.
+BACKSLASH = chr(92)
+LITERAL_ESCAPE_TEXT = BACKSLASH + "u0000"
+
+# The nasty one: literal text shaped like a high surrogate escape, immediately
+# followed by a genuinely unpaired low surrogate. Read naively the two look
+# like a valid pair, the row slips through, and ``->>`` fails the whole query.
+SURROGATE_BEHIND_LITERAL = BACKSLASH + "ud83d" + LONE_LOW_SURROGATE
+
 
 @pytest.fixture()
 def pg_session() -> Iterator[Session]:
@@ -116,6 +127,18 @@ def _seed_admin_with_trace_events(db: Session) -> User:
         # Dropped, with the escape in the extracted field rather than beside
         # it: the guard reads the whole payload, so position must not matter.
         ("llm_call_start", {"model_name": f"tainted-{NUL_PAYLOAD}"}),
+        # Dropped: a real unpaired surrogate hiding behind text that imitates
+        # the other half of a pair.
+        (
+            "llm_call_start",
+            {"model_name": "hidden-model", "note": SURROGATE_BEHIND_LITERAL},
+        ),
+        # Kept: text that only looks like an escape extracts fine, so the
+        # guard must not treat it as a hazard.
+        (
+            "llm_call_start",
+            {"model_name": "literal-escape-model", "note": LITERAL_ESCAPE_TEXT},
+        ),
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "web_search"}),
@@ -152,10 +175,10 @@ async def test_monitoring_stats_counts_active_models_on_postgresql(
 
     stats = await get_monitoring_stats(db=pg_session, current_user=admin)
 
-    # gpt-4o, claude-opus and the emoji model. The four payloads carrying an
-    # unconvertible escape are dropped by the guard; the valid surrogate pair
-    # is not.
-    assert stats["activeModels"] == 3
+    # gpt-4o, claude-opus, the emoji model and the literal-escape model. The
+    # five payloads carrying an escape PostgreSQL cannot convert are dropped;
+    # a valid surrogate pair and text that merely looks like an escape are not.
+    assert stats["activeModels"] == 4
 
 
 @pytest.mark.postgresql
@@ -186,4 +209,5 @@ async def test_model_stats_returns_per_model_calls_on_postgresql(
         "gpt-4o": 2,
         "claude-opus": 1,
         f"emoji-model {NON_BMP_CHAR}": 1,
+        "literal-escape-model": 1,
     }

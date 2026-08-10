@@ -22,25 +22,31 @@ logger = logging.getLogger(__name__)
 # Create router
 monitor_router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 
-# POSIX regex over a payload's text form, matching the JSON escape
-# sequences PostgreSQL accepts into a json column but refuses to convert to
-# text. Three arms: the NUL escape; a high surrogate with no low surrogate
-# after it; a low surrogate with no high surrogate before it. A valid
-# surrogate pair -- how json.dumps writes any non-BMP character, emoji
-# included -- matches no arm and is left alone.
-#
-# Backslashes are doubled because this is a regex pattern, not a Python
-# escape: "\\" matches the single literal backslash that opens
-# the escape in the stored text.
-#
-# Known over-match: a payload whose text genuinely contains those six
-# characters (a doubled backslash in the JSON) is dropped even though ->>
-# would have read it. Dropping a safe row costs one row of monitoring; the
-# opposite error fails the whole request.
+# The guard below matches on the payload's *text* form, where a doubled
+# backslash is an escaped backslash rather than the start of an escape.
+# Those are neutralized first, so every backslash that survives opens a
+# real JSON escape. That is what makes the match exact in both directions:
+# without it, text that merely looks like an escape is dropped, and worse,
+# a real unpaired surrogate sitting right after such text is missed.
+PG_ESCAPED_BACKSLASH = r"\\"
+PG_ESCAPED_BACKSLASH_STANDIN = "__"
+
+# A valid surrogate pair converts to text without complaint, so pairs are
+# removed before matching -- any surrogate escape still standing after that
+# is unpaired by construction. Stripping is also what keeps this cheap:
+# the lookahead/lookbehind form this replaces cost roughly an order of
+# magnitude more on a table the monitoring dashboard scans.
+PG_SURROGATE_PAIR_PATTERN = (
+    r"\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
+
+# What PostgreSQL stores happily in a json column but refuses to convert to
+# text: the NUL escape, and either half of an unpaired surrogate. Matched
+# against the normalized, pair-stripped text produced above.
 PG_UNSAFE_ESCAPE_PATTERN = (
     r"\\u0000"
-    r"|\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})"
-    r"|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+    r"|\\u[dD][89abAB][0-9a-fA-F]{2}"
+    r"|\\u[dD][c-fC-F][0-9a-fA-F]{2}"
 )
 
 
@@ -99,13 +105,29 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
         # does not exist in PostgreSQL at all, so every query through this
         # branch failed.
         #
+        # Two normalizations run before the match, and both are load-bearing:
+        # escaped backslashes become an inert stand-in so nothing that merely
+        # looks like an escape is treated as one, and valid surrogate pairs are
+        # deleted so whatever surrogate escape remains is unpaired. Only then
+        # is a plain alternation enough -- no lookaround, which is what made an
+        # earlier version of this guard cost an order of magnitude more on a
+        # table these dashboard endpoints scan.
+        #
         # The MySQL/SQLite branches strip the escape and keep the row. Doing
         # that here would mean casting the edited text back to json, which
         # raises whenever the edit leaves invalid JSON -- one bad row would
         # again fail the request.
+        payload_text = func.replace(
+            sql_cast(column, Text),
+            PG_ESCAPED_BACKSLASH,
+            PG_ESCAPED_BACKSLASH_STANDIN,
+        )
+        unpaired_only = func.regexp_replace(
+            payload_text, PG_SURROGATE_PAIR_PATTERN, "", "g"
+        )
         valid_data = expression.case(
             (
-                sql_cast(column, Text).op("~")(PG_UNSAFE_ESCAPE_PATTERN),
+                unpaired_only.op("~")(PG_UNSAFE_ESCAPE_PATTERN),
                 expression.null(),
             ),
             else_=column,
@@ -127,7 +149,14 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
 
 def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> Any:
     """
-    Safe JSON field extraction with NULL checks
+    JSON field extraction expression for the session's dialect.
+
+    This used to wrap the extraction in ``CASE WHEN expr IS NOT NULL THEN expr
+    ELSE NULL END``, which is an identity -- it returned ``expr`` when non-NULL
+    and NULL otherwise, i.e. ``expr``. It was not free, though: call sites
+    reference the expression in SELECT, WHERE and GROUP BY, and neither
+    SQLAlchemy nor the PostgreSQL planner collapses the repeats, so the wrapper
+    doubled the guard from three occurrences per query to six.
 
     Args:
         column: SQLAlchemy column object
@@ -135,10 +164,9 @@ def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> An
         db_session: Database session
 
     Returns:
-        JSON field extraction expression with NULL checks
+        JSON field extraction expression suitable for the current database
     """
-    json_expr = get_json_field_expression(column, field_path, db_session)
-    return expression.case((json_expr.isnot(None), json_expr), else_=None)
+    return get_json_field_expression(column, field_path, db_session)
 
 
 @monitor_router.get("/tools")
