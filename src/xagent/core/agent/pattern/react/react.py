@@ -54,7 +54,11 @@ from ...context.enrichment import (
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...language import final_answer_language_rule
-from ...result import tool_result_succeeded, unwrap_final_answer_content
+from ...result import (
+    CONTROL_TOOL_NAMES,
+    tool_result_succeeded,
+    unwrap_final_answer_content,
+)
 from ...runtime import (
     ExecutionInterrupted,
     LLMCallInterrupted,
@@ -1658,7 +1662,7 @@ class ReActPattern(AgentPattern):
         return [*external_tools, *self._builtin_tool_schemas()]
 
     def _control_tool_names(self) -> set[str]:
-        return {"final_answer", "send_message", "ask_user_question"}
+        return set(CONTROL_TOOL_NAMES)
 
     async def _handle_control_tool(
         self,

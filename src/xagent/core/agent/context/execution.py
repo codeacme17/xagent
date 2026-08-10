@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -25,6 +26,7 @@ from ..language import (
     output_language_policy,
     response_language_rules,
 )
+from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
     COMPONENT_LOADERS,
     ExecutionComponent,
@@ -36,13 +38,23 @@ from .components import (
 from .enrichment import MEMORY_CONTEXT_METADATA_KEY, SKILL_CONTEXT_METADATA_KEY
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
-from .skill_tool import LOADED_SKILLS_METADATA_KEY, SKILL_INDEX_METADATA_KEY
+from .skill_tool import (
+    LOAD_SKILL_TOOL_NAME,
+    LOADED_SKILLS_METADATA_KEY,
+    SKILL_INDEX_METADATA_KEY,
+)
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 COMPACT_SUMMARY_MAX_TOKENS = 1024
 COMPACT_SUMMARY_MIN_TOKENS = 256
 COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
 COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
+COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS = 1024
+COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
+
+# load_skill retrieves guidance, not evidence, and re-running it restores
+# nothing a dropped observation held.
+NON_EVIDENCE_TOOL_NAMES = CONTROL_TOOL_NAMES | {LOAD_SKILL_TOOL_NAME}
 COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 
 
@@ -1019,6 +1031,7 @@ class ExecutionContext:
                 metadata={
                     "removed_count": removed,
                     "dropped_tool_result_count": sum(dropped_tool_counts.values()),
+                    "dropped_tool_results_by_name": dropped_tool_counts,
                 },
             )
 
@@ -1064,6 +1077,9 @@ class ExecutionContext:
             self._context_refs_removed_by_compaction(latest_user)
         )
         dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
+        # next_messages below keeps only the system summary and, at most, a
+        # role=="user" message, so no tool observation survives: here the whole
+        # list is the diff. truncate needs a real diff; this does not.
         dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
         dropped_tools_notice = self._dropped_tool_results_notice(dropped_tool_counts)
         summary_content = (
@@ -1076,8 +1092,11 @@ class ExecutionContext:
             "you need was lost in compaction. This summary is a lossy paraphrase of "
             "the raw history, not the history itself: when the answer needs an exact "
             "value, figure, statistic, table row, quotation, or identifier that this "
-            "summary does not literally contain, re-run the tool that produced it "
+            "summary does not literally contain, re-read or re-query the source "
             "instead of reconstructing the value from this summary or from memory. "
+            "Only re-run tools that read; if the value came from a tool that writes, "
+            "sends, executes, or otherwise changes state, do not re-run it -- re-read "
+            "the artifact it produced, or report the value as unavailable. "
             "Current system instructions still take precedence, and the latest user "
             "request remains the overall goal."
         )
@@ -1106,6 +1125,7 @@ class ExecutionContext:
                 "retained_context_ref_count": len(compacted_context_refs),
                 "dropped_context_ref_count": len(dropped_context_refs),
                 "dropped_tool_result_count": sum(dropped_tool_counts.values()),
+                "dropped_tool_results_by_name": dropped_tool_counts,
             },
         )
         if original_tokens is not None:
@@ -1186,17 +1206,28 @@ class ExecutionContext:
         replaced their content and ``raw_result``, so compacting them away
         destroys no evidence and counting them would overstate the loss.
         Hidden messages are excluded because they are not in the prompt at all.
+        Failed and cancelled calls are excluded because they never produced a
+        value to lose, and telling the model they did would let it read a
+        failure as already-succeeded. Control pseudo-tools are excluded because
+        re-running one ends the run or re-contacts the user rather than
+        restoring evidence.
         """
-        counts: dict[str, int] = {}
+        names: list[str] = []
         for message in messages:
+            if message.role != "tool":
+                continue
             metadata = message.metadata or {}
             if message.hidden or metadata.get("superseded"):
                 continue
-            if message.role != "tool":
+            if not tool_result_succeeded(metadata.get("raw_result")):
                 continue
-            name = str(metadata.get("tool_name") or "").strip() or "unnamed tool"
-            counts[name] = counts.get(name, 0) + 1
-        return counts
+            # Whitespace-only names would silently fragment the aggregation,
+            # so normalize before using the name as a key.
+            name = " ".join(str(metadata.get("tool_name") or "").split())
+            if name in NON_EVIDENCE_TOOL_NAMES:
+                continue
+            names.append(name or "unnamed tool")
+        return dict(Counter(names))
 
     @staticmethod
     def _dropped_tool_results_notice(counts: dict[str, int]) -> str:
@@ -1207,22 +1238,36 @@ class ExecutionContext:
         """
         if not counts:
             return ""
-        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
-        lines = [
-            f"- {name} x{count}" if count > 1 else f"- {name}" for name, count in listed
-        ]
-        omitted = len(ordered) - len(listed)
-        if omitted:
-            lines.append(f"- ... {omitted} additional tool(s) omitted")
         total = sum(counts.values())
+        call_label = "call was" if total == 1 else "calls were"
         prefix = (
-            f"Raw observations from {total} completed tool call(s) were dropped by "
-            "this compaction. Their exact values are no longer in context; only the "
+            f"Raw observations from {total} tool {call_label} dropped by this "
+            "compaction. Their exact values are no longer in context; only the "
             "summary above describes them. Treat any figure not literally present in "
             "that summary as unavailable rather than recalled. Tools whose results "
             "were dropped:\n"
         )
+        # Tool names can come from dynamic MCP server config, so bound both the
+        # per-name length and the total notice size the way the sibling
+        # reference notice does.
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        listed = ordered[:COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES]
+        lines: list[str] = []
+        current_chars = len(prefix)
+        omitted = len(ordered) - len(listed)
+        for name, count in listed:
+            clamped = name[:COMPACT_DROPPED_TOOL_NAME_MAX_CHARS]
+            line = f"- {clamped} x{count}" if count > 1 else f"- {clamped}"
+            if current_chars + len(line) + 1 > COMPACT_DROPPED_TOOL_NOTICE_MAX_CHARS:
+                omitted += 1
+                continue
+            lines.append(line)
+            current_chars += len(line) + 1
+        if omitted:
+            name_label = "name" if omitted == 1 else "names"
+            lines.append(
+                f"- ... {omitted} additional distinct tool {name_label} omitted"
+            )
         return prefix + "\n".join(lines)
 
     def _latest_visible_user_message(self) -> Message | None:
