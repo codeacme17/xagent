@@ -16,7 +16,7 @@ per-model call counts.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy.orm import Session
@@ -46,7 +46,11 @@ def _seed_model_calls(db: Session, model_names: list[str], *, owner: str) -> Use
     db.commit()
     db.refresh(task)
 
-    now = datetime.now()
+    # Aware UTC, matching what production writes into this tz-aware column
+    # (``websocket.py`` persists ``datetime.now(timezone.utc)``). No assertion
+    # here depends on it -- ``get_model_stats`` never reads ``timestamp``, and
+    # the column is only populated because it is ``nullable=False``.
+    now = datetime.now(timezone.utc)
     for index, model_name in enumerate(model_names):
         db.add(
             TraceEvent(
