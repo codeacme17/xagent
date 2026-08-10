@@ -13,6 +13,7 @@ from xagent.core.agent.context import (
     Message,
 )
 from xagent.core.agent.context import enrichment as enrichment_module
+from xagent.core.context_ref import SUPERSEDES_SCOPE_KEY
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
@@ -813,6 +814,39 @@ def test_compact_with_llm_omits_tool_notice_without_tool_results() -> None:
     assert "were dropped by this compaction" not in ctx.messages[0].content
 
 
+def test_compact_with_llm_excludes_superseded_tool_results_from_notice() -> None:
+    """A superseded observation lost its raw result before compaction ran.
+
+    ``ComputerTool`` stamps a supersedes scope on every result, so counting
+    superseded messages would report a whole browser session as dropped
+    evidence when only the newest observation actually carried any.
+    """
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Browse the dashboard")
+    for index in range(3):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": call_id, "type": "function", "function": {"name": "computer"}}
+            ],
+        )
+        ctx.add_tool_result(
+            "computer",
+            {"output": f"view {index}", SUPERSEDES_SCOPE_KEY: "computer:task-1"},
+            call_id,
+        )
+
+    result = ctx.compact_with_llm_response({"content": "Inspected the dashboard."})
+
+    notice = ctx.messages[0].content
+    assert "1 completed tool call(s) were dropped" in notice
+    assert "- computer\n" in f"{notice}\n"
+    assert "- computer x" not in notice
+    assert result.metadata["dropped_tool_result_count"] == 1
+
+
 def test_compact_with_llm_ignores_hidden_tool_results_in_notice() -> None:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
@@ -823,8 +857,8 @@ def test_compact_with_llm_ignores_hidden_tool_results_in_notice() -> None:
             {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
         ],
     )
-    superseded = ctx.add_tool_result("read_file", {"output": "stale"}, "call-1")
-    ctx.messages[ctx.messages.index(superseded)] = replace(superseded, hidden=True)
+    stale = ctx.add_tool_result("read_file", {"output": "stale"}, "call-1")
+    ctx.messages[ctx.messages.index(stale)] = replace(stale, hidden=True)
 
     result = ctx.compact_with_llm_response({"content": "Read the file."})
 

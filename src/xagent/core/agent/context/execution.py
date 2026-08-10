@@ -1180,16 +1180,20 @@ class ExecutionContext:
 
     @staticmethod
     def _dropped_tool_result_counts(messages: list[Message]) -> dict[str, int]:
-        """Count visible tool observations, keyed by tool name.
+        """Count tool observations whose raw result this compaction discards.
 
-        Hidden messages are excluded: they were already absent from the prompt
-        before compaction, so reporting them as newly dropped would be wrong.
+        Superseded observations are excluded: a later observation already
+        replaced their content and ``raw_result``, so compacting them away
+        destroys no evidence and counting them would overstate the loss.
+        Hidden messages are excluded because they are not in the prompt at all.
         """
         counts: dict[str, int] = {}
         for message in messages:
-            if message.hidden or message.role != "tool":
-                continue
             metadata = message.metadata or {}
+            if message.hidden or metadata.get("superseded"):
+                continue
+            if message.role != "tool":
+                continue
             name = str(metadata.get("tool_name") or "").strip() or "unnamed tool"
             counts[name] = counts.get(name, 0) + 1
         return counts
