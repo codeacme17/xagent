@@ -34,6 +34,7 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 
 logger = logging.getLogger(__name__)
@@ -54,12 +55,12 @@ def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> 
     failed while it is in fact connected. A best-effort side effect must not
     be able to change what the callback returns.
     """
+    # The module is imported at module level so that a genuine module
+    # resolution failure surfaces at startup instead of being logged here as a
+    # routine provisioning warning. The call stays inside the guard, and going
+    # through the module keeps the attribute lookup late so tests can patch it.
     try:
-        from ..services.gmail_provisioning import (
-            best_effort_provision_gmail_watches_for_user,
-        )
-
-        best_effort_provision_gmail_watches_for_user(
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
             db,
             user_id=user_id,
             context="after OAuth callback",

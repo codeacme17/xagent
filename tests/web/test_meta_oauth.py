@@ -280,12 +280,16 @@ def test_gmail_callback_survives_a_raising_account_lookup_during_provisioning(
 
     def provision_with_failing_account_lookup(provision_db, **kwargs):
         # Fail only the lookups the service itself issues; the callback's own
-        # queries, which run before the OAuth commit, must succeed.
+        # queries, which run before the OAuth commit, must succeed. The revert
+        # has to happen here rather than at teardown, because this test queries
+        # the session again below to assert the OAuth row was committed. `pop`
+        # rather than `del` so a refactor that skips the assignment surfaces as
+        # its own failure instead of an AttributeError from this line.
         provision_db.query = failing_query
         try:
             return real_provision(provision_db, **kwargs)
         finally:
-            del provision_db.query
+            provision_db.__dict__.pop("query", None)
 
     monkeypatch.setattr(
         gmail_provisioning,

@@ -1220,15 +1220,24 @@ def best_effort_provision_gmail_watches_for_user(
     already bound to that mailbox gets its delivery resources re-ensured.
     Failures are recorded on the watch state, never raised; a failure before
     any account resolves has no watch state to land on and is only logged.
+
+    Rolls back ``db`` on failure, so callers must not hold uncommitted work on
+    that session across this call.
     """
     # The account lookup and the binding resolution are inside the guard, not
     # just the per-account loop: the caller runs this after committing the
     # OAuth token, so a raise here would turn an already-successful connect
-    # into an error page. A mailbox missed here is picked up by
-    # ``scan_due_gmail_watch_renewals``, which selects Gmail accounts owned by
-    # users with an enabled Gmail trigger and no watch state row at all.
-    # ``sweep_gmail_provisioning`` cannot cover this: it only retries mailboxes
-    # that already have a watch state row.
+    # into an error page.
+    #
+    # A mailbox missed here has no automatic retry under the default
+    # configuration. ``XAGENT_GMAIL_WATCH_ENABLED`` defaults to false and gates
+    # both ``scan_due_gmail_watch_renewals`` and ``sweep_gmail_provisioning``;
+    # only with it set does the former recover this case, by selecting Gmail
+    # accounts that back an enabled Gmail trigger and have no watch state row.
+    # (``sweep_gmail_provisioning`` never covers it either way: it only retries
+    # mailboxes that already have such a row.) Otherwise the mailbox stays
+    # unprovisioned until its trigger is next saved, which re-enters
+    # provisioning through ``GmailTriggerProvider.register``.
     try:
         accounts = (
             db.query(UserOAuth)
