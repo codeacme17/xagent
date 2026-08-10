@@ -13,7 +13,6 @@ from xagent.core.agent.context import (
     Message,
 )
 from xagent.core.agent.context import enrichment as enrichment_module
-from xagent.core.context_ref import SUPERSEDES_SCOPE_KEY
 from xagent.core.agent.context.enrichment import (
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
@@ -28,6 +27,7 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
+from xagent.core.context_ref import SUPERSEDES_SCOPE_KEY
 from xagent.web.user_isolated_memory import current_user_id
 
 
