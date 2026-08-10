@@ -9,7 +9,7 @@ from sqlalchemy import JSON, Column, Integer
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.declarative import declarative_base
 
-from xagent.web.api.monitor import PG_NUL_ESCAPE_PATTERN, get_json_field_expression
+from xagent.web.api.monitor import PG_UNSAFE_ESCAPE_PATTERN, get_json_field_expression
 
 Base = declarative_base()
 
@@ -68,7 +68,7 @@ class TestMonitorDatabaseCompatibility:
         assert "CAST(trace_events.data AS TEXT) ~ " in statement
         assert "->>" in statement
         # The pattern travels as a bind parameter, not as inlined SQL.
-        assert PG_NUL_ESCAPE_PATTERN in compiled.params.values()
+        assert PG_UNSAFE_ESCAPE_PATTERN in compiled.params.values()
 
     def test_mysql_json_extraction(self):
         """测试 MySQL 的 JSON 字段提取"""

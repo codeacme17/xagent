@@ -18,6 +18,12 @@ The two symptoms differ by endpoint, which is why all three are covered here:
   query after their handler, so they returned HTTP 200 with an empty list --
   a dashboard of zeros with nothing but a log line to show for it.
 
+The seed data also pins which payloads the dialect guard drops. PostgreSQL
+accepts several escape sequences into a ``json`` column that ``->>`` then
+refuses to convert -- the NUL escape and either half of an unpaired UTF-16
+surrogate -- and one such row fails the whole query. A *valid* surrogate pair
+is not a hazard and must survive, so a non-BMP payload is seeded alongside.
+
 Fixture pattern copied from
 ``tests/web/services/test_task_status_storage_postgresql.py`` (skip-if-unset
 via ``XAGENT_TEST_POSTGRES_URL``; CI provides it in the PostgreSQL job).
@@ -41,11 +47,19 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.user import User
 
-# A JSON string value PostgreSQL accepts into a ``json`` column but refuses to
-# convert to text: ``json ->> key`` raises "unsupported Unicode escape
-# sequence" for it. This is the payload shape the dialect branch's guard
-# exists to keep out of ``->>``.
-NUL_PAYLOAD = "\x00"
+# String values PostgreSQL accepts into a ``json`` column but then refuses to
+# convert to text, so ``json ->> key`` raises on them and takes the whole query
+# down with it. These are the payload shapes the dialect branch's guard exists
+# to keep away from ``->>``. Built with ``chr`` because an editor will happily
+# turn an escape sequence into the character it names, and a lone surrogate
+# character is not encodable as UTF-8.
+NUL_PAYLOAD = chr(0x0000)  # -> ``unsupported Unicode escape sequence``
+LONE_HIGH_SURROGATE = chr(0xD800)  # -> ``invalid input syntax for type json``
+LONE_LOW_SURROGATE = chr(0xDC00)  # same, from the other side of the pair
+
+# A non-BMP character, which ``json.dumps`` writes as a *valid* surrogate
+# pair. It must NOT be dropped: emoji in an LLM payload are ordinary.
+NON_BMP_CHAR = chr(0x1F600)
 
 
 @pytest.fixture()
@@ -73,8 +87,9 @@ def pg_session() -> Iterator[Session]:
 def _seed_admin_with_trace_events(db: Session) -> User:
     """One admin, one task, and the trace events the three endpoints count.
 
-    Every payload carrying ``NUL_PAYLOAD`` is one the guard must drop without
-    failing the surrounding query.
+    Every payload carrying an unconvertible escape is one the guard must drop
+    without failing the surrounding query; the paired-surrogate payload is one
+    it must leave alone.
     """
     admin = User(username="monitor-pg-admin", password_hash="hash", is_admin=True)
     db.add(admin)
@@ -87,15 +102,28 @@ def _seed_admin_with_trace_events(db: Session) -> User:
     db.refresh(task)
 
     now = datetime.now()
+    emoji_model = f"emoji-model {NON_BMP_CHAR}"
     payloads: list[tuple[str, dict[str, Any]]] = [
         ("llm_call_start", {"model_name": "gpt-4o", "step_id": "s1", "attempt": 1}),
         ("llm_call_start", {"model_name": "gpt-4o", "step_id": "s2", "attempt": 1}),
         ("llm_call_start", {"model_name": "claude-opus", "step_id": "s3"}),
+        # Kept: a valid surrogate pair is not a hazard and must still count.
+        ("llm_call_start", {"model_name": emoji_model, "step_id": "s4"}),
+        # Dropped: one row per unconvertible escape class.
         ("llm_call_start", {"model_name": "nul-model", "note": NUL_PAYLOAD}),
+        ("llm_call_start", {"model_name": "high-model", "note": LONE_HIGH_SURROGATE}),
+        ("llm_call_start", {"model_name": "low-model", "note": LONE_LOW_SURROGATE}),
+        # Dropped, with the escape in the extracted field rather than beside
+        # it: the guard reads the whole payload, so position must not matter.
+        ("llm_call_start", {"model_name": f"tainted-{NUL_PAYLOAD}"}),
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "web_search"}),
         ("tool_execution_start", {"tool_name": "nul-tool", "note": NUL_PAYLOAD}),
+        (
+            "tool_execution_start",
+            {"tool_name": "surrogate-tool", "note": LONE_HIGH_SURROGATE},
+        ),
     ]
     for index, (event_type, data) in enumerate(payloads):
         db.add(
@@ -124,8 +152,10 @@ async def test_monitoring_stats_counts_active_models_on_postgresql(
 
     stats = await get_monitoring_stats(db=pg_session, current_user=admin)
 
-    # gpt-4o and claude-opus; the NUL-carrying payload is dropped by the guard.
-    assert stats["activeModels"] == 2
+    # gpt-4o, claude-opus and the emoji model. The four payloads carrying an
+    # unconvertible escape are dropped by the guard; the valid surrogate pair
+    # is not.
+    assert stats["activeModels"] == 3
 
 
 @pytest.mark.postgresql
@@ -155,4 +185,5 @@ async def test_model_stats_returns_per_model_calls_on_postgresql(
     assert {entry["name"]: entry["total_tasks"] for entry in stats} == {
         "gpt-4o": 2,
         "claude-opus": 1,
+        f"emoji-model {NON_BMP_CHAR}": 1,
     }

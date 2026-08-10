@@ -22,10 +22,26 @@ logger = logging.getLogger(__name__)
 # Create router
 monitor_router = APIRouter(prefix="/api/monitor", tags=["monitor"])
 
-# POSIX regex matching the six-character JSON escape for NUL (a backslash
-# followed by "u0000") in a payload's text form. The backslash is doubled
-# because this is a regex pattern, not a Python escape.
-PG_NUL_ESCAPE_PATTERN = r"\\u0000"
+# POSIX regex over a payload's text form, matching the JSON escape
+# sequences PostgreSQL accepts into a json column but refuses to convert to
+# text. Three arms: the NUL escape; a high surrogate with no low surrogate
+# after it; a low surrogate with no high surrogate before it. A valid
+# surrogate pair -- how json.dumps writes any non-BMP character, emoji
+# included -- matches no arm and is left alone.
+#
+# Backslashes are doubled because this is a regex pattern, not a Python
+# escape: "\\" matches the single literal backslash that opens
+# the escape in the stored text.
+#
+# Known over-match: a payload whose text genuinely contains those six
+# characters (a doubled backslash in the JSON) is dropped even though ->>
+# would have read it. Dropping a safe row costs one row of monitoring; the
+# opposite error fails the whole request.
+PG_UNSAFE_ESCAPE_PATTERN = (
+    r"\\u0000"
+    r"|\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})"
+    r"|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
 
 
 def is_admin_user(user: User) -> bool:
@@ -68,15 +84,20 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
     dialect_name = db_session.bind.dialect.name
 
     if dialect_name == "postgresql":
-        # PostgreSQL extracts a JSON field as text with ->>. A json value may
-        # legally carry a NUL escape, but converting such a value to text
-        # raises "unsupported Unicode escape sequence", so null the payload out
-        # before extracting and let the whole row drop instead of failing the
-        # query. Matching runs on the column's text form because valid JSON
-        # never holds a raw control character (RFC 8259 requires escaping) --
-        # the escape sequence is what has to be found. ~ is the regex-match
-        # operator and applies to text; the ~? used here before does not exist
-        # in PostgreSQL at all, so every query through this branch failed.
+        # PostgreSQL extracts a JSON field as text with ->>. A json value can
+        # legally carry escape sequences that ->> then refuses to convert --
+        # NUL raises "unsupported Unicode escape sequence", an unpaired UTF-16
+        # surrogate raises "invalid input syntax for type json" -- and one such
+        # row fails the entire query. Null those payloads out before extracting
+        # so the row drops instead. jsonb would reject them at write time, but
+        # this column is json, which stores them happily.
+        #
+        # Matching runs on the column's text form because valid JSON never
+        # holds a raw control character or a bare surrogate (RFC 8259 requires
+        # escaping) -- the escape sequence is what has to be found. ~ is the
+        # regex-match operator and applies to text; the ~? used here before
+        # does not exist in PostgreSQL at all, so every query through this
+        # branch failed.
         #
         # The MySQL/SQLite branches strip the escape and keep the row. Doing
         # that here would mean casting the edited text back to json, which
@@ -84,7 +105,7 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
         # again fail the request.
         valid_data = expression.case(
             (
-                sql_cast(column, Text).op("~")(PG_NUL_ESCAPE_PATTERN),
+                sql_cast(column, Text).op("~")(PG_UNSAFE_ESCAPE_PATTERN),
                 expression.null(),
             ),
             else_=column,
