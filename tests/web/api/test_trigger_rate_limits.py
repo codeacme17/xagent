@@ -313,6 +313,11 @@ class TestRemoteIpDerivation:
             "[2001:db8::1]:8080": "2001:db8::1",
             # Brackets with no port are still a valid IPv6 reference.
             "[2001:db8::1]": "2001:db8::1",
+            # Brackets are stripped without checking the host is IPv6. No real
+            # proxy emits this (RFC 3986 reserves brackets for IPv6), but it
+            # yields the same string the bare form would, so it cannot reach a
+            # different bucket than its canonical spelling.
+            "[1.2.3.4]:80": "1.2.3.4",
         }
         for forwarded, expected in cases.items():
             request = self._request("10.0.0.1", forwarded)
@@ -357,6 +362,17 @@ class TestRemoteIpDerivation:
             "[]:80",
             "[not-an-ip]:80",
             "evil:8080",
+            # Multi-colon non-IP: pins the no-bracket, no-port fallthrough in
+            # _split_host_port, which is otherwise only reached by entries that
+            # do parse as IPv6.
+            "a:b:c",
+            # ipaddress.ip_address() accepts an unbounded IPv6 zone-id, which
+            # would otherwise be returned verbatim and persisted as the client
+            # IP — the exact unbounded-string injection this validation exists
+            # to prevent.
+            "::1%eth0",
+            "::1%" + "A" * 4000,
+            "[fe80::1%eth0]:80",
         )
         for entry in forged:
             request = self._request("10.0.0.1", entry)

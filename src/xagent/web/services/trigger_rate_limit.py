@@ -239,6 +239,14 @@ def _client_ip_from_forwarded_entry(candidate: str) -> str | None:
     quota (#1185). The port is dropped rather than kept so buckets stay keyed
     per client rather than per ephemeral connection.
     """
+    # ipaddress.ip_address() accepts an IPv6 zone-id suffix, and the zone-id
+    # itself is unbounded and unvalidated: `::1%` + 4000 characters parses and
+    # round-trips. A zone-id names a local interface, so it is meaningless for
+    # a remote client address and no proxy emits one — but leaving it accepted
+    # would defeat the bound this validation exists to enforce, since the
+    # result is persisted and used as Redis key material.
+    if "%" in candidate:
+        return None
     host, port = _split_host_port(candidate)
     if host is None:
         return None
@@ -258,7 +266,10 @@ def _split_host_port(candidate: str) -> tuple[str | None, str | None]:
     IPv6 literal is never split: ``2001:db8::1:8080`` is a valid address whose
     last group only looks like a port, so splitting on the final colon would
     silently rewrite it into a *different* address. Only the unambiguous forms
-    carry a port: bracketed IPv6, and a host with exactly one colon (IPv4).
+    carry a port: a bracketed host, and a host with exactly one colon (IPv4).
+    Brackets are not checked for IPv6 specifically — RFC 3986 reserves them for
+    it, and a bracketed IPv4 still yields the same string its bare form would,
+    so it lands in the same bucket.
     """
     if candidate.startswith("["):
         closing = candidate.find("]")
