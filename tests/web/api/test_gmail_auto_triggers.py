@@ -1368,6 +1368,7 @@ def test_best_effort_provisioning_targets_only_referenced_mailboxes(
     """After OAuth, only mailboxes bound to enabled Gmail triggers are provisioned."""
     from xagent.web.services import gmail_provisioning
 
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     calls: list[str] = []
 
     def fake_ensure(_db, account, **_kwargs):

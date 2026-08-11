@@ -1380,7 +1380,14 @@ def get_gmail_callback_base_url() -> str | None:
 
 
 def get_gmail_watch_enabled() -> bool:
-    """Return whether Gmail automatic watch registration is enabled."""
+    """Return whether the Gmail watch feature is enabled.
+
+    Gates both watch registration (OAuth connect, Gmail trigger
+    create/update/enable) and the background renewal/retry scans. With the
+    flag off (the default) no watch is created, so none can silently expire
+    unrenewed; Gmail triggers report a failed provisioning status with an
+    explicit disabled error instead.
+    """
     return _get_bool_env(GMAIL_WATCH_ENABLED, False)
 
 
