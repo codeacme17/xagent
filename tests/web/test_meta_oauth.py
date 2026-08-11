@@ -448,6 +448,69 @@ def test_oauth_callback_still_fails_when_the_success_page_cannot_be_rendered(
     assert "Authentication Failed" in response.body.decode()
 
 
+def test_oauth_callback_survives_a_non_integer_user_id_claim(
+    db_session, monkeypatch, caplog
+):
+    """Coercing the state claim is post-commit work, so it belongs in the guard.
+
+    A ``user_id`` claim that is not an integer only becomes observable once the
+    OAuth row is committed, so failing the coercion has to behave like any
+    other post-commit failure rather than rendering a 500 for a connect that
+    already succeeded. Reachable if a deployment is still running on the
+    default ``XAGENT_JWT_SECRET``, which makes the state token forgeable.
+    """
+    db, _user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": "7abc",
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "gmail-token",
+                    "refresh_token": "gmail-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.modify",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    provision = Mock()
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        provision,
+    )
+
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    assert "Authentication Failed" not in response.body.decode()
+    provision.assert_not_called()
+    assert "Post-commit OAuth side effects failed" in caplog.text
+
+
 def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
     db_session, monkeypatch
 ):
