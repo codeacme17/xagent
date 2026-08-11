@@ -581,10 +581,10 @@ async def get_model_stats(
             if model_name and model_calls > 0
         ]
 
-        # Denominator for each model's share of the traffic. Deliberately not
-        # named ``total_calls``: the loop below used to bind that same name to
-        # the per-model count, so the rate divided a model's calls by itself
-        # and every model reported 100% (#1245).
+        # Denominator for each model's share of the traffic. Must stay distinct
+        # from the loop's per-model variable: while the two shared a name the
+        # rate divided a model's calls by itself and every model reported 100%
+        # (#1245).
         all_model_calls = sum(model_calls for _, model_calls in counted_models)
 
         result = []
@@ -604,10 +604,6 @@ async def get_model_stats(
                     "failed_tasks": None,
                 }
             )
-
-        # If no real data, return empty list
-        if not result:
-            return []
 
         return result
     except Exception as e:

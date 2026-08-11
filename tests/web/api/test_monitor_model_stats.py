@@ -30,18 +30,21 @@ from .conftest import _direct_db_session
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 
-def _seed_model_calls(db: Session, model_names: list[str], *, owner: str) -> User:
-    """One admin with one ``llm_call_start`` event per name in ``model_names``.
+def _seed_model_calls(
+    db: Session, model_names: list[str], *, owner: str, is_admin: bool = True
+) -> User:
+    """One user with one ``llm_call_start`` event per name in ``model_names``.
 
-    Repeat a name to give that model more calls. ``owner`` keeps usernames
-    distinct so a test never depends on another test's rows surviving.
+    Repeat a name to give that model more calls. ``owner`` must differ between
+    calls within a test -- ``User.username`` is ``unique=True``, so reusing one
+    raises rather than merely mixing two users' traffic together.
     """
-    admin = User(username=owner, password_hash="hash", is_admin=True)
-    db.add(admin)
+    user = User(username=owner, password_hash="hash", is_admin=is_admin)
+    db.add(user)
     db.commit()
-    db.refresh(admin)
+    db.refresh(user)
 
-    task = Task(user_id=admin.id, title=f"{owner}-task")
+    task = Task(user_id=user.id, title=f"{owner}-task")
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -62,7 +65,7 @@ def _seed_model_calls(db: Session, model_names: list[str], *, owner: str) -> Use
             )
         )
     db.commit()
-    return admin
+    return user
 
 
 async def test_usage_rate_is_each_model_share_of_all_calls() -> None:
@@ -133,5 +136,57 @@ async def test_nameless_calls_stay_out_of_the_denominator() -> None:
         assert [(entry["name"], entry["usage_rate"]) for entry in stats] == [
             ("gpt-4o", 100.0)
         ]
+    finally:
+        db.close()
+
+
+async def test_no_calls_yields_an_empty_list() -> None:
+    """No traffic returns ``[]`` rather than raising or reporting a zero row.
+
+    The handler used to end with ``if not result: return []`` ahead of
+    ``return result``, which could not be told apart from it -- both arms
+    returned an equal empty list. That branch is gone; this pins the behaviour
+    it was there to express.
+    """
+    db = _direct_db_session()
+    try:
+        member = _seed_model_calls(db, [], owner="no-traffic-user")
+
+        assert await get_model_stats(db=db, current_user=member) == []
+    finally:
+        db.close()
+
+
+async def test_non_admin_shares_are_scoped_to_their_own_calls() -> None:
+    """A regular user's denominator is their own traffic, not the fleet's.
+
+    Non-admins get a ``task_id`` subquery restricting the scan to their own
+    tasks, so both the numerator and the denominator shrink to what they can
+    see. Now that the denominator is read, a leak would not just add rows the
+    caller should not see -- it would silently restate the rates for the rows
+    they should. The other user's traffic is sized so the two readings cannot
+    be confused: fleet-wide would be 90.0/10.0, own-traffic 75.0/25.0.
+    """
+    db = _direct_db_session()
+    try:
+        _seed_model_calls(db, ["gpt-4o"] * 6, owner="other-tenant")
+        member = _seed_model_calls(
+            db,
+            ["gpt-4o", "gpt-4o", "gpt-4o", "claude-opus"],
+            owner="member",
+            is_admin=False,
+        )
+
+        stats = await get_model_stats(db=db, current_user=member)
+
+        assert {entry["name"]: entry["usage_rate"] for entry in stats} == {
+            "gpt-4o": 75.0,
+            "claude-opus": 25.0,
+        }
+        # The counts too, so a leak cannot hide behind a coincidental ratio.
+        assert {entry["name"]: entry["total_tasks"] for entry in stats} == {
+            "gpt-4o": 3,
+            "claude-opus": 1,
+        }
     finally:
         db.close()
