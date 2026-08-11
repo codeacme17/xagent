@@ -11,13 +11,14 @@ unconstructible instead of merely narrated in docstrings.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from xagent.web.api.public_chat_access import ShareChatAccessContext
 
 
-def _context_kwargs(**entity: object) -> dict[str, object]:
+def _context_kwargs(**entity: Any) -> dict[str, Any]:
     return {
         "user": SimpleNamespace(id=1),
         "share_token": "tok",
@@ -27,28 +28,24 @@ def _context_kwargs(**entity: object) -> dict[str, object]:
 
 
 def test_agent_only_context_constructs() -> None:
-    context = ShareChatAccessContext(
-        **_context_kwargs(agent=SimpleNamespace(id=7))  # type: ignore[arg-type]
-    )
+    context = ShareChatAccessContext(**_context_kwargs(agent=SimpleNamespace(id=7)))
     assert context.workforce is None
 
 
 def test_workforce_only_context_constructs() -> None:
-    context = ShareChatAccessContext(
-        **_context_kwargs(workforce=SimpleNamespace(id=7))  # type: ignore[arg-type]
-    )
+    context = ShareChatAccessContext(**_context_kwargs(workforce=SimpleNamespace(id=7)))
     assert context.agent is None
 
 
 def test_neither_entity_set_is_rejected() -> None:
     with pytest.raises(ValueError, match="exactly one"):
-        ShareChatAccessContext(**_context_kwargs())  # type: ignore[arg-type]
+        ShareChatAccessContext(**_context_kwargs())
 
 
 def test_both_entities_set_is_rejected() -> None:
     with pytest.raises(ValueError, match="exactly one"):
         ShareChatAccessContext(
-            **_context_kwargs(  # type: ignore[arg-type]
+            **_context_kwargs(
                 agent=SimpleNamespace(id=7),
                 workforce=SimpleNamespace(id=9),
             )
@@ -67,14 +64,12 @@ class _FalsyEntity:
 
 
 def test_falsy_entity_object_counts_as_set() -> None:
-    context = ShareChatAccessContext(
-        **_context_kwargs(agent=_FalsyEntity())  # type: ignore[arg-type]
-    )
+    context = ShareChatAccessContext(**_context_kwargs(agent=_FalsyEntity()))
     assert context.agent is not None
 
     with pytest.raises(ValueError, match="exactly one"):
         ShareChatAccessContext(
-            **_context_kwargs(  # type: ignore[arg-type]
+            **_context_kwargs(
                 agent=_FalsyEntity(),
                 workforce=_FalsyEntity(),
             )
