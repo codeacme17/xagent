@@ -45,6 +45,7 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user_oauth import UserOAuth
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -162,28 +163,33 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _coerce_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
 def _trigger_facing_status(state: GmailWatchState) -> tuple[str, str | None]:
     """Derive the status a trigger should report from its mailbox watch state.
 
-    An ``active`` row whose ``watch_expiration`` has passed is reported as
-    failed: Gmail has already dropped the watch, so the row only looks
-    healthy while nothing is delivered. With ``XAGENT_GMAIL_WATCH_ENABLED``
-    off a ``pending`` row is reported as failed too — the sweep that would
-    converge it is gated by the same flag, so it never resolves. Both
-    ``provision_gmail_trigger`` and the reconcile paths derive through this
-    one helper so the reported status cannot flap between them.
+    Four derivations beyond a plain pass-through of the stored status and
+    last_error:
+
+    - An ``active`` row whose ``watch_expiration`` has passed is reported as
+      failed: Gmail has already dropped the watch, so the row only looks
+      healthy while nothing is delivered.
+    - An ``active`` row with no recorded expiration is reported as failed too
+      while ``XAGENT_GMAIL_WATCH_ENABLED`` is off: with the flag on the
+      renewal scan treats a null expiration as due and renews it imminently,
+      so it is only a problem when nothing will ever renew it.
+    - With the flag off, a ``pending`` row is reported as failed — the sweep
+      that would converge it is gated by the same flag, so it never
+      resolves.
+    - A row already stored as ``failed`` keeps its status, but while the flag
+      is off its error is annotated to note that automatic retry is disabled
+      too, distinguishing it from a failure the sweep would otherwise retry.
+
+    Both ``provision_gmail_trigger`` and the reconcile paths derive through
+    this one helper so the reported status cannot flap between them.
     """
     status = str(state.status or TriggerProvisioningStatus.PENDING.value)
     last_error = getattr(state, "last_error", None)
     error = str(last_error) if last_error else None
+    watch_enabled = get_gmail_watch_enabled()
     if status == TriggerProvisioningStatus.ACTIVE.value:
         expiration = _coerce_utc(getattr(state, "watch_expiration", None))
         if expiration is not None and expiration <= _now():
@@ -191,12 +197,26 @@ def _trigger_facing_status(state: GmailWatchState) -> tuple[str, str | None]:
             error = (
                 f"Gmail watch expired at {expiration.isoformat()} and was not renewed"
             )
-    elif (
-        status == TriggerProvisioningStatus.PENDING.value
-        and not get_gmail_watch_enabled()
-    ):
+        elif expiration is None and not watch_enabled:
+            status = TriggerProvisioningStatus.FAILED.value
+            error = (
+                "Gmail watch has no recorded expiration and cannot be renewed "
+                "while watch registration is disabled "
+                "(set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+            )
+    elif status == TriggerProvisioningStatus.PENDING.value and not watch_enabled:
         status = TriggerProvisioningStatus.FAILED.value
         error = error or GMAIL_WATCH_DISABLED_ERROR
+    elif (
+        status == TriggerProvisioningStatus.FAILED.value
+        and error
+        and not watch_enabled
+        and "XAGENT_GMAIL_WATCH_ENABLED" not in error
+    ):
+        error = (
+            f"{error} (automatic retry is disabled; "
+            "set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+        )
     return status, error
 
 
@@ -1225,11 +1245,15 @@ def sweep_gmail_provisioning(
     """Retry stale pending and failed Gmail registrations.
 
     Only mailboxes still referenced by an enabled Gmail trigger are retried.
-    Returns the number of registration attempts. Gated internally on
-    ``XAGENT_GMAIL_WATCH_ENABLED`` (like the renewal scan) so no caller can
-    re-register watches while the feature is switched off.
+    Returns the number of registration attempts. Registration retries are
+    gated on ``XAGENT_GMAIL_WATCH_ENABLED`` (like the renewal scan), so this
+    function re-registers nothing while the feature is switched off.
+    Trigger-status reconciliation runs either way, though: it does not touch
+    the cloud, and skipping it while disabled would leave disabled/expired
+    statuses frozen instead of observable through the trigger API.
     """
     if not get_gmail_watch_enabled():
+        reconcile_gmail_trigger_provisioning(db, batch_size=max(1, min(limit, 500)))
         return 0
 
     scan_time = now or _now()

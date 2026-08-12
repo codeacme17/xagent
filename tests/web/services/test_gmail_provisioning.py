@@ -979,10 +979,49 @@ def test_provision_gmail_trigger_disabled_reports_existing_watch_state(
     assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
 
 
+def test_provision_gmail_trigger_disabled_reports_null_expiration_as_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An active row with no recorded expiration cannot self-heal while the
+    flag is off — the renewal scan that would give it a real expiration is
+    gated by the same flag — so it must not look healthy (#1231)."""
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    from xagent.web.services.gmail_provisioning import provision_gmail_trigger
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+        watch_expiration=None,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    def forbidden_run_in_thread(_account_id: int) -> NoReturn:
+        raise AssertionError("provisioning thread must not start while disabled")
+
+    status = provision_gmail_trigger(
+        db_session, trigger, run_in_thread=forbidden_run_in_thread
+    )
+    assert status == TriggerProvisioningStatus.FAILED.value
+    error = str(trigger.provisioning_error)
+    assert "disabled" in error or "expiration" in error
+
+    # Reconcile agrees, proving the derived status does not flap.
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
+
+
 def test_best_effort_provision_disabled_registers_nothing(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    """Differential check: the spy fires while enabled, not while disabled."""
     user = _create_user(db_session)
     agent = _create_agent(db_session, user)
     account = _create_oauth(db_session, user)
@@ -995,11 +1034,20 @@ def test_best_effort_provision_disabled_registers_nothing(
         lambda _db, acct, **_kwargs: calls.append(int(acct.id)),
     )
 
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+        db_session, user_id=int(user.id), context="test"
+    )
+    # Positive control: proves the spy is actually wired before trusting the
+    # disabled case's absence of calls below.
+    assert calls == [int(account.id)]
+
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
     gmail_provisioning.best_effort_provision_gmail_watches_for_user(
         db_session, user_id=int(user.id), context="test"
     )
 
-    assert calls == []
+    assert calls == [int(account.id)]
     assert db_session.query(GmailWatchState).count() == 0
 
 
@@ -1027,6 +1075,39 @@ def test_sweep_disabled_retries_nothing(
 
     db_session.refresh(state)
     assert state.status == TriggerProvisioningStatus.FAILED.value
+
+
+def test_sweep_disabled_still_reconciles_trigger_status(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Registration retries are gated on the flag, but trigger-status
+    reconciliation must still run so a stored failure's disabled note stays
+    observable through the trigger API (#1231)."""
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.FAILED.value,
+        last_error="watch registration denied",
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    assert sweep_gmail_provisioning(db_session) == 0
+
+    db_session.refresh(state)
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert "watch registration denied" in str(trigger.provisioning_error)
+    assert "XAGENT_GMAIL_WATCH_ENABLED" in str(trigger.provisioning_error)
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from ..models.gmail_watch import GmailWatchState
 from ..models.oauth_provider import OAuthProvider
 from ..models.trigger import AgentTrigger, TriggerType
 from ..models.user_oauth import UserOAuth
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -218,14 +219,6 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
     return _GmailApiService(AuthorizedSession(creds))
 
 
-def _coerce_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
 def _exception_status_code(exc: Exception) -> int | None:
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
@@ -281,8 +274,20 @@ def _renew_watch_for_account(
     The legacy shared-token global-topic registration path has been removed;
     a deployment without per-mailbox Pub/Sub configuration converges to a
     failed watch state with a clear last_error instead.
+
+    Gated on ``XAGENT_GMAIL_WATCH_ENABLED`` like the renewal scan that calls
+    this directly: without the gate here too, the webhook stale-history path
+    (``collect_gmail_pubsub_events``) would reach this function ungated and
+    re-register a watch while the flag is off, recreating the
+    silently-expiring-watch bug (#1231).
     """
-    from .gmail_provisioning import ensure_gmail_mailbox_provisioned
+    from .gmail_provisioning import (
+        GMAIL_WATCH_DISABLED_ERROR,
+        ensure_gmail_mailbox_provisioned,
+    )
+
+    if not get_gmail_watch_enabled():
+        raise GmailTriggerError(GMAIL_WATCH_DISABLED_ERROR)
 
     state = ensure_gmail_mailbox_provisioned(
         db,

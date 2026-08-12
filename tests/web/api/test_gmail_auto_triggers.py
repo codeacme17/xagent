@@ -29,6 +29,7 @@ from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import gmail_topic_path
 from xagent.web.services.gmail_triggers import (
     GmailPubsubNotification,
+    GmailTriggerError,
     GmailWatchConfigurationError,
     _credentials_expiry,
     _get_google_oauth_config,
@@ -1908,6 +1909,7 @@ def test_collect_gmail_pubsub_events_skips_subject_mismatch() -> None:
 def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
     monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-expired-history-user")
@@ -1958,6 +1960,56 @@ def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
             }
         ]
         assert state.topic_name == expected_topic
+    finally:
+        db.close()
+
+
+def test_collect_gmail_pubsub_events_does_not_reregister_while_watch_disabled(
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
+) -> None:
+    """With the flag off, a stale-history callback must not re-register a
+    watch: that would recreate the silently-expiring-watch bug (#1231)."""
+    monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-expired-history-disabled-user")
+        oauth = _create_gmail_oauth(db, user)
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        expired_history_service = _FakeGmailService(
+            history_exception=_FakeHttpError(404, "history expired")
+        )
+        renewed_watch_service = _FakeGmailService(
+            {"historyId": "333", "expiration": "1782864000000"}
+        )
+        services = iter([expired_history_service, renewed_watch_service])
+
+        with pytest.raises(GmailTriggerError):
+            asyncio.run(
+                collect_gmail_pubsub_events(
+                    db,
+                    GmailPubsubNotification(
+                        email_address="codeacme17@gmail.com",
+                        history_id="222",
+                        pubsub_message_id="pubsub-expired-disabled",
+                    ),
+                    state=state,
+                    service_factory=lambda _db, _oauth: next(services),
+                )
+            )
+
+        db.refresh(state)
+        # The watch endpoint was never called: history_id stays at the
+        # original value instead of adopting the renewal service's.
+        assert state.history_id == "100"
+        assert renewed_watch_service.calls == []
     finally:
         db.close()
 

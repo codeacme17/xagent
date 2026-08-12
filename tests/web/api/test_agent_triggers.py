@@ -1077,6 +1077,7 @@ def test_listing_triggers_reflects_background_provisioning_convergence(
 ) -> None:
     """Status reported by the API self-resolves once the watch state converges,
     without requiring another user-initiated create/update."""
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     from xagent.web.models.gmail_watch import GmailWatchState
 
     def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
