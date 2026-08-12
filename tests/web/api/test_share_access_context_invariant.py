@@ -28,12 +28,16 @@ def _context_kwargs(**entity: Any) -> dict[str, Any]:
 
 
 def test_agent_only_context_constructs() -> None:
-    context = ShareChatAccessContext(**_context_kwargs(agent=SimpleNamespace(id=7)))
+    agent = SimpleNamespace(id=7)
+    context = ShareChatAccessContext(**_context_kwargs(agent=agent))
+    assert context.agent is agent
     assert context.workforce is None
 
 
 def test_workforce_only_context_constructs() -> None:
-    context = ShareChatAccessContext(**_context_kwargs(workforce=SimpleNamespace(id=7)))
+    workforce = SimpleNamespace(id=7)
+    context = ShareChatAccessContext(**_context_kwargs(workforce=workforce))
+    assert context.workforce is workforce
     assert context.agent is None
 
 
@@ -64,13 +68,7 @@ class _FalsyEntity:
 
 
 def test_falsy_entity_object_counts_as_set() -> None:
-    context = ShareChatAccessContext(**_context_kwargs(agent=_FalsyEntity()))
-    assert context.agent is not None
-
-    with pytest.raises(ValueError, match="exactly one"):
-        ShareChatAccessContext(
-            **_context_kwargs(
-                agent=_FalsyEntity(),
-                workforce=_FalsyEntity(),
-            )
-        )
+    agent = _FalsyEntity()
+    context = ShareChatAccessContext(**_context_kwargs(agent=agent))
+    assert context.agent is agent
+    assert context.workforce is None

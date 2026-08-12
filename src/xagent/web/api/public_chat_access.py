@@ -119,9 +119,11 @@ class ShareChatAccessContext:
         # workforce bucket; a neither-set one has no billing bucket at all.
         # Compared against None, not truthiness — tests construct the context
         # with arbitrary stand-in objects. A violation is a programming
-        # defect, never a bad credential, so ValueError deliberately does NOT
-        # map to a 401: get_share_chat_user only projects _PublicTokenRejected
-        # / HTTPException to 401 and lets defects propagate loudly (#1214).
+        # defect, never a bad credential: get_share_chat_user only rewrites
+        # _PublicTokenRejected into a 401 and passes HTTPException through
+        # unchanged (e.g. the 403s from ensure_share_*_available), so this
+        # ValueError propagates loudly (#1214). Both production construction
+        # sites set exactly one entity; the guard defends future call sites.
         if (self.agent is None) == (self.workforce is None):
             raise ValueError(
                 "ShareChatAccessContext requires exactly one of 'agent' or 'workforce'"
