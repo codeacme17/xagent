@@ -32,6 +32,7 @@ from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_provisioning
 from xagent.web.services.gmail_provisioning import (
     GMAIL_PUSH_PUBLISHER,
+    GMAIL_WATCH_DISABLED_ERROR,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
@@ -845,6 +846,77 @@ def test_reconcile_copies_watch_state_status_onto_triggers(
 
     # Idempotent: nothing to update on a second pass.
     assert reconcile_gmail_trigger_provisioning(db_session) == 0
+
+
+@pytest.mark.parametrize(
+    ("watch_enabled", "expected_updates", "expected_status", "expected_error"),
+    [
+        (
+            "false",
+            1,
+            TriggerProvisioningStatus.FAILED.value,
+            GMAIL_WATCH_DISABLED_ERROR,
+        ),
+        ("true", 0, TriggerProvisioningStatus.ACTIVE.value, None),
+    ],
+)
+def test_reconcile_missing_watch_state_follows_watch_feature_flag(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    watch_enabled: str,
+    expected_updates: int,
+    expected_status: str,
+    expected_error: str | None,
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", watch_enabled)
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+    setattr(trigger, "provisioning_error", None)
+    db_session.add(trigger)
+    db_session.commit()
+
+    assert db_session.query(GmailWatchState).count() == 0
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == (
+        expected_updates
+    )
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == expected_status
+    assert trigger.provisioning_error == expected_error
+
+
+@pytest.mark.parametrize("stored_error", [None, ""])
+def test_reconcile_disabled_failed_watch_without_error_exposes_disabled_reason(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    stored_error: str | None,
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.FAILED.value,
+        last_error=stored_error,
+    )
+    db_session.add_all([trigger, state])
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 1
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_WATCH_DISABLED_ERROR
 
 
 def test_reconcile_reports_expired_active_watch_as_failed(

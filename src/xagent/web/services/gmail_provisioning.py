@@ -207,16 +207,14 @@ def _trigger_facing_status(state: GmailWatchState) -> tuple[str, str | None]:
     elif status == TriggerProvisioningStatus.PENDING.value and not watch_enabled:
         status = TriggerProvisioningStatus.FAILED.value
         error = error or GMAIL_WATCH_DISABLED_ERROR
-    elif (
-        status == TriggerProvisioningStatus.FAILED.value
-        and error
-        and not watch_enabled
-        and "XAGENT_GMAIL_WATCH_ENABLED" not in error
-    ):
-        error = (
-            f"{error} (automatic retry is disabled; "
-            "set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
-        )
+    elif status == TriggerProvisioningStatus.FAILED.value and not watch_enabled:
+        if not error:
+            error = GMAIL_WATCH_DISABLED_ERROR
+        elif "XAGENT_GMAIL_WATCH_ENABLED" not in error:
+            error = (
+                f"{error} (automatic retry is disabled; "
+                "set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+            )
     return status, error
 
 
@@ -1137,9 +1135,14 @@ def _reconcile_gmail_trigger_batch(
     for trigger in candidates:
         key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
         state = states_by_key.get(key)
+        error: str | None
         if state is None:
-            continue
-        status, error = _trigger_facing_status(state)
+            if get_gmail_watch_enabled():
+                continue
+            status = TriggerProvisioningStatus.FAILED.value
+            error = GMAIL_WATCH_DISABLED_ERROR
+        else:
+            status, error = _trigger_facing_status(state)
         if (
             str(trigger.provisioning_status or "") == status
             and (trigger.provisioning_error or None) == error

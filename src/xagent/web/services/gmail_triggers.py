@@ -24,7 +24,7 @@ from ...config import (
 from ...core.utils.encryption import decrypt_value
 from ..models.gmail_watch import GmailWatchState
 from ..models.oauth_provider import OAuthProvider
-from ..models.trigger import AgentTrigger, TriggerType
+from ..models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..models.user_oauth import UserOAuth
 from .time_utils import coerce_utc as _coerce_utc
 
@@ -254,10 +254,13 @@ def _record_watch_state_error(
     *,
     state_id: int,
     error_message: str,
+    mark_failed: bool = False,
 ) -> None:
     state = db.query(GmailWatchState).filter(GmailWatchState.id == state_id).first()
     if state is None:
         return
+    if mark_failed:
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
     setattr(state, "last_error", error_message)
     db.add(state)
     db.commit()
@@ -582,14 +585,24 @@ async def collect_gmail_pubsub_events(
                 exc_info=True,
             )
             db.rollback()
+            from .gmail_provisioning import GMAIL_WATCH_DISABLED_ERROR
+
+            watch_error = str(watch_exc).strip()
+            error_message = (
+                GMAIL_WATCH_DISABLED_ERROR
+                if watch_error == GMAIL_WATCH_DISABLED_ERROR
+                else (
+                    "Gmail history expired and re-registration failed"
+                    + (f": {watch_error}" if watch_error else "")
+                )
+            )
             _record_watch_state_error(
                 db,
                 state_id=state_id,
-                error_message="Gmail history expired and re-registration failed",
+                error_message=error_message,
+                mark_failed=True,
             )
-            raise GmailTriggerError(
-                "Gmail history expired and re-registration failed"
-            ) from watch_exc
+            raise GmailTriggerError(error_message) from watch_exc
         return GmailPubsubEventCollection(events=[], skipped=1)
 
     triggers = (

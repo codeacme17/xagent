@@ -1384,9 +1384,11 @@ def get_gmail_watch_enabled() -> bool:
 
     Gates both watch registration (OAuth connect, Gmail trigger
     create/update/enable) and the background renewal/retry scans. With the
-    flag off (the default) no watch is created, so none can silently expire
-    unrenewed; Gmail triggers report a failed provisioning status with an
-    explicit disabled error instead.
+    flag off (the default), no new watch is created and Gmail triggers report
+    a failed provisioning status with an explicit disabled error where
+    applicable. An existing Gmail watch is not stopped by disabling this flag:
+    callbacks can remain deliverable until the watch expires or its mailbox
+    resources are explicitly torn down.
     """
     return _get_bool_env(GMAIL_WATCH_ENABLED, False)
 
