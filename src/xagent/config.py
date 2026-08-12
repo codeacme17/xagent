@@ -1389,6 +1389,15 @@ def get_gmail_watch_enabled() -> bool:
     applicable. An existing Gmail watch is not stopped by disabling this flag:
     callbacks can remain deliverable until the watch expires or its mailbox
     resources are explicitly torn down.
+
+    Teardown is deliberately left ungated: rebinding, disabling, or deleting
+    a Gmail trigger still releases the old mailbox's watch and Pub/Sub
+    resources while this flag is off, so switching it off never strands
+    those resources.
+
+    The operator endpoint-reconciliation CLI
+    (``reconcile_gmail_push_endpoints``) is also deliberately ungated, so
+    push endpoints can be migrated ahead of enabling this flag.
     """
     return _get_bool_env(GMAIL_WATCH_ENABLED, False)
 

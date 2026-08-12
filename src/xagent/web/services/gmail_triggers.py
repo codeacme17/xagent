@@ -588,20 +588,31 @@ async def collect_gmail_pubsub_events(
             from .gmail_provisioning import GMAIL_WATCH_DISABLED_ERROR
 
             watch_error = str(watch_exc).strip()
+            disabled = watch_error == GMAIL_WATCH_DISABLED_ERROR
             error_message = (
                 GMAIL_WATCH_DISABLED_ERROR
-                if watch_error == GMAIL_WATCH_DISABLED_ERROR
+                if disabled
                 else (
                     "Gmail history expired and re-registration failed"
                     + (f": {watch_error}" if watch_error else "")
                 )
             )
+            # The disabled case is a permanent condition, not a transient
+            # failure: retrying re-registration will fail identically until an
+            # operator flips XAGENT_GMAIL_WATCH_ENABLED, and the renewal scan
+            # already retries by expiration once it is. Mark the row failed
+            # and ack (200) instead of raising, so Pub/Sub does not redeliver
+            # with backoff for the retention window; a transient failure keeps
+            # last_error only (no status flip) and still raises so the
+            # pipeline's failure_status=500 preserves redelivery semantics.
             _record_watch_state_error(
                 db,
                 state_id=state_id,
                 error_message=error_message,
-                mark_failed=True,
+                mark_failed=disabled,
             )
+            if disabled:
+                return GmailPubsubEventCollection(events=[], skipped=1)
             raise GmailTriggerError(error_message) from watch_exc
         return GmailPubsubEventCollection(events=[], skipped=1)
 

@@ -21,6 +21,7 @@ from ....config import (
     get_gmail_callback_base_url,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
+    get_gmail_watch_enabled,
 )
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
@@ -31,6 +32,7 @@ from ..gmail_provisioning import (
 )
 from ..ops_signals import (
     GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+    GMAIL_WATCH_REGISTRATION_DISABLED,
     clear_degradation,
     register_degradation,
 )
@@ -80,6 +82,31 @@ def warn_if_gmail_oidc_verification_degraded() -> None:
         "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but "
         "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not; Gmail OIDC "
         "verification will skip service-account email checks"
+    )
+
+
+def warn_if_gmail_watch_registration_degraded() -> None:
+    """Startup config-drift check for Gmail watch registration.
+
+    A configured Pub/Sub project without the watch feature enabled means
+    Gmail watch registration and renewal are disabled: Gmail triggers report
+    failed provisioning and existing watches expire unrenewed. Registering
+    the degradation at startup surfaces the drift on /health.
+    """
+    if not get_gmail_pubsub_project_id() or get_gmail_watch_enabled():
+        return
+    register_degradation(
+        GMAIL_WATCH_REGISTRATION_DISABLED,
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but XAGENT_GMAIL_WATCH_ENABLED "
+        "is not; Gmail watch registration and renewal are disabled, so Gmail "
+        "triggers report failed provisioning and existing watches expire "
+        "unrenewed",
+    )
+    logger.warning(
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but "
+        "XAGENT_GMAIL_WATCH_ENABLED is not; Gmail watch registration and "
+        "renewal are disabled, so Gmail triggers report failed provisioning "
+        "and existing watches expire unrenewed"
     )
 
 
@@ -492,6 +519,16 @@ class GmailProvider:
         _ = (trigger, events)
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
+            return
+        if (
+            str(state.status) == TriggerProvisioningStatus.FAILED.value
+            and not get_gmail_watch_enabled()
+        ):
+            # While registration is disabled, parse_events already acked this
+            # callback (skipped, no history advance) instead of raising; the
+            # pipeline still calls finalize_callback for the acked event. Do
+            # not let a successful-looking finalize clear the FAILED/disabled
+            # marking that collect_gmail_pubsub_events just recorded.
             return
         notification = _decode_pubsub_notification(
             raw_body,

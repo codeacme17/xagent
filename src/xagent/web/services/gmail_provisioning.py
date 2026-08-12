@@ -893,6 +893,21 @@ def _ensure_gmail_mailbox_provisioned_locked(
     if not email:
         raise GmailProvisioningError("Gmail account email is required")
 
+    if not get_gmail_watch_enabled():
+        # Defense in depth: every production caller of this function already
+        # checks the flag before reaching here (provision_gmail_trigger,
+        # sweep_gmail_provisioning, best_effort_provision_gmail_watches_for_user),
+        # so this only fires for a future ungated caller. Converging to a
+        # failed watch state here preserves this function's "never raises"
+        # contract instead of leaking the disabled condition as an exception.
+        state = _get_or_create_watch_state(db, oauth_account, email)
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
+        setattr(state, "last_error", GMAIL_WATCH_DISABLED_ERROR)
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+        return state
+
     state = _get_or_create_watch_state(db, oauth_account, email)
     state_id = int(state.id)
     try:
@@ -1113,19 +1128,57 @@ def reconcile_gmail_trigger_provisioning(
             return updated
 
 
+def _bound_gmail_oauth_account_id(trigger: AgentTrigger) -> int | None:
+    """Read a trigger's bound OAuth account id, tolerating malformed configs.
+
+    Mirrors the coercion in ``_referenced_gmail_oauth_account_ids``: any
+    value that is present but not int-coercible is treated the same as a
+    missing binding rather than raising.
+    """
+    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
+    raw_account_id = config.get("oauth_account_id")
+    try:
+        return int(raw_account_id) if raw_account_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _reconcile_gmail_trigger_batch(
     db: Session, candidates: Sequence[AgentTrigger]
 ) -> int:
-    """Copy diverged watch-state status onto one bounded candidate batch."""
+    """Copy diverged watch-state status onto one bounded candidate batch.
+
+    Looks up each trigger's watch state by its bound OAuth account id
+    (``config.oauth_account_id``) when one is present and valid, falling back
+    to the legacy ``(user_id, resource_id-email)`` key only for legacy or
+    malformed configs that carry no usable binding. This mirrors
+    ``_referenced_gmail_oauth_account_ids``'s precedence: a trigger's
+    ``resource_id`` mailbox email can go stale (the connected Google account
+    changed email and a reconnect refreshed ``GmailWatchState.email``), and
+    matching by the durable account id instead of the stale email avoids a
+    spurious miss that would otherwise clobber an active trigger to
+    failed/disabled once the flag-off None-state behavior below kicks in.
+    """
     if not candidates:
         return 0
 
-    emails = {str(trigger.resource_id).strip().lower() for trigger in candidates}
-    states = (
-        db.query(GmailWatchState)
-        .filter(func.lower(GmailWatchState.email).in_(emails))
-        .all()
-    )
+    account_ids: set[int] = set()
+    emails: set[str] = set()
+    for trigger in candidates:
+        bound_account_id = _bound_gmail_oauth_account_id(trigger)
+        if bound_account_id is not None:
+            account_ids.add(bound_account_id)
+        else:
+            emails.add(str(trigger.resource_id).strip().lower())
+
+    filters = []
+    if account_ids:
+        filters.append(GmailWatchState.oauth_account_id.in_(account_ids))
+    if emails:
+        filters.append(func.lower(GmailWatchState.email).in_(emails))
+    states = db.query(GmailWatchState).filter(or_(*filters)).all() if filters else []
+
+    states_by_account_id = {int(state.oauth_account_id): state for state in states}
     states_by_key = {
         (int(state.user_id), str(state.email or "").strip().lower()): state
         for state in states
@@ -1133,8 +1186,12 @@ def _reconcile_gmail_trigger_batch(
 
     updated = 0
     for trigger in candidates:
-        key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
-        state = states_by_key.get(key)
+        bound_account_id = _bound_gmail_oauth_account_id(trigger)
+        if bound_account_id is not None:
+            state = states_by_account_id.get(bound_account_id)
+        else:
+            key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
+            state = states_by_key.get(key)
         error: str | None
         if state is None:
             if get_gmail_watch_enabled():
