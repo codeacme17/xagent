@@ -88,6 +88,8 @@ class PublicChatAccessContext:
     widget_agent_id: int | None = None
     # Set instead of ``widget_agent_id`` when the widget key exposes a
     # workforce. Exactly one of the two is populated for a widget guest.
+    # Structural enforcement is tracked in #1288 (the share twin is already
+    # enforced below, #1225).
     widget_workforce_id: int | None = None
 
 
