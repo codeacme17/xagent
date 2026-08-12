@@ -979,6 +979,43 @@ def test_provision_gmail_trigger_disabled_reports_existing_watch_state(
     assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
 
 
+def test_provision_gmail_trigger_reports_expired_watch_with_flag_on(
+    db_session: Session,
+) -> None:
+    """Flag on: a save whose background thread fails to converge must surface
+    a stale expired watch as failed, not echo the row's active status."""
+    import threading
+
+    from xagent.web.services.gmail_provisioning import provision_gmail_trigger
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+        watch_expiration=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    def noop_run_in_thread(_account_id: int) -> threading.Thread:
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        return thread
+
+    status = provision_gmail_trigger(
+        db_session, trigger, run_in_thread=noop_run_in_thread
+    )
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert "expired" in str(trigger.provisioning_error)
+
+
 def test_provision_gmail_trigger_disabled_reports_null_expiration_as_failed(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
