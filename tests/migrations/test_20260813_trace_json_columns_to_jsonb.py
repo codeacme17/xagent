@@ -429,24 +429,52 @@ class TestOfflineSql:
         assert "?" not in sql
 
 
+def _batch_span() -> int:
+    """One full id batch plus a remainder, so the cleanup loop runs twice.
+
+    Derived from the migration's own constant rather than hardcoded: the
+    point of these tests is that the loop iterates, which stops being true
+    if someone raises REWRITE_BATCH_SIZE past a fixed row count here.
+    """
+    return _migration_module().REWRITE_BATCH_SIZE + 3
+
+
+def _insert_many(conn: sa.engine.Connection, payloads: dict[int, str]) -> None:
+    """Seed rows in one round trip -- a batch-span worth of single INSERTs
+    dominates these tests' runtime otherwise."""
+    conn.execute(
+        text(
+            "INSERT INTO trace_events "
+            "(id, task_id, event_id, event_type, timestamp, data) "
+            "VALUES (:id, 1, :event_id, 'llm_call_start', "
+            "'2026-08-13 00:00:00', CAST(:payload AS json))"
+        ),
+        [
+            {"id": row_id, "event_id": f"evt-{row_id}", "payload": payload}
+            for row_id, payload in payloads.items()
+        ],
+    )
+
+
 @pytest.mark.postgresql
 class TestBatchedCleanup:
-    """The cleanup walks matching rows in bounded batches so the migration
-    never materializes every poisoned payload at once. A single batch is
-    exercised by the tests above; this class forces the loop to run more
-    than once, which is the only way the keyset advance is covered.
+    """The cleanup pages over matching ids and reads one payload at a time,
+    so neither the whole matching set nor a batch of payloads is ever
+    resident. The tests above stay inside a single batch; this class forces
+    the loop to iterate, which is the only way the keyset advance is
+    covered.
     """
 
     def test_rewrites_more_rows_than_one_batch(self, postgres_engine) -> None:
-        migration = _migration_module()
-        row_count = migration.REWRITE_BATCH_SIZE * 2 + 3
+        row_count = _batch_span()
         with postgres_engine.begin() as conn:
-            for row_id in range(1, row_count + 1):
-                _insert_trace_event(
-                    conn,
-                    row_id=row_id,
-                    payload_json_text='{"v": "n' + NUL_ESCAPE + '"}',
-                )
+            _insert_many(
+                conn,
+                {
+                    row_id: '{"v": "n' + NUL_ESCAPE + '"}'
+                    for row_id in range(1, row_count + 1)
+                },
+            )
 
         _upgrade(postgres_engine)
 
@@ -463,15 +491,21 @@ class TestBatchedCleanup:
     def test_clean_rows_between_poisoned_ones_are_untouched(
         self, postgres_engine
     ) -> None:
-        """The batch predicate matches only poisoned rows, so the keyset
-        advance steps over clean rows rather than rewriting them."""
+        """The id scan matches only poisoned rows, so the keyset advance
+        steps over clean rows rather than rewriting them."""
+        span = _batch_span()
         with postgres_engine.begin() as conn:
-            for row_id in range(1, migration_batch_span() + 1):
-                if row_id % 2:
-                    payload = '{"v": "bad' + NUL_ESCAPE + '"}'
-                else:
-                    payload = '{"v": "' + PAIR_ESCAPE + '"}'
-                _insert_trace_event(conn, row_id=row_id, payload_json_text=payload)
+            _insert_many(
+                conn,
+                {
+                    row_id: (
+                        '{"v": "bad' + NUL_ESCAPE + '"}'
+                        if row_id % 2
+                        else '{"v": "' + PAIR_ESCAPE + '"}'
+                    )
+                    for row_id in range(1, span + 1)
+                },
+            )
 
         _upgrade(postgres_engine)
 
@@ -484,10 +518,5 @@ class TestBatchedCleanup:
                 text("SELECT count(*) FROM trace_events WHERE data->>'v' = :v"),
                 {"v": f"bad{REPLACEMENT}"},
             ).scalar_one()
-        assert good == migration_batch_span() // 2
-        assert bad == migration_batch_span() - migration_batch_span() // 2
-
-
-def migration_batch_span() -> int:
-    """One batch plus a remainder, so the loop runs twice."""
-    return _migration_module().REWRITE_BATCH_SIZE + 5
+        assert good == span // 2
+        assert bad == span - span // 2
