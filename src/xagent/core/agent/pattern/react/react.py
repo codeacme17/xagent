@@ -36,6 +36,7 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
@@ -71,6 +72,8 @@ from ...runtime import (
 )
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
+
+logger = logging.getLogger(__name__)
 
 
 class ReActReasoningMode(str, Enum):
@@ -590,6 +593,20 @@ class ReActPattern(AgentPattern):
                     normalized,
                     force_final_answer=force_final_answer_now,
                 )
+                empty_final_answer = self._empty_final_answer_call(normalized)
+                if empty_final_answer is not None:
+                    logger.warning(
+                        "ReAct final_answer carried no answer text; discarding the "
+                        "response and retrying. iteration=%s arg_keys=%s",
+                        iteration,
+                        sorted(self._tool_call_args_dict(empty_final_answer)),
+                    )
+                if recover_full_tool_set:
+                    recovery_reason: str | None = "unavailable_tool_call"
+                elif empty_final_answer is not None:
+                    recovery_reason = "empty_final_answer"
+                else:
+                    recovery_reason = None
                 try:
                     (
                         response,
@@ -603,9 +620,7 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
-                        recovery_reason=(
-                            "unavailable_tool_call" if recover_full_tool_set else None
-                        ),
+                        recovery_reason=recovery_reason,
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -699,6 +714,11 @@ class ReActPattern(AgentPattern):
         answer_streamer: ReActFinalAnswerStreamer | None,
         stream_failure_message: str,
     ) -> dict[str, Any]:
+        logger.warning(
+            "ReAct failing the run after an invalid tool protocol: %s (iteration=%s)",
+            stream_failure_message,
+            iteration,
+        )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
         await runtime.checkpoint(
@@ -864,6 +884,16 @@ class ReActPattern(AgentPattern):
                 "complete user-facing response in its answer field."
             )
             retry_phase = "malformed_tool_arguments_recovery"
+        elif recovery_reason == "empty_final_answer":
+            retry_instruction = (
+                "The previous response called final_answer with an empty answer "
+                "field, so the user received no reply at all. Retry this turn: if "
+                "the task is complete, call final_answer again with the complete "
+                "user-facing response in its answer field; if work remains, call "
+                "the appropriate available work tool instead. Never call "
+                "final_answer with an omitted, empty, or whitespace-only answer."
+            )
+            retry_phase = "empty_final_answer_recovery"
         else:
             retry_instruction = (
                 "The previous response used an invalid tool protocol. Retry the same "
@@ -960,7 +990,32 @@ class ReActPattern(AgentPattern):
                 continue
             if force_final_answer and tool_call.get("name") != "final_answer":
                 return True
-        return False
+        return self._empty_final_answer_call(normalized) is not None
+
+    def _empty_final_answer_call(
+        self, normalized: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the first ``final_answer`` call that carries no answer text.
+
+        Under ``tool_choice="required"`` ``final_answer`` is the only way ReAct
+        can reply, so an empty ``answer`` produces a run that completes with
+        nothing streamed and nothing persisted. Treating it as a tool-protocol
+        violation routes it into the pattern's existing single repair retry
+        instead of finalizing silently.
+        """
+
+        for tool_call in normalized.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            if tool_call.get("name") != "final_answer":
+                continue
+            args = tool_call.get("args")
+            answer = args.get("answer") if isinstance(args, dict) else None
+            # Coerce exactly as ``_handle_control_tool`` does, so this check and
+            # the finalization it guards agree on what counts as an answer.
+            if answer is None or not str(answer).strip():
+                return tool_call
+        return None
 
     def _requires_full_tool_set_recovery(
         self,
@@ -1390,21 +1445,24 @@ class ReActPattern(AgentPattern):
                 function_payload = tool_call.get("function")
                 if isinstance(function_payload, dict):
                     arguments = function_payload.get("arguments", {})
+                    name = function_payload.get("name")
                     normalized.append(
                         {
                             "id": tool_call.get("id") or f"tool_call_{index}",
-                            "name": function_payload.get("name"),
-                            "args": self._coerce_arguments(arguments),
+                            "name": name,
+                            "args": self._coerce_arguments(arguments, tool_name=name),
                         }
                     )
                     continue
 
+                name = tool_call.get("name")
                 normalized.append(
                     {
                         "id": tool_call.get("id") or f"tool_call_{index}",
-                        "name": tool_call.get("name"),
+                        "name": name,
                         "args": self._coerce_arguments(
-                            tool_call.get("args", tool_call.get("arguments", {}))
+                            tool_call.get("args", tool_call.get("arguments", {})),
+                            tool_name=name,
                         ),
                     }
                 )
@@ -1412,12 +1470,14 @@ class ReActPattern(AgentPattern):
 
             function_payload = getattr(tool_call, "function", None)
             if function_payload is not None:
+                name = getattr(function_payload, "name", None)
                 normalized.append(
                     {
                         "id": getattr(tool_call, "id", None) or f"tool_call_{index}",
-                        "name": getattr(function_payload, "name", None),
+                        "name": name,
                         "args": self._coerce_arguments(
-                            getattr(function_payload, "arguments", {})
+                            getattr(function_payload, "arguments", {}),
+                            tool_name=name,
                         ),
                     }
                 )
@@ -1442,16 +1502,48 @@ class ReActPattern(AgentPattern):
                 self.pending_tool_call_content[tool_call_id] = content
             return
 
-    def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
+    def _coerce_arguments(
+        self, arguments: Any, *, tool_name: str | None = None
+    ) -> dict[str, Any]:
         if isinstance(arguments, dict):
             return arguments
         if isinstance(arguments, str):
             try:
                 parsed = json.loads(arguments)
             except json.JSONDecodeError:
-                return {"input": arguments}
-            return parsed if isinstance(parsed, dict) else {"input": parsed}
+                logger.warning(
+                    "ReAct tool call %s returned malformed JSON arguments "
+                    "(%d chars); treating them as absent.",
+                    tool_name or "<unknown>",
+                    len(arguments),
+                )
+                return self._fallback_arguments(tool_name, arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning(
+                "ReAct tool call %s returned non-object JSON arguments (%s).",
+                tool_name or "<unknown>",
+                type(parsed).__name__,
+            )
+            return self._fallback_arguments(tool_name, parsed)
         return {}
+
+    def _fallback_arguments(
+        self, tool_name: str | None, payload: Any
+    ) -> dict[str, Any]:
+        """Wrap unusable tool arguments, or drop them for control tools.
+
+        Work tools tolerate an opaque ``input`` passthrough. Control tools do
+        not: ``final_answer`` owns the run's only user-visible exit, so smuggling
+        a malformed payload through as ``input`` would silently strip ``answer``
+        and finalize the run with nothing to show. Returning empty args instead
+        lets ``_response_requires_tool_protocol_retry`` reject the call and spend
+        the pattern's one repair retry on it.
+        """
+
+        if tool_name in self._control_tool_names():
+            return {}
+        return {"input": payload}
 
     def _build_tool_schema(self, tool: Any) -> dict[str, Any]:
         name = self._tool_name(tool)
@@ -1684,6 +1776,9 @@ class ReActPattern(AgentPattern):
 
         if name == "final_answer":
             answer = str(args.get("answer", ""))
+            if not answer.strip():
+                self._reject_empty_final_answer(tool_call, context)
+                return None
             outcome = self._final_answer_outcome(args.get("outcome"))
             self._record_tool_call(
                 tool_call,
@@ -1825,6 +1920,41 @@ class ReActPattern(AgentPattern):
             }
 
         return None
+
+    def _reject_empty_final_answer(
+        self, tool_call: dict[str, Any], context: Any
+    ) -> None:
+        """Refuse to finalize on an empty ``final_answer`` and re-request one.
+
+        ``_response_requires_tool_protocol_retry`` catches this on the turn the
+        model produces it, so this guard covers the paths that reach the handler
+        without passing through response normalization — most importantly a
+        checkpoint resume that restores ``pending_tool_calls`` verbatim.
+
+        Returning ``None`` keeps the run in the loop; ``force_final_answer_next``
+        makes the next turn re-request ``final_answer``, and if that turn is empty
+        too the normalization guard fails the run instead of looping.
+        """
+
+        logger.warning(
+            "ReAct refusing to finalize on final_answer with no answer text; "
+            "re-requesting a final answer. tool_call_id=%s arg_keys=%s",
+            tool_call.get("id"),
+            sorted(self._tool_call_args_dict(tool_call)),
+        )
+        error = (
+            "final_answer was called with an empty answer, so the user received "
+            "nothing. Call final_answer again with the complete user-facing "
+            "response in its answer field."
+        )
+        self._record_tool_call(tool_call, status="failed", error=error)
+        context.add_tool_result(
+            tool_name="final_answer",
+            result={"error": error},
+            tool_call_id=tool_call.get("id"),
+        )
+        self.status = "thinking"
+        self.force_final_answer_next = True
 
     def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
         """Whether ``name`` may run concurrently with other safe tools.

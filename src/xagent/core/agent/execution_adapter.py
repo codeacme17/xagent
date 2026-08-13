@@ -366,6 +366,20 @@ class AgentExecutionAdapter:
                 # ``agent_result`` specifically so a backfilled preamble
                 # cannot be mistaken for a real final answer.
                 output = self._latest_assistant_message(result.get("context"))
+        if not output:
+            # A run that reports success with nothing to show is a bug in the
+            # pattern that produced it, and the placeholder erases the evidence.
+            # Log before substituting so there is something to debug from.
+            logger.warning(
+                "Agent %r produced no output; substituting the placeholder. "
+                "execution_type=%s pattern=%s status=%s success=%s task_id=%s",
+                self.config.name,
+                execution_type,
+                self.config.pattern,
+                status,
+                result.get("success"),
+                execution_id,
+            )
         normalized = {
             "status": status,
             "output": output or NO_OUTPUT_PLACEHOLDER,
