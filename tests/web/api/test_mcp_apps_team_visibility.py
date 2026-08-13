@@ -65,7 +65,9 @@ def _install_visibility(mapping: dict[int, dict[str, set[int]]]) -> None:
     connector_team_scope.set_connector_team_hooks(visibility=visibility)
 
 
-def _add_server(db, owner: User | None, name: str = "records") -> MCPServer:
+def _add_server(
+    db, owner: User, name: str = "records", *, is_active: bool = True
+) -> MCPServer:
     server = MCPServer.from_config(
         {
             "name": name,
@@ -78,20 +80,37 @@ def _add_server(db, owner: User | None, name: str = "records") -> MCPServer:
     db.add(server)
     db.commit()
     db.refresh(server)
-    if owner is not None:
-        db.add(
-            UserMCPServer(
-                user_id=owner.id,
-                mcpserver_id=server.id,
-                is_owner=True,
-                is_active=True,
-            )
+    db.add(
+        UserMCPServer(
+            user_id=owner.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=is_active,
         )
-        db.commit()
+    )
+    db.commit()
     return server
 
 
-def _add_oauth_server(db, owner: User | None, name: str = "notes") -> MCPServer:
+def _add_unowned_server(db, name: str) -> MCPServer:
+    """A server row with no personal association for anyone — reachable only
+    through the team overlay."""
+    server = MCPServer.from_config(
+        {
+            "name": name,
+            "description": f"{name} MCP server",
+            "managed": "external",
+            "transport": "stdio",
+            "command": f"{name}-mcp",
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    return server
+
+
+def _add_oauth_server(db, owner: User, name: str = "notes") -> MCPServer:
     server = MCPServer.from_config(
         {
             "name": name,
@@ -109,20 +128,19 @@ def _add_oauth_server(db, owner: User | None, name: str = "notes") -> MCPServer:
     db.add(server)
     db.commit()
     db.refresh(server)
-    if owner is not None:
-        db.add(
-            UserMCPServer(
-                user_id=owner.id,
-                mcpserver_id=server.id,
-                is_owner=True,
-                is_active=True,
-            )
+    db.add(
+        UserMCPServer(
+            user_id=owner.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
         )
-        db.commit()
+    )
+    db.commit()
     return server
 
 
-def _add_custom_api(db, owner: User | None, name: str = "billing") -> CustomApi:
+def _add_custom_api(db, owner: User, name: str = "billing") -> CustomApi:
     api = CustomApi(
         name=name,
         description=f"{name} API",
@@ -132,16 +150,15 @@ def _add_custom_api(db, owner: User | None, name: str = "billing") -> CustomApi:
     db.add(api)
     db.commit()
     db.refresh(api)
-    if owner is not None:
-        db.add(
-            UserCustomApi(
-                user_id=owner.id,
-                custom_api_id=api.id,
-                is_owner=True,
-                is_active=True,
-            )
+    db.add(
+        UserCustomApi(
+            user_id=owner.id,
+            custom_api_id=api.id,
+            is_owner=True,
+            is_active=True,
         )
-        db.commit()
+    )
+    db.commit()
     return api
 
 
@@ -222,19 +239,30 @@ def test_a_personal_row_plus_a_team_link_lists_the_connector_exactly_once(db_ses
 
 
 def test_a_connector_owned_by_another_team_is_never_listed(db_session):
-    """AC4: the overlay adds exactly what the hook reports for this user."""
-    db, creator, member = db_session
-    _add_server(db, creator)
-    _add_custom_api(db, creator)
-    # The hook answers empty for `member`: they belong to no team owning these.
-    _install_visibility({int(creator.id): {"mcp": set(), "custom_api": set()}})
+    """AC4: the overlay is keyed on the *requesting* user, so a connector a
+    live hook reports for someone else must not reach this user's picker.
 
+    `shared` has no personal association for anyone, so it is reachable only
+    through the overlay: the creator's assertion fails if the overlay is
+    deleted, and the member's fails if it ignores the requesting user. An
+    answer that was empty for everyone — or a connector the creator also owned
+    personally — would leave both assertions true either way."""
+    db, creator, member = db_session
+    shared = _add_unowned_server(db, "shared")
+    _install_visibility(
+        {int(creator.id): {"mcp": {int(shared.id)}, "custom_api": set()}}
+    )
+
+    assert _local_ids(db, creator) == ["shared"]
     assert _local_ids(db, member) == []
 
 
 def test_standalone_response_is_unchanged_with_no_hook_installed(db_session):
     """AC5: `visible_team_connector_ids` resolves empty without a hook, so a
-    standalone deployment sees byte-identical results."""
+    standalone deployment takes the pre-overlay path. Entry *fields* on that
+    path are pinned by the existing tests in test_mcp_oauth_flow.py; what this
+    pins is that the overlay adds and removes nothing when no hook is
+    installed."""
     db, creator, member = db_session
     _add_server(db, creator)
     _add_custom_api(db, creator)
@@ -294,9 +322,13 @@ def test_a_team_owned_mcp_oauth_server_carries_no_auth_type(db_session):
     assert "auth_type" not in entry
 
 
-def test_search_and_category_filters_apply_to_overlaid_connectors(db_session):
-    """The overlay feeds the same loops, so the existing filters must still
-    narrow the result rather than being bypassed for team-owned rows."""
+def test_the_search_filter_applies_to_overlaid_connectors(db_session):
+    """The overlay feeds the same loops, so the existing search filter must
+    still narrow the result rather than being bypassed for team-owned rows.
+
+    No category assertion here: the local branch discards *every* row for any
+    category other than "All", so a category assertion holds even with the
+    overlay deleted and would pin nothing."""
     db, creator, member = db_session
     records = _add_server(db, creator, name="records")
     shipping = _add_server(db, creator, name="shipping")
@@ -323,9 +355,64 @@ def test_search_and_category_filters_apply_to_overlaid_connectors(db_session):
         )
     ] == ["records"]
 
-    assert (
-        list_mcp_apps(
-            location="local", category="Productivity", current_user=member, db=db
-        )
-        == []
+
+@pytest.mark.parametrize("location", ["local", "all"])
+def test_the_overlay_applies_to_both_local_and_all(db_session, location):
+    """`location="all"` runs the same branch as "local". The frontend only
+    sends "local" today, so pin that the branch is entered for both rather
+    than leaving "all" to drift."""
+    db, creator, member = db_session
+    server = _add_server(db, creator)
+    api = _add_custom_api(db, creator)
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": {int(api.id)},
+            }
+        }
     )
+
+    ids = [
+        a["id"] for a in list_mcp_apps(location=location, current_user=member, db=db)
+    ]
+    assert ids == ["records", "billing"]
+
+
+def test_an_inactive_personal_row_plus_a_team_link_lists_one_entry(db_session):
+    """A member who deactivated their own association while the connector stays
+    team-owned must still see exactly one row, not one per source.
+
+    The dedup index is built from *all* personal associations regardless of
+    `is_active`, matching `get_mcp_servers`' `own_mcp_ids`; an index that
+    filtered on `is_active` would overlay a second copy of this server."""
+    db, creator, _member = db_session
+    server = _add_server(db, creator, is_active=False)
+    _install_visibility(
+        {int(creator.id): {"mcp": {int(server.id)}, "custom_api": set()}}
+    )
+
+    assert _local_ids(db, creator).count("records") == 1
+
+
+def test_a_hook_answering_string_ids_is_not_silently_resolved(db_session):
+    """Regression pin for a fail-open path: SQLite's numeric affinity makes
+    `id IN ('1')` match an INTEGER primary key, so a hook answering string ids
+    would list a connector the dedup index (int-keyed) considered missing.
+
+    Element types are the hook's contract (`dict[str, set[int]]`). This pins
+    today's behavior so a future validator in `connector_team_scope` — which
+    must check element types, not just the container shape — has a test that
+    changes when the behavior does."""
+    db, creator, member = db_session
+    server = _add_server(db, creator)
+    _install_visibility(
+        {int(member.id): {"mcp": {str(server.id)}, "custom_api": set()}}  # type: ignore[dict-item]
+    )
+
+    listed = _local_ids(db, member)
+    # Documents the current fail-open outcome rather than asserting it is
+    # correct: a string id resolves through the IN clause and reaches the
+    # picker. A validator rejecting non-int members would turn this into a
+    # raised error, and this assertion is where that change surfaces.
+    assert listed == ["records"]
