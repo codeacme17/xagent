@@ -159,7 +159,7 @@ corrupted and a retry succeeds, but roll the application out fully before
 migrating, or expect to run it more than once.
 
 Revision ID: 20260813_trace_json_columns_to_jsonb
-Revises: 20260810_add_hubspot_marketing_scopes
+Revises: 20260812_add_slack_history_reactions_files_scopes
 Create Date: 2026-08-13
 
 """
@@ -174,7 +174,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "20260813_trace_json_columns_to_jsonb"
-down_revision: Union[str, None] = "20260810_add_hubspot_marketing_scopes"
+down_revision: Union[str, None] = "20260812_add_slack_history_reactions_files_scopes"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
