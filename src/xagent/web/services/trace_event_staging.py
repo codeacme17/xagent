@@ -32,6 +32,16 @@ constructs its own ``TraceEvent`` row and adds it to the session directly,
 without going through ``_save_trace_event`` or this function. This function
 is the sole construction point on the ``_save_trace_event`` path, not the
 only place a trace row is ever built in the codebase.
+
+A third writer would have to sanitize for itself too (#1248): every payload
+reaching these columns must pass ``sanitize_json_payload`` first, and that
+is a convention here rather than something the type system enforces. It is
+not enforced structurally because the ordering is load-bearing -- the
+sanitize has to happen before ``encode_checkpoint_data_for_storage`` hashes
+the payload, which a column-level ``TypeDecorator`` (running at bind time,
+long after the hash) could not guarantee. On PostgreSQL a missed sanitize
+fails loudly at INSERT, since the columns are ``jsonb``; on SQLite it would
+store silently, so a new writer is worth checking by hand.
 """
 
 from __future__ import annotations

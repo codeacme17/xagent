@@ -45,17 +45,38 @@ monitoring endpoints), where key order already carries no meaning, and
 duplicate keys cannot be produced by ``json.dumps`` from a dict in the
 first place -- the write path only ever serializes dicts.
 
-``jsonb`` does, however, re-render numbers: a float stored as ``1e+16``
-reads back as the int ``10000000000000000``, and ``-0.0`` as ``0.0``
-(``numeric`` has no signed zero). The checkpoint blob path re-hashes
-payloads it reads and compares them against the hash recorded at write
-time, so a *pre-existing* row carrying either shape becomes undecodable
-after this migration. New writes are covered -- the write-side sanitizer
-normalizes both before the hash is taken -- and rows this migration
-rewrites get the same two normalizations applied here. Rows it does not
-touch are deliberately left alone: catching them would mean rewriting
-every row in all three tables to defend against shapes that need a float
-above 2**53, or a negative zero, in trace output.
+``jsonb`` does, however, re-render numbers. Its numbers are ``numeric``,
+so it keeps the literal's exact value and prints it in plain notation:
+``1e+16`` reads back as the int ``10000000000000000``, ``1e25`` as 10^25,
+and ``-0.0`` as ``0.0`` (``numeric`` has no signed zero). A long decimal
+is preserved in full -- the retype is about *notation and Python type*,
+not precision.
+
+The checkpoint blob path re-hashes payloads it reads and compares them
+against the hash recorded at write time, so a *pre-existing* row carrying
+a shape whose Python type changes becomes undecodable after this
+migration. New writes are covered: the write-side sanitizer normalizes
+both shapes before the hash is taken. Rows this migration does not touch
+are deliberately left alone -- catching them would mean rewriting every
+row in all three tables to defend against shapes that need a float above
+2**53, or a negative zero, in trace output. That leaves such rows with a
+disclosed failure and no remedy of their own; the pre-flight below counts
+only the NUL rows this migration actually rewrites, and a float-shaped
+row hits the same escalation with no count query to warn about it. The
+supported remedy is the same one: prune the affected task's checkpoint
+history.
+
+The rows this migration *does* rewrite keep their numbers verbatim rather
+than being normalized here, so ``jsonb`` applies its own conversion on
+ingest identically for rewritten and untouched rows. Normalizing in the
+migration would make the two diverge, because reaching the number at all
+means parsing it, and a float64 round-trip is lossy where ``numeric`` is
+not: it renders ``1e25`` as 10000000000000000905969664 rather than 10^25,
+truncates a literal carrying more precision than a double holds, and
+turns ``1e1000`` into ``inf`` -- which ``json.dumps`` writes as
+``Infinity``, not JSON, failing the rewrite's own cast. Parsing to
+``Decimal`` and emitting each number as its own literal avoids all three;
+see ``_loads_preserving_numbers`` and ``_dumps_preserving_numbers``.
 
 Rewriting a *blob* row has a cost the paragraph above does not cover, and
 it is the one thing to weigh before running this. Replacing NUL with
@@ -165,8 +186,8 @@ Create Date: 2026-08-13
 """
 
 import json
-import math
 import re
+from decimal import Decimal
 from typing import Any, Sequence, Union
 
 import sqlalchemy as sa
@@ -205,13 +226,18 @@ UNSAFE_ESCAPE_PATTERN = (
 )
 
 # The Python-side rewrite: NUL and every surrogate code point become
-# U+FFFD, and floats jsonb would hand back as ints are converted up front.
-# Mirrors web/utils/json_payload_sanitizer.py, which documents both rules;
-# duplicated here because a migration must not import application code that
-# can drift.
+# U+FFFD. Mirrors the code-point half of
+# web/utils/json_payload_sanitizer.py, which documents the rule; duplicated
+# here because a migration must not import application code that can drift.
+# The sanitizer's number normalization has deliberately no counterpart here
+# -- see _sanitize.
 _UNSTORABLE_CODE_POINTS = re.compile("[\x00\ud800-\udfff]")
 _REPLACEMENT_CHARACTER = "�"
-_EXPONENT_NOTATION_THRESHOLD = 1e16
+
+# Placeholder marker for a number held out of json.dumps. Long and
+# namespaced so a collision with real payload text is implausible; checked
+# for anyway before any substitution runs.
+_NUMBER_TOKEN_PREFIX = "__xagent_jsonb_migration_number_"
 
 # Ids per cleanup batch. This bounds a list of integers, not payloads --
 # the rewrite loop reads one payload at a time (see
@@ -228,23 +254,72 @@ def _sanitize(value: Any) -> Any:
     cannot fire here. ``re.sub`` already returns the original object when
     nothing matches, so only the container spine is rebuilt, never the text
     -- a few percent of the json.loads/json.dumps pair that brackets this
-    call, and far less than one payload."""
+    call, and far less than one payload.
+
+    Numbers are deliberately not touched. They arrive as ``Decimal`` (see
+    ``_loads_preserving_numbers``) and leave verbatim, so ``jsonb`` applies
+    its own normalization on ingest -- identically for a row this rewrites
+    and a row it never looks at. Normalizing here instead would make the
+    two diverge: a float64 round-trip renders ``1e25`` as
+    10000000000000000905969664, where the cast produces 10^25.
+    """
     if isinstance(value, str):
         return _UNSTORABLE_CODE_POINTS.sub(_REPLACEMENT_CHARACTER, value)
-    # No bool guard needed: bool subclasses int, not float, so True/False
-    # never reach this branch.
-    if isinstance(value, float):
-        if abs(value) >= _EXPONENT_NOTATION_THRESHOLD and value.is_integer():
-            return int(value)
-        # numeric has no signed zero, so jsonb renders -0.0 as 0.0.
-        if value == 0.0 and math.copysign(1.0, value) < 0:
-            return 0.0
-        return value
     if isinstance(value, dict):
         return {_sanitize(key): _sanitize(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_sanitize(item) for item in value]
     return value
+
+
+def _loads_preserving_numbers(payload_text: str) -> Any:
+    """Parse without letting a number through float64.
+
+    ``json.loads`` maps every JSON float onto a Python float, which silently
+    truncates a literal carrying more precision than a double holds and
+    turns ``1e1000`` into ``inf`` -- and ``json.dumps`` then writes
+    ``Infinity``, which is not JSON and fails the UPDATE's cast. ``jsonb``
+    itself does neither: its numbers are ``numeric``, so it keeps the exact
+    literal. Parsing to ``Decimal`` matches that, and integers are already
+    arbitrary precision.
+    """
+    return json.loads(payload_text, parse_float=Decimal)
+
+
+def _dumps_preserving_numbers(value: Any, *, payload_text: str) -> str:
+    """Serialize with every ``Decimal`` written as its own literal.
+
+    ``json.dumps`` cannot emit a ``Decimal`` (and ``default=`` would quote
+    it into a string), so each one is swapped for a placeholder string and
+    the placeholder's *quoted* form is substituted back afterwards. The
+    prefix is checked against the original payload first: a collision would
+    otherwise let payload text be replaced by a number.
+    """
+    if _NUMBER_TOKEN_PREFIX in payload_text:
+        raise RuntimeError(
+            f"payload already contains {_NUMBER_TOKEN_PREFIX!r}; refusing to "
+            "rewrite it rather than risk substituting into payload text"
+        )
+
+    literals: list[str] = []
+
+    def tokenize(item: Any) -> Any:
+        if isinstance(item, Decimal):
+            literals.append(str(item))
+            return f"{_NUMBER_TOKEN_PREFIX}{len(literals) - 1}__"
+        if isinstance(item, dict):
+            return {key: tokenize(sub) for key, sub in item.items()}
+        if isinstance(item, list):
+            return [tokenize(sub) for sub in item]
+        return item
+
+    text = json.dumps(tokenize(value))
+    for index, literal in enumerate(literals):
+        quoted = json.dumps(f"{_NUMBER_TOKEN_PREFIX}{index}__")
+        if quoted not in text:
+            raise RuntimeError(f"number placeholder {quoted} vanished during encode")
+        text = text.replace(quoted, literal, 1)
+    return text
 
 
 def _table_exists(name: str) -> bool:
@@ -339,8 +414,16 @@ def _rewrite_unconvertible_rows(table: str, column: str) -> None:
                 # a row that no longer exists needs no rewrite.
                 continue
             payload_text = payload_row[0]
-            cleaned = _sanitize(json.loads(payload_text))
-            bind.execute(update, {"payload": json.dumps(cleaned), "id": row_id})
+            cleaned = _sanitize(_loads_preserving_numbers(payload_text))
+            bind.execute(
+                update,
+                {
+                    "payload": _dumps_preserving_numbers(
+                        cleaned, payload_text=payload_text
+                    ),
+                    "id": row_id,
+                },
+            )
         # A rewritten row no longer matches the predicate, so the next
         # batch would find these again only by id -- advance past them.
         after = row_ids[-1]

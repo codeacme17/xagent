@@ -34,9 +34,12 @@ what this file can and must pin:
   seeded alongside text that merely looks like an escape.
 
 The read guard in ``get_json_field_expression`` still exists for databases
-whose migration has not run; with ``jsonb`` it can never match, so its
-matching behaviour stays pinned by the dialect-independent unit tests in
-``tests/web/test_monitor_api.py``, not here.
+whose migration has not run. With ``jsonb`` it can never match, so no test
+over the model's own table can reach its drop path any more --
+``TestReadGuardAgainstNativeJson`` therefore builds a throwaway table with
+a native ``json`` column and runs the guard against that, which keeps the
+branch's normalize-then-match SQL executing on real PostgreSQL rather than
+only in the dialect-independent mirrors in ``tests/web/test_monitor_api.py``.
 
 Fixture pattern copied from
 ``tests/web/services/test_task_status_storage_postgresql.py`` (skip-if-unset
@@ -51,10 +54,13 @@ from datetime import datetime
 from typing import Any, Iterator
 
 import pytest
+from sqlalchemy import JSON, Column, Integer, MetaData, Table, select
+from sqlalchemy import text as sa_text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from xagent.web.api.monitor import (
+    get_json_field_expression,
     get_model_stats,
     get_monitoring_stats,
     get_popular_tools,
@@ -433,3 +439,114 @@ class TestJsonbRoundTripFidelity:
         stored = self._round_trip(pg_session, task, payload)
 
         assert json.dumps(stored, sort_keys=True) == json.dumps(payload, sort_keys=True)
+
+
+@pytest.mark.postgresql
+class TestReadGuardAgainstNativeJson:
+    """The guard's drop path, executed against a real ``json`` column.
+
+    ``get_json_field_expression``'s PostgreSQL branch exists for databases
+    whose migration has not run yet. Since #1248 the model's own column is
+    ``jsonb``, so no test above can plant a payload the guard has to drop --
+    which left the branch's normalize-then-match SQL (the escaped-backslash
+    stand-in, the pair strip, the alternation) with no real-PostgreSQL
+    execution at all, only Python mirrors of its semantics.
+
+    This class restores that coverage by building a throwaway table whose
+    payload column is native ``json``, so the hazardous rows are storable
+    again, and running the guard expression against it. It is deliberately
+    not the model's table: the point is to exercise the branch on the shape
+    it was written for, and the model must stay ``jsonb``.
+    """
+
+    TABLE = "monitor_guard_native_json"
+
+    @pytest.fixture()
+    def native_json_table(self, pg_session: Session) -> Iterator[Any]:
+        pg_session.execute(
+            sa_text(
+                f"CREATE TABLE {self.TABLE} "
+                "(id integer PRIMARY KEY, data json NOT NULL)"
+            )
+        )
+        pg_session.commit()
+        table = Table(
+            self.TABLE,
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("data", JSON, nullable=False),
+        )
+        try:
+            yield table
+        finally:
+            pg_session.rollback()
+            pg_session.execute(sa_text(f"DROP TABLE IF EXISTS {self.TABLE}"))
+            pg_session.commit()
+
+    def _seed(self, db: Session, rows: list[tuple[int, str]]) -> None:
+        for row_id, payload_json_text in rows:
+            db.execute(
+                sa_text(
+                    f"INSERT INTO {self.TABLE} (id, data) "
+                    "VALUES (:id, CAST(:payload AS json))"
+                ),
+                {"id": row_id, "payload": payload_json_text},
+            )
+        db.commit()
+
+    def test_hazardous_rows_are_dropped_and_benign_rows_survive(
+        self, pg_session: Session, native_json_table: Any
+    ) -> None:
+        """One query over a mix: without the guard this raises and takes
+        every row with it, which is exactly #1149."""
+        backslash = chr(92)
+        self._seed(
+            pg_session,
+            [
+                (1, '{"model_name": "plain"}'),
+                # Hazards the guard must null out.
+                (2, '{"model_name": "nul' + backslash + 'u0000"}'),
+                (3, '{"model_name": "high' + backslash + 'ud800"}'),
+                (4, '{"model_name": "low' + backslash + 'udc00"}'),
+                # An orphan hiding behind text shaped like the other half of
+                # a pair -- the case the escaped-backslash stand-in exists
+                # for. Read naively the two look like a valid pair.
+                (
+                    5,
+                    '{"model_name": "hidden'
+                    + backslash
+                    + backslash
+                    + "ud83d"
+                    + backslash
+                    + 'udc00"}',
+                ),
+                # Benign and must survive: a valid pair, and text that only
+                # looks like an escape.
+                (
+                    6,
+                    '{"model_name": "emoji'
+                    + backslash
+                    + "ud83d"
+                    + backslash
+                    + 'ude00"}',
+                ),
+                (7, '{"model_name": "literal' + backslash + backslash + 'u0000"}'),
+            ],
+        )
+
+        expression = get_json_field_expression(
+            native_json_table.c.data, "model_name", pg_session
+        )
+        rows = pg_session.execute(
+            select(native_json_table.c.id, expression).order_by(native_json_table.c.id)
+        ).fetchall()
+
+        assert dict(rows) == {
+            1: "plain",
+            2: None,
+            3: None,
+            4: None,
+            5: None,
+            6: f"emoji{NON_BMP_CHAR}",
+            7: "literal" + backslash + "u0000",
+        }

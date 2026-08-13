@@ -94,11 +94,17 @@ def sanitize_json_payload(value: Any) -> Any:
     ``"a\\ud800"`` both become ``"a\\ufffd"``); the later key wins, matching
     ``json.loads`` duplicate-key behaviour.
 
-    Recursion is unbounded on purpose. A cap would have to leave whatever
-    sits below it unsanitized, which is the payload shape this function
-    exists to keep out of the column -- so a structure deep enough to
-    exhaust the stack fails its write loudly instead of storing something
-    the database cannot read back.
+    Recursion is unbounded on purpose: a depth cap would have to leave
+    whatever sits below it unsanitized, which is the payload shape this
+    function exists to keep out of the column. A structure deep enough to
+    exhaust the stack therefore raises ``RecursionError`` rather than
+    storing something the database cannot read back -- but note that both
+    callers treat a raising trace write as best-effort (``websocket.py``
+    rolls back and logs; ``trace_handlers.py`` logs and continues), so the
+    row is dropped with a log line, not surfaced to the caller. Payloads
+    that deep are not a shape the write paths produce -- the staging path's
+    own ``serialize_value`` recursion would hit the limit first -- so this
+    is a stated boundary, not a guard anything relies on.
     """
     cleaned = _sanitize(value)
     return value if cleaned is _UNCHANGED else cleaned
@@ -107,9 +113,11 @@ def sanitize_json_payload(value: Any) -> Any:
 def _sanitize(value: Any) -> Any:
     """Return the sanitized form of ``value``, or ``_UNCHANGED``."""
     if isinstance(value, str):
-        if _UNSTORABLE_CODE_POINTS.search(value):
-            return _UNSTORABLE_CODE_POINTS.sub(REPLACEMENT_CHARACTER, value)
-        return _UNCHANGED
+        # One pass, not a search followed by a sub: re.sub hands back the
+        # original object when nothing matched, so identity answers the
+        # "did anything change" question for free.
+        cleaned = _UNSTORABLE_CODE_POINTS.sub(REPLACEMENT_CHARACTER, value)
+        return _UNCHANGED if cleaned is value else cleaned
     # No bool guard needed: bool subclasses int, not float, so True/False
     # never reach this branch.
     if isinstance(value, float):

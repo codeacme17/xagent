@@ -412,6 +412,68 @@ class TestUpgradePostgres:
         assert payload["cost"] == 10000000000000000
         assert isinstance(payload["cost"], int)
 
+    def test_rewrite_preserves_numbers_a_float_round_trip_would_damage(
+        self, postgres_engine
+    ) -> None:
+        """The rewrite must not launder numbers through float64. jsonb's
+        numbers are numeric, so it keeps the literal exactly; parsing to
+        float would truncate the long decimal, turn 1e1000 into inf (which
+        json.dumps writes as ``Infinity``, failing the rewrite's own cast),
+        and render 1e25 as 10000000000000000905969664 rather than 10^25.
+        """
+        with postgres_engine.begin() as conn:
+            _insert_trace_event(
+                conn,
+                row_id=1,
+                payload_json_text=(
+                    '{"v": "n' + NUL_ESCAPE + '", '
+                    '"precise": 0.123456789012345678901, '
+                    '"huge": 1e1000, "exp": 1e25}'
+                ),
+            )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT data->>'v', data->>'precise', data->>'huge', "
+                    "data->>'exp' FROM trace_events WHERE id = 1"
+                )
+            ).one()
+        assert row[0] == f"n{REPLACEMENT}"
+        # Exactly what a plain CAST would have produced for these numbers.
+        assert row[1] == "0.123456789012345678901"
+        assert row[2] == "1" + "0" * 1000
+        assert row[3] == "1" + "0" * 25
+
+    def test_untouched_row_and_rewritten_row_agree_on_numbers(
+        self, postgres_engine
+    ) -> None:
+        """The property that makes the choice defensible: whether or not a
+        row is rewritten must not change how its numbers land."""
+        numbers = '"precise": 0.123456789012345678901, "exp": 1e25'
+        with postgres_engine.begin() as conn:
+            _insert_trace_event(
+                conn,
+                row_id=1,
+                payload_json_text='{"v": "n' + NUL_ESCAPE + '", ' + numbers + "}",
+            )
+            _insert_trace_event(
+                conn, row_id=2, payload_json_text='{"v": "clean", ' + numbers + "}"
+            )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT data->>'precise', data->>'exp' FROM trace_events "
+                    "ORDER BY id"
+                )
+            ).fetchall()
+        assert rows[0] == rows[1]
+
     def test_benign_payloads_convert_unrewritten(self, postgres_engine) -> None:
         with postgres_engine.begin() as conn:
             _insert_trace_event(
