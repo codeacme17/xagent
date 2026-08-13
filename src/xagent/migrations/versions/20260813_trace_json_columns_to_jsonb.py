@@ -168,6 +168,19 @@ def _table_exists(name: str) -> bool:
 
 
 def _column_is_jsonb(table: str, column: str) -> bool:
+    """Whether the column is already jsonb. Callers must have established
+    that the table exists (both do, via _table_exists three lines up); a
+    missing one raises NoSuchTableError out of here rather than resolving
+    to a bool.
+
+    That is deliberate, not an oversight. This answer carries opposite
+    polarity in the two directions -- upgrade() reads False as "convert
+    this column", downgrade() reads False as "skip it" -- so there is no
+    default a missing table could safely collapse to. Swallowing it would
+    tell upgrade() to proceed against a table that is not there, and the
+    cleanup SELECT would raise the same failure one step later with a
+    worse message.
+    """
     for col in sa.inspect(op.get_bind()).get_columns(table):
         if col["name"] == column:
             return isinstance(col["type"], postgresql.JSONB)
