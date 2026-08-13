@@ -1523,6 +1523,17 @@ _MISSING_CHILD_OUTPUT_MESSAGE = (
     "output, so there is no answer from it to use."
 )
 
+_CHILD_NO_ANSWER_MESSAGE = (
+    "The delegated agent never produced an answer, so there is no result from "
+    "it to use."
+)
+
+# Child statuses that mean "the pattern ended without ever producing an answer".
+# Their own ``error`` text names runtime internals, which the parent model
+# cannot act on, so they get the message above and the allowlisted
+# ``missing_delegated_output`` code instead of the raw diagnostic.
+_CHILD_NO_ANSWER_STATUSES = frozenset({"invalid_tool_protocol"})
+
 # Recognized, not produced, here: ``AgentExecutionAdapter._normalize_result``
 # and this module's own post-run default substitute these when a run left no
 # text of its own behind on the normalized fallback surface. A completed
@@ -1646,6 +1657,11 @@ def _classify_delegated_child_failure(
 
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
+        if isinstance(status, str) and status.lower() in _CHILD_NO_ANSWER_STATUSES:
+            return _classified_failure(
+                _CHILD_NO_ANSWER_MESSAGE,
+                failure_code="missing_delegated_output",
+            )
         error_text = result.get("error")
         output_text = result.get("output")
         if isinstance(error_text, str) and error_text:

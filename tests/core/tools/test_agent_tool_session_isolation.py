@@ -12,7 +12,10 @@ from sqlalchemy.orm import sessionmaker
 import xagent.core.tools.adapters.vibe.agent_tool as mod
 import xagent.core.tools.adapters.vibe.db_session as db_session_module
 from xagent.core.agent.result import tool_result_succeeded
-from xagent.core.tools.adapters.vibe.agent_tool import AgentTool
+from xagent.core.tools.adapters.vibe.agent_tool import (
+    _CHILD_NO_ANSWER_MESSAGE,
+    AgentTool,
+)
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
@@ -978,14 +981,17 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
     """A real ReAct child that answers with an empty ``final_answer`` fails closed.
 
     ReAct now rejects an empty ``final_answer`` as a tool-protocol violation and
-    spends its one repair retry on it, so this scenario fails inside the child's
-    own run rather than reaching the parent as a ``completed`` result for the
-    classifier to reject. The fail-closed property is what matters here; the
-    classifier's ``missing_delegated_output`` branch is still reached by
-    completed-but-empty children and stays covered by
-    ``test_agent_tool_completed_child_without_usable_output_fails_closed``,
-    whose parametrized rows also serve as the drift detector for
-    ``NO_OUTPUT_PLACEHOLDER`` / ``NO_RESPONSE_PLACEHOLDER``.
+    spends its one repair retry on it, so the child fails inside its own run
+    instead of reaching the parent as a ``completed`` result. It still classifies
+    as ``missing_delegated_output`` — the child never produced an answer either
+    way — but via the no-answer-status branch rather than the completed-but-empty
+    one, and the parent sees an actionable message instead of the runtime's
+    "invalid tool protocol" diagnostic.
+
+    ``test_agent_tool_completed_child_without_usable_output_fails_closed``
+    covers the completed-but-empty branch, and its parametrized rows serve as
+    the drift detector for ``NO_OUTPUT_PLACEHOLDER`` /
+    ``NO_RESPONSE_PLACEHOLDER``.
     """
 
     llm = _StubSingleCallLLM(
@@ -1007,12 +1013,17 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
 
     result = await tool.run_json_async({"task": "run"})
 
+    assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
     assert tool_result_succeeded(result) is False
     # The child re-requested an answer once before giving up, instead of
     # finalizing the empty one.
     assert llm.calls == 2
+    # The parent gets an actionable message, not the child's internal
+    # "invalid tool protocol" diagnostic.
+    assert "tool protocol" not in result["output"]
+    assert result["output"] == _CHILD_NO_ANSWER_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1060,7 @@ async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
 
     result = await tool.run_json_async({"task": "run"})
 
+    assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
     assert tool_result_succeeded(result) is False
