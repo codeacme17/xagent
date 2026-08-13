@@ -141,8 +141,9 @@ def _index_of(seen, predicate, what):  # type: ignore[no-untyped-def]
 def _assert_pointer_nulled_before_trace_events_deleted(seen) -> None:  # type: ignore[no-untyped-def]
     null_first = _index_of(
         seen,
-        lambda s: s.startswith("UPDATE tasks")
-        and "last_checkpoint_trace_event_id" in s,
+        lambda s: (
+            s.startswith("UPDATE tasks") and "last_checkpoint_trace_event_id" in s
+        ),
         "pointer NULL update",
     )
     trace_delete = _index_of(
@@ -455,8 +456,9 @@ def _assert_interaction_delete_between_pointer_update_and_trace_events_delete(
 ) -> None:  # type: ignore[no-untyped-def]
     pointer_update = _index_of(
         seen,
-        lambda s: s.startswith("UPDATE tasks")
-        and "last_checkpoint_trace_event_id" in s,
+        lambda s: (
+            s.startswith("UPDATE tasks") and "last_checkpoint_trace_event_id" in s
+        ),
         "pointer NULL update",
     )
     interaction_delete = _index_of(

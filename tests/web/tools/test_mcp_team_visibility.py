@@ -150,11 +150,11 @@ def _install_env_t(seed) -> None:
         team_visibility=_team_visibility_hook(seed)
     )
     agent_team_scope.set_agent_team_scope_hook(
-        lambda db, user_id: agent_team_scope.AgentTeamScope(
-            team_id=T1, is_team_admin=False
+        lambda db, user_id: (
+            agent_team_scope.AgentTeamScope(team_id=T1, is_team_admin=False)
+            if user_id == int(seed.c.id)
+            else None
         )
-        if user_id == int(seed.c.id)
-        else None
     )
 
 

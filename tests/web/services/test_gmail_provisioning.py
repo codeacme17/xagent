@@ -1252,6 +1252,46 @@ def test_provision_gmail_trigger_disabled_reports_failed_without_registering(
     assert db_session.query(GmailWatchState).count() == 0
 
 
+def test_provision_gmail_trigger_disabled_mentions_project_id_when_also_missing(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the flag off and the project id also unset, the trigger-facing
+    message must surface both missing prerequisites at once instead of
+    letting an operator discover them one error at a time (#1231 F4)."""
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    from xagent.web.services.gmail_provisioning import provision_gmail_trigger
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+
+    def forbidden_run_in_thread(_account_id: int) -> NoReturn:
+        raise AssertionError("provisioning thread must not start while disabled")
+
+    # Phase 1: project id still set (the autouse fixture's default) - the
+    # message mentions only the watch-enabled flag.
+    status = provision_gmail_trigger(
+        db_session, trigger, run_in_thread=forbidden_run_in_thread
+    )
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert "XAGENT_GMAIL_WATCH_ENABLED" in str(trigger.provisioning_error)
+    assert "XAGENT_GMAIL_PUBSUB_PROJECT_ID" not in str(trigger.provisioning_error)
+
+    # Phase 2: project id also unset - both prerequisites are mentioned.
+    monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", raising=False)
+    other_account = _create_oauth(db_session, user, email="second@gmail.example")
+    other_trigger = _create_gmail_trigger(db_session, user, agent, other_account)
+
+    status = provision_gmail_trigger(
+        db_session, other_trigger, run_in_thread=forbidden_run_in_thread
+    )
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert "XAGENT_GMAIL_WATCH_ENABLED" in str(other_trigger.provisioning_error)
+    assert "XAGENT_GMAIL_PUBSUB_PROJECT_ID" in str(other_trigger.provisioning_error)
+    assert db_session.query(GmailWatchState).count() == 0
+
+
 def test_provision_gmail_trigger_disabled_reports_existing_watch_state(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

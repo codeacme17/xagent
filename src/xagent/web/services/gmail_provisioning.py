@@ -68,6 +68,19 @@ GMAIL_WATCH_DISABLED_ERROR = (
 )
 
 
+def gmail_watch_disabled_error() -> str:
+    """Trigger-facing disabled message, extended with the project-id
+    prerequisite when that is also missing (default deployments would
+    otherwise discover the two requirements one error at a time)."""
+    if get_gmail_pubsub_project_id():
+        return GMAIL_WATCH_DISABLED_ERROR
+    return (
+        "Gmail watch registration is disabled "
+        "(set XAGENT_GMAIL_WATCH_ENABLED=true and "
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID to enable)"
+    )
+
+
 class GmailProvisioningError(RuntimeError):
     """Raised when per-mailbox Gmail provisioning cannot proceed."""
 
@@ -206,10 +219,10 @@ def _trigger_facing_status(state: GmailWatchState) -> tuple[str, str | None]:
             )
     elif status == TriggerProvisioningStatus.PENDING.value and not watch_enabled:
         status = TriggerProvisioningStatus.FAILED.value
-        error = error or GMAIL_WATCH_DISABLED_ERROR
+        error = error or gmail_watch_disabled_error()
     elif status == TriggerProvisioningStatus.FAILED.value and not watch_enabled:
         if not error:
-            error = GMAIL_WATCH_DISABLED_ERROR
+            error = gmail_watch_disabled_error()
         elif "XAGENT_GMAIL_WATCH_ENABLED" not in error:
             error = (
                 f"{error} (automatic retry is disabled; "
@@ -293,6 +306,19 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
     return project_id, base_url, push_service_account
 
 
+def _coerce_oauth_account_id(value: Any) -> int | None:
+    """Tolerantly coerce a stored ``oauth_account_id`` value to an int.
+
+    ``None`` maps to ``None``; anything int-coercible maps to that int;
+    anything else (a malformed config value) also maps to ``None`` rather
+    than raising.
+    """
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _referenced_gmail_oauth_account_ids(
     db: Session,
     accounts: Sequence[tuple[int, str]],
@@ -337,13 +363,7 @@ def _referenced_gmail_oauth_account_ids(
     referenced: set[int] = set()
     for raw_config, raw_resource_id in candidate_rows:
         config = raw_config if isinstance(raw_config, dict) else {}
-        raw_account_id = config.get("oauth_account_id")
-        try:
-            bound_account_id = (
-                int(raw_account_id) if raw_account_id is not None else None
-            )
-        except (TypeError, ValueError):
-            bound_account_id = None
+        bound_account_id = _coerce_oauth_account_id(config.get("oauth_account_id"))
         if bound_account_id in account_ids:
             referenced.add(bound_account_id)
             continue
@@ -896,10 +916,11 @@ def _ensure_gmail_mailbox_provisioned_locked(
     if not get_gmail_watch_enabled():
         # Defense in depth: every production caller of this function already
         # checks the flag before reaching here (provision_gmail_trigger,
-        # sweep_gmail_provisioning, best_effort_provision_gmail_watches_for_user),
-        # so this only fires for a future ungated caller. Converging to a
-        # failed watch state here preserves this function's "never raises"
-        # contract instead of leaking the disabled condition as an exception.
+        # sweep_gmail_provisioning, best_effort_provision_gmail_watches_for_user,
+        # _renew_watch_for_account), so this only fires for a future ungated
+        # caller. Converging to a failed watch state here preserves this
+        # function's "never raises" contract instead of leaking the disabled
+        # condition as an exception.
         state = _get_or_create_watch_state(db, oauth_account, email)
         setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
         setattr(state, "last_error", GMAIL_WATCH_DISABLED_ERROR)
@@ -1022,7 +1043,7 @@ def provision_gmail_trigger(
         )
         if state is None:
             status = TriggerProvisioningStatus.FAILED.value
-            error: str | None = GMAIL_WATCH_DISABLED_ERROR
+            error: str | None = gmail_watch_disabled_error()
         else:
             status, error = _trigger_facing_status(state)
         setattr(trigger, "provisioning_status", status)
@@ -1136,11 +1157,7 @@ def _bound_gmail_oauth_account_id(trigger: AgentTrigger) -> int | None:
     missing binding rather than raising.
     """
     config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
-    raw_account_id = config.get("oauth_account_id")
-    try:
-        return int(raw_account_id) if raw_account_id is not None else None
-    except (TypeError, ValueError):
-        return None
+    return _coerce_oauth_account_id(config.get("oauth_account_id"))
 
 
 def _reconcile_gmail_trigger_batch(
@@ -1197,7 +1214,7 @@ def _reconcile_gmail_trigger_batch(
             if get_gmail_watch_enabled():
                 continue
             status = TriggerProvisioningStatus.FAILED.value
-            error = GMAIL_WATCH_DISABLED_ERROR
+            error = gmail_watch_disabled_error()
         else:
             status, error = _trigger_facing_status(state)
         if (

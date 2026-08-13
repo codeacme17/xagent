@@ -2151,6 +2151,66 @@ def test_gmail_unified_callback_acks_and_stays_disabled_when_watch_disabled(
         db.close()
 
 
+def test_gmail_unified_callback_advances_transient_failure_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_bg_scheduler,
+) -> None:
+    """A row failed for a transient reason (not the disabled marking) while
+    the flag happens to be off must keep advancing its cursor once a valid
+    push arrives - only the exact disabled marking should freeze finalize
+    (#1231 review follow-up, F2)."""
+    monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-transient-failure-flag-off-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-transient-flag-off"
+        )
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
+        setattr(state, "last_error", "quota exceeded")
+        db.add(state)
+        db.commit()
+
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-transient"}}]}]
+            },
+            messages={"msg-transient": _gmail_message("msg-transient")},
+        )
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=fake_verify,
+            ),
+            replace=True,
+        )
+        raw_body = _gmail_pubsub_push_body(
+            claimed_email="attacker@example.com",
+            message_id="pubsub-transient-flag-off",
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-transient-flag-off",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["outcome"] == "accepted"
+        db.refresh(state)
+        assert state.history_id == "222"
+        assert state.last_error is None
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_records_service_configuration_error() -> None:
     db = _direct_db_session()
     try:

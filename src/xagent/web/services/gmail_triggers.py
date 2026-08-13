@@ -45,6 +45,10 @@ class GmailWatchConfigurationError(GmailTriggerError):
     """Raised when Gmail watch cannot be configured for the deployment."""
 
 
+class GmailWatchDisabledError(GmailWatchConfigurationError):
+    """Raised when watch (re-)registration is blocked by XAGENT_GMAIL_WATCH_ENABLED."""
+
+
 class _GmailApiRequest:
     def __init__(
         self,
@@ -290,7 +294,7 @@ def _renew_watch_for_account(
     )
 
     if not get_gmail_watch_enabled():
-        raise GmailTriggerError(GMAIL_WATCH_DISABLED_ERROR)
+        raise GmailWatchDisabledError(GMAIL_WATCH_DISABLED_ERROR)
 
     state = ensure_gmail_mailbox_provisioned(
         db,
@@ -588,7 +592,7 @@ async def collect_gmail_pubsub_events(
             from .gmail_provisioning import GMAIL_WATCH_DISABLED_ERROR
 
             watch_error = str(watch_exc).strip()
-            disabled = watch_error == GMAIL_WATCH_DISABLED_ERROR
+            disabled = isinstance(watch_exc, GmailWatchDisabledError)
             error_message = (
                 GMAIL_WATCH_DISABLED_ERROR
                 if disabled

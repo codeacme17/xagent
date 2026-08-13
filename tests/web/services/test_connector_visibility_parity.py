@@ -135,11 +135,11 @@ def seed(db_session: Session):
     # runner-keyed misimplementation is distinguishable from the correct
     # agent-keyed one on the ``team=None`` cell.
     agent_team_scope.set_agent_team_scope_hook(
-        lambda db, user_id: agent_team_scope.AgentTeamScope(
-            team_id=T1, is_team_admin=False
+        lambda db, user_id: (
+            agent_team_scope.AgentTeamScope(team_id=T1, is_team_admin=False)
+            if user_id == int(c.id)
+            else None
         )
-        if user_id == int(c.id)
-        else None
     )
     return SimpleNamespace(
         c=c,

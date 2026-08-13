@@ -26,6 +26,7 @@ from ....config import (
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..gmail_provisioning import (
+    GMAIL_WATCH_DISABLED_ERROR,
     gmail_callback_url,
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
@@ -95,19 +96,14 @@ def warn_if_gmail_watch_registration_degraded() -> None:
     """
     if not get_gmail_pubsub_project_id() or get_gmail_watch_enabled():
         return
-    register_degradation(
-        GMAIL_WATCH_REGISTRATION_DISABLED,
+    message = (
         "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but XAGENT_GMAIL_WATCH_ENABLED "
         "is not; Gmail watch registration and renewal are disabled, so Gmail "
         "triggers report failed provisioning and existing watches expire "
-        "unrenewed",
+        "unrenewed"
     )
-    logger.warning(
-        "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but "
-        "XAGENT_GMAIL_WATCH_ENABLED is not; Gmail watch registration and "
-        "renewal are disabled, so Gmail triggers report failed provisioning "
-        "and existing watches expire unrenewed"
-    )
+    register_degradation(GMAIL_WATCH_REGISTRATION_DISABLED, message)
+    logger.warning(message)
 
 
 def _binding_oauth_account_id(config: Any) -> int | None:
@@ -523,12 +519,21 @@ class GmailProvider:
         if (
             str(state.status) == TriggerProvisioningStatus.FAILED.value
             and not get_gmail_watch_enabled()
+            and str(state.last_error or "") == GMAIL_WATCH_DISABLED_ERROR
         ):
             # While registration is disabled, parse_events already acked this
             # callback (skipped, no history advance) instead of raising; the
             # pipeline still calls finalize_callback for the acked event. Do
             # not let a successful-looking finalize clear the FAILED/disabled
             # marking that collect_gmail_pubsub_events just recorded.
+            #
+            # The guard keys on the exact disabled marking, not just
+            # status+flag: a row failed for a transient reason (e.g. a prior
+            # message batch error) while the flag happens to be off must keep
+            # advancing its cursor when a valid push later arrives, since the
+            # only writers of this precise last_error string are the
+            # choke-point gate (_ensure_gmail_mailbox_provisioned_locked) and
+            # the webhook disabled-ack site (collect_gmail_pubsub_events).
             return
         notification = _decode_pubsub_notification(
             raw_body,
