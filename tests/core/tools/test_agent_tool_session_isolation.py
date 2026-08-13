@@ -856,10 +856,10 @@ async def test_agent_tool_without_resolved_model_fails_closed(monkeypatch):
 class _StubSingleCallLLM:
     """Minimal LLM stub returning one fixed tool call from ``chat()``.
 
-    Each scenario below only needs a single LLM turn: both the
-    ``ask_user_question`` and the empty ``final_answer`` control tools end
-    the ReAct loop immediately once handled, so no follow-up response is
-    ever requested.
+    ``ask_user_question`` ends the ReAct loop immediately once handled, so
+    those scenarios only need a single turn. An empty ``final_answer`` is
+    rejected as a tool-protocol violation and re-requested once, so those
+    scenarios take two turns and get this same fixed response both times.
     """
 
     model_name = "stub-model"
@@ -977,12 +977,15 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
 ):
     """A real ReAct child that answers with an empty ``final_answer`` fails closed.
 
-    The classifier reads the child's raw ``""`` final answer directly, so
-    this scenario never touches the placeholder constants at all; it is
-    ``test_agent_tool_completed_child_without_usable_output_fails_closed``'s
-    parametrized rows (which do exercise the literal placeholder strings)
-    that serve as the drift detector for ``NO_OUTPUT_PLACEHOLDER`` /
-    ``NO_RESPONSE_PLACEHOLDER``.
+    ReAct now rejects an empty ``final_answer`` as a tool-protocol violation and
+    spends its one repair retry on it, so this scenario fails inside the child's
+    own run rather than reaching the parent as a ``completed`` result for the
+    classifier to reject. The fail-closed property is what matters here; the
+    classifier's ``missing_delegated_output`` branch is still reached by
+    completed-but-empty children and stays covered by
+    ``test_agent_tool_completed_child_without_usable_output_fails_closed``,
+    whose parametrized rows also serve as the drift detector for
+    ``NO_OUTPUT_PLACEHOLDER`` / ``NO_RESPONSE_PLACEHOLDER``.
     """
 
     llm = _StubSingleCallLLM(
@@ -1004,25 +1007,27 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
 
     result = await tool.run_json_async({"task": "run"})
 
-    assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    # The child re-requested an answer once before giving up, instead of
+    # finalizing the empty one.
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio
 async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
     monkeypatch, tmp_path
 ):
-    """A completed child with an empty final answer fails closed even when
-    the adapter backfilled a non-empty earlier assistant message as output.
+    """A child with an empty final answer never surfaces a stale preamble.
 
     The single LLM turn carries both a reasoning preamble (assistant
-    ``content``) and an empty ``final_answer``. ``AgentExecutionAdapter``
-    backfills the normalized ``output`` from that preamble via
-    ``_latest_assistant_message`` because the pattern's own answer is falsy
-    (execution_adapter.py:362-363, 399-409) — without reading the raw
-    ``agent_result`` envelope, the classifier would see a non-empty
-    ``output`` and let this reach the parent as a completed response.
+    ``content``) and an empty ``final_answer``. The preamble is exactly what
+    ``AgentExecutionAdapter`` would backfill as ``output`` via
+    ``_latest_assistant_message`` when the pattern's own answer is falsy, so
+    the invariant under test is that it must never reach the parent as the
+    child's answer. ReAct now rejects the empty ``final_answer`` before the run
+    can complete, so the failure is reported instead of the preamble.
     """
 
     llm = _StubSingleCallLLM(
@@ -1044,9 +1049,14 @@ async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
 
     result = await tool.run_json_async({"task": "run"})
 
-    assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    # The invariant: the preamble must not be laundered into the child's answer.
+    assert "Let me look into that for you." not in json.dumps(
+        {key: value for key, value in result.items() if key != "agent_result"},
+        default=str,
+    )
 
 
 @pytest.mark.asyncio
