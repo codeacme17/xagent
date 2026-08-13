@@ -54,6 +54,7 @@ not rewritten wholesale.
 
 from __future__ import annotations
 
+import math
 import re
 from itertools import islice
 from typing import Any
@@ -109,10 +110,17 @@ def _sanitize(value: Any) -> Any:
         if _UNSTORABLE_CODE_POINTS.search(value):
             return _UNSTORABLE_CODE_POINTS.sub(REPLACEMENT_CHARACTER, value)
         return _UNCHANGED
-    # bool is an int subclass, and True/False are not numbers to normalize.
-    if isinstance(value, float) and not isinstance(value, bool):
+    # No bool guard needed: bool subclasses int, not float, so True/False
+    # never reach this branch.
+    if isinstance(value, float):
         if abs(value) >= _EXPONENT_NOTATION_THRESHOLD and value.is_integer():
             return int(value)
+        # PostgreSQL numeric has no signed zero, so jsonb renders -0.0 as
+        # 0.0 while json.dumps writes "-0.0". Same class of retype as the
+        # exponent case above, at the opposite end of the range. copysign,
+        # because -0.0 == 0.0 is True and cannot distinguish them.
+        if value == 0.0 and math.copysign(1.0, value) < 0:
+            return 0.0
         return _UNCHANGED
     if isinstance(value, dict):
         cleaned_dict: dict[Any, Any] | None = None

@@ -19,6 +19,7 @@ Two properties matter beyond simple replacement:
 from __future__ import annotations
 
 import json
+import math
 
 from xagent.web.utils.json_payload_sanitizer import (
     REPLACEMENT_CHARACTER,
@@ -149,7 +150,27 @@ class TestFloatsJsonbWouldRetype:
         for value in (0.1, 3.14, 2.0, 1e-10, 0.0):
             assert sanitize_json_payload(value) is value
 
+    def test_negative_zero_is_normalized_to_positive_zero(self) -> None:
+        """PostgreSQL numeric has no signed zero, so jsonb renders -0.0 as
+        0.0 while json.dumps writes "-0.0". Without this the write-time
+        hash of a payload carrying -0.0 would not match what comes back."""
+        cleaned = sanitize_json_payload(-0.0)
+        assert json.dumps(cleaned) == "0.0"
+        assert math.copysign(1.0, cleaned) > 0
+
+    def test_negative_zero_is_normalized_when_nested(self) -> None:
+        cleaned = sanitize_json_payload({"outer": [{"n": -0.0}]})
+        assert json.dumps(cleaned, sort_keys=True) == '{"outer": [{"n": 0.0}]}'
+
+    def test_positive_zero_keeps_its_identity(self) -> None:
+        """The negative-zero branch must not turn every zero into a copy --
+        +0.0 already matches what jsonb hands back."""
+        value = 0.0
+        assert sanitize_json_payload(value) is value
+
     def test_bools_are_not_treated_as_numbers(self) -> None:
+        # bool subclasses int, not float, so the float branch never sees
+        # one; this pins the outcome rather than the mechanism.
         for value in (True, False):
             assert sanitize_json_payload(value) is value
 

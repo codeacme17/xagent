@@ -46,17 +46,78 @@ duplicate keys cannot be produced by ``json.dumps`` from a dict in the
 first place -- the write path only ever serializes dicts.
 
 ``jsonb`` does, however, re-render numbers: a float stored as ``1e+16``
-reads back as the int ``10000000000000000``. The checkpoint blob path
-re-hashes payloads it reads and compares them against the write-time
-hash, so a *pre-existing* row carrying such a float becomes undecodable
+reads back as the int ``10000000000000000``, and ``-0.0`` as ``0.0``
+(``numeric`` has no signed zero). The checkpoint blob path re-hashes
+payloads it reads and compares them against the hash recorded at write
+time, so a *pre-existing* row carrying either shape becomes undecodable
 after this migration. New writes are covered -- the write-side sanitizer
-normalizes those floats before the hash is taken -- and rows this
-migration rewrites are normalized here too. Rows it does not touch are
-deliberately left alone: catching them would mean rewriting every row in
-the three tables to defend against a payload shape that requires a float
-above 2**53 in trace output, and the existing failure mode for an
-unreadable checkpoint row is already a logged skip that falls back to an
-older checkpoint (``web/api/trace_handlers.py``), not a lost task.
+normalizes both before the hash is taken -- and rows this migration
+rewrites get the same two normalizations applied here. Rows it does not
+touch are deliberately left alone: catching them would mean rewriting
+every row in all three tables to defend against shapes that need a float
+above 2**53, or a negative zero, in trace output.
+
+Rewriting a *blob* row has a cost the paragraph above does not cover, and
+it is the one thing to weigh before running this. Replacing NUL with
+U+FFFD changes the payload, so its canonical hash changes -- but the hash
+is also the blob's identity: ``trace_events.data`` references a blob by
+embedding the hash value itself, and strict restore re-hashes what it
+read and compares it against that reference
+(``_load_messages_by_refs`` / ``_load_checkpoint_blob_by_ref``,
+``web/services/trace_message_storage.py``). So a rewritten blob row still
+resolves but fails verification: ``CheckpointMessageDecodeError``, which
+``web/api/trace_handlers.py`` logs and treats as a skip, falling back to
+an older checkpoint row.
+
+Whether that fallback finds anything depends on which blob it was. Blob
+rows are deduplicated per task, and ``context.system_prompt`` and
+``context.metadata`` are typically byte-identical across every checkpoint
+of a task -- so for those, one poisoned row means *no* readable
+checkpoint at all, and the scan escalates to ``CheckpointCorruptError``:
+HTTP 400 from the a2a resume path and a non-recoverable verdict in lease
+recovery. For a mid-conversation message blob, checkpoints predating that
+message still decode, so the task loses progress rather than the task.
+
+The hash columns are therefore left verbatim on purpose, and the two
+alternatives were considered and rejected:
+
+* Recomputing ``message_hash``/``blob_hash`` from the rewritten payload
+  makes the row unreachable rather than unverifiable -- the references in
+  ``trace_events.data`` still name the old hash -- and it can abort the
+  migration outright: if the task re-checkpointed the same content after
+  the sanitizer landed, the new hash already exists and the UPDATE
+  violates ``uq_trace_message_blobs_task_hash``. Doing it properly would
+  mean remapping the hash inside every referring payload, including the
+  refs marker's own hash, which is the application's hashing contract
+  reimplemented in a migration.
+* Deleting the affected blob rows lands on the same
+  ``CheckpointMessageDecodeError`` for strict restore, so it buys nothing
+  there, and it costs the non-strict readers: every viewer path
+  (``api/conversation_logs.py``, ``api/workforces.py``,
+  ``services/task_setup_snapshot.py``) decodes with ``strict=False``,
+  which skips hash verification and renders the cleaned payload fine. A
+  deleted row breaks those too.
+
+Only NUL can reach a blob row this way. ``canonical_json_bytes`` uses
+``ensure_ascii=False``, so a payload carrying an unpaired surrogate
+raises ``UnicodeEncodeError`` before it can be hashed -- such a payload
+never became a blob row in the first place. It can sit in
+``trace_events.data``, which has no self-hash, and rewriting that column
+is harmless.
+
+Before running this on a deployment that predates the write-side
+sanitizer, count the blob rows that would be rewritten. Neither query
+writes anything:
+
+    SELECT count(*) FROM trace_message_blobs
+    WHERE CAST(message_data AS text) LIKE '%\\u0000%';
+
+    SELECT count(*) FROM trace_checkpoint_blobs
+    WHERE CAST(blob_data AS text) LIKE '%\\u0000%';
+
+A non-zero count means some tasks will lose strict checkpoint recovery.
+Pruning those tasks' checkpoint history first is the supported remedy and
+turns a surprise 400 into a deliberate one.
 
 The detection patterns assume a UTF8 server encoding, which is what the
 shipped compose file runs. On a server in another encoding the cast also
@@ -68,16 +129,34 @@ nothing is converted), but it needs the row cleaned by hand before the
 upgrade can proceed. The read guard in ``web/api/monitor.py`` documents
 the same limitation for the same patterns.
 
+Two further shapes are legal in ``json`` and rejected by ``jsonb``, and
+this cleanup handles neither: a number outside ``numeric``'s exponent
+range, and nesting past ``jsonb``'s depth limit. No application write path
+can produce either -- a Python float caps at ~1.8e308, ``json.dumps``
+recurses within the interpreter's own limit -- so only a manual or
+external writer could have planted one. Such a row fails the ALTER the
+same safe way as the encoding case above.
+
 Operationally this is the expensive kind of migration, and on a large
 deployment it should be scheduled rather than slipped into a routine
 restart. ``ALTER ... TYPE`` takes an ACCESS EXCLUSIVE lock and rewrites
 every row of the table -- there is no in-place path from ``json`` to
 ``jsonb``, because the on-disk representation genuinely differs -- and the
 cleanup scan that precedes it is an unindexed full-table regex pass over
-the same rows. Both run inside one transaction per table, so the lock is
-held for the whole of it, and ``trace_events`` is the table the monitoring
-dashboard already scans. Pruning checkpoint history first shortens both
-steps.
+the same rows. ``env.py`` sets ``transaction_per_migration=True`` on
+PostgreSQL, so all three tables' scans and ALTERs run in *one*
+transaction: the ``trace_events`` lock is taken first and held until the
+two blob tables have converted too. Budget the window for the whole
+migration, not per table, and note that ``trace_events`` is the table the
+monitoring dashboard already scans. Pruning checkpoint history first
+shortens every step.
+
+Deployment ordering matters for the same reason. An old instance still
+running without the write-side sanitizer can insert a fresh unconvertible
+row after the cleanup scan has passed it but before the ALTER takes its
+lock; the ALTER then fails and the whole migration rolls back. Nothing is
+corrupted and a retry succeeds, but roll the application out fully before
+migrating, or expect to run it more than once.
 
 Revision ID: 20260813_trace_json_columns_to_jsonb
 Revises: 20260810_add_hubspot_marketing_scopes
@@ -86,6 +165,7 @@ Create Date: 2026-08-13
 """
 
 import json
+import math
 import re
 from typing import Any, Sequence, Union
 
@@ -151,10 +231,14 @@ def _sanitize(value: Any) -> Any:
     call, and far less than one payload."""
     if isinstance(value, str):
         return _UNSTORABLE_CODE_POINTS.sub(_REPLACEMENT_CHARACTER, value)
-    # bool is an int subclass, and True/False are not numbers to normalize.
-    if isinstance(value, float) and not isinstance(value, bool):
+    # No bool guard needed: bool subclasses int, not float, so True/False
+    # never reach this branch.
+    if isinstance(value, float):
         if abs(value) >= _EXPONENT_NOTATION_THRESHOLD and value.is_integer():
             return int(value)
+        # numeric has no signed zero, so jsonb renders -0.0 as 0.0.
+        if value == 0.0 and math.copysign(1.0, value) < 0:
+            return 0.0
         return value
     if isinstance(value, dict):
         return {_sanitize(key): _sanitize(item) for key, item in value.items()}

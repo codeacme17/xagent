@@ -83,17 +83,30 @@ def _pre_migration_metadata() -> sa.MetaData:
         sa.Column("timestamp", sa.DateTime(timezone=True), nullable=False),
         sa.Column("data", sa.JSON, nullable=False),
     )
+    # The hash and bytes columns are carried here even though the migration
+    # never writes them: that it leaves them verbatim is a contract (the
+    # hash is the blob's identity, referenced from trace_events.data), and
+    # a fixture without them cannot pin it.
     sa.Table(
         "trace_message_blobs",
         metadata,
         sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("task_id", sa.Integer, nullable=False),
+        sa.Column("execution_id", sa.String(255), nullable=False),
+        sa.Column("message_hash", sa.String(80), nullable=False),
         sa.Column("message_data", sa.JSON, nullable=False),
+        sa.Column("message_bytes", sa.Integer, nullable=False),
     )
     sa.Table(
         "trace_checkpoint_blobs",
         metadata,
         sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("task_id", sa.Integer, nullable=False),
+        sa.Column("execution_id", sa.String(255), nullable=False),
+        sa.Column("blob_kind", sa.String(255), nullable=False),
+        sa.Column("blob_hash", sa.String(80), nullable=False),
         sa.Column("blob_data", sa.JSON, nullable=False),
+        sa.Column("blob_bytes", sa.Integer, nullable=False),
     )
     return metadata
 
@@ -125,6 +138,54 @@ def _insert_trace_event(
             "'2026-08-13 00:00:00', CAST(:payload AS json))"
         ),
         {"id": row_id, "event_id": f"evt-{row_id}", "payload": payload_json_text},
+    )
+
+
+def _insert_message_blob(
+    conn: sa.engine.Connection,
+    *,
+    row_id: int,
+    payload_json_text: str,
+    message_hash: str | None = None,
+    message_bytes: int = 0,
+) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO trace_message_blobs "
+            "(id, task_id, execution_id, message_hash, message_data, "
+            "message_bytes) VALUES (:id, 1, 'exec-1', :hash, "
+            "CAST(:payload AS json), :bytes)"
+        ),
+        {
+            "id": row_id,
+            "hash": message_hash or f"sha256:msg-{row_id}",
+            "payload": payload_json_text,
+            "bytes": message_bytes,
+        },
+    )
+
+
+def _insert_checkpoint_blob(
+    conn: sa.engine.Connection,
+    *,
+    row_id: int,
+    payload_json_text: str,
+    blob_hash: str | None = None,
+    blob_bytes: int = 0,
+) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO trace_checkpoint_blobs "
+            "(id, task_id, execution_id, blob_kind, blob_hash, blob_data, "
+            "blob_bytes) VALUES (:id, 1, 'exec-1', 'context.metadata', "
+            ":hash, CAST(:payload AS json), :bytes)"
+        ),
+        {
+            "id": row_id,
+            "hash": blob_hash or f"sha256:blob-{row_id}",
+            "payload": payload_json_text,
+            "bytes": blob_bytes,
+        },
     )
 
 
@@ -185,9 +246,40 @@ class TestSqliteNoOp:
             ).scalar_one()
         assert stored == payload
 
-    def test_downgrade_is_a_no_op(self, sqlite_engine: sa.engine.Engine) -> None:
+    def test_downgrade_leaves_schema_and_rows_untouched(
+        self, sqlite_engine: sa.engine.Engine
+    ) -> None:
+        """Symmetric with the upgrade test above: the downgrade must also
+        assert, not merely run without raising."""
+        payload = '{"model_name": "gpt-4o"}'
+        with sqlite_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO trace_events "
+                    "(id, task_id, event_id, event_type, timestamp, data) "
+                    "VALUES (1, 1, 'evt-1', 'llm_call_start', "
+                    "'2026-08-13 00:00:00', :payload)"
+                ),
+                {"payload": payload},
+            )
+        before = {
+            c["name"]: str(c["type"])
+            for c in sa.inspect(sqlite_engine).get_columns("trace_events")
+        }
+
         _upgrade(sqlite_engine)
         _downgrade(sqlite_engine)
+
+        after = {
+            c["name"]: str(c["type"])
+            for c in sa.inspect(sqlite_engine).get_columns("trace_events")
+        }
+        assert after == before
+        with sqlite_engine.begin() as conn:
+            stored = conn.execute(
+                text("SELECT data FROM trace_events WHERE id = 1")
+            ).scalar_one()
+        assert stored == payload
 
 
 def _postgres_url() -> str | None:
@@ -259,6 +351,67 @@ class TestUpgradePostgres:
             3: f"y{REPLACEMENT}",
         }
 
+    def test_rewrites_a_payload_mixing_valid_pairs_with_orphans(
+        self, postgres_engine
+    ) -> None:
+        """The shape the pair-strip and the unsafe predicate only interact
+        on: a valid surrogate pair sitting next to an orphan. The pair must
+        be stripped before matching, or the orphan behind it is missed and
+        the ALTER fails on the row."""
+        with postgres_engine.begin() as conn:
+            _insert_trace_event(
+                conn,
+                row_id=1,
+                payload_json_text=(
+                    '{"v": "' + PAIR_ESCAPE + LONE_LOW_ESCAPE + PAIR_ESCAPE + '"}'
+                ),
+            )
+            _insert_trace_event(
+                conn,
+                row_id=2,
+                payload_json_text=(
+                    '{"v": "' + LITERAL_ESCAPE_TEXT + LONE_HIGH_ESCAPE + '"}'
+                ),
+            )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            values = dict(
+                conn.execute(
+                    text("SELECT id, data->>'v' FROM trace_events ORDER BY id")
+                ).fetchall()
+            )
+        emoji = chr(0x1F600)
+        # Row 1: both valid pairs survive as real characters, the orphan
+        # between them is replaced. Row 2: text that only looks like an
+        # escape is preserved, the orphan after it is still caught.
+        assert values == {
+            1: f"{emoji}{REPLACEMENT}{emoji}",
+            2: BS + "u0000" + REPLACEMENT,
+        }
+
+    def test_rewrites_a_large_float_alongside_the_escape(self, postgres_engine) -> None:
+        """The migration's own float normalization: a row selected for its
+        escape also gets its exponent-notation floats converted, so the
+        rewritten payload matches what jsonb would hand back."""
+        with postgres_engine.begin() as conn:
+            _insert_trace_event(
+                conn,
+                row_id=1,
+                payload_json_text='{"v": "n' + NUL_ESCAPE + '", "cost": 1e16}',
+            )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            payload = conn.execute(
+                text("SELECT data FROM trace_events WHERE id = 1")
+            ).scalar_one()
+        assert payload["v"] == f"n{REPLACEMENT}"
+        assert payload["cost"] == 10000000000000000
+        assert isinstance(payload["cost"], int)
+
     def test_benign_payloads_convert_unrewritten(self, postgres_engine) -> None:
         with postgres_engine.begin() as conn:
             _insert_trace_event(
@@ -284,19 +437,11 @@ class TestUpgradePostgres:
 
     def test_cleans_the_blob_tables_too(self, postgres_engine) -> None:
         with postgres_engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO trace_message_blobs (id, message_data) "
-                    "VALUES (1, CAST(:payload AS json))"
-                ),
-                {"payload": '{"m": "' + LONE_HIGH_ESCAPE + '"}'},
+            _insert_message_blob(
+                conn, row_id=1, payload_json_text='{"m": "' + LONE_HIGH_ESCAPE + '"}'
             )
-            conn.execute(
-                text(
-                    "INSERT INTO trace_checkpoint_blobs (id, blob_data) "
-                    "VALUES (1, CAST(:payload AS json))"
-                ),
-                {"payload": '{"b": "' + NUL_ESCAPE + '"}'},
+            _insert_checkpoint_blob(
+                conn, row_id=1, payload_json_text='{"b": "' + NUL_ESCAPE + '"}'
             )
 
         _upgrade(postgres_engine)
@@ -310,6 +455,38 @@ class TestUpgradePostgres:
             ).scalar_one()
         assert message == REPLACEMENT
         assert blob == REPLACEMENT
+
+    def test_blob_hash_columns_are_left_verbatim(self, postgres_engine) -> None:
+        """The hash is the blob's identity, not a checksum of the column:
+        ``trace_events.data`` references a blob by embedding the hash value,
+        so rewriting it would make the row unreachable instead of merely
+        unverifiable, and could collide with a post-sanitizer row under
+        uq_trace_message_blobs_task_hash. The migration therefore rewrites
+        the payload and leaves the hash alone -- a deliberate choice with a
+        documented cost (see the module docstring), which this pins so it
+        cannot be changed silently.
+        """
+        with postgres_engine.begin() as conn:
+            _insert_message_blob(
+                conn,
+                row_id=1,
+                payload_json_text='{"m": "n' + NUL_ESCAPE + '"}',
+                message_hash="sha256:deadbeef",
+                message_bytes=999,
+            )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT message_hash, message_bytes, message_data->>'m' "
+                    "FROM trace_message_blobs WHERE id = 1"
+                )
+            ).one()
+        assert row[0] == "sha256:deadbeef"
+        assert row[1] == 999
+        assert row[2] == f"n{REPLACEMENT}"
 
     def test_jsonb_rejects_the_hazard_after_upgrade(self, postgres_engine) -> None:
         """The invariant the whole migration exists to establish: after it,

@@ -381,6 +381,47 @@ class TestJsonbRoundTripFidelity:
         ).one()
         assert isinstance(row.data["cost"], int)
 
+    def test_negative_zero_survives_as_the_same_json(self, pg_session: Session) -> None:
+        """The other end of the numeric range: PostgreSQL numeric has no
+        signed zero, so an unsanitized -0.0 comes back as 0.0 and breaks
+        the hash the same way a large float does."""
+        task = self._task(pg_session, "roundtrip-negzero")
+        payload = {"delta": -0.0, "ratio": 0.5}
+
+        stored = self._round_trip(pg_session, task, payload)
+
+        expected = sanitize_json_payload(payload)
+        assert json.dumps(stored, sort_keys=True) == json.dumps(
+            expected, sort_keys=True
+        )
+
+    def test_unsanitized_negative_zero_would_lose_its_sign(
+        self, pg_session: Session
+    ) -> None:
+        """Control for the test above: the sign really is dropped by the
+        column, so the normalization is load-bearing."""
+        task = self._task(pg_session, "roundtrip-negzero-control")
+        pg_session.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="roundtrip-negzero-control",
+                event_type="llm_call_start",
+                timestamp=datetime.now(),
+                data={"delta": -0.0},
+            )
+        )
+        pg_session.commit()
+        pg_session.expunge_all()
+
+        row = pg_session.execute(
+            TraceEvent.__table__.select().where(
+                TraceEvent.event_id == "roundtrip-negzero-control"
+            )
+        ).one()
+        # json.dumps of the *unsanitized* payload writes "-0.0"; what the
+        # column hands back no longer does.
+        assert json.dumps(row.data["delta"]) == "0.0"
+
     def test_ordinary_payload_survives_unchanged(self, pg_session: Session) -> None:
         task = self._task(pg_session, "roundtrip-plain")
         payload = {
