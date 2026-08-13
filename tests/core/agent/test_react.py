@@ -5300,7 +5300,21 @@ async def test_react_retries_final_answer_with_malformed_arguments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_react_re_requests_final_answer_for_resumed_empty_pending_call() -> None:
+@pytest.mark.parametrize(
+    "blank_answer",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"answer": ""}, id="empty-string"),
+        pytest.param({"answer": "   \n"}, id="whitespace"),
+        # ``str(None)`` is the literal "None", which would sail past a naive
+        # ``str(args.get("answer", "")).strip()`` check and be finalized as the
+        # user-facing answer.
+        pytest.param({"answer": None}, id="none"),
+    ],
+)
+async def test_react_re_requests_final_answer_for_resumed_empty_pending_call(
+    blank_answer: dict[str, Any],
+) -> None:
     """A pending call restored from a checkpoint bypasses response normalization."""
 
     llm = StreamingEmptyFinalAnswerLLM()
@@ -5310,7 +5324,11 @@ async def test_react_re_requests_final_answer_for_resumed_empty_pending_call() -
         {
             "id": "call_resumed",
             "name": "final_answer",
-            "args": {"response_language": "English", "outcome": "completed"},
+            "args": {
+                "response_language": "English",
+                "outcome": "completed",
+                **blank_answer,
+            },
         }
     ]
 
@@ -5329,6 +5347,23 @@ async def test_react_re_requests_final_answer_for_resumed_empty_pending_call() -
     assert [
         tool["function"]["name"] for tool in llm.stream_calls[0].get("tools") or []
     ] == ["final_answer"]
+
+
+def test_final_answer_text_treats_none_as_absent() -> None:
+    """One coercion for both the protocol check and finalization.
+
+    ``str(None)`` is the literal "None"; if the two sites coerce independently
+    they drift, and a null answer gets finalized as the string "None".
+    """
+
+    pattern = ReActPattern()
+
+    assert pattern._final_answer_text({"answer": None}) == ""
+    assert pattern._final_answer_text({}) == ""
+    assert pattern._final_answer_text(None) == ""
+    assert pattern._final_answer_text({"answer": ""}) == ""
+    assert pattern._final_answer_text({"answer": "  hi  "}) == "  hi  "
+    assert pattern._final_answer_text({"answer": 0}) == "0"
 
 
 def test_coerce_arguments_drops_unusable_control_tool_payloads() -> None:

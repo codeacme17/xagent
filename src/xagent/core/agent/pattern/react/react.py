@@ -1009,13 +1009,25 @@ class ReActPattern(AgentPattern):
                 continue
             if tool_call.get("name") != "final_answer":
                 continue
-            args = tool_call.get("args")
-            answer = args.get("answer") if isinstance(args, dict) else None
-            # Coerce exactly as ``_handle_control_tool`` does, so this check and
-            # the finalization it guards agree on what counts as an answer.
-            if answer is None or not str(answer).strip():
+            if not self._final_answer_text(tool_call.get("args")).strip():
                 return tool_call
         return None
+
+    def _final_answer_text(self, args: Any) -> str:
+        """Coerce a ``final_answer`` argument payload into its answer text.
+
+        The single coercion for both this check and the finalization it guards,
+        so the two cannot disagree on what counts as an answer. ``None`` must
+        become the empty string rather than ``str(None)``, which would yield the
+        literal ``"None"`` and be sent to the user as the answer.
+        """
+
+        if not isinstance(args, dict):
+            return ""
+        answer = args.get("answer")
+        if answer is None:
+            return ""
+        return str(answer)
 
     def _requires_full_tool_set_recovery(
         self,
@@ -1775,7 +1787,7 @@ class ReActPattern(AgentPattern):
         args = tool_call.get("args", {})
 
         if name == "final_answer":
-            answer = str(args.get("answer", ""))
+            answer = self._final_answer_text(args)
             if not answer.strip():
                 self._reject_empty_final_answer(tool_call, context)
                 return None
