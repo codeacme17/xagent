@@ -58,6 +58,16 @@ above 2**53 in trace output, and the existing failure mode for an
 unreadable checkpoint row is already a logged skip that falls back to an
 older checkpoint (``web/api/trace_handlers.py``), not a lost task.
 
+The detection patterns assume a UTF8 server encoding, which is what the
+shipped compose file runs. On a server in another encoding the cast also
+rejects any escape naming a character outside that charset -- including a
+valid surrogate pair, which the pair-stripping step deliberately removes
+before matching -- so the cleanup would miss such a row and the ALTER
+would fail on it. That is a safe failure (the transaction rolls back and
+nothing is converted), but it needs the row cleaned by hand before the
+upgrade can proceed. The read guard in ``web/api/monitor.py`` documents
+the same limitation for the same patterns.
+
 Operationally this is the expensive kind of migration, and on a large
 deployment it should be scheduled rather than slipped into a routine
 restart. ``ALTER ... TYPE`` takes an ACCESS EXCLUSIVE lock and rewrites
@@ -123,6 +133,11 @@ _UNSTORABLE_CODE_POINTS = re.compile("[\x00\ud800-\udfff]")
 _REPLACEMENT_CHARACTER = "�"
 _EXPONENT_NOTATION_THRESHOLD = 1e16
 
+# Rows per cleanup batch. Small enough that one batch of checkpoint blobs
+# stays comfortably in memory, large enough that the scan is not dominated
+# by round trips on the usual case of nothing to fix.
+REWRITE_BATCH_SIZE = 100
+
 
 def _sanitize(value: Any) -> Any:
     if isinstance(value, str):
@@ -156,34 +171,56 @@ def _rewrite_unconvertible_rows(table: str, column: str) -> None:
     Rows carrying such payloads exist only where something slipped past the
     (younger) write-side sanitizer, so the scan usually matches nothing;
     the full-table regex pass runs once, here, not on any query path.
+
+    Matching rows are walked in id order, one bounded batch at a time,
+    rather than collected up front. These payloads are whole trace events
+    and checkpoint blobs -- the blob tables exist precisely because they
+    get large -- so a deployment that emitted bad output for a while could
+    otherwise materialize every poisoned payload in the migration process
+    at once. Keyset pagination, not OFFSET: the loop rewrites the rows it
+    just read, and an OFFSET walk would skip past rows as the result set
+    shifts under it.
     """
     bind = op.get_bind()
-    rows = bind.execute(
-        sa.text(
-            # noqa: S608 -- table/column come from TRACE_JSON_COLUMNS above,
-            # never from user input; the payload patterns are bound below.
-            f"SELECT id, CAST({column} AS text) AS payload FROM {table} "  # noqa: S608
-            f"WHERE regexp_replace("
-            f"replace(CAST({column} AS text), :bs, :standin), "
-            f":pair, '', 'g') ~ :unsafe"
-        ),
-        {
-            "bs": ESCAPED_BACKSLASH,
-            "standin": ESCAPED_BACKSLASH_STANDIN,
-            "pair": SURROGATE_PAIR_PATTERN,
-            "unsafe": UNSAFE_ESCAPE_PATTERN,
-        },
-    ).fetchall()
-
+    # noqa: S608 on both statements -- table/column come from
+    # TRACE_JSON_COLUMNS above, never from user input, and every payload
+    # pattern is bound as a parameter rather than interpolated.
+    select_batch = sa.text(
+        f"SELECT id, CAST({column} AS text) AS payload FROM {table} "  # noqa: S608
+        f"WHERE id > :after "
+        f"AND regexp_replace("
+        f"replace(CAST({column} AS text), :bs, :standin), "
+        f":pair, '', 'g') ~ :unsafe "
+        f"ORDER BY id LIMIT :limit"
+    )
     # The column is still json at this point -- the ALTER runs after this
     # returns -- so the rewritten payload is cast back to json, not jsonb.
     update = sa.text(
         f"UPDATE {table} SET {column} = CAST(:payload AS json) "  # noqa: S608
         f"WHERE id = :id"
     )
-    for row_id, payload_text in rows:
-        cleaned = _sanitize(json.loads(payload_text))
-        bind.execute(update, {"payload": json.dumps(cleaned), "id": row_id})
+
+    after = 0
+    while True:
+        rows = bind.execute(
+            select_batch,
+            {
+                "after": after,
+                "bs": ESCAPED_BACKSLASH,
+                "standin": ESCAPED_BACKSLASH_STANDIN,
+                "pair": SURROGATE_PAIR_PATTERN,
+                "unsafe": UNSAFE_ESCAPE_PATTERN,
+                "limit": REWRITE_BATCH_SIZE,
+            },
+        ).fetchall()
+        if not rows:
+            return
+        for row_id, payload_text in rows:
+            cleaned = _sanitize(json.loads(payload_text))
+            bind.execute(update, {"payload": json.dumps(cleaned), "id": row_id})
+        # A rewritten row no longer matches the predicate, so the next
+        # batch would find these again only by id -- advance past them.
+        after = rows[-1][0]
 
 
 def upgrade() -> None:

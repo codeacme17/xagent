@@ -55,6 +55,7 @@ not rewritten wholesale.
 from __future__ import annotations
 
 import re
+from itertools import islice
 from typing import Any
 
 REPLACEMENT_CHARACTER = "�"
@@ -69,44 +70,79 @@ _UNSTORABLE_CODE_POINTS = re.compile("[\x00\ud800-\udfff]")
 _EXPONENT_NOTATION_THRESHOLD = 1e16
 
 
+# Returned by _sanitize for a value that needs no edit, so a container can
+# tell "nothing changed here" from "changed to something falsy" and skip
+# copying itself. A module-private sentinel, never part of a payload.
+_UNCHANGED = object()
+
+
 def sanitize_json_payload(value: Any) -> Any:
     """Return ``value`` in the form the jsonb column will hand back.
 
     Unstorable code points become U+FFFD, and floats jsonb would return as
     ints are converted up front. Walks strings, dicts (keys included),
-    lists, and tuples; every other type passes through untouched. A payload
-    that needs no change is returned as the *same object* -- this runs on
-    every trace write and almost every payload is clean, so the clean path
-    must not copy.
+    lists, and tuples; every other type passes through untouched.
+
+    A payload that needs no change is returned as the *same object*, and no
+    copy of it is built along the way: this runs on every trace write and
+    almost every payload is clean, so the clean path allocates nothing.
+    Containers copy on first change only, backfilling the prefix they had
+    already walked.
 
     Two distinct dict keys can collide after replacement (``"a\\x00"`` and
     ``"a\\ud800"`` both become ``"a\\ufffd"``); the later key wins, matching
     ``json.loads`` duplicate-key behaviour.
+
+    Recursion is unbounded on purpose. A cap would have to leave whatever
+    sits below it unsanitized, which is the payload shape this function
+    exists to keep out of the column -- so a structure deep enough to
+    exhaust the stack fails its write loudly instead of storing something
+    the database cannot read back.
     """
+    cleaned = _sanitize(value)
+    return value if cleaned is _UNCHANGED else cleaned
+
+
+def _sanitize(value: Any) -> Any:
+    """Return the sanitized form of ``value``, or ``_UNCHANGED``."""
     if isinstance(value, str):
         if _UNSTORABLE_CODE_POINTS.search(value):
             return _UNSTORABLE_CODE_POINTS.sub(REPLACEMENT_CHARACTER, value)
-        return value
+        return _UNCHANGED
     # bool is an int subclass, and True/False are not numbers to normalize.
     if isinstance(value, float) and not isinstance(value, bool):
         if abs(value) >= _EXPONENT_NOTATION_THRESHOLD and value.is_integer():
             return int(value)
-        return value
+        return _UNCHANGED
     if isinstance(value, dict):
-        changed = False
-        cleaned_dict: dict[Any, Any] = {}
-        for key, item in value.items():
-            cleaned_key = sanitize_json_payload(key)
-            cleaned_item = sanitize_json_payload(item)
-            if cleaned_key is not key or cleaned_item is not item:
-                changed = True
-            cleaned_dict[cleaned_key] = cleaned_item
-        return cleaned_dict if changed else value
+        cleaned_dict: dict[Any, Any] | None = None
+        for index, (key, item) in enumerate(value.items()):
+            new_key = _sanitize(key)
+            new_item = _sanitize(item)
+            if new_key is _UNCHANGED and new_item is _UNCHANGED:
+                if cleaned_dict is not None:
+                    cleaned_dict[key] = item
+                continue
+            if cleaned_dict is None:
+                # First change: take the prefix already walked, which by
+                # construction needed no edit, and copy from here on.
+                cleaned_dict = dict(islice(value.items(), index))
+            cleaned_dict[key if new_key is _UNCHANGED else new_key] = (
+                item if new_item is _UNCHANGED else new_item
+            )
+        return _UNCHANGED if cleaned_dict is None else cleaned_dict
     if isinstance(value, (list, tuple)):
-        cleaned_items = [sanitize_json_payload(item) for item in value]
-        if all(new is old for new, old in zip(cleaned_items, value)):
-            return value
-        if isinstance(value, tuple):
-            return tuple(cleaned_items)
-        return cleaned_items
-    return value
+        cleaned_items: list[Any] | None = None
+        for index, item in enumerate(value):
+            new_item = _sanitize(item)
+            if new_item is _UNCHANGED:
+                if cleaned_items is not None:
+                    cleaned_items.append(item)
+                continue
+            if cleaned_items is None:
+                cleaned_items = list(value[:index])
+            cleaned_items.append(new_item)
+        if cleaned_items is None:
+            return _UNCHANGED
+        return tuple(cleaned_items) if isinstance(value, tuple) else cleaned_items
+    return _UNCHANGED

@@ -166,3 +166,51 @@ class TestFloatsJsonbWouldRetype:
         # json.loads models what psycopg2 does with the jsonb column's
         # plain-notation output.
         assert json.dumps(json.loads(stored), sort_keys=True) == stored
+
+
+class TestCleanPathAllocatesNothing:
+    """The hot-path contract the docstring states: a clean payload is not
+    merely returned unchanged, it is never copied on the way. Pinned because
+    the obvious implementation (build a copy, then decide whether to return
+    it) satisfies every other test in this file while doing the work anyway.
+    """
+
+    def test_clean_nested_payload_keeps_every_container_identity(self) -> None:
+        inner_list = ["a", "b"]
+        inner_dict = {"items": inner_list, "score": 1.5}
+        payload = {"model_name": "gpt-4o", "nested": inner_dict}
+
+        cleaned = sanitize_json_payload(payload)
+
+        assert cleaned is payload
+        assert cleaned["nested"] is inner_dict
+        assert cleaned["nested"]["items"] is inner_list
+
+    def test_unchanged_siblings_are_reused_not_rebuilt(self) -> None:
+        """Even when a copy is unavoidable, the branches that needed no edit
+        are carried over by reference rather than rebuilt."""
+        before = {"deep": ["untouched"]}
+        after = {"also": "clean"}
+        payload = {"before": before, "dirty": f"x{NUL}", "after": after}
+
+        cleaned = sanitize_json_payload(payload)
+
+        assert cleaned is not payload
+        # The prefix backfilled at the first change and the suffix walked
+        # afterwards must both be the original objects.
+        assert cleaned["before"] is before
+        assert cleaned["after"] is after
+
+    def test_dict_key_order_is_preserved_across_a_copy(self) -> None:
+        payload = {"first": 1, "dirty": f"x{NUL}", "last": 3}
+
+        cleaned = sanitize_json_payload(payload)
+
+        assert list(cleaned) == ["first", "dirty", "last"]
+
+    def test_list_order_is_preserved_across_a_copy(self) -> None:
+        payload = ["head", f"mid{NUL}", "tail"]
+
+        cleaned = sanitize_json_payload(payload)
+
+        assert cleaned == ["head", f"mid{REPLACEMENT_CHARACTER}", "tail"]

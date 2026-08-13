@@ -427,3 +427,67 @@ class TestOfflineSql:
         assert "%(" not in sql
         assert ":param" not in sql
         assert "?" not in sql
+
+
+@pytest.mark.postgresql
+class TestBatchedCleanup:
+    """The cleanup walks matching rows in bounded batches so the migration
+    never materializes every poisoned payload at once. A single batch is
+    exercised by the tests above; this class forces the loop to run more
+    than once, which is the only way the keyset advance is covered.
+    """
+
+    def test_rewrites_more_rows_than_one_batch(self, postgres_engine) -> None:
+        migration = _migration_module()
+        row_count = migration.REWRITE_BATCH_SIZE * 2 + 3
+        with postgres_engine.begin() as conn:
+            for row_id in range(1, row_count + 1):
+                _insert_trace_event(
+                    conn,
+                    row_id=row_id,
+                    payload_json_text='{"v": "n' + NUL_ESCAPE + '"}',
+                )
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            distinct = conn.execute(
+                text("SELECT DISTINCT data->>'v' FROM trace_events")
+            ).fetchall()
+            total = conn.execute(text("SELECT count(*) FROM trace_events")).scalar_one()
+        # Every row rewritten, none skipped by the keyset advance and none
+        # left behind for the cast to choke on.
+        assert total == row_count
+        assert distinct == [(f"n{REPLACEMENT}",)]
+
+    def test_clean_rows_between_poisoned_ones_are_untouched(
+        self, postgres_engine
+    ) -> None:
+        """The batch predicate matches only poisoned rows, so the keyset
+        advance steps over clean rows rather than rewriting them."""
+        with postgres_engine.begin() as conn:
+            for row_id in range(1, migration_batch_span() + 1):
+                if row_id % 2:
+                    payload = '{"v": "bad' + NUL_ESCAPE + '"}'
+                else:
+                    payload = '{"v": "' + PAIR_ESCAPE + '"}'
+                _insert_trace_event(conn, row_id=row_id, payload_json_text=payload)
+
+        _upgrade(postgres_engine)
+
+        with postgres_engine.begin() as conn:
+            good = conn.execute(
+                text("SELECT count(*) FROM trace_events WHERE data->>'v' = :v"),
+                {"v": chr(0x1F600)},
+            ).scalar_one()
+            bad = conn.execute(
+                text("SELECT count(*) FROM trace_events WHERE data->>'v' = :v"),
+                {"v": f"bad{REPLACEMENT}"},
+            ).scalar_one()
+        assert good == migration_batch_span() // 2
+        assert bad == migration_batch_span() - migration_batch_span() // 2
+
+
+def migration_batch_span() -> int:
+    """One batch plus a remainder, so the loop runs twice."""
+    return _migration_module().REWRITE_BATCH_SIZE + 5
