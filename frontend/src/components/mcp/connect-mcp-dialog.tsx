@@ -710,12 +710,27 @@ export function ConnectMcpDialog({
     }
   }
 
-  // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
-  // shared server row + this user's association, runs Dynamic Client
-  // Registration when the provider has no static client, and returns the
-  // authorization URL. Mirrors custom-mcp-form's handleConnectMcpOAuth,
-  // but keyed by catalog app_id instead of a server id.
+  // A user-added (custom) MCP server is authorized per server row, not per
+  // catalog app id: /api/mcp/apps/{id}/oauth/connect resolves the catalog and
+  // nothing else, so custom servers must drive the per-server endpoint the
+  // custom MCP edit form already uses (#1313). Null for catalog apps.
+  const customMcpServerId = (app: AppIntegration): number | null =>
+    app.is_custom && Number.isInteger(app.server_id) ? (app.server_id as number) : null
+
+  // Remote-MCP OAuth app: the backend ensures the server row + this user's
+  // association, runs Dynamic Client Registration when the provider has no
+  // static client, and returns the authorization URL. Mirrors
+  // custom-mcp-form's handleConnectMcpOAuth. Serves both a catalog app
+  // (e.g. Granola), keyed by app_id, and a custom server, keyed by server id.
   const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
+    const serverId = customMcpServerId(app)
+    const connectUrl = serverId === null
+      ? `${getApiUrl()}/api/mcp/apps/${app.id}/oauth/connect`
+      : `${getApiUrl()}/api/mcp/${serverId}/oauth/connect`
+    // The post-consent recheck below has to query the same listing branch the
+    // entry came from: a custom server only appears under location=local, so
+    // asking for remote would report every custom connect as a failure.
+    const refreshLocation = serverId === null ? "remote" : "local"
     markAppLoading(app.id)
     // Open the popup synchronously on the click, before any await — popup
     // blockers reject windows opened outside direct user-gesture handling.
@@ -737,7 +752,7 @@ export function ConnectMcpDialog({
     }
     popup.opener = null
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/oauth/connect`, {
+      const response = await apiRequest(connectUrl, {
         method: "POST",
         credentials: "include",
         headers: {
@@ -799,7 +814,7 @@ export function ConnectMcpDialog({
       void (async () => {
         let connected = false
         try {
-          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=remote`)
+          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${refreshLocation}`)
           if (response.ok) {
             const data = sanitizeAppIntegrations(await response.json())
             connected = data.some(
@@ -826,8 +841,8 @@ export function ConnectMcpDialog({
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
     if (app.auth_type !== "builtin_oauth") {
       // Key-based catalog app: collect the key; keyless app: connect directly;
-      // remote-MCP OAuth app: start the per-user OAuth (DCR) flow. Anything
-      // else is a mis-authored entry.
+      // remote-MCP OAuth app (catalog or user-added custom server): start the
+      // per-user OAuth (DCR) flow. Anything else is a mis-authored entry.
       if (app.auth_type === "api_key") {
         openKeyConnect(app);
       } else if (app.auth_type === "keyless") {
