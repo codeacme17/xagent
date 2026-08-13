@@ -1148,6 +1148,7 @@ const zh = {
           team: "归属团队",
         },
         configure: "配置",
+        authorize: "授权",
         connectSuccess: "已连接 {name}",
         disconnect: "断开连接",
         disconnectSuccess: "已成功断开 {name} 的连接",

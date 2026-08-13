@@ -204,6 +204,34 @@ export function ConnectMcpDialog({
 
   const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
 
+  // Holding a personal credential for a connector and being allowed to attach
+  // it to an agent are two different questions, and since #1097 the picker
+  // conflated them: is_connected for an mcp_oauth server requires an active
+  // MCPOAuthGrant for the viewer, and a card that isn't connected can't be
+  // toggled into the selection.
+  //
+  // A user-added mcp_oauth server can be backed by tokens supplied out of
+  // band instead — an embedding application installs
+  // set_oauth_token_resolver_hook (src/xagent/web/tools/config.py) and
+  // provisions them per end user, server to server. There is no interactive
+  // consent in that model and no identity the editor could sign in as, so a
+  // grant for the editor never exists and the card is reported permanently
+  // unconnected: not a state the repaired Connect flow (#1313/#1323) can
+  // resolve either, just a dead end. The backend never agreed with the gate
+  // anyway — agent create/update accepts an `mcp:<server>` selector with no
+  // connected-state validation, and the runtime resolves tokens through the
+  // hook regardless of grants — so this is a UI-only block on a legitimate
+  // attach (#1332).
+  //
+  // Deliberately narrow to the custom mcp_oauth shape rather than relaxing
+  // the gate at large: every other custom shape already reports connected
+  // unconditionally, while an unconnected *catalog* card genuinely does need
+  // its Connect flow run first (an api_key app has nowhere else to get its
+  // key from). Connected-state display is untouched — only selection stops
+  // depending on it.
+  const isAttachableWithoutGrant = (app: AppIntegration) =>
+    Boolean(app.is_custom) && app.auth_type === "mcp_oauth"
+
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300)
     return () => clearTimeout(timer)
@@ -953,7 +981,7 @@ export function ConnectMcpDialog({
   }
 
   const handleCardClick = (app: AppIntegration, isGloballyConnected: boolean) => {
-    if (isSelectMode && isGloballyConnected) {
+    if (isSelectMode && (isGloballyConnected || isAttachableWithoutGrant(app))) {
       // Match isSelected's own check (id OR name) below, not just name: a
       // consumer (e.g. agent-builder.tsx re-seeding after save) can store
       // this connector's id instead of its display name once resolved to
@@ -1325,7 +1353,7 @@ export function ConnectMcpDialog({
                               <div className="flex items-center gap-2">
                                 {isLoading ? (
                                   <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
-                                ) : isGloballyConnected && (
+                                ) : isGloballyConnected ? (
                                   <Button
                                     variant="ghost"
                                     size="sm"
@@ -1337,7 +1365,26 @@ export function ConnectMcpDialog({
                                   >
                                     <Settings className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.configure')}
                                   </Button>
-                                )}
+                                ) : isSelectMode && isAttachableWithoutGrant(app) ? (
+                                  // The card body now toggles selection for these
+                                  // (see isAttachableWithoutGrant), which would
+                                  // otherwise take the detail modal — and with it
+                                  // the Connect button — out of reach in select
+                                  // mode. Editors who do use the interactive flow
+                                  // keep it here; everyone else can ignore it and
+                                  // just attach.
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 text-xs text-slate-600 hover:text-slate-900 px-2 bg-slate-100 hover:bg-slate-200"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSelectedApp(app);
+                                    }}
+                                  >
+                                    <Plus className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.authorize')}
+                                  </Button>
+                                ) : null}
                               </div>
                             </div>
                           </CardContent>
