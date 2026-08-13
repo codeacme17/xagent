@@ -18,11 +18,25 @@ The two symptoms differ by endpoint, which is why all three are covered here:
   query after their handler, so they returned HTTP 200 with an empty list --
   a dashboard of zeros with nothing but a log line to show for it.
 
-The seed data also pins which payloads the dialect guard drops. PostgreSQL
-accepts several escape sequences into a ``json`` column that ``->>`` then
-refuses to convert -- the NUL escape and either half of an unpaired UTF-16
-surrogate -- and one such row fails the whole query. A *valid* surrogate pair
-is not a hazard and must survive, so a non-BMP payload is seeded alongside.
+Since #1248 the column is ``jsonb``, which decodes escapes to native text at
+INSERT and therefore rejects the payload shapes that used to poison reads --
+the NUL escape and either half of an unpaired UTF-16 surrogate. That moves
+what this file can and must pin:
+
+- the hazardous shapes can no longer be seeded at all; a class of tests here
+  asserts the INSERT itself fails, which is the invariant the migration
+  exists to establish;
+- the write-side sanitizer (``web/utils/json_payload_sanitizer.py``) must
+  turn each of those shapes into something the column accepts and ``->>``
+  reads back;
+- the endpoints are exercised over storable payloads only. A *valid*
+  surrogate pair is not a hazard and must survive, so a non-BMP payload is
+  seeded alongside text that merely looks like an escape.
+
+The read guard in ``get_json_field_expression`` still exists for databases
+whose migration has not run; with ``jsonb`` it can never match, so its
+matching behaviour stays pinned by the dialect-independent unit tests in
+``tests/web/test_monitor_api.py``, not here.
 
 Fixture pattern copied from
 ``tests/web/services/test_task_status_storage_postgresql.py`` (skip-if-unset
@@ -31,11 +45,13 @@ via ``XAGENT_TEST_POSTGRES_URL``; CI provides it in the PostgreSQL job).
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 from typing import Any, Iterator
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from xagent.web.api.monitor import (
@@ -46,13 +62,17 @@ from xagent.web.api.monitor import (
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.utils.json_payload_sanitizer import (
+    REPLACEMENT_CHARACTER,
+    sanitize_json_payload,
+)
 
-# String values PostgreSQL accepts into a ``json`` column but then refuses to
-# convert to text, so ``json ->> key`` raises on them and takes the whole query
-# down with it. These are the payload shapes the dialect branch's guard exists
-# to keep away from ``->>``. Built with ``chr`` because an editor will happily
-# turn an escape sequence into the character it names, and a lone surrogate
-# character is not encodable as UTF-8.
+# String values a ``json`` column accepted but ``->>`` then refused to convert
+# to text, taking the whole query down with it (#1149). ``jsonb`` refuses them
+# at INSERT instead (#1248), which is what the rejection tests below pin.
+# Built with ``chr`` because an editor will happily turn an escape sequence
+# into the character it names, and a lone surrogate character is not encodable
+# as UTF-8.
 NUL_PAYLOAD = chr(0x0000)  # -> ``unsupported Unicode escape sequence``
 LONE_HIGH_SURROGATE = chr(0xD800)  # -> ``invalid input syntax for type json``
 LONE_LOW_SURROGATE = chr(0xDC00)  # same, from the other side of the pair
@@ -98,9 +118,10 @@ def pg_session() -> Iterator[Session]:
 def _seed_admin_with_trace_events(db: Session) -> User:
     """One admin, one task, and the trace events the three endpoints count.
 
-    Every payload carrying an unconvertible escape is one the guard must drop
-    without failing the surrounding query; the paired-surrogate payload is one
-    it must leave alone.
+    Every payload here is one ``jsonb`` stores: the hazardous shapes are
+    unstorable since #1248 and are covered by ``TestJsonbRejectsHazards``
+    instead. The paired-surrogate and literal-escape payloads are the ones
+    nothing may drop.
     """
     admin = User(username="monitor-pg-admin", password_hash="hash", is_admin=True)
     db.add(admin)
@@ -118,23 +139,10 @@ def _seed_admin_with_trace_events(db: Session) -> User:
         ("llm_call_start", {"model_name": "gpt-4o", "step_id": "s1", "attempt": 1}),
         ("llm_call_start", {"model_name": "gpt-4o", "step_id": "s2", "attempt": 1}),
         ("llm_call_start", {"model_name": "claude-opus", "step_id": "s3"}),
-        # Kept: a valid surrogate pair is not a hazard and must still count.
+        # A valid surrogate pair is not a hazard and must still count.
         ("llm_call_start", {"model_name": emoji_model, "step_id": "s4"}),
-        # Dropped: one row per unconvertible escape class.
-        ("llm_call_start", {"model_name": "nul-model", "note": NUL_PAYLOAD}),
-        ("llm_call_start", {"model_name": "high-model", "note": LONE_HIGH_SURROGATE}),
-        ("llm_call_start", {"model_name": "low-model", "note": LONE_LOW_SURROGATE}),
-        # Dropped, with the escape in the extracted field rather than beside
-        # it: the guard reads the whole payload, so position must not matter.
-        ("llm_call_start", {"model_name": f"tainted-{NUL_PAYLOAD}"}),
-        # Dropped: a real unpaired surrogate hiding behind text that imitates
-        # the other half of a pair.
-        (
-            "llm_call_start",
-            {"model_name": "hidden-model", "note": SURROGATE_BEHIND_LITERAL},
-        ),
-        # Kept: text that only looks like an escape extracts fine, so the
-        # guard must not treat it as a hazard.
+        # Text that only looks like an escape extracts fine, so nothing may
+        # treat it as a hazard.
         (
             "llm_call_start",
             {"model_name": "literal-escape-model", "note": LITERAL_ESCAPE_TEXT},
@@ -142,11 +150,6 @@ def _seed_admin_with_trace_events(db: Session) -> User:
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "calculator"}),
         ("tool_execution_start", {"tool_name": "web_search"}),
-        ("tool_execution_start", {"tool_name": "nul-tool", "note": NUL_PAYLOAD}),
-        (
-            "tool_execution_start",
-            {"tool_name": "surrogate-tool", "note": LONE_HIGH_SURROGATE},
-        ),
     ]
     for index, (event_type, data) in enumerate(payloads):
         db.add(
@@ -175,9 +178,9 @@ async def test_monitoring_stats_counts_active_models_on_postgresql(
 
     stats = await get_monitoring_stats(db=pg_session, current_user=admin)
 
-    # gpt-4o, claude-opus, the emoji model and the literal-escape model. The
-    # five payloads carrying an escape PostgreSQL cannot convert are dropped;
-    # a valid surrogate pair and text that merely looks like an escape are not.
+    # gpt-4o, claude-opus, the emoji model and the literal-escape model: a
+    # valid surrogate pair and text that merely looks like an escape both
+    # count as ordinary models.
     assert stats["activeModels"] == 4
 
 
@@ -211,3 +214,181 @@ async def test_model_stats_returns_per_model_calls_on_postgresql(
         f"emoji-model {NON_BMP_CHAR}": 1,
         "literal-escape-model": 1,
     }
+
+
+@pytest.mark.postgresql
+class TestJsonbRejectsHazards:
+    """The invariant #1248 establishes: the column can no longer hold a
+    payload ``->>`` cannot read back. Each shape that used to fail a whole
+    monitoring query now fails its own INSERT instead, which is a local,
+    attributable error rather than a silent dashboard of zeros.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "payload"),
+        [
+            ("nul", {"model_name": "nul-model", "note": NUL_PAYLOAD}),
+            ("high", {"model_name": "high-model", "note": LONE_HIGH_SURROGATE}),
+            ("low", {"model_name": "low-model", "note": LONE_LOW_SURROGATE}),
+            # The escape in the extracted field rather than beside it:
+            # position must not matter.
+            ("in-field", {"model_name": f"tainted-{NUL_PAYLOAD}"}),
+            # A real unpaired surrogate hiding behind text that imitates the
+            # other half of a pair.
+            (
+                "hidden",
+                {"model_name": "hidden-model", "note": SURROGATE_BEHIND_LITERAL},
+            ),
+        ],
+    )
+    def test_unstorable_payload_is_rejected_at_insert(
+        self, pg_session: Session, label: str, payload: dict[str, Any]
+    ) -> None:
+        admin = User(
+            username=f"reject-{label}-admin", password_hash="hash", is_admin=True
+        )
+        pg_session.add(admin)
+        pg_session.commit()
+        task = Task(user_id=admin.id, title=f"reject-{label}")
+        pg_session.add(task)
+        pg_session.commit()
+
+        pg_session.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id=f"reject-{label}",
+                event_type="llm_call_start",
+                timestamp=datetime.now(),
+                data=payload,
+            )
+        )
+        with pytest.raises(DBAPIError):
+            pg_session.commit()
+        pg_session.rollback()
+
+    def test_sanitized_payload_is_storable_and_readable(
+        self, pg_session: Session
+    ) -> None:
+        """The other half of the contract: what the write-side sanitizer
+        produces from a hazardous payload must both store and read back --
+        otherwise the sanitizer would only be trading one failure for
+        another.
+        """
+        admin = User(username="sanitized-admin", password_hash="hash", is_admin=True)
+        pg_session.add(admin)
+        pg_session.commit()
+        task = Task(user_id=admin.id, title="sanitized")
+        pg_session.add(task)
+        pg_session.commit()
+
+        hazardous = {
+            "model_name": f"m{NUL_PAYLOAD}{LONE_HIGH_SURROGATE}",
+            "note": LONE_LOW_SURROGATE,
+        }
+        pg_session.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="sanitized-1",
+                event_type="llm_call_start",
+                timestamp=datetime.now(),
+                data=sanitize_json_payload(hazardous),
+            )
+        )
+        pg_session.commit()
+
+        stats = pg_session.execute(
+            TraceEvent.__table__.select().where(TraceEvent.event_id == "sanitized-1")
+        ).one()
+        assert stats.data["model_name"] == f"m{REPLACEMENT_CHARACTER * 2}"
+
+
+@pytest.mark.postgresql
+class TestJsonbRoundTripFidelity:
+    """What the checkpoint blob path depends on: a payload written through
+    the sanitizer must come back from ``jsonb`` as the *same JSON*, not
+    merely the same numbers. ``trace_message_storage`` re-hashes what it
+    reads and rejects a mismatch as corruption, so an int/float retype on
+    the way through the column would cost a task its checkpoint.
+    """
+
+    def _task(self, db: Session, label: str) -> Task:
+        admin = User(username=f"{label}-admin", password_hash="hash", is_admin=True)
+        db.add(admin)
+        db.commit()
+        task = Task(user_id=admin.id, title=label)
+        db.add(task)
+        db.commit()
+        return task
+
+    def _round_trip(self, db: Session, task: Task, payload: dict[str, Any]) -> Any:
+        task_id = int(task.id)
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id=f"roundtrip-{task_id}",
+                event_type="llm_call_start",
+                timestamp=datetime.now(),
+                data=sanitize_json_payload(payload),
+            )
+        )
+        db.commit()
+        # Read through a Core select on a fresh transaction, so what comes
+        # back is what the column returned and not the dict still held in
+        # the session's identity map.
+        db.expunge_all()
+        row = db.execute(
+            TraceEvent.__table__.select().where(
+                TraceEvent.__table__.c.task_id == task_id
+            )
+        ).one()
+        return row.data
+
+    def test_large_float_survives_as_the_same_json(self, pg_session: Session) -> None:
+        task = self._task(pg_session, "roundtrip-float")
+        payload = {"cost": 1e16, "ratio": 0.1, "count": 3}
+
+        stored = self._round_trip(pg_session, task, payload)
+
+        # The sanitizer converted 1e16 up front, so what comes back matches
+        # byte for byte under the canonical form the blob hash uses.
+        expected = sanitize_json_payload(payload)
+        assert json.dumps(stored, sort_keys=True) == json.dumps(
+            expected, sort_keys=True
+        )
+
+    def test_unsanitized_large_float_would_change_type(
+        self, pg_session: Session
+    ) -> None:
+        """The control: without the sanitizer's normalization the retype is
+        real, so the test above is pinning behaviour and not a tautology."""
+        task = self._task(pg_session, "roundtrip-control")
+        pg_session.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="roundtrip-control",
+                event_type="llm_call_start",
+                timestamp=datetime.now(),
+                data={"cost": 1e16},
+            )
+        )
+        pg_session.commit()
+        pg_session.expunge_all()
+
+        row = pg_session.execute(
+            TraceEvent.__table__.select().where(
+                TraceEvent.event_id == "roundtrip-control"
+            )
+        ).one()
+        assert isinstance(row.data["cost"], int)
+
+    def test_ordinary_payload_survives_unchanged(self, pg_session: Session) -> None:
+        task = self._task(pg_session, "roundtrip-plain")
+        payload = {
+            "model_name": f"emoji {NON_BMP_CHAR}",
+            "nested": {"items": ["a", "b"], "ok": True, "score": 1.5},
+            "none": None,
+        }
+
+        stored = self._round_trip(pg_session, task, payload)
+
+        assert json.dumps(stored, sort_keys=True) == json.dumps(payload, sort_keys=True)

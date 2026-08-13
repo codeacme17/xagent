@@ -100,8 +100,15 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
         # NUL raises "unsupported Unicode escape sequence", an unpaired UTF-16
         # surrogate raises "invalid input syntax for type json" -- and one such
         # row fails the entire query. Null those payloads out before extracting
-        # so the row drops instead. jsonb would reject them at write time, but
-        # this column is json, which stores them happily.
+        # so the row drops instead.
+        #
+        # These columns are jsonb since #1248, and jsonb rejects such payloads
+        # at INSERT, so on a migrated database this guard can never match. It
+        # stays because it is not this module's business to assume the
+        # migration has run: a database still on the json type -- one upgraded
+        # by hand, or mid-rollout -- carries exactly the rows it defends
+        # against. Per that issue, do not remove it while any deployment can
+        # still hold such a payload.
         #
         # Matching runs on the column's text form because valid JSON never
         # holds a raw control character or a bare surrogate (RFC 8259 requires
