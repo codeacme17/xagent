@@ -178,6 +178,18 @@ export function ConnectMcpDialog({
   // in-flight connect POST that resolves after the dialog (or the whole
   // component) is gone doesn't register a poll nothing will ever clear.
   const isMountedRef = React.useRef(true)
+  // F5 (close case): isMountedRef only flips on unmount, but both consumers
+  // of this dialog keep the component mounted across open/close — only the
+  // `open` prop changes. Checking `open` itself would be decorative here:
+  // it's a prop captured in handleConnectMcpOAuthApp's per-render closure,
+  // so by the time the async function resumes after the connect POST it's
+  // reading a stale value, same as the `|| !open` checks above. Instead this
+  // generation counter is bumped every time clearMcpOauthPollState() tears
+  // down poll state (dialog-close branch and unmount cleanup alike), so a
+  // connect POST that resolves after either teardown can tell its captured
+  // generation is stale and bail out before registering a poll nothing will
+  // ever clear.
+  const mcpOauthPollGenerationRef = React.useRef(0)
 
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
@@ -298,6 +310,10 @@ export function ConnectMcpDialog({
     // of which app(s) they belonged to, so it clears every in-flight app,
     // not just one.
     setLoadingApps(new Set())
+    // F5 (close case): bump so any handleConnectMcpOAuthApp call that
+    // captured the generation before this teardown ran can detect it's
+    // stale and skip registering a new poll.
+    mcpOauthPollGenerationRef.current += 1
   }
 
   useEffect(() => {
@@ -723,6 +739,10 @@ export function ConnectMcpDialog({
   // custom-mcp-form's handleConnectMcpOAuth. Serves both a catalog app
   // (e.g. Granola), keyed by app_id, and a custom server, keyed by server id.
   const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
+    // F5 (close case): captured before the popup opens and before any await,
+    // so it reflects poll state as of this click — not a stale closure value
+    // read after the dialog has since closed and reopened.
+    const pollGeneration = mcpOauthPollGenerationRef.current
     const serverId = customMcpServerId(app)
     const connectUrl = serverId === null
       ? `${getApiUrl()}/api/mcp/apps/${app.id}/oauth/connect`
@@ -783,13 +803,18 @@ export function ConnectMcpDialog({
       clearAppLoading(app.id)
       return
     }
-    // F5: if the dialog closed (or this component unmounted) while the
-    // connect POST was in flight, don't register a poll after the cleanup
-    // effects have already run — it would never get cleared. The popup
-    // itself is left navigating to the authorization URL either way; the
-    // user can still complete auth in it, and the next apps refresh (e.g.
-    // reopening the dialog) will reflect it.
-    if (!isMountedRef.current) return
+    // F5: don't register a poll after the cleanup effects have already run
+    // — it would never get cleared. isMountedRef only covers the unmount
+    // case (the whole component gone); it stays true across an ordinary
+    // dialog close since both consumers keep this component mounted and
+    // only toggle the `open` prop. The close case — including a
+    // close-then-reopen while this POST was in flight — is instead covered
+    // by comparing the generation captured above against the counter, which
+    // clearMcpOauthPollState() bumps on every teardown (close branch and
+    // unmount alike). The popup itself is left navigating to the
+    // authorization URL either way; the user can still complete auth in it,
+    // and the next apps refresh (e.g. reopening the dialog) will reflect it.
+    if (!isMountedRef.current || pollGeneration !== mcpOauthPollGenerationRef.current) return
 
     // The popup's opener link is severed (popup.opener = null), so unlike the
     // builtin flow there is no postMessage channel — and a closed popup can
