@@ -592,6 +592,14 @@ class ReActPattern(AgentPattern):
                     )
                 if answer_streamer is not None:
                     await answer_streamer.fail("invalid tool protocol, retrying")
+                # Rejecting the whole response drops any assistant preamble it
+                # carried: the response is discarded before ``add_assistant_message``,
+                # so the retry rebuilds from context without it. Deliberate - the
+                # preamble arrived attached to a protocol violation, so it is not a
+                # vetted user-facing answer, and replaying the model's own discarded
+                # prose invites it to treat that text as already committed. The cost
+                # is that a model which keeps emitting "preamble + empty answer"
+                # fails the run without the user seeing the preamble.
                 recover_full_tool_set = self._requires_full_tool_set_recovery(
                     normalized,
                     force_final_answer=force_final_answer_now,

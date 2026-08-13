@@ -5137,9 +5137,11 @@ class StreamingEmptyFinalAnswerLLM:
         *,
         recover: bool = True,
         broken_arguments: str = '{"response_language":"English","outcome":"completed"}',
+        preamble: str = "",
     ) -> None:
         self.recover = recover
         self.broken_arguments = broken_arguments
+        self.preamble = preamble
         self.stream_calls: list[dict[str, Any]] = []
 
     async def chat(self, **kwargs: Any) -> Any:
@@ -5157,6 +5159,8 @@ class StreamingEmptyFinalAnswerLLM:
             if call_index > 0 and self.recover
             else self.broken_arguments
         )
+        if self.preamble:
+            yield StreamChunk(type=ChunkType.TOKEN, delta=self.preamble)
         yield StreamChunk(
             type=ChunkType.TOOL_CALL,
             tool_calls=[
@@ -5683,3 +5687,32 @@ def test_reject_empty_final_answer_tolerates_non_string_arg_keys() -> None:
     pattern._reject_empty_final_answer(tool_call, context)
 
     assert pattern.force_final_answer_next is True
+
+
+@pytest.mark.asyncio
+async def test_react_discards_the_preamble_with_the_rejected_response() -> None:
+    """Pins the documented cost of whole-response rejection.
+
+    The preamble arrived attached to a protocol violation, so it is not a vetted
+    answer and is dropped with the response rather than replayed into the retry.
+    A model that recovers supersedes it; one that repeats the pattern fails the
+    run and the preamble is never shown.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(preamble="Let me look into that.")
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert "Let me look into that." not in str(result["response"])
+    assert all(
+        "Let me look into that." not in str(event.get("content") or event.get("delta"))
+        for event in outbound.events
+    )
