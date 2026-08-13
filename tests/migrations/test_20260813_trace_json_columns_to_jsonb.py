@@ -32,7 +32,7 @@ from sqlalchemy import create_engine, text
 
 from xagent.db.config import create_alembic_config
 
-PARENT_REVISION = "20260809_add_task_interaction_requests"
+PARENT_REVISION = "20260810_add_hubspot_marketing_scopes"
 TARGET_REVISION = "20260813_trace_json_columns_to_jsonb"
 
 TRACE_JSON_COLUMNS = (
