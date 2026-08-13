@@ -5410,3 +5410,69 @@ def test_empty_final_answer_call_detects_blank_answers() -> None:
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -> None:
+    """A rejected resume batch must not run work the fresh path would discard.
+
+    The fresh-turn path throws away the whole offending response, so a
+    ``[final_answer(""), work_tool]`` batch never executes the work tool. A
+    resumed batch has to match, or a pre-fix checkpoint replays a side effect
+    that the same model output would never have produced on a live turn.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    # The side-effecting tool never ran.
+    assert tool.calls == []
+    # I2: the abandoned call still got exactly one result.
+    assert pattern.tool_ledger["call_work"].status == "cancelled"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_finalizes_a_scalar_zero_answer() -> None:
+    """``answer=0`` is an answer, not an absent one.
+
+    The empty check coerces before testing, so a falsy scalar must survive the
+    guard and reach the user rather than being rejected as blank.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":0,"outcome":"completed"}',
+    )
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "0"
+    # Accepted on the first turn: no repair retry was spent.
+    assert len(llm.stream_calls) == 1
