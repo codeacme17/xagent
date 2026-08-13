@@ -123,11 +123,15 @@ vi.mock("./custom-mcp-form", () => ({
 
 vi.mock("./official-mcp-settings-dialog", () => ({
   OfficialMcpSettingsDialog: ({
+    app,
+    open,
     isConnecting,
     onConfigure,
     onOpenChange,
     onConnectStart,
   }: {
+    app?: { name?: string } | null
+    open?: boolean
     isConnecting?: boolean
     onConfigure: (app: object) => void
     onOpenChange: (open: boolean) => void
@@ -140,6 +144,10 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       <div data-testid="settings-is-connecting">
         {isConnecting ? "connecting" : "idle"}
       </div>
+      {/* Which app the detail modal is open for (empty when closed). The mock
+          renders unconditionally, so `open` is the only way a test can tell
+          whether a card click routed to the modal or toggled the selection. */}
+      <div data-testid="settings-open-app">{open ? app?.name ?? "" : ""}</div>
       <button
         type="button"
         onClick={() => onConfigure(customApiApp(1, "aggregated-a"))}
@@ -1665,5 +1673,122 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenCalledWith([])
+  })
+
+  // A custom mcp_oauth connector whose access tokens are supplied out of band
+  // through set_oauth_token_resolver_hook: is_connected stays false forever
+  // because no MCPOAuthGrant is ever written for the editor, so gating the
+  // select-mode toggle on it made the connector permanently unattachable —
+  // even though the agent endpoints accept its selector with no
+  // connected-state check and the runtime resolves credentials without a
+  // grant (#1332).
+  const unauthorizedCustomMcp = () => ({ ...customMcpOauthApp(), name: "Records MCP" })
+
+  function renderSelectModeWith(apps: object[], onConnectSelected: () => void) {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => apps })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    return render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={selectedMcpServers}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+  }
+
+  it("selects and deselects a custom mcp_oauth connector the editor holds no grant for (#1332)", async () => {
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([unauthorizedCustomMcp()], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    // The click must toggle the selection, not divert to the detail modal.
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["Records MCP"])
+
+    // Removal has to work too, or an accidental attach would be unrevertable.
+    fireEvent.click(screen.getByText("Records MCP"))
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("keeps the per-server OAuth flow reachable from the card in select mode (#1323)", async () => {
+    // The card click no longer opens the detail modal for these entries, so
+    // the Connect button repaired in #1323 needs its own trigger — otherwise
+    // relaxing the gate would strip the interactive flow from editors who do
+    // authorize personally.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([unauthorizedCustomMcp()], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.authorize" }))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
+
+    // Opening the modal must not have counted as a selection toggle.
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("still gates selection on connected state for an unconnected catalog app", async () => {
+    // Only local/custom entries are relaxed. A catalog app reporting
+    // is_connected: false has no association row for this user at all, so
+    // connecting is a genuine prerequisite and the card must keep routing to
+    // the detail modal instead of attaching a connector that does not exist
+    // for them.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([keylessApp()], onConnectSelected)
+    await screen.findByText("Chrome")
+
+    fireEvent.click(screen.getByText("Chrome"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Chrome")
+    // No card-level Authorize trigger either: that is the mcp_oauth shape only.
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("still gates selection on a custom mcp_oauth entry whose association is deactivated", async () => {
+    // list_mcp_apps' local loop does not filter is_active, and emits auth_type
+    // only while the association *is* active — so a deactivated mcp_oauth
+    // server is listed as is_connected: false with no auth_type. The runtime's
+    // server query drops inactive associations outright, so attaching one would
+    // silently load zero tools; it needs re-enabling, not re-authorization, and
+    // must keep its card-click route to the detail modal.
+    const onConnectSelected = vi.fn()
+    const dormant: Record<string, unknown> = { ...unauthorizedCustomMcp() }
+    delete dormant.auth_type
+    renderSelectModeWith([dormant], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("opens the detail modal on card click outside select mode", async () => {
+    // The Tools page has no selection to toggle, so the card click keeps its
+    // original destination for connected and unconnected entries alike.
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [unauthorizedCustomMcp()] })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    render(<ConnectMcpDialog open onOpenChange={vi.fn()} selectedMcpServers={selectedMcpServers} />)
+    await screen.findByText("Records MCP")
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
   })
 })
