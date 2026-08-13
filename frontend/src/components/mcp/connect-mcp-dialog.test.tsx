@@ -578,14 +578,20 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     }
   })
 
-  it("rechecks a closed custom mcp_oauth popup against the local listing", async () => {
+  it("rechecks a closed custom mcp_oauth popup against the local listing and auto-selects it", async () => {
     // The popup's opener link is severed, so a closed popup is ambiguous and
     // the handler asks the backend what actually happened. A custom server
     // only exists under location=local — querying the remote branch (as the
     // catalog path does) would report every custom connect as a failure.
+    //
+    // Passing onConnectSelected also puts the dialog in select mode, which is
+    // what makes the connect-records trigger's autoSelect true — so a
+    // recheck that confirms the connection must also land "records" in the
+    // committed selection (#1332).
     const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
     const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
     const onSuccess = vi.fn()
+    const onConnectSelected = vi.fn()
     let localListCalls = 0
     try {
       apiRequestMock.mockImplementation((url: string) => {
@@ -614,6 +620,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
           onOpenChange={vi.fn()}
           selectedMcpServers={selectedMcpServers}
           onSuccess={onSuccess}
+          onConnectSelected={onConnectSelected}
         />,
       )
 
@@ -632,6 +639,14 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
       expect(localListCalls).toBe(1)
       expect(onSuccess).toHaveBeenCalled()
+
+      // Commit the selection to observe it. Fake timers are still active, so
+      // this must stay on synchronous queries (getByRole) — findBy*/waitFor
+      // would hang.
+      act(() => {
+        fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+      })
+      expect(onConnectSelected).toHaveBeenCalledWith(["records"])
     } finally {
       openSpy.mockRestore()
       vi.useRealTimers()
@@ -1709,6 +1724,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(screen.getByText("Records MCP"))
     // The click must toggle the selection, not divert to the detail modal.
     expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    // Becoming attachable must not change connected-state display: this
+    // connector is still unconnected (is_connected: false), so it must stay
+    // unchecked.
+    expect(screen.queryByTestId("connected-check")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith(["Records MCP"])
 
@@ -1716,6 +1735,19 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(screen.getByText("Records MCP"))
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("shows Configure and the connected checkmark, not Authorize, for a connected custom mcp_oauth entry (#1332)", async () => {
+    // isAttachable widening the select-mode gate must not disturb the
+    // isGloballyConnected branch of the footer ternary: a connected entry
+    // has to keep showing Configure plus the checkmark, never Authorize.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([{ ...unauthorizedCustomMcp(), is_connected: true }], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    expect(screen.getByRole("button", { name: "tools.mcp.dialog.configure" })).not.toBeNull()
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+    expect(screen.getByTestId("connected-check")).not.toBeNull()
   })
 
   it("keeps the per-server OAuth flow reachable from the card in select mode (#1323)", async () => {
@@ -1735,19 +1767,28 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("still gates selection on connected state for an unconnected catalog app", async () => {
-    // Only local/custom entries are relaxed. A catalog app reporting
-    // is_connected: false has no association row for this user at all, so
-    // connecting is a genuine prerequisite and the card must keep routing to
-    // the detail modal instead of attaching a connector that does not exist
-    // for them.
+  it("still gates selection on connected state for unconnected catalog apps", async () => {
+    // Only local/custom entries are relaxed. mcpOauthApp() (Granola) is the
+    // load-bearing fixture here: it carries the exact same auth_type as the
+    // custom mcp_oauth population this predicate widens, but it is a
+    // *catalog* entry, so its is_connected: false means the user has no
+    // association row for it at all — connecting really is a prerequisite,
+    // and dropping the is_custom conjunct would wrongly attach it. keylessApp
+    // (Chrome) is included alongside it as a non-mcp_oauth catalog control.
+    // Both must keep routing the card click to the detail modal instead of
+    // attaching a connector that does not exist for them.
     const onConnectSelected = vi.fn()
-    renderSelectModeWith([keylessApp()], onConnectSelected)
+    renderSelectModeWith([mcpOauthApp(), keylessApp()], onConnectSelected)
     await screen.findByText("Chrome")
+
+    fireEvent.click(screen.getByText("Granola"))
+    // Assert right after each click: a later click would overwrite this.
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Granola")
 
     fireEvent.click(screen.getByText("Chrome"))
     expect(screen.getByTestId("settings-open-app").textContent).toBe("Chrome")
-    // No card-level Authorize trigger either: that is the mcp_oauth shape only.
+
+    // No card-level Authorize trigger for either: is_custom is required too.
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
 
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))

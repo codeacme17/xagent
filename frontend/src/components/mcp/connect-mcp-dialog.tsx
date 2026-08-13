@@ -216,6 +216,14 @@ export function ConnectMcpDialog({
   // agent create/update endpoints accept its `mcp:<name>` selector with no
   // connected-state check and the runtime resolves credentials without a grant.
   //
+  // A custom mcp_oauth server whose consent was simply never started, or was
+  // abandoned partway, is indistinguishable in this listing from a
+  // hook-resolved one — create_mcp_server writes the association row at
+  // creation time, long before any consent, so is_connected is false either
+  // way. This predicate makes that server attachable too: the card shows no
+  // checkmark and offers Authorize as a one-click recovery, and the agent
+  // create/update endpoints never validated connected state to begin with.
+  //
   // Both conjuncts are load-bearing, and neither can be widened:
   //
   // - is_custom, because a *catalog* mcp_oauth app (e.g. Granola) carries the
@@ -224,11 +232,20 @@ export function ConnectMcpDialog({
   //   attaching it would select a connector that does not exist for them.
   // - auth_type, because the backend emits it on a local entry only for the
   //   mcp_oauth shape *and only while the association is active* (see
-  //   list_mcp_apps). A deactivated association is still listed with
-  //   is_connected: false, and the runtime's server query drops inactive
-  //   associations outright — attaching one would silently load zero tools.
-  //   That entry keeps its existing card-click route to the detail modal, where
-  //   it needs re-enabling rather than re-authorization.
+  //   list_mcp_apps). An association deactivated before any grant completed is
+  //   listed with is_connected: false and no auth_type, so it keeps its
+  //   existing card-click route to the detail modal, where it needs
+  //   re-enabling rather than re-authorization. That matters because the
+  //   runtime's server query drops inactive associations outright, so
+  //   attaching one would have loaded zero tools.
+  //
+  //   Deactivation *after* consent is a different, pre-existing story:
+  //   toggle_mcp_server only flips is_active and never revokes the grant, so
+  //   such an entry lists as is_connected: true and is attachable through the
+  //   first conjunct regardless of this one — showing the checkmark plus
+  //   Configure, never Authorize. The runtime still drops it, but the old gate
+  //   was is_connected alone, so that card behaves here exactly as it did
+  //   before this predicate existed.
   const isAttachable = (app: AppIntegration) =>
     isAppConnected(app) || (Boolean(app.is_custom) && app.auth_type === "mcp_oauth")
 
@@ -1301,7 +1318,7 @@ export function ConnectMcpDialog({
                       return (
                         <Card key={app.id} className={`p-[0] cursor-pointer transition-colors shadow-sm relative ${isSelectMode && isSelected ? 'border-blue-500 bg-blue-50/30 ring-1 ring-blue-500' : 'hover:border-slate-300 border-slate-200'}`} onClick={() => handleCardClick(app)}>
                           {isGloballyConnected && (
-                            <div className="absolute top-4 right-4 text-green-500">
+                            <div data-testid="connected-check" className="absolute top-4 right-4 text-green-500">
                               <CheckCircle2 className="h-5 w-5 fill-green-100" />
                             </div>
                           )}
