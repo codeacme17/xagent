@@ -32,7 +32,7 @@ from sqlalchemy import create_engine, text
 
 from xagent.db.config import create_alembic_config
 
-PARENT_REVISION = "20260812_add_slack_history_reactions_files_scopes"
+PARENT_REVISION = "20260812_seed_intercom_mcp_app"
 TARGET_REVISION = "20260813_trace_json_columns_to_jsonb"
 
 TRACE_JSON_COLUMNS = (
