@@ -19,6 +19,7 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -5476,3 +5477,209 @@ async def test_react_finalizes_a_scalar_zero_answer() -> None:
     assert result["response"] == "0"
     # Accepted on the first turn: no repair retry was spent.
     assert len(llm.stream_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_marks_the_abandoned_run_when_the_answer_stayed_empty() -> None:
+    """The abandoned result distinguishes "never answered" from other violations.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed control
+    calls, and a non-``final_answer`` tool on a forced turn. Delegated-child
+    classification reads this marker so it does not collapse all of them into
+    "never produced an answer" and discard the child's own diagnostic.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert "final_answer without an answer" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_does_not_mark_other_tool_protocol_violations() -> None:
+    """A non-empty-answer violation keeps the generic error and no marker."""
+
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is False
+    assert "invalid tool protocol response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_survives_a_state_roundtrip() -> None:
+    """The post-rejection state is recoverable through the real mechanism.
+
+    The guard exists for checkpoint resumes, so the rejection it performs has to
+    survive ``get_state``/``load_state`` rather than only an in-process mutation.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    resumed = ReActPattern(max_iterations=3)
+    resumed.load_state(pattern.get_state())
+    assert resumed.pending_tool_calls == pattern.pending_tool_calls
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    result = await resumed.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=PatternRuntime(execution_id="task-1"),
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+
+    # The forcing the rejection installed is itself serializable, which is what a
+    # crash between the rejection and the next turn would depend on.
+    carried = ReActPattern()
+    carried.load_state(resumed.get_state())
+    assert carried.force_final_answer_next is False  # cleared once answered
+    assert carried.tool_ledger["call_resumed"].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_abandons_after_forced_retry() -> None:
+    """resume -> reject -> forced turn -> empty -> in-turn retry -> abandon."""
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert pattern.pending_tool_calls == []
+    # The forced turn plus its one in-turn repair attempt, and no more.
+    assert len(llm.stream_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() -> None:
+    """Pins the documented limit of the resume guard's batch discard.
+
+    In ``[work_tool, final_answer("")]`` the work tool has already executed by
+    the time the rejection runs, so the match with the fresh path's
+    whole-response rejection is exact only when the empty answer comes first.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    tool = FakeTool()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    # The work tool ran: the rejection cannot reach back past it.
+    assert tool.calls == [{"expression": "2+2"}]
+    assert pattern.tool_ledger["call_work"].status == "completed"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+
+
+def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
+    """The rejection must not read back as a successful tool result."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {"id": "call_1", "name": "final_answer", "args": {"answer": ""}}
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    recorded = pattern.tool_ledger["call_1"]
+    assert recorded.status == "failed"
+    # The recorded result carries the keys ``tool_result_succeeded`` reads, so a
+    # consumer cannot read this failure back as a success.
+    assert tool_result_succeeded(recorded.result) is False
+    # Same shape as the cancelled siblings, so the ledger is uniform.
+    assert recorded.result["status"] == "error"
+    tool_messages = [m for m in context.messages if getattr(m, "role", None) == "tool"]
+    assert "empty answer" in tool_messages[-1].content
+
+
+def test_reject_empty_final_answer_tolerates_non_string_arg_keys() -> None:
+    """Log formatting must not abort the run it is diagnosing.
+
+    ``sorted`` over mixed-type keys raises ``TypeError``, and ``run()`` re-raises
+    from its ``except``, so an unsortable payload would fail the run at exactly
+    the point this guard exists to recover from.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {
+        "id": "call_1",
+        "name": "final_answer",
+        "args": {"answer": "", 1: "numeric", None: "null"},
+    }
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    assert pattern.force_final_answer_next is True

@@ -1528,11 +1528,28 @@ _CHILD_NO_ANSWER_MESSAGE = (
     "it to use."
 )
 
-# Child statuses that mean "the pattern ended without ever producing an answer".
-# Their own ``error`` text names runtime internals, which the parent model
-# cannot act on, so they get the message above and the allowlisted
-# ``missing_delegated_output`` code instead of the raw diagnostic.
-_CHILD_NO_ANSWER_STATUSES = frozenset({"invalid_tool_protocol"})
+
+def _child_never_answered(result: dict[str, Any]) -> bool:
+    """Whether the child's pattern ended without ever producing an answer.
+
+    ``invalid_tool_protocol`` alone is not enough: it also covers provider
+    protocol errors, mixed control calls, and a non-``final_answer`` tool on a
+    forced turn, all of which predate the empty-answer guard and may follow a
+    child that did produce text. For those the child's own ``error`` is the
+    parent's only signal, so it must survive rather than being replaced by
+    "never produced an answer". ReAct marks the empty-answer case explicitly
+    (``ReActPattern._invalid_tool_protocol_result``); only that maps here.
+    """
+
+    if result.get("empty_final_answer") is True:
+        return True
+    # ``AgentExecutionAdapter._normalize_result`` keeps the pattern's own result
+    # under ``agent_result``; the marker only survives there once normalized.
+    agent_result = result.get("agent_result")
+    return isinstance(agent_result, dict) and (
+        agent_result.get("empty_final_answer") is True
+    )
+
 
 # Recognized, not produced, here: ``AgentExecutionAdapter._normalize_result``
 # and this module's own post-run default substitute these when a run left no
@@ -1657,7 +1674,7 @@ def _classify_delegated_child_failure(
 
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
-        if isinstance(status, str) and status.lower() in _CHILD_NO_ANSWER_STATUSES:
+        if _child_never_answered(result):
             return _classified_failure(
                 _CHILD_NO_ANSWER_MESSAGE,
                 failure_code="missing_delegated_output",

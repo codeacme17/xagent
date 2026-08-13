@@ -1072,6 +1072,54 @@ async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker", "expects_no_answer_classification"),
+    [
+        pytest.param(True, True, id="empty-answer"),
+        pytest.param(False, False, id="other-protocol-violation"),
+    ],
+)
+async def test_agent_tool_child_protocol_failure_keeps_its_diagnostic(
+    monkeypatch, marker, expects_no_answer_classification
+):
+    """Only a genuinely unanswered child is classified as missing output.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed
+    control calls, and a non-``final_answer`` tool on a forced turn, which can
+    follow a child that did produce text. For those the child's own error is the
+    parent's only way to tell "the child model misbehaved" from "the child had
+    nothing to say", so it must survive classification.
+    """
+
+    child_error = "The model returned an invalid tool protocol response."
+
+    async def execute_task():
+        return {
+            "status": "invalid_tool_protocol",
+            "success": False,
+            "error": child_error,
+            "empty_final_answer": marker,
+        }
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["status"] == "error"
+    assert result["success"] is False
+    if expects_no_answer_classification:
+        assert result["failure_code"] == "missing_delegated_output"
+        assert child_error not in result["output"]
+    else:
+        assert "failure_code" not in result
+        assert result["output"] == child_error
+
+
+@pytest.mark.asyncio
 async def test_agent_tool_real_child_answering_with_placeholder_text_succeeds(
     monkeypatch, tmp_path
 ):

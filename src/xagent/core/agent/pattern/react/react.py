@@ -586,6 +586,9 @@ class ReActPattern(AgentPattern):
                         iteration=iteration,
                         answer_streamer=answer_streamer,
                         stream_failure_message=("invalid tool protocol after recovery"),
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
                     )
                 if answer_streamer is not None:
                     await answer_streamer.fail("invalid tool protocol, retrying")
@@ -599,7 +602,7 @@ class ReActPattern(AgentPattern):
                         "ReAct final_answer carried no answer text; discarding the "
                         "response and retrying. iteration=%s arg_keys=%s",
                         iteration,
-                        sorted(self._tool_call_args_dict(empty_final_answer)),
+                        sorted(self._tool_call_args_dict(empty_final_answer), key=str),
                     )
                 if recover_full_tool_set:
                     recovery_reason: str | None = "unavailable_tool_call"
@@ -648,6 +651,9 @@ class ReActPattern(AgentPattern):
                         iteration=iteration,
                         answer_streamer=answer_streamer,
                         stream_failure_message="invalid tool protocol after retry",
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
                     )
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
@@ -714,11 +720,24 @@ class ReActPattern(AgentPattern):
         iteration: int,
         answer_streamer: ReActFinalAnswerStreamer | None,
         stream_failure_message: str,
+        empty_final_answer: bool = False,
     ) -> dict[str, Any]:
+        """Abandon the run after the one repair attempt failed.
+
+        ``empty_final_answer`` distinguishes "the model never produced an answer"
+        from the status's other producers (provider protocol errors, mixed
+        control calls, a non-``final_answer`` tool on a forced turn), whose
+        ``error`` text is the only signal a caller has. Delegated-child
+        classification reads it to avoid collapsing all four into "never
+        produced an answer" - see ``agent_tool._classify_delegated_failure``.
+        """
+
         logger.warning(
-            "ReAct failing the run after an invalid tool protocol: %s (iteration=%s)",
+            "ReAct failing the run after an invalid tool protocol: %s "
+            "(iteration=%s empty_final_answer=%s)",
             stream_failure_message,
             iteration,
+            empty_final_answer,
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
@@ -728,15 +747,20 @@ class ReActPattern(AgentPattern):
             pattern=self,
             metadata={"iteration": iteration},
         )
+        error = (
+            "The model called final_answer without an answer twice, so the run "
+            "produced no response."
+            if empty_final_answer
+            else "The model returned an invalid tool protocol response "
+            "after one repair attempt."
+        )
         return PatternResult(
             success=False,
-            error=(
-                "The model returned an invalid tool protocol response "
-                "after one repair attempt."
-            ),
+            error=error,
             metadata={
                 "iterations": iteration + 1,
                 "status": "invalid_tool_protocol",
+                "empty_final_answer": empty_final_answer,
             },
         ).to_dict()
 
@@ -1657,8 +1681,8 @@ class ReActPattern(AgentPattern):
                             "answer": {
                                 "type": "string",
                                 "description": (
-                                    "Complete user-facing answer. It must match "
-                                    "response_language. "
+                                    "Complete user-facing answer. It must be "
+                                    "non-empty and must match response_language. "
                                     f"{final_answer_language_rule()}"
                                 ),
                             },
@@ -1967,37 +1991,54 @@ class ReActPattern(AgentPattern):
         makes the next turn re-request ``final_answer``, and if that turn is empty
         too the normalization guard fails the run instead of looping.
 
-        Two deliberate differences from the fresh-turn path. The rest of the
-        batch is discarded, matching the fresh path's whole-response rejection:
-        otherwise a resumed ``[final_answer(""), work_tool]`` batch would execute
-        a side-effecting tool that the fresh path never runs. And the next turn is
-        forced to ``final_answer`` alone, where the fresh path restores the full
-        tool set - forcing guarantees termination and no tool re-execution after a
-        resume, at the cost that a resumed run with genuinely incomplete work must
-        answer or fail rather than continue that work.
+        Two deliberate differences from the fresh-turn path.
+
+        Sibling calls still pending are discarded, matching the fresh path's
+        whole-response rejection for the order that matters: a resumed
+        ``[final_answer(""), work_tool]`` batch would otherwise execute a
+        side-effecting tool that the fresh path never runs. The match is not
+        exact in the reverse order - in ``[work_tool, final_answer("")]`` the
+        work tool has already executed by the time this runs, and nothing here
+        undoes it.
+
+        And the next turn is forced to ``final_answer`` alone, where the fresh
+        path restores the full tool set. That bounds the run: a second empty
+        answer ends it as ``invalid_tool_protocol`` rather than looping. It does
+        not prevent tool re-execution outright - if the forced turn calls a
+        non-``final_answer`` tool, ``_requires_full_tool_set_recovery`` restores
+        the full set and clears the flag, so a discarded work tool can be
+        re-invoked on that turn.
         """
 
         logger.warning(
             "ReAct refusing to finalize on final_answer with no answer text; "
             "re-requesting a final answer. tool_call_id=%s arg_keys=%s",
             tool_call.get("id"),
-            sorted(self._tool_call_args_dict(tool_call)),
+            sorted(self._tool_call_args_dict(tool_call), key=str),
         )
         error = (
             "final_answer was called with an empty answer, so the user received "
             "nothing. Call final_answer again with the complete user-facing "
             "response in its answer field."
         )
-        self._record_tool_call(tool_call, status="failed", error=error)
+        # Carry the classification keys ``tool_result_succeeded`` reads, so this
+        # failure is not read back as a success, and record the same shape in the
+        # ledger as the cancelled siblings below.
+        failure = {"success": False, "status": "error", "error": error}
+        self._record_tool_call(tool_call, status="failed", result=failure, error=error)
         context.add_tool_result(
             tool_name="final_answer",
-            result={"error": error},
+            result=failure,
             tool_call_id=tool_call.get("id"),
         )
         # Leave only the rejected call for the caller to pop, and close out the
         # rest of the batch so no unexecuted call is left without a result.
-        remaining = self.pending_tool_calls[1:]
-        self.pending_tool_calls = self.pending_tool_calls[:1]
+        # Selected by identity rather than position: the caller happens to pass
+        # the head of the queue today, but nothing here depends on that.
+        remaining = [
+            pending for pending in self.pending_tool_calls if pending is not tool_call
+        ]
+        self.pending_tool_calls = [tool_call]
         self._cancel_tool_calls(
             remaining,
             context,
