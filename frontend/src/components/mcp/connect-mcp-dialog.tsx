@@ -232,10 +232,14 @@ export function ConnectMcpDialog({
   //   attaching it would select a connector that does not exist for them.
   // - auth_type, because the backend emits it on a local entry only when a
   //   personal association exists, is active, and the server is the
-  //   mcp_oauth shape (see list_mcp_apps). One consequence: a team-owned
-  //   connector surfaced by #1338's visibility overlay has no personal
-  //   association, so it gets no auth_type either, and this predicate routes
-  //   it to the detail modal instead of making it attachable.
+  //   mcp_oauth shape (see list_mcp_apps). One consequence, once #1338's team
+  //   visibility overlay is in the tree (it is on main, but landed after this
+  //   branch was cut, so the population is not reproducible from this
+  //   branch's own backend): a team-owned connector the overlay surfaces has
+  //   no personal association, so it gets no auth_type either, and this
+  //   predicate routes it to the detail modal instead of making it
+  //   attachable. #1347 tracks expressing that case as attachable-but-not-
+  //   authorizable rather than deciding it by an absent hint.
   //
   //   An association deactivated before any grant completed is likewise
   //   listed with is_connected: false and no auth_type, so it keeps its

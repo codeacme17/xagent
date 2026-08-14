@@ -1342,6 +1342,18 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       })
 
       expect(onSuccess).toHaveBeenCalled()
+
+      // Commit the selection to observe the auto-select this test is named
+      // for: the append is local state, so onConnectSelected only sees it
+      // through the footer. Granola is the fixture that makes the assertion
+      // discriminating — its id ("granola") and display name ("Granola")
+      // differ, so this fails if the append ever switches to app.id, whereas
+      // the custom-server equivalent below cannot tell the two apart (its id
+      // and name are both "records").
+      act(() => {
+        fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+      })
+      expect(onConnectSelected).toHaveBeenCalledWith(["Granola"])
     } finally {
       openSpy.mockRestore()
       vi.useRealTimers()
@@ -1767,14 +1779,13 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     renderSelectModeWith([{ ...unauthorizedCustomMcp(), is_connected: true }], onConnectSelected)
     await screen.findByText("Records MCP")
 
-    expect(screen.getByRole("button", { name: "tools.mcp.dialog.configure" })).not.toBeNull()
+    // getBy* throws when absent, so the bare calls are the assertions.
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
     // Scoped through the card: connected-check is non-unique across the grid
     // by construction, so an ungrounded query would throw as soon as a
     // second connected app rendered.
-    expect(
-      within(screen.getByTestId("connector-card-records")).getByTestId("connected-check"),
-    ).not.toBeNull()
+    within(screen.getByTestId("connector-card-records")).getByTestId("connected-check")
   })
 
   it("keeps the per-server OAuth flow reachable from the card in select mode (#1323)", async () => {
@@ -1829,7 +1840,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     // auth_type. (toggle_mcp_server never revokes a completed grant, so this
     // only holds pre-consent: deactivating *after* consent instead lists
     // is_connected: true and is attachable through the first disjunct, with
-    // the checkmark and Configure — that population is exercised elsewhere.)
+    // the checkmark and Configure. No test renders that exact shape — it is
+    // indistinguishable here from an ordinary connected entry, and the
+    // regression it would guard against, replacing the first disjunct with
+    // one that also demands auth_type, already fails the seeded keyless
+    // test below.)
     // The runtime's server query drops inactive associations outright, so
     // attaching this one would silently load zero tools — hence it must keep
     // its card-click route to the detail modal rather than becoming
