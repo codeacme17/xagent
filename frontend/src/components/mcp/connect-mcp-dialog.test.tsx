@@ -1683,8 +1683,20 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     )
     await screen.findByText("Chrome")
 
+    // The card must render selected from the id-only seed before the click —
+    // isSelected matches by id OR name, not just name.
+    expect(screen.getByTestId("connector-card-chrome-devtools")).toHaveAttribute(
+      "data-selected",
+      "true",
+    )
+
     // One click on the visually-selected card must deselect it outright.
     fireEvent.click(screen.getByText("Chrome"))
+
+    expect(screen.getByTestId("connector-card-chrome-devtools")).toHaveAttribute(
+      "data-selected",
+      "false",
+    )
 
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenCalledWith([])
@@ -1699,13 +1711,19 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   // grant (#1332).
   const unauthorizedCustomMcp = () => ({ ...customMcpOauthApp(), name: "Records MCP" })
 
-  function renderSelectModeWith(apps: object[], onConnectSelected: () => void) {
+  // Shared by renderSelectModeWith below and the non-select-mode card-click
+  // test, which otherwise duplicated this exact mockImplementation block.
+  function mockAppsList(apps: object[]) {
     apiRequestMock.mockImplementation((url: string) => {
       if (url.includes("/api/mcp/apps?")) {
         return Promise.resolve({ ok: true, json: async () => apps })
       }
       throw new Error(`Unexpected request: ${url}`)
     })
+  }
+
+  function renderSelectModeWith(apps: object[], onConnectSelected: () => void) {
+    mockAppsList(apps)
     return render(
       <ConnectMcpDialog
         open
@@ -1726,8 +1744,12 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(screen.getByTestId("settings-open-app").textContent).toBe("")
     // Becoming attachable must not change connected-state display: this
     // connector is still unconnected (is_connected: false), so it must stay
-    // unchecked.
-    expect(screen.queryByTestId("connected-check")).toBeNull()
+    // unchecked. Scoped through the card: connected-check is non-unique
+    // across the grid by construction, so an ungrounded query would throw as
+    // soon as a second connected app rendered.
+    expect(
+      within(screen.getByTestId("connector-card-records")).queryByTestId("connected-check"),
+    ).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith(["Records MCP"])
 
@@ -1747,7 +1769,12 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     expect(screen.getByRole("button", { name: "tools.mcp.dialog.configure" })).not.toBeNull()
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
-    expect(screen.getByTestId("connected-check")).not.toBeNull()
+    // Scoped through the card: connected-check is non-unique across the grid
+    // by construction, so an ungrounded query would throw as soon as a
+    // second connected app rendered.
+    expect(
+      within(screen.getByTestId("connector-card-records")).getByTestId("connected-check"),
+    ).not.toBeNull()
   })
 
   it("keeps the per-server OAuth flow reachable from the card in select mode (#1323)", async () => {
@@ -1795,13 +1822,19 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("still gates selection on a custom mcp_oauth entry whose association is deactivated", async () => {
+  it("still gates selection on a custom mcp_oauth entry whose association was deactivated before consent completed", async () => {
     // list_mcp_apps' local loop does not filter is_active, and emits auth_type
     // only while the association *is* active — so a deactivated mcp_oauth
-    // server is listed as is_connected: false with no auth_type. The runtime's
-    // server query drops inactive associations outright, so attaching one would
-    // silently load zero tools; it needs re-enabling, not re-authorization, and
-    // must keep its card-click route to the detail modal.
+    // server with no completed grant is listed as is_connected: false with no
+    // auth_type. (toggle_mcp_server never revokes a completed grant, so this
+    // only holds pre-consent: deactivating *after* consent instead lists
+    // is_connected: true and is attachable through the first disjunct, with
+    // the checkmark and Configure — that population is exercised elsewhere.)
+    // The runtime's server query drops inactive associations outright, so
+    // attaching this one would silently load zero tools — hence it must keep
+    // its card-click route to the detail modal rather than becoming
+    // selectable. That route offers no recovery today either; see the
+    // isAttachable comment.
     const onConnectSelected = vi.fn()
     const dormant: Record<string, unknown> = { ...unauthorizedCustomMcp() }
     delete dormant.auth_type
@@ -1819,12 +1852,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   it("opens the detail modal on card click outside select mode", async () => {
     // The Tools page has no selection to toggle, so the card click keeps its
     // original destination for connected and unconnected entries alike.
-    apiRequestMock.mockImplementation((url: string) => {
-      if (url.includes("/api/mcp/apps?")) {
-        return Promise.resolve({ ok: true, json: async () => [unauthorizedCustomMcp()] })
-      }
-      throw new Error(`Unexpected request: ${url}`)
-    })
+    mockAppsList([unauthorizedCustomMcp()])
     render(<ConnectMcpDialog open onOpenChange={vi.fn()} selectedMcpServers={selectedMcpServers} />)
     await screen.findByText("Records MCP")
 

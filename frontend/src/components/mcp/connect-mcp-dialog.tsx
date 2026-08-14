@@ -230,12 +230,23 @@ export function ConnectMcpDialog({
   //   same auth_type while is_connected: false there means the user has no
   //   association row for it at all. Connecting really is a prerequisite, so
   //   attaching it would select a connector that does not exist for them.
-  // - auth_type, because the backend emits it on a local entry only for the
-  //   mcp_oauth shape *and only while the association is active* (see
-  //   list_mcp_apps). An association deactivated before any grant completed is
+  // - auth_type, because the backend emits it on a local entry only when a
+  //   personal association exists, is active, and the server is the
+  //   mcp_oauth shape (see list_mcp_apps). One consequence: a team-owned
+  //   connector surfaced by #1338's visibility overlay has no personal
+  //   association, so it gets no auth_type either, and this predicate routes
+  //   it to the detail modal instead of making it attachable.
+  //
+  //   An association deactivated before any grant completed is likewise
   //   listed with is_connected: false and no auth_type, so it keeps its
-  //   existing card-click route to the detail modal, where it needs
-  //   re-enabling rather than re-authorization. That matters because the
+  //   existing card-click route to the detail modal — and that route offers
+  //   no recovery today: the modal's Connect button has no auth_type to
+  //   dispatch on, so it falls through to the mis-authored-entry toast, and
+  //   nothing in the frontend calls the toggle endpoint that would
+  //   reactivate the association. (list_mcp_apps withholds auth_type here
+  //   because, in its own words, "a deactivated server needs re-enabling,
+  //   not re-authorization" — that is the backend's rationale for omitting
+  //   the field, not a recovery this modal actually offers.) Regardless, the
   //   runtime's server query drops inactive associations outright, so
   //   attaching one would have loaded zero tools.
   //
@@ -1316,7 +1327,13 @@ export function ConnectMcpDialog({
                       const isSelected = localSelectedServers.includes(app.id) || localSelectedServers.includes(app.name)
                       const isLoading = loadingApps.has(app.id)
                       return (
-                        <Card key={app.id} className={`p-[0] cursor-pointer transition-colors shadow-sm relative ${isSelectMode && isSelected ? 'border-blue-500 bg-blue-50/30 ring-1 ring-blue-500' : 'hover:border-slate-300 border-slate-200'}`} onClick={() => handleCardClick(app)}>
+                        <Card
+                          key={app.id}
+                          data-testid={`connector-card-${app.id}`}
+                          data-selected={isSelectMode && isSelected}
+                          className={`p-[0] cursor-pointer transition-colors shadow-sm relative ${isSelectMode && isSelected ? 'border-blue-500 bg-blue-50/30 ring-1 ring-blue-500' : 'hover:border-slate-300 border-slate-200'}`}
+                          onClick={() => handleCardClick(app)}
+                        >
                           {isGloballyConnected && (
                             <div data-testid="connected-check" className="absolute top-4 right-4 text-green-500">
                               <CheckCircle2 className="h-5 w-5 fill-green-100" />
