@@ -2038,9 +2038,24 @@ def list_mcp_apps(
                 .all()
             )
 
-        library_names = {app["name"].lower() for app in library_apps}
+        # Skip the rows the catalog branch already speaks for, matching a row to
+        # an app on the same keys that branch does (_app_lookup_keys, via
+        # _connected_non_oauth_server_for_app). Two conventions name a catalog
+        # app's shared row: the app_id (_ensure_catalog_app_server,
+        # _ensure_catalog_mcp_oauth_server) and the display name
+        # (_ensure_user_mcp_server, for builtin_oauth). Keying the skip on names
+        # alone let every app whose app_id and name differ — google-maps/"Google
+        # Maps" and chrome-devtools/"Chrome" ship that way — through as a second,
+        # is_custom entry: a Configure button pointed at the custom-server edit
+        # form, and, for the mcp_oauth shape, an entry the picker considered
+        # attachable with no grant behind it (#1346).
+        library_keys = {
+            key
+            for app in library_apps
+            for key in _app_lookup_keys(app.get("id"), app.get("name"))
+        }
         for server, user_mcp in local_mcps:
-            if server.name.lower() in library_names:
+            if _normalize_app_key(server.name) in library_keys:
                 continue
 
             if search:

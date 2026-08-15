@@ -665,8 +665,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # seeded app uses. Known, accepted caveat: api/mcp.py couples
             # catalog apps to user-server names by normalized id AND display
             # name (_is_reserved_catalog_name rejects creating/renaming a
-            # server to either; library_names hides user servers whose name
-            # matches a catalog app name) -- and the display name below is
+            # server to either; the local branch's library_keys skip hides
+            # user servers matching either key) -- and the display name below is
             # deliberately kept as the friendlier "Chrome", so a user-created
             # server literally named "chrome"/"Chrome" is still rejected on
             # create/rename and suppressed from the local listing. Product
