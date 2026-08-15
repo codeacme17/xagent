@@ -976,8 +976,21 @@ export function ConnectMcpDialog({
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
+  // Whether this entry is in the working selection, by the same id-OR-name
+  // check the card's own isSelected uses.
+  const isLocallySelected = (app: AppIntegration) =>
+    localSelectedServers.some(name => name === app.id || name === app.name)
+
   const handleCardClick = (app: AppIntegration) => {
-    if (isSelectMode && isAttachable(app)) {
+    // Deselection is not gated on can_attach (#1347). An entry can become
+    // unattachable while it is already in the selection -- a connector
+    // disabled on the Tools page after being attached, or one attached before
+    // this gate existed -- and the card still renders selected, because
+    // isSelected is computed from the selection alone. Refusing the click
+    // there would leave a visibly-selected card that clicking only ever opens
+    // a modal for, the same un-removable state #1280 was filed for. Attaching
+    // stays gated; only removing is always allowed.
+    if (isSelectMode && (isAttachable(app) || isLocallySelected(app))) {
       // Match isSelected's own check (id OR name) below, not just name: a
       // consumer (e.g. agent-builder.tsx re-seeding after save) can store
       // this connector's id instead of its display name once resolved to

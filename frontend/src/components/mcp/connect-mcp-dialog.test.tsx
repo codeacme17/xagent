@@ -1949,6 +1949,48 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
+  it("deselects an entry that became unattachable while already selected", async () => {
+    // can_attach can go false under a selection that already exists: a
+    // connector disabled on the Tools page after being attached, or one
+    // attached before the gate existed. The card still renders selected
+    // (isSelected reads the selection, not the gate), so refusing the click
+    // would leave it visibly selected and removable only from the builder's
+    // own list — the un-removable state #1280 was filed for. Attaching stays
+    // gated; removing does not.
+    const onConnectSelected = vi.fn()
+    const dormant = {
+      ...unauthorizedCustomMcp(),
+      is_connected: true,
+      can_attach: false,
+      can_authorize: false,
+    }
+    mockAppsList([dormant])
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={["Records MCP"]}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+    await screen.findByText("Records MCP")
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "true")
+
+    fireEvent.click(screen.getByText("Records MCP"))
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "false")
+    // Removing must not have opened the modal instead.
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+
+    // And it must not be re-attachable: the gate still refuses the second click.
+    fireEvent.click(
+      within(screen.getByTestId("connector-card-records")).getByText("Records MCP"),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
   it("opens the detail modal on card click outside select mode", async () => {
     // The Tools page has no selection to toggle, so the card click keeps its
     // original destination for connected and unconnected entries alike — and
