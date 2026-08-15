@@ -1852,6 +1852,84 @@ def _mcp_oauth_server_is_actually_connected(
     return cast(int, server.id) in active_grant_server_ids
 
 
+def _local_mcp_can_attach(
+    server: MCPServer,
+    user_mcp: Optional[UserMCPServer],
+    *,
+    active_grant_server_ids: set[int],
+    token_resolver_installed: bool,
+) -> bool:
+    """Whether a local entry may be selected into an agent (#1347).
+
+    Two independent conditions, matching what the runtime actually does with
+    the selection in ``_load_visible_runtime_connectors``:
+
+    - The runtime resolves a server through the user's own *active*
+      association, or through the team link the visibility hook reports. A
+      deactivated personal association is dropped there, so attaching it would
+      load zero tools; ``user_mcp is None`` means the entry reached this
+      listing through the team overlay alone (#1338), which the runtime
+      overlays identically.
+    - Credentials must plausibly resolve. Only the mcp_oauth shape can fail
+      this: every other shape carries its credentials on the server row and its
+      env layers. An mcp_oauth server needs an active ``MCPOAuthGrant`` for the
+      requesting user, or a resolver hook that may supply tokens out of band --
+      the latter being deployment-level and coarse by necessity, see
+      ``oauth_token_resolver_installed``.
+
+    Before this field the picker re-derived the decision from
+    ``is_connected``/``is_custom``/``auth_type`` and got a strictly looser
+    answer: a custom mcp_oauth server whose consent was never started was
+    attachable in every deployment and failed at run time with "MCP server
+    credentials are unavailable". Standalone xagent installs no resolver, so
+    that population now fails early instead, with the detail modal's Connect
+    (#1323) as its recovery.
+    """
+    association_ok = user_mcp is None or bool(user_mcp.is_active)
+    if not association_ok:
+        return False
+    if not _is_mcp_oauth_server(server):
+        return True
+    return cast(int, server.id) in active_grant_server_ids or token_resolver_installed
+
+
+def _local_mcp_can_authorize(
+    server: MCPServer,
+    user_mcp: Optional[UserMCPServer],
+    *,
+    token_resolver_installed: bool,
+) -> bool:
+    """Whether starting the per-server MCP OAuth flow is meaningful (#1347).
+
+    Scoped to ``POST /api/mcp/{server_id}/oauth/connect``, the route the
+    picker's card-level Authorize trigger starts. Catalog entries connect
+    through ``/apps/{app_id}/oauth/connect`` (or the provider login) dispatched
+    on ``auth_type`` as they always have, and deliberately report ``False``
+    here rather than having this field restate that dispatch.
+
+    Three ways the flow is not meaningful:
+
+    - The server is not the mcp_oauth shape, so there is no consent to give.
+    - The user holds no active personal association. The endpoint resolves one
+      with ``require_active=True`` and 404s otherwise, so both a team-owned row
+      (``user_mcp is None``, #1338) and a deactivated one would dead-end in a
+      failed popup -- the latter needs re-enabling, not re-authorization.
+    - A resolver hook supplies this deployment's tokens out of band. There is
+      then no interactive consent and no identity the editor could sign in as,
+      so the trigger would assert "needs authorization" against a connector
+      that has no authorization step at all (#1332).
+
+    Unlike ``can_attach`` this does not consider grant state: re-consenting an
+    already-granted server is legitimate, and the picker gates the trigger on
+    unconnected state itself.
+    """
+    if token_resolver_installed:
+        return False
+    if user_mcp is None or not user_mcp.is_active:
+        return False
+    return _is_mcp_oauth_server(server)
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -1932,6 +2010,12 @@ def list_mcp_apps(
         .all()
     }
 
+    # Read once for the whole response: the hook is a process-global, so every
+    # entry in one listing must be decided against the same answer.
+    from ..tools.config import oauth_token_resolver_installed
+
+    token_resolver_installed = oauth_token_resolver_installed()
+
     if location in ["remote", "all"]:
         for app in library_apps:
             if app.get("auth_type") == "builtin_oauth":
@@ -1992,6 +2076,12 @@ def list_mcp_apps(
 
             app_copy = app.copy()
             app_copy["is_connected"] = is_connected
+            # A catalog app the user never connected has no association row at
+            # all, so there is no connector to attach -- connecting really is
+            # the prerequisite. Stating that here is what stops the picker from
+            # inferring it from is_custom's absence on this branch (#1347).
+            app_copy["can_attach"] = is_connected
+            app_copy["can_authorize"] = False
             app_copy["shared_env_available"] = app_shared_env
             app_copy["platform_env_available"] = app_platform_env
             app_copy["user_env_configured"] = app_user_env
@@ -2073,6 +2163,17 @@ def list_mcp_apps(
                 "is_local": True,
                 "server_id": server.id,
                 "is_custom": True,
+                "can_attach": _local_mcp_can_attach(
+                    server,
+                    user_mcp,
+                    active_grant_server_ids=active_grant_server_ids,
+                    token_resolver_installed=token_resolver_installed,
+                ),
+                "can_authorize": _local_mcp_can_authorize(
+                    server,
+                    user_mcp,
+                    token_resolver_installed=token_resolver_installed,
+                ),
             }
             # The picker dispatches its Connect button on auth_type, and custom
             # entries used to omit the field entirely — so an mcp_oauth server
@@ -2090,6 +2191,13 @@ def list_mcp_apps(
             # excluded for the same reason, more strongly: the member holds no
             # association at all, so /{server_id}/oauth/connect would 404 and
             # the advertised flow would dead-end in a failed popup.
+            #
+            # can_authorize above repeats those last two exclusions on purpose:
+            # this field still answers "which Connect flow does the settings
+            # dialog dispatch", while can_authorize answers "may the picker
+            # advertise consent" and additionally goes false when a resolver
+            # hook supplies the tokens. Keeping them separate is what let the
+            # picker stop reading auth_type as an attachability hint (#1347).
             if (
                 user_mcp is not None
                 and user_mcp.is_active
@@ -2108,19 +2216,23 @@ def list_mcp_apps(
         )
 
         # Same overlay as the MCP half above: a team-owned Custom API has no
-        # UserCustomApi row for the member. Nothing in the entry below reads
-        # the association, so team-owned APIs need no stand-in — only the id.
-        local_custom_apis: list[CustomApi] = [
-            api for _user_api, api in user_custom_apis
+        # UserCustomApi row for the member, so it is carried as (api, None).
+        # The association is read only for can_attach below — a team-owned API
+        # is one the runtime overlays by id, exactly like the MCP half.
+        local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
+            (api, user_api) for user_api, api in user_custom_apis
         ]
-        own_api_ids = {cast(int, api.id) for api in local_custom_apis}
+        own_api_ids = {cast(int, api.id) for api, _ in local_custom_apis}
         missing_api = [aid for aid in team_ids["custom_api"] if aid not in own_api_ids]
         if missing_api:
             local_custom_apis.extend(
-                db.query(CustomApi).filter(CustomApi.id.in_(missing_api)).all()
+                (api, None)
+                for api in db.query(CustomApi)
+                .filter(CustomApi.id.in_(missing_api))
+                .all()
             )
 
-        for api in local_custom_apis:
+        for api, user_api in local_custom_apis:
             if search:
                 search_lower = search.lower()
                 if search_lower not in api.name.lower() and (
@@ -2145,6 +2257,16 @@ def list_mcp_apps(
                     "is_local": True,
                     "server_id": api.id,
                     "is_custom": True,
+                    # A Custom API carries its own credentials on the row and
+                    # has no OAuth consent step of any kind, so credentials
+                    # never gate it and consent is never meaningful -- which is
+                    # also why this loop reports is_connected: True
+                    # unconditionally. Only the association gate applies, and
+                    # for the same reason as the MCP half: the runtime's own
+                    # query filters UserCustomApi.is_active, so a deactivated
+                    # API would load zero tools if attached.
+                    "can_attach": user_api is None or bool(user_api.is_active),
+                    "can_authorize": False,
                     "runtime_input_schema": api.runtime_input_schema,
                     "runtime_bindings": api.runtime_bindings,
                     "allow_delegated_authorization": bool(
