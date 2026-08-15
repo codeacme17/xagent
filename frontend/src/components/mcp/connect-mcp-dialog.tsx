@@ -218,7 +218,15 @@ export function ConnectMcpDialog({
   // time, and a team-owned one was refused for want of an auth_type hint.
   //
   // Entries with can_attach false keep their card-click route to the detail
-  // modal, where Connect starts the flow repaired in #1323.
+  // modal, where Connect starts the flow repaired in #1323 — for the entries
+  // that carry an auth_type to dispatch on. One population does not: an
+  // association deactivated *before* any consent completed is listed with
+  // is_connected: false and no auth_type, so the modal's Connect falls through
+  // handleConnectApp's dispatch to the mis-authored-entry toast, and nothing
+  // in the frontend calls the toggle endpoint that would re-enable it. That
+  // dead end predates this gate (the backend withholds auth_type there because
+  // "a deactivated server needs re-enabling, not re-authorization") and is
+  // tracked separately; keep it recorded here so it stays discoverable.
   const isAttachable = (app: AppIntegration) => Boolean(app.can_attach)
 
   // Whether the card may advertise interactive authorization. Separate from
@@ -976,10 +984,16 @@ export function ConnectMcpDialog({
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
-  // Whether this entry is in the working selection, by the same id-OR-name
-  // check the card's own isSelected uses.
+  // The one id-OR-name selection check, previously written out at three
+  // sites. List-taking rather than closing over localSelectedServers, because
+  // the toggle below runs inside a functional updater and must read `prev`,
+  // not the render-time value. Deliberately does not absorb onDisconnect's
+  // case-insensitive variant, which is a different comparison.
+  const selectionMatches = (list: string[], app: AppIntegration) =>
+    list.some(name => name === app.id || name === app.name)
+
   const isLocallySelected = (app: AppIntegration) =>
-    localSelectedServers.some(name => name === app.id || name === app.name)
+    selectionMatches(localSelectedServers, app)
 
   const handleCardClick = (app: AppIntegration) => {
     // Deselection is not gated on can_attach (#1347). An entry can become
@@ -1001,7 +1015,7 @@ export function ConnectMcpDialog({
       // still selected, and clicking again just oscillated between the two
       // states without ever reaching "deselected").
       setLocalSelectedServers(prev =>
-        prev.some(name => name === app.id || name === app.name)
+        selectionMatches(prev, app)
           ? prev.filter(name => name !== app.id && name !== app.name)
           : [...prev, app.name]
       );
@@ -1305,7 +1319,7 @@ export function ConnectMcpDialog({
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {apps.map(app => {
                       const isGloballyConnected = isAppConnected(app)
-                      const isSelected = localSelectedServers.includes(app.id) || localSelectedServers.includes(app.name)
+                      const isSelected = isLocallySelected(app)
                       const isLoading = loadingApps.has(app.id)
                       return (
                         <Card

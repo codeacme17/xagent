@@ -12,6 +12,7 @@ import json
 import logging
 import secrets
 import shlex
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
@@ -1856,20 +1857,23 @@ def _local_mcp_can_attach(
     server: MCPServer,
     user_mcp: Optional[UserMCPServer],
     *,
+    team_mcp_ids: Collection[int],
     active_grant_server_ids: set[int],
     token_resolver_installed: bool,
 ) -> bool:
     """Whether a local entry may be selected into an agent (#1347).
 
-    Two independent conditions, matching what the runtime actually does with
-    the selection in ``_load_visible_runtime_connectors``:
+    Two independent conditions:
 
-    - The runtime resolves a server through the user's own *active*
-      association, or through the team link the visibility hook reports. A
-      deactivated personal association is dropped there, so attaching it would
-      load zero tools; ``user_mcp is None`` means the entry reached this
-      listing through the team overlay alone (#1338), which the runtime
-      overlays identically.
+    - The runtime must see the connector at all. Delegated to
+      ``connector_visible_to_user``, the in-Python twin of the
+      ``visible_*_clause`` predicates, so this endpoint expresses the
+      visibility rule the same way the runtime loader and the SQL clauses do
+      instead of restating it. Restating it is what produced the bug this
+      argument exists to fix: ``is_active`` gates only the *personal* arm, so
+      a team-visible connector stays attachable through a deactivated personal
+      link, which a bare ``user_mcp.is_active`` check refused while
+      ``_load_visible_runtime_connectors`` loaded it.
     - Credentials must plausibly resolve. Only the mcp_oauth shape can fail
       this: every other shape carries its credentials on the server row and its
       env layers. An mcp_oauth server needs an active ``MCPOAuthGrant`` for the
@@ -1877,20 +1881,55 @@ def _local_mcp_can_attach(
       the latter being deployment-level and coarse by necessity, see
       ``oauth_token_resolver_installed``.
 
-    Before this field the picker re-derived the decision from
-    ``is_connected``/``is_custom``/``auth_type`` and got a strictly looser
-    answer: a custom mcp_oauth server whose consent was never started was
-    attachable in every deployment and failed at run time with "MCP server
-    credentials are unavailable". Standalone xagent installs no resolver, so
-    that population now fails early instead, with the detail modal's Connect
-    (#1323) as its recovery.
+    Two approximations, both deliberate and both loose in the same direction
+    (this may say yes where the runtime later says no; it never says no where
+    the runtime would have succeeded):
+
+    - The grant check accepts any active ``MCPOAuthGrant`` for the user, while
+      the runtime's ``select_mcp_oauth_grants`` additionally matches
+      canonicalized resource, issuer, ``resource_owner_key``, configured
+      ``client_id``, and a required-scope subset. Editing a server's auth
+      config does not reconcile existing grants, so an edited server can
+      report attachable and still fail at run time. Narrowing this belongs at
+      the source (revoking grants the edit invalidates), not in a fourth copy
+      of that six-term predicate here.
+    - The resolver hook is probed for presence, not for this provider and
+      user; a truthful answer would mean one embedder round-trip per listed
+      connector on a list request.
     """
-    association_ok = user_mcp is None or bool(user_mcp.is_active)
-    if not association_ok:
+    from ..services.connector_team_scope import connector_visible_to_user
+
+    if not connector_visible_to_user(
+        association=user_mcp,
+        connector_id=cast(int, server.id),
+        team_ids=team_mcp_ids,
+    ):
         return False
     if not _is_mcp_oauth_server(server):
         return True
     return cast(int, server.id) in active_grant_server_ids or token_resolver_installed
+
+
+def _local_mcp_consent_association_ok(
+    server: MCPServer, user_mcp: Optional[UserMCPServer]
+) -> bool:
+    """Whether ``POST /api/mcp/{server_id}/oauth/connect`` would resolve.
+
+    The endpoint calls ``_get_user_mcp_server_or_404(..., require_active=True)``
+    on the mcp_oauth shape, so all three terms are the endpoint's own
+    preconditions. Deliberately *not* the visibility rule above: a team-owned
+    row (``user_mcp is None``) is visible and attachable, yet has no personal
+    association for that route to resolve, so consent there would 404.
+
+    Shared by ``can_authorize`` and the ``auth_type`` hint below, which is the
+    same condition plus, respectively, the resolver term and nothing -- they
+    used to be two textual copies that could drift apart silently.
+    """
+    return (
+        user_mcp is not None
+        and bool(user_mcp.is_active)
+        and _is_mcp_oauth_server(server)
+    )
 
 
 def _local_mcp_can_authorize(
@@ -1907,17 +1946,14 @@ def _local_mcp_can_authorize(
     on ``auth_type`` as they always have, and deliberately report ``False``
     here rather than having this field restate that dispatch.
 
-    Three ways the flow is not meaningful:
-
-    - The server is not the mcp_oauth shape, so there is no consent to give.
-    - The user holds no active personal association. The endpoint resolves one
-      with ``require_active=True`` and 404s otherwise, so both a team-owned row
-      (``user_mcp is None``, #1338) and a deactivated one would dead-end in a
-      failed popup -- the latter needs re-enabling, not re-authorization.
-    - A resolver hook supplies this deployment's tokens out of band. There is
-      then no interactive consent and no identity the editor could sign in as,
-      so the trigger would assert "needs authorization" against a connector
-      that has no authorization step at all (#1332).
+    False in three cases: the endpoint's own preconditions fail (see
+    ``_local_mcp_consent_association_ok`` -- not the mcp_oauth shape, no
+    personal association, or a deactivated one, which needs re-enabling rather
+    than re-authorization); or a resolver hook supplies this deployment's
+    tokens out of band, where there is no interactive consent and no identity
+    the editor could sign in as, so the trigger would assert "needs
+    authorization" against a connector that has no authorization step at all
+    (#1332).
 
     Unlike ``can_attach`` this does not consider grant state: re-consenting an
     already-granted server is legitimate, and the picker gates the trigger on
@@ -1925,9 +1961,7 @@ def _local_mcp_can_authorize(
     """
     if token_resolver_installed:
         return False
-    if user_mcp is None or not user_mcp.is_active:
-        return False
-    return _is_mcp_oauth_server(server)
+    return _local_mcp_consent_association_ok(server, user_mcp)
 
 
 @mcp_router.get("/apps", response_model=List[dict])
@@ -2108,7 +2142,10 @@ def list_mcp_apps(
         # me*", which only a personal association can establish. Standalone
         # deployments install no hook, resolve empty, and take the same path
         # they always did.
-        from ..services.connector_team_scope import visible_team_connector_ids
+        from ..services.connector_team_scope import (
+            connector_visible_to_user,
+            visible_team_connector_ids,
+        )
 
         team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
 
@@ -2166,6 +2203,7 @@ def list_mcp_apps(
                 "can_attach": _local_mcp_can_attach(
                     server,
                     user_mcp,
+                    team_mcp_ids=team_ids["mcp"],
                     active_grant_server_ids=active_grant_server_ids,
                     token_resolver_installed=token_resolver_installed,
                 ),
@@ -2198,11 +2236,7 @@ def list_mcp_apps(
             # advertise consent" and additionally goes false when a resolver
             # hook supplies the tokens. Keeping them separate is what let the
             # picker stop reading auth_type as an attachability hint (#1347).
-            if (
-                user_mcp is not None
-                and user_mcp.is_active
-                and _is_mcp_oauth_server(server)
-            ):
+            if _local_mcp_consent_association_ok(server, user_mcp):
                 entry["auth_type"] = "mcp_oauth"
 
             results.append(entry)
@@ -2261,11 +2295,15 @@ def list_mcp_apps(
                     # has no OAuth consent step of any kind, so credentials
                     # never gate it and consent is never meaningful -- which is
                     # also why this loop reports is_connected: True
-                    # unconditionally. Only the association gate applies, and
-                    # for the same reason as the MCP half: the runtime's own
-                    # query filters UserCustomApi.is_active, so a deactivated
-                    # API would load zero tools if attached.
-                    "can_attach": user_api is None or bool(user_api.is_active),
+                    # unconditionally. Only visibility applies, through the
+                    # same shared predicate as the MCP half: the runtime drops
+                    # a deactivated personal link, but re-adds the team arm, so
+                    # a team-visible API stays attachable through one.
+                    "can_attach": connector_visible_to_user(
+                        association=user_api,
+                        connector_id=cast(int, api.id),
+                        team_ids=team_ids["custom_api"],
+                    ),
                     "can_authorize": False,
                     "runtime_input_schema": api.runtime_input_schema,
                     "runtime_bindings": api.runtime_bindings,

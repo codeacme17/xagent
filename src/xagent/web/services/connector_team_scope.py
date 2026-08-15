@@ -252,6 +252,30 @@ def resolve_team_connector_ids_or_raise(
         ) from exc
 
 
+def connector_visible_to_user(
+    *, association: Any, connector_id: int, team_ids: Collection[int]
+) -> bool:
+    """In-Python twin of the ``visible_*_clause`` predicates below.
+
+    Same rule, expressed for callers that hold already-loaded ORM rows rather
+    than a query to filter: an active personal association, unioned with the
+    team-owned ids. ``is_active`` gates only the personal arm, so a
+    team-visible connector stays visible through a deactivated personal link
+    -- the corner that separates this from a naive ``association.is_active``
+    check, and the one ``/api/mcp/apps`` got wrong before #1384.
+
+    ``association`` is the ``UserMCPServer``/``UserCustomApi`` row, or None
+    when the caller resolved the connector through the team overlay alone.
+    Kept beside the clauses so the three expressions of this rule (here, the
+    clauses, and ``_load_visible_runtime_connectors``) live in one module and
+    move together.
+    """
+
+    if association is not None and bool(association.is_active):
+        return True
+    return connector_id in set(team_ids)
+
+
 def visible_mcp_server_clause(
     owner_user_id: int | None, team_mcp_ids: Collection[int]
 ) -> ColumnElement[bool]:

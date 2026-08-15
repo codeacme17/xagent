@@ -475,6 +475,83 @@ def test_a_team_owned_connector_is_never_authorizable_even_holding_a_grant(
     assert entry["can_authorize"] is False
 
 
+def test_a_team_link_survives_a_deactivated_personal_association(db_session):
+    """`is_active` gates only the *personal* arm of the visibility rule.
+
+    A member who holds both a (deactivated) personal association and a team
+    link is carried into the listing as (server, inactive_user_mcp) -- the
+    overlay skips ids already covered personally -- so a bare
+    `user_mcp.is_active` check refuses it. The runtime does the opposite:
+    `_load_visible_runtime_connectors` drops the inactive personal link and
+    then re-adds the team ids, which `visible_mcp_server_clause` states
+    outright. Refusing here would be a fail-early on a connector that loads
+    fine."""
+    db, owner, member = db_session
+    server = _add_stdio_server(db, owner)
+    db.add(
+        UserMCPServer(
+            user_id=member.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=False,
+        )
+    )
+    db.commit()
+    _install_visibility(
+        {int(member.id): {"mcp": {int(server.id)}, "custom_api": set()}}
+    )
+
+    assert _entry(db, member, "files")["can_attach"] is True
+
+    # Without the team link the same row is refused -- the personal arm still
+    # gates, so this pins the team arm rather than the removal of the check.
+    connector_team_scope.set_connector_team_hooks()
+    assert _entry(db, member, "files")["can_attach"] is False
+
+
+def test_a_team_link_survives_a_deactivated_custom_api_association(db_session):
+    """The Custom API half of the same rule (`visible_custom_api_clause`)."""
+    db, owner, member = db_session
+    api = _add_custom_api(db, owner)
+    db.add(
+        UserCustomApi(
+            user_id=member.id,
+            custom_api_id=api.id,
+            is_owner=False,
+            is_active=False,
+        )
+    )
+    db.commit()
+    _install_visibility({int(member.id): {"mcp": set(), "custom_api": {int(api.id)}}})
+
+    assert _entry(db, member, "billing")["can_attach"] is True
+
+    connector_team_scope.set_connector_team_hooks()
+    assert _entry(db, member, "billing")["can_attach"] is False
+
+
+def test_auth_type_and_can_authorize_agree_on_the_consent_preconditions(db_session):
+    """`auth_type` and `can_authorize` share one predicate and must not drift.
+
+    They answer different questions -- which Connect flow the settings dialog
+    dispatches, and whether the picker may advertise consent -- but the second
+    is exactly the first plus the resolver term. Pinned as an algebraic
+    relation so an edit to either condition alone fails here."""
+    db, owner, _member = db_session
+    _add_oauth_server(db, owner)
+
+    entry = _entry(db, owner, "records")
+    assert entry["auth_type"] == "mcp_oauth"
+    assert entry["can_authorize"] is True
+
+    # Installing the resolver must move can_authorize alone: auth_type keeps
+    # answering the dispatch question, which the hook does not change.
+    _install_token_resolver()
+    entry = _entry(db, owner, "records")
+    assert entry["auth_type"] == "mcp_oauth"
+    assert entry["can_authorize"] is False
+
+
 def test_a_team_owned_non_oauth_connector_is_attachable_standalone_of_any_hook(
     db_session,
 ):
@@ -497,6 +574,56 @@ def test_a_team_owned_custom_api_is_attachable(db_session):
     _install_visibility({int(member.id): {"mcp": set(), "custom_api": {int(api.id)}}})
 
     assert _entry(db, member, "billing")["can_attach"] is True
+
+
+def test_a_connected_catalog_app_is_attachable(db_session):
+    """The positive half of the catalog rule, and the branch's largest
+    population by far. `is_connected` there means an active association to the
+    server row the connect route writes under the catalog app id -- a stdio
+    app, so no grant is involved and the credential gate cannot mask a
+    regression in the association half. The app id must stay outside the
+    builtin registry: `_app_to_dict` lets a builtin entry override the stored
+    transport and launch_config, which would silently reshape this fixture."""
+    db, owner, _member = db_session
+    app = PublicMCPApp(
+        app_id="acme-docs",
+        name="Acme Docs",
+        description="A catalog app",
+        icon="",
+        category="Productivity",
+        transport="stdio",
+        launch_config={"command": "acme-docs-mcp"},
+        is_visible_in_connector=True,
+    )
+    db.add(app)
+    db.commit()
+    # The connect route stores the row under the catalog app_id, which is how
+    # _connected_non_oauth_server_for_app resolves it back.
+    server = MCPServer.from_config(
+        {
+            "name": "acme-docs",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "acme-docs-mcp",
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=owner.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    entry = _entry(db, owner, "acme-docs", location="remote")
+    assert entry["is_connected"] is True
+    assert entry["can_attach"] is True
+    assert entry["can_authorize"] is False
 
 
 # --- Every entry carries both fields ---------------------------------------
