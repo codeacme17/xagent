@@ -1,19 +1,28 @@
 """`/api/mcp/apps`'s local branch must not re-emit a connected catalog app
 (#1346).
 
-The catalog branch matches a stored server row to its app on *both* the app_id
-and the display name (`_connected_non_oauth_server_for_app` ->
-`_app_lookup_keys`), but the local branch's skip compared the row's name against
-display names only. Catalog connects name the shared row after the app_id
-(`_ensure_catalog_app_server`, `_ensure_catalog_mcp_oauth_server`), so every app
-whose app_id and name differ escaped the skip and was emitted a second time as
-an `is_custom: true` "Local" entry.
+Catalog connects name the shared row after the app_id
+(`_ensure_catalog_app_server`, `_ensure_catalog_mcp_oauth_server`) while the
+builtin_oauth path names it after the display name (`_ensure_user_mcp_server`).
+The local branch's skip compared the row's raw lowercased name against display
+names only, so it missed a catalog row on two independent counts, each covered
+by its own test below:
 
-Two app shapes appear below. Built-in ids (`google-maps`) take their name,
-transport and launch_config from `builtin_mcp_registry` regardless of what the
-row stores, so they pin the duplicate a user reaches on a stock deployment.
-Fictional ids (`acme*`) are admin-created apps, whose stored fields are used
-as-is — the only way to vary the shape under test.
+* **normalization** — `_normalize_app_key` folds whitespace to hyphens, so the
+  row `google-maps` never matched its app's name "Google Maps" under `.lower()`.
+  This is the miss reachable on a stock deployment.
+* **the app_id key** — an app_id that is not a hyphenated spelling of its name
+  (`chrome-devtools`/"Chrome") has no name for the row to match at all.
+
+Either miss emitted the app a second time as an `is_custom: true` "Local" entry.
+Because most catalog pairs collapse to a single key, a suite built only from
+those would stay green with either half of `_catalog_app_keys` deleted; the
+`acme-crm`/"Widget Hub" pair exists to keep both halves under test.
+
+Built-in ids (`google-maps`) take their name, transport and launch_config from
+`builtin_mcp_registry` regardless of what the row stores. Fictional ids
+(`acme*`) are admin-created apps, whose stored fields are used as-is — the only
+way to vary the shape under test.
 """
 
 from __future__ import annotations
@@ -24,9 +33,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api.mcp import list_mcp_apps
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import connector_team_scope
@@ -56,9 +67,15 @@ def db_session(tmp_path):
     db.commit()
     db.refresh(user)
 
-    yield db, user
-    db.close()
-    engine.dispose()
+    try:
+        yield db, user
+    finally:
+        # Nested so the engine is disposed even if closing the session raises,
+        # while the first failure still propagates.
+        try:
+            db.close()
+        finally:
+            engine.dispose()
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +195,36 @@ def _associate(db, user: User, server: MCPServer, *, is_owner: bool = False) -> 
     db.commit()
 
 
+def _add_active_grant(db, user: User, server: MCPServer) -> None:
+    """An mcp_oauth app counts as connected only with a completed grant behind
+    the association (`_mcp_oauth_server_is_actually_connected`)."""
+    client = MCPOAuthClient(
+        mcp_server_id=server.id,
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        client_id="client-123",
+        token_endpoint_auth_method="none",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+    )
+    db.add(client)
+    db.flush()
+    db.add(
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource=_MCP_OAUTH_LAUNCH["url"],
+            scope="",
+            access_token=encrypt_value("runtime-token"),
+            status="active",
+        )
+    )
+    db.commit()
+
+
 def _install_visibility(user: User, server_ids: set[int]) -> None:
     def visibility(_db, user_id: int) -> dict[str, set[int]]:
         if int(user_id) != int(user.id):
@@ -187,11 +234,51 @@ def _install_visibility(user: User, server_ids: set[int]) -> None:
     connector_team_scope.set_connector_team_hooks(visibility=visibility)
 
 
+def test_a_row_matching_only_the_app_id_key_is_listed_once(db_session):
+    """The app_id half of `_catalog_app_keys`: "Widget Hub" normalizes to
+    `widget-hub`, which the row named `acme-crm` cannot match, so only the
+    app_id key can resolve this row to its app.
+
+    Admin-created because no *connectable* shipped app diverges this way today:
+    `facebook`/"Facebook Pages" is builtin_oauth (row named after the display
+    name, so the name key already covers it) and `chrome-devtools`/"Chrome" is
+    hidden, with `_reject_hidden_catalog_app` 404ing new connects. The id key is
+    forward cover for admin-created apps and for legacy `chrome-devtools`
+    rows."""
+    db, user = db_session
+    _add_key_based_app(db, "acme-crm", "Widget Hub")
+    server = _add_catalog_server(db, "acme-crm")
+    _associate(db, user, server)
+
+    entries = [
+        a
+        for a in list_mcp_apps(location="all", current_user=user, db=db)
+        if a["id"] == "acme-crm"
+    ]
+    assert len(entries) == 1
+    assert entries[0]["name"] == "Widget Hub"
+    assert entries[0].get("is_custom") is not True
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
+def test_a_row_matching_only_the_display_name_key_is_listed_once(db_session):
+    """The mirror of the test above, and the reason the name key cannot simply
+    be replaced by the app_id: the builtin_oauth convention names the row after
+    the display name, which `acme-crm` does not match."""
+    db, user = db_session
+    _add_key_based_app(db, "acme-crm", "Widget Hub")
+    server = _add_custom_server(db, "Widget Hub")
+    _associate(db, user, server)
+
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
 def test_a_connected_catalog_app_with_a_mismatched_id_is_listed_once(db_session):
     """AC1: `location=all` emits the app from the catalog branch only.
 
-    `google-maps`/"Google Maps" is a shipped built-in pair, so this is the
-    duplicate a user reaches today with no admin action at all."""
+    The normalization half of the fix: `google-maps`/"Google Maps" is a shipped
+    built-in pair whose keys agree only *after* whitespace folding, so this is
+    the duplicate a user reaches today with no admin action at all."""
     db, user = db_session
     _add_key_based_app(db, "google-maps", "Google Maps")
     server = _add_catalog_server(db, "google-maps")
@@ -254,7 +341,17 @@ def test_an_mcp_oauth_catalog_app_produces_no_ungranted_local_twin(db_session):
 def test_a_team_overlaid_catalog_row_is_skipped_too(db_session):
     """The overlay feeds the same loop as `(server, user_mcp)` pairs, so a
     catalog row reaching the branch through team visibility (#1321) — with no
-    personal association at all — must obey the same skip."""
+    personal association at all — must obey the same skip.
+
+    This costs a team member the only picker entry they had for a team-shared
+    catalog connector, which is a deliberate alignment rather than a new
+    limitation: the same is already true of every catalog app whose id and name
+    collapse to one key, pinned by
+    test_mcp_apps_team_visibility.py::test_a_team_owned_server_named_like_a_catalog_app_is_skipped.
+    The entry this removes was the #1346 duplicate itself — `is_custom`, so its
+    Configure and Delete were misrouted. Giving team-shared catalog connectors a
+    correctly-shaped entry is #1321 follow-up work, not something to recover by
+    letting the duplicate back through."""
     db, user = db_session
     _add_key_based_app(db, "google-maps", "Google Maps")
     server = _add_catalog_server(db, "google-maps")
@@ -304,6 +401,74 @@ def test_an_unrelated_custom_server_is_still_listed(db_session):
     entries = list_mcp_apps(location="local", current_user=user, db=db)
     assert [a["id"] for a in entries] == ["records"]
     assert entries[0]["is_custom"] is True
+
+
+def test_a_granted_mcp_oauth_catalog_app_is_emitted_once_and_connected(db_session):
+    """The positive counterpart to the twin test above: consent completed, so
+    the app must still be emitted exactly once — by the catalog branch, marked
+    connected — rather than the skip swallowing the connector entirely."""
+    db, user = db_session
+    _add_mcp_oauth_app(db, "acme-notes", "Acme Notes")
+    server = _add_mcp_oauth_server(db, "acme-notes")
+    _associate(db, user, server)
+    _add_active_grant(db, user, server)
+
+    entries = [
+        a
+        for a in list_mcp_apps(location="all", current_user=user, db=db)
+        if a["id"] == "acme-notes"
+    ]
+    assert len(entries) == 1
+    assert entries[0]["is_connected"] is True
+    assert entries[0]["server_id"] == server.id
+    assert entries[0].get("is_custom") is not True
+
+
+def test_an_oauth_row_left_under_an_old_display_name_is_still_skipped(db_session):
+    """A third naming convention the name key alone cannot follow: an oauth row
+    records its app in `auth.app_id`, and renaming a non-builtin app (permitted
+    — `_BUILTIN_PROTECTED_FIELDS` guards built-ins only) leaves already-created
+    rows under the old display name. The catalog branch keeps resolving such a
+    row through `_oauth_server_lookup_keys`, so the skip must follow the same
+    key or the `is_custom` twin returns."""
+    db, user = db_session
+    # Renamed to "Widget Portal"; the row still carries the pre-rename name.
+    _add_app(db, "acme-portal", "Widget Portal", transport="oauth", launch_config={})
+    server = _add_server_row(
+        db,
+        {
+            "name": "Legacy Portal",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"app_id": "acme-portal", "provider": "acme"},
+        },
+    )
+    _associate(db, user, server)
+
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
+def test_a_custom_row_cannot_claim_a_catalog_identity_through_auth(db_session):
+    """`auth.app_id` is only honored for the oauth transport, whose auth we
+    write ourselves. A custom server's auth is caller-authored, so a claim made
+    there must not remove the row from its owner's Local tab."""
+    db, user = db_session
+    _add_key_based_app(db, "acme-crm", "Widget Hub")
+    server = _add_server_row(
+        db,
+        {
+            "name": "records",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://records.example.com/mcp",
+            "auth": {"app_id": "acme-crm"},
+        },
+    )
+    _associate(db, user, server, is_owner=True)
+
+    assert [
+        a["id"] for a in list_mcp_apps(location="local", current_user=user, db=db)
+    ] == ["records"]
 
 
 def test_remote_results_are_unchanged(db_session):
