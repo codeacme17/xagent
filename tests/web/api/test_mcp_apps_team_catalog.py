@@ -650,7 +650,7 @@ def test_the_local_branch_flags_a_team_shared_custom_connector(db_session):
     )
     _associate(db, member, personal)
     shared_api = _add_custom_api(db, "reports")
-    personal_api = _add_custom_api(db, "billing", owner=member)
+    _add_custom_api(db, "billing", owner=member)
     _install_visibility(member, {int(shared.id)}, {int(shared_api.id)})
 
     local = {
