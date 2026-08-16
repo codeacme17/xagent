@@ -617,7 +617,14 @@ export function ConnectMcpDialog({
 
       // If in select mode (agent builder), switch to local tab and select the new server
       if (isSelectMode) {
+        // Both view switches run before the lookup below, not after it: they
+        // are what the user is waiting to see once a save succeeds, and
+        // sequencing them behind an unbounded GET would leave them staring at
+        // the form (spinner and all) for as long as that request takes. Only
+        // the selection decision genuinely needs the listing.
+        setActiveTab("library");
         if (!editingCustomServerId) {
+          setActiveLocation("local");
           const newServerName = mcpFormData.name;
           // #1390: this used to append the name unconditionally, while the
           // card-click path gates on the backend's can_attach — and the two
@@ -633,9 +640,10 @@ export function ConnectMcpDialog({
           //
           // Looked up through its own location=local read rather than the
           // loadApps() refresh above: that one sends the library sidebar's
-          // filters, whose location is still "remote" by default at this point
-          // (the switch to "local" happens below), plus any search/category
-          // narrowing — so its response routinely omits the very entry this
+          // filters, whose location was still "remote" by default when it
+          // fired, plus any search/category narrowing — and the refresh the
+          // switch above triggers carries the same search/category narrowing.
+          // Either response routinely omits the very entry this
           // has to decide on. Matching on name is what the listing supports: a
           // local entry's id *is* its name, and both create endpoints store
           // the submitted name verbatim (neither side trims). Name alone is
@@ -657,9 +665,7 @@ export function ConnectMcpDialog({
           if (created && isAttachable(created)) {
             setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
           }
-          setActiveLocation("local");
         }
-        setActiveTab("library");
       } else {
         // If in standalone tools page, just close the dialog
         requestClose();
