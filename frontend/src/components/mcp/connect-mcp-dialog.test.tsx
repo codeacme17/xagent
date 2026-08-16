@@ -1772,21 +1772,29 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   // Deactivated *after* consent: toggle_mcp_server never revokes the grant, so
   // this still lists as connected (checkmark + Configure) while the runtime's
   // is_active filter drops it — can_attach is the only field that can say so.
-  const deactivatedCustomMcp = () => ({
-    ...unauthorizedCustomMcp(),
-    is_connected: true,
-    can_attach: false,
-    can_authorize: false,
-  })
-
-  // Deactivated *before* any consent: all four signals false and no auth_type,
-  // so the card carries no button at all. The detail modal is reachable but
-  // offers no recovery — its Connect has no auth_type to dispatch on.
-  const dormantBeforeConsent = () => {
-    const entry: Record<string, unknown> = { ...deactivatedCustomMcp(), is_connected: false }
+  // The grant survives; the auth_type hint does not.
+  const deactivatedCustomMcp = () => {
+    // No auth_type: the backend emits it only alongside an *active* personal
+    // association (_local_mcp_consent_association_ok), so a deactivated entry
+    // never carries one however its consent went. Deleted rather than omitted
+    // because the base factory is the connected shape, which does carry it.
+    const entry: Record<string, unknown> = {
+      ...unauthorizedCustomMcp(),
+      is_connected: true,
+      can_attach: false,
+      can_authorize: false,
+    }
     delete entry.auth_type
     return entry
   }
+
+  // Deactivated *before* any consent: the same shape with is_connected false
+  // too, so the card carries no button at all. The detail modal is reachable
+  // but offers no recovery — its Connect has no auth_type to dispatch on.
+  const dormantBeforeConsent = () => ({
+    ...deactivatedCustomMcp(),
+    is_connected: false,
+  })
 
   // Shared by renderSelectModeWith below and the non-select-mode card-click
   // test, which otherwise duplicated this exact mockImplementation block.
@@ -1942,10 +1950,11 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
   it("refuses a deactivated association even when it lists as connected", async () => {
     // toggle_mcp_server flips is_active and never revokes a completed grant,
-    // so a connector deactivated *after* consent lists as is_connected: true
-    // with auth_type — indistinguishable from an ordinary connected entry in
-    // everything the picker used to read, and attachable through the old
-    // is_connected disjunct. The runtime's server query drops inactive
+    // so a connector deactivated *after* consent still lists as
+    // is_connected: true — indistinguishable from an ordinary connected entry
+    // in the one field the old predicate's first disjunct read, and attachable
+    // through it. (auth_type is withheld here, but the old predicate never
+    // reached its second disjunct for a connected entry.) The runtime's server query drops inactive
     // associations outright, so attaching it would silently load zero tools.
     // can_attach is the only field that can carry this (#1347), and
     // can_authorize is false alongside it because the per-server OAuth

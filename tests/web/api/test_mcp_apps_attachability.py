@@ -228,6 +228,26 @@ def _add_catalog_oauth_app(db, app_id: str = "granola") -> PublicMCPApp:
     return app
 
 
+def _add_catalog_builtin_oauth_app(db, app_id: str = "acme-crm") -> PublicMCPApp:
+    """A provider-redirect catalog app. `transport == "oauth"` is what
+    classify_app_auth keys on, and it takes its own branch in list_mcp_apps --
+    the one the other catalog fixtures never reach."""
+    app = PublicMCPApp(
+        app_id=app_id,
+        name="Acme CRM",
+        description="A builtin-oauth catalog app",
+        icon="",
+        category="Productivity",
+        transport="oauth",
+        provider_name="acme",
+        is_visible_in_connector=True,
+    )
+    db.add(app)
+    db.commit()
+    db.refresh(app)
+    return app
+
+
 def _entry(db, user: User, entry_id: str, *, location: str = "local") -> dict:
     return next(
         a
@@ -367,6 +387,22 @@ def test_an_unconnected_catalog_oauth_app_is_not_attachable(db_session):
     assert entry["can_attach"] is False
     # Catalog entries connect through /apps/{app_id}/oauth/connect, dispatched
     # on auth_type; can_authorize deliberately does not restate that.
+    assert entry["can_authorize"] is False
+
+
+def test_an_unconnected_builtin_oauth_catalog_app_is_not_attachable(db_session):
+    """The builtin_oauth branch resolves connected state through
+    `_connected_oauth_server_for_app` and the user's UserOAuth accounts, not
+    through the association lookups the other catalog fixtures exercise. Its
+    `can_attach` is emitted by the same line, but nothing else in this file
+    routes through that branch."""
+    db, owner, _member = db_session
+    _add_catalog_builtin_oauth_app(db)
+
+    entry = _entry(db, owner, "acme-crm", location="remote")
+    assert entry["auth_type"] == "builtin_oauth"
+    assert entry["is_connected"] is False
+    assert entry["can_attach"] is False
     assert entry["can_authorize"] is False
 
 
@@ -637,9 +673,12 @@ def test_every_listed_entry_carries_both_decisions(db_session):
     _add_oauth_server(db, owner)
     _add_custom_api(db, owner)
     _add_catalog_oauth_app(db)
+    _add_catalog_builtin_oauth_app(db)
 
     entries = list_mcp_apps(location="all", current_user=owner, db=db)
-    assert {"files", "records", "billing", "granola"} <= {e["id"] for e in entries}
+    assert {"files", "records", "billing", "granola", "acme-crm"} <= {
+        e["id"] for e in entries
+    }
     for entry in entries:
         assert isinstance(entry.get("can_attach"), bool), entry["id"]
         assert isinstance(entry.get("can_authorize"), bool), entry["id"]

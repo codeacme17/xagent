@@ -10,9 +10,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from sqlalchemy.sql.elements import ColumnElement
+
+if TYPE_CHECKING:
+    from ..models.custom_api import UserCustomApi
+    from ..models.mcp import UserMCPServer
 
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
@@ -253,7 +257,10 @@ def resolve_team_connector_ids_or_raise(
 
 
 def connector_visible_to_user(
-    *, association: Any, connector_id: int, team_ids: Collection[int]
+    *,
+    association: "UserMCPServer | UserCustomApi | None",
+    connector_id: int,
+    team_ids: Collection[int],
 ) -> bool:
     """In-Python twin of the ``visible_*_clause`` predicates below.
 
@@ -264,16 +271,16 @@ def connector_visible_to_user(
     -- the corner that separates this from a naive ``association.is_active``
     check, and the one ``/api/mcp/apps`` got wrong before #1384.
 
-    ``association`` is the ``UserMCPServer``/``UserCustomApi`` row, or None
-    when the caller resolved the connector through the team overlay alone.
-    Kept beside the clauses so the three expressions of this rule (here, the
-    clauses, and ``_load_visible_runtime_connectors``) live in one module and
-    move together.
+    ``association`` is None when the caller resolved the connector through the
+    team overlay alone. Kept beside the clauses it mirrors so the declarative
+    and imperative forms of the rule move together;
+    ``_load_visible_runtime_connectors`` expresses the same union a third time
+    in connector_runtime.py, against its own queries.
     """
 
     if association is not None and bool(association.is_active):
         return True
-    return connector_id in set(team_ids)
+    return connector_id in team_ids
 
 
 def visible_mcp_server_clause(

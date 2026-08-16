@@ -1863,39 +1863,23 @@ def _local_mcp_can_attach(
 ) -> bool:
     """Whether a local entry may be selected into an agent (#1347).
 
-    Two independent conditions:
+    Visible to the runtime AND credentials that plausibly resolve. Visibility
+    is delegated, never restated -- ``connector_visible_to_user`` is where the
+    "``is_active`` gates only the personal arm" corner lives. Credentials gate
+    only the mcp_oauth shape; every other shape carries them on the server row
+    and its env layers.
 
-    - The runtime must see the connector at all. Delegated to
-      ``connector_visible_to_user``, the in-Python twin of the
-      ``visible_*_clause`` predicates, so this endpoint expresses the
-      visibility rule the same way the runtime loader and the SQL clauses do
-      instead of restating it. Restating it is what produced the bug this
-      argument exists to fix: ``is_active`` gates only the *personal* arm, so
-      a team-visible connector stays attachable through a deactivated personal
-      link, which a bare ``user_mcp.is_active`` check refused while
-      ``_load_visible_runtime_connectors`` loaded it.
-    - Credentials must plausibly resolve. Only the mcp_oauth shape can fail
-      this: every other shape carries its credentials on the server row and its
-      env layers. An mcp_oauth server needs an active ``MCPOAuthGrant`` for the
-      requesting user, or a resolver hook that may supply tokens out of band --
-      the latter being deployment-level and coarse by necessity, see
-      ``oauth_token_resolver_installed``.
+    Both credential terms are approximations, loose in one direction only
+    (may say yes where the runtime later says no, never no where it would have
+    succeeded):
 
-    Two approximations, both deliberate and both loose in the same direction
-    (this may say yes where the runtime later says no; it never says no where
-    the runtime would have succeeded):
-
-    - The grant check accepts any active ``MCPOAuthGrant`` for the user, while
-      the runtime's ``select_mcp_oauth_grants`` additionally matches
-      canonicalized resource, issuer, ``resource_owner_key``, configured
-      ``client_id``, and a required-scope subset. Editing a server's auth
-      config does not reconcile existing grants, so an edited server can
-      report attachable and still fail at run time. Narrowing this belongs at
-      the source (revoking grants the edit invalidates), not in a fourth copy
-      of that six-term predicate here.
+    - Any active ``MCPOAuthGrant`` counts, while the runtime's
+      ``select_mcp_oauth_grants`` also matches resource, issuer,
+      ``resource_owner_key``, ``client_id`` and a scope subset. Auth-config
+      edits do not reconcile grants (#1388); narrowing belongs there, not in a
+      fourth copy of that predicate here.
     - The resolver hook is probed for presence, not for this provider and
-      user; a truthful answer would mean one embedder round-trip per listed
-      connector on a list request.
+      user -- see ``oauth_token_resolver_installed``.
     """
     from ..services.connector_team_scope import connector_visible_to_user
 
