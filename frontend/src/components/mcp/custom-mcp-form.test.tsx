@@ -162,6 +162,75 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(popup.location.href).toBe("https://auth.example.com/authorize")
   })
 
+  it("fires exactly one oauth/connect POST when Connect is double-clicked in the same tick", async () => {
+    // #1330: this button drives the same per-server DCR endpoint the connector
+    // dialog does, and its only guard is disabled={oauthAction === "connect"} —
+    // React state, so it lags a commit cycle behind two clicks landing in the
+    // same tick. The fixture drops client_id to model the DCR case: with no
+    // configured client, each POST that reaches the backend registers a new
+    // client at the third-party authorization server, and the one the local
+    // IntegrityError fallback discards stays registered over there.
+    const popup = {
+      closed: false,
+      opener: window,
+      close: vi.fn(),
+      location: { href: "" },
+    }
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+
+    let connectCalls = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        return Promise.resolve(okJson({ server_id: 42, grants: [] }))
+      }
+      if (url === "http://api.local/api/mcp/42/oauth/connect") {
+        connectCalls += 1
+        return Promise.resolve(
+          okJson({ authorization_url: "https://auth.example.com/authorize" })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    renderMcpOAuthForm({
+      config: {
+        url: "https://mcp.example.com/mcp",
+        auth: {
+          type: "mcp_oauth",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example.com",
+          scope: "records.read",
+        },
+      },
+    })
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/42/oauth/status"
+      )
+    })
+
+    vi.useFakeTimers()
+    const connectButton = screen.getByText("tools.mcp.dialog.oauthConnect")
+    // Both clicks are dispatched inside one act() scope so React defers the
+    // re-render until it exits — the second click therefore lands on a button
+    // whose disabled prop has not been committed yet, which is exactly the
+    // window scripted clicks or a client retry hit. Two separate fireEvent
+    // calls would not reproduce it: React flushes discrete-event updates
+    // synchronously, so the second click would find the button already
+    // disabled and this test would pass with or without the guard.
+    await act(async () => {
+      fireEvent.click(connectButton)
+      fireEvent.click(connectButton)
+    })
+    await act(async () => {
+      await flushPromises()
+    })
+
+    expect(connectCalls).toBe(1)
+    expect(popup.location.href).toBe("https://auth.example.com/authorize")
+  })
+
   it("treats websocket as an MCP OAuth-capable transport", () => {
     expect(isHttpMcpOAuthTransport("streamable_http")).toBe(true)
     expect(isHttpMcpOAuthTransport("sse")).toBe(true)
