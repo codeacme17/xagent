@@ -448,6 +448,62 @@ def test_an_oauth_row_left_under_an_old_display_name_is_still_skipped(db_session
     assert list_mcp_apps(location="local", current_user=user, db=db) == []
 
 
+def test_an_oauth_row_carrying_only_a_provider_is_skipped(db_session):
+    """`_server_catalog_keys` borrows `_oauth_server_lookup_keys`' fallback, so
+    a legacy row recording only `auth.provider` is matched against catalog ids.
+
+    Pinned because it is the one direction where the skip's key set crosses
+    namespaces: the catalog branch claims such a row by provider too, so the
+    alternative is the #1346 twin returning for rows too old to carry an
+    app_id."""
+    db, user = db_session
+    _add_app(db, "acme", "Widget Suite", transport="oauth", launch_config={})
+    server = _add_server_row(
+        db,
+        {
+            "name": "Legacy Suite",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"provider": "acme"},
+        },
+    )
+    _associate(db, user, server)
+
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
+def test_a_row_named_after_a_hyphenated_display_name_is_skipped(db_session):
+    """The whitespace-folding half of `_normalize_app_key`, isolated: the row
+    spells "Widget Hub" as `widget-hub` and the app_id (`acme-crm`) matches
+    neither, so only folding the app's display name resolves it. Under the old
+    raw `.lower()` comparison this row was emitted as a twin."""
+    db, user = db_session
+    _add_key_based_app(db, "acme-crm", "Widget Hub")
+    server = _add_custom_server(db, "widget-hub")
+    _associate(db, user, server)
+
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
+def test_a_user_owned_row_named_after_a_catalog_app_id_is_suppressed(db_session):
+    """Pins the behavior change this fix declines to avoid, so it is a decision
+    on record rather than a silent side effect (#1346's AC3).
+
+    A row owned by a user (`is_owner=True`) under a catalog app_id is a legacy
+    squatter — `_is_reserved_catalog_name` refuses to create or rename one
+    today. Ownership would tell it apart from an official shared row, but only
+    for the id key: the builtin_oauth rows that are legitimately `is_owner=True`
+    are matched by the *name* key, so an ownership-qualified skip would have to
+    be transport-scoped as well, and it would restore the row only for its
+    owner. It stays listed, editable and deletable via /api/mcp/servers."""
+    db, user = db_session
+    _add_key_based_app(db, "acme-crm", "Widget Hub")
+    server = _add_custom_server(db, "acme-crm")
+    _associate(db, user, server, is_owner=True)
+
+    assert list_mcp_apps(location="local", current_user=user, db=db) == []
+
+
 def test_a_custom_row_cannot_claim_a_catalog_identity_through_auth(db_session):
     """`auth.app_id` is only honored for the oauth transport, whose auth we
     write ourselves. A custom server's auth is caller-authored, so a claim made
