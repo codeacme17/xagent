@@ -78,6 +78,13 @@ logger = logging.getLogger(__name__)
 MCP_OAUTH_STATE_COOKIE = "xagent_mcp_oauth_state"
 MCP_OAUTH_STATE_TTL = timedelta(minutes=10)
 MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = int(MCP_OAUTH_STATE_TTL.total_seconds())
+# How long an expired mcp_oauth_flow_states row is kept before the sweep in
+# connect_mcp_oauth deletes it. A row is already unusable the moment it expires
+# — _claim_mcp_oauth_flow_state requires expires_at > now — so this grace
+# period exists only to keep the sweep well clear of rows a callback may still
+# be racing to claim, and to leave a recent trail for debugging a failed
+# authorization. Matches the Slack OAuth flow-state ledger's retention.
+MCP_OAUTH_FLOW_STATE_RETENTION = timedelta(days=1)
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
@@ -4126,6 +4133,21 @@ async def connect_mcp_oauth(
         redirect_uri=redirect_uri,
         registration_lookup_hash=registration_lookup_hash,
     )
+
+    # Sweep this table's dead rows before adding another, mirroring the Slack
+    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
+    # double-submitted authorization leaves a row that is permanently unusable
+    # once it expires (the claim query requires consumed_at IS NULL and
+    # expires_at > now), but nothing deleted it: the only other deletes are the
+    # per-user purge on disconnect and the FK cascade on server deletion, so
+    # the table grew without bound. Deliberately global rather than scoped to
+    # this user/server — a user who never reconnects would otherwise keep their
+    # rows forever, which is the leak this is meant to close. Filtering on
+    # expires_at alone (an indexed column) also covers consumed rows, since
+    # every row expires within MCP_OAUTH_STATE_TTL of being created.
+    db.query(MCPOAuthFlowState).filter(
+        MCPOAuthFlowState.expires_at < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
+    ).delete(synchronize_session=False)
 
     state_value = secrets.token_urlsafe(32)
     code_verifier = secrets.token_urlsafe(64)

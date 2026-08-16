@@ -656,6 +656,75 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_connect_sweeps_flow_states_expired_past_the_retention_window(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
+    db.commit()
+
+    now = mcp_api._utc_now()
+
+    def _flow_state(state: str, owner: User, expires_at) -> MCPOAuthFlowState:
+        return MCPOAuthFlowState(
+            state=state,
+            mcp_server_id=server.id,
+            user_id=owner.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{owner.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            code_verifier=encrypt_value("verifier-123"),
+            expires_at=expires_at,
+        )
+
+    db.add_all(
+        [
+            # Abandoned past the retention window — the row the sweep exists
+            # for. Owned by the *other* user, so this also pins the sweep as
+            # global: scoping it to the connecting user would leave the rows of
+            # anyone who never reconnects in the table forever, which is the
+            # leak being closed.
+            _flow_state(
+                "stale-other-user",
+                other_user,
+                now - mcp_api.MCP_OAUTH_FLOW_STATE_RETENTION - timedelta(minutes=1),
+            ),
+            # Already unusable (the claim query requires expires_at > now) but
+            # still inside the retention window, so it is kept — the grace
+            # period is what keeps the sweep clear of any callback still
+            # racing to claim its row.
+            _flow_state("recently-expired", user, now - timedelta(minutes=1)),
+            # Another authorization still in progress.
+            _flow_state("in-flight", other_user, now + mcp_api.MCP_OAUTH_STATE_TTL),
+        ]
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    surviving = {row.state for row in db.query(MCPOAuthFlowState).all()}
+    assert "stale-other-user" not in surviving
+    assert {"recently-expired", "in-flight"} <= surviving
+    # The sweep runs in the same transaction as the insert, so the new row must
+    # still be there once it commits.
+    assert _redirect_query(response)["state"][0] in surviving
+
+
+@pytest.mark.asyncio
 async def test_connect_dynamically_registers_public_client_when_client_id_is_empty(
     db_session, monkeypatch
 ):
