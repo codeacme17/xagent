@@ -263,6 +263,27 @@ export function ConnectMcpDialog({
     }
   }
 
+  // One-off listing read for a single location, independent of the sidebar
+  // filters loadApps() sends and of the `apps` state it writes. Both callers
+  // need one specific entry that the *current* filters routinely exclude: the
+  // post-consent recheck runs against whichever branch the entry came from
+  // while the user may have narrowed the catalog, and the post-create lookup
+  // in handleSaveResponse runs while activeLocation is still the tab the form
+  // was opened from ("remote" by default). Null on any failure, so callers can
+  // tell "the backend did not answer" apart from "answered, entry absent".
+  const fetchAppsByLocation = async (
+    location: string,
+  ): Promise<AppIntegration[] | null> => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${location}`)
+      if (!response.ok) return null
+      return sanitizeAppIntegrations(await response.json())
+    } catch (error) {
+      console.error("Failed to load apps:", error)
+      return null
+    }
+  }
+
   // Batch-fetch team-sharing status for connected connectors and merge it into
   // the apps list so cards/settings can show Shared/Private/Needs-config.
   const loadSharingStatus = async (list: AppIntegration[]) => {
@@ -598,7 +619,44 @@ export function ConnectMcpDialog({
       if (isSelectMode) {
         if (!editingCustomServerId) {
           const newServerName = mcpFormData.name;
-          setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
+          // #1390: this used to append the name unconditionally, while the
+          // card-click path gates on the backend's can_attach — and the two
+          // disagreed on exactly one shape. create_mcp_server writes an active
+          // server row with no MCPOAuthGrant (only the OAuth callback writes
+          // one), so a custom mcp_oauth connector lists with can_attach false
+          // the moment it is created; auto-selecting it produced the run-time
+          // "MCP server credentials are unavailable" failure that #1347 added
+          // the field to prevent, reached through the create path rather than
+          // the click path. Not a dead end: the same entry carries
+          // can_authorize, so its card offers Authorize, whose completion
+          // flips can_attach and makes it selectable.
+          //
+          // Looked up through its own location=local read rather than the
+          // loadApps() refresh above: that one sends the library sidebar's
+          // filters, whose location is still "remote" by default at this point
+          // (the switch to "local" happens below), plus any search/category
+          // narrowing — so its response routinely omits the very entry this
+          // has to decide on. Matching on name is what the listing supports: a
+          // local entry's id *is* its name, and both create endpoints store
+          // the submitted name verbatim (neither side trims). Name alone is
+          // not unique across the two halves of that listing though — the MCP
+          // and Custom API tables enforce uniqueness separately, and MCP rows
+          // are appended first — so the same transport discriminator this
+          // function already dispatched the POST on narrows it to one row.
+          //
+          // Silence (request failed, or an entry the listing does not show)
+          // leaves the connector created-but-unselected, same as an explicit
+          // false. The click path also requires an affirmative can_attach, and
+          // the local tab this switches to puts the card one click away.
+          const createdCustomApi = mcpFormData.transport === "custom_api";
+          const listing = await fetchAppsByLocation("local");
+          const created = listing?.find(entry =>
+            entry.name === newServerName
+            && (entry.transport === "custom_api") === createdCustomApi
+          );
+          if (created && isAttachable(created)) {
+            setLocalSelectedServers(prev => prev.includes(newServerName) ? prev : [...prev, newServerName]);
+          }
           setActiveLocation("local");
         }
         setActiveTab("library");
@@ -869,18 +927,13 @@ export function ConnectMcpDialog({
         return
       }
       void (async () => {
-        let connected = false
-        try {
-          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${refreshLocation}`)
-          if (response.ok) {
-            const data = sanitizeAppIntegrations(await response.json())
-            connected = data.some(
-              (candidate) => candidate.id === app.id && candidate.is_connected,
-            )
-          }
-        } catch (error) {
-          console.error("Failed to refresh apps after the OAuth popup closed:", error)
-        }
+        // A failed recheck reads as "not connected", same as before this
+        // shared helper existed: the success actions below stay gated on a
+        // positive answer, never on the absence of a negative one.
+        const listing = await fetchAppsByLocation(refreshLocation)
+        const connected = (listing ?? []).some(
+          (candidate) => candidate.id === app.id && candidate.is_connected,
+        )
         loadApps()
         if (!connected) return
         if (onSuccess) onSuccess()
