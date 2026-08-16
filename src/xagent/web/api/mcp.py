@@ -1765,11 +1765,19 @@ def _lookup_oauth_server_for_app(
 
 def _build_active_non_oauth_server_lookup(
     user_mcps: list[tuple[MCPServer, Optional[UserMCPServer]]],
-) -> dict[tuple[str, str], MCPServer]:
+) -> dict[tuple[str, str], list[MCPServer]]:
     """``(transport, name)`` index of non-oauth rows. ``None`` association means
     the row was reached through the team overlay — see the oauth twin above for
-    why that arm carries no ``is_active`` gate."""
-    lookup: dict[tuple[str, str], MCPServer] = {}
+    why that arm carries no ``is_active`` gate.
+
+    List-valued like that twin: distinct raw names can normalize to one key
+    ("Acme Notes"/`acme-notes`), and keeping only the first arrival would let
+    whichever row happens to sort earlier mask the rest from any consumer that
+    can tell them apart (the team resolution scans candidates against the
+    app's official launch config). Consumers that cannot — the personal
+    connected-state path — take the first candidate, preserving the exact
+    first-wins semantics the old single-valued index had."""
+    lookup: dict[tuple[str, str], list[MCPServer]] = {}
     for server, user_mcp in user_mcps:
         transport = _normalize_app_key(server.transport)
         server_name = _normalize_app_key(server.name)
@@ -1777,7 +1785,7 @@ def _build_active_non_oauth_server_lookup(
             continue
         if not transport or transport == "oauth" or not server_name:
             continue
-        lookup.setdefault((transport, server_name), server)
+        lookup.setdefault((transport, server_name), []).append(server)
     return lookup
 
 
@@ -1856,38 +1864,43 @@ def _app_user_env_configured(
     return _env_covers_required(getattr(assoc, "env", None), required)
 
 
-def _non_oauth_server_for_app(
-    app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
-) -> Optional[MCPServer]:
-    """The row in ``non_oauth_server_lookup`` that backs this catalog app.
+def _non_oauth_servers_for_app(
+    app: dict, non_oauth_server_lookup: dict[tuple[str, str], list[MCPServer]]
+) -> list[MCPServer]:
+    """The rows in ``non_oauth_server_lookup`` that could back this catalog app.
 
     The identity rule alone — transport plus one of ``_catalog_app_keys`` — with
-    no claim about *why* the row is in the lookup. What the answer means is the
-    caller's: the same rule resolves "connected for me" against the personal
-    index and "shared with me" against the team one (#1387).
+    no claim about *why* a row is in the lookup or which candidate is the right
+    one. What the answer means is the caller's: the personal connected-state
+    path takes the first candidate ("connected for me", first-wins as always),
+    while the team resolution scans them against the official launch config
+    ("shared with me", #1387). Candidates keep key order and dedupe by object,
+    mirroring ``_lookup_oauth_server_for_app``.
     """
     app_transport = _normalize_app_key(app.get("transport"))
     if not app_transport or app_transport == "oauth":
-        return None
+        return []
 
-    return next(
-        (
-            non_oauth_server_lookup[(app_transport, app_key)]
-            for app_key in _catalog_app_keys(app)
-            if (app_transport, app_key) in non_oauth_server_lookup
-        ),
-        None,
-    )
+    seen_servers: set[int] = set()
+    candidates: list[MCPServer] = []
+    for app_key in _catalog_app_keys(app):
+        for server in non_oauth_server_lookup.get((app_transport, app_key), []):
+            marker = id(server)
+            if marker in seen_servers:
+                continue
+            seen_servers.add(marker)
+            candidates.append(server)
+    return candidates
 
 
 def _connected_non_oauth_server_for_app(
-    app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
+    app: dict, non_oauth_server_lookup: dict[tuple[str, str], list[MCPServer]]
 ) -> Optional[int]:
-    server = _non_oauth_server_for_app(app, non_oauth_server_lookup)
-    if not server:
+    servers = _non_oauth_servers_for_app(app, non_oauth_server_lookup)
+    if not servers:
         return None
 
-    return cast(int, server.id)
+    return cast(int, servers[0].id)
 
 
 def _is_mcp_oauth_server(server: MCPServer) -> bool:
@@ -2038,14 +2051,24 @@ def _team_row_matches_catalog_launch(app: dict, server: MCPServer) -> bool:
             and (server.args or []) == (launch.get("args") or [])
         )
     if auth_type == "mcp_oauth":
-        return bool(server.url == launch.get("url"))
+        # The auth shape is part of the identity, not just the URL: a same-URL
+        # row whose auth is bearer/api-key/absent would otherwise claim the
+        # mcp_oauth identity while _local_mcp_can_attach, seeing a non-oauth
+        # shape, skips the grant gate every real mcp_oauth row is subject to.
+        # A legitimately provisioned row always passes -- the ensure helper
+        # writes the catalog's auth (type "mcp_oauth" by classification), and
+        # encryption touches only SENSITIVE_AUTH_FIELDS values, never `type`.
+        # Deliberately not full auth-dict equality: the catalog syncs a row's
+        # auth at connect time only, so a row that predates a catalog auth
+        # edit is stale but still the app's own row.
+        return bool(server.url == launch.get("url") and _is_mcp_oauth_server(server))
     return False
 
 
 def _team_shared_server_for_app(
     app: dict,
     team_oauth_server_lookup: dict[str, list[MCPServer]],
-    team_non_oauth_server_lookup: dict[tuple[str, str], MCPServer],
+    team_non_oauth_server_lookup: dict[tuple[str, str], list[MCPServer]],
 ) -> Optional[MCPServer]:
     """The team-visible row backing this catalog app, if the member has one.
 
@@ -2062,19 +2085,26 @@ def _team_shared_server_for_app(
     connected entry that hides where the connector came from.
 
     The non-oauth arm additionally requires the row to run the app's official
-    launch config (see _team_row_matches_catalog_launch); a same-named foreign
-    row yields no team-shared entry, falling back to the pre-#1387 state --
-    still listed by /api/mcp/servers, just never rendered in catalog shape. The
+    launch config (see _team_row_matches_catalog_launch), scanning every
+    same-key candidate rather than only the first: two team-visible rows can
+    normalize to one key, and giving the earlier-sorted foreign row a veto
+    would mask the app's own row behind it. A key with no matching candidate
+    yields no team-shared entry, falling back to the pre-#1387 state -- still
+    listed by /api/mcp/servers, just never rendered in catalog shape. The
     builtin_oauth arm needs no such check: _is_oauth_server_for_app matches on
     the app_id/provider metadata our own provisioning writes, and the row
     carries no caller-authored launch to misrepresent.
     """
     if app.get("auth_type") == "builtin_oauth":
         return _lookup_oauth_server_for_app(app, team_oauth_server_lookup)
-    server = _non_oauth_server_for_app(app, team_non_oauth_server_lookup)
-    if server is not None and not _team_row_matches_catalog_launch(app, server):
-        return None
-    return server
+    return next(
+        (
+            server
+            for server in _non_oauth_servers_for_app(app, team_non_oauth_server_lookup)
+            if _team_row_matches_catalog_launch(app, server)
+        ),
+        None,
+    )
 
 
 def _catalog_team_shared_can_attach(
@@ -2096,8 +2126,9 @@ def _catalog_team_shared_can_attach(
     ``builtin_oauth`` authorization is the member's own provider login, held on
     ``UserOAuth`` and never on the shared row, so sharing the connector shares
     no credential for it: attachable only once the member has a usable account
-    of their own, which is also the state ``is_connected`` would report if they
-    additionally held a personal association. Without one the entry stays
+    of their own (or a resolver hook supplies the deployment's tokens out of
+    band -- see below), which is also the state ``is_connected`` would report
+    if they additionally held a personal association. Without one the entry stays
     unattachable and its card keeps the catalog Connect route -- "connect it for
     yourself", the same answer the ``mcp_oauth`` shape gets from
     ``_local_mcp_can_attach``'s grant term.
@@ -2121,6 +2152,15 @@ def _catalog_team_shared_can_attach(
     ):
         return False
     if app.get("auth_type") != "builtin_oauth":
+        return True
+    # The resolver hook outranks the account check, mirroring how
+    # _local_mcp_can_attach treats it for the mcp_oauth shape: the runtime
+    # resolves every transport=="oauth" server's token through the installed
+    # hook first and falls back to UserOAuth only without one, so on a
+    # resolver deployment the row runs with no account at all. Same
+    # approximation as there -- the hook is probed for presence, not for this
+    # provider and user.
+    if token_resolver_installed:
         return True
     return any(key in oauth_account_lookup for key in _oauth_keys_for_app(app))
 
@@ -2253,7 +2293,7 @@ def list_mcp_apps(
     # personal link -- and are read from ``user_mcps`` rather than re-queried.
     # Skipped for location=local, whose branch never consults these indexes.
     team_oauth_server_lookup: dict[str, list[MCPServer]] = {}
-    team_non_oauth_server_lookup: dict[tuple[str, str], MCPServer] = {}
+    team_non_oauth_server_lookup: dict[tuple[str, str], list[MCPServer]] = {}
     if team_ids["mcp"] and location in ["remote", "all"]:
         team_servers: list[tuple[MCPServer, Optional[UserMCPServer]]] = [
             (server, None)

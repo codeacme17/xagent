@@ -84,6 +84,18 @@ def _reset_connector_team_hooks():
     connector_team_scope.set_connector_team_hooks()
 
 
+@pytest.fixture()
+def _token_resolver_installed():
+    """Install a token-resolver hook for the test's duration. Presence is all
+    the listing probes (`oauth_token_resolver_installed`), so the body never
+    runs."""
+    from xagent.web.tools.config import set_oauth_token_resolver_hook
+
+    set_oauth_token_resolver_hook(lambda **_kwargs: None)
+    yield
+    set_oauth_token_resolver_hook(None)
+
+
 def _install_visibility(
     user: User, server_ids: set[int], custom_api_ids: set[int] | None = None
 ) -> None:
@@ -456,6 +468,61 @@ def test_a_team_row_pointing_at_a_foreign_url_is_not_claimed(db_session):
     assert entry["can_attach"] is False
 
 
+@pytest.mark.parametrize(
+    "auth",
+    [{"type": "bearer", "bearer_token": "shared-token"}, None],
+    ids=["bearer", "no-auth"],
+)
+def test_a_team_row_with_a_foreign_auth_shape_is_not_claimed(db_session, auth):
+    """The same URL is not enough for the mcp_oauth identity: the auth shape is
+    part of it. A same-URL row whose auth is bearer or absent reads as a
+    non-oauth shape to _local_mcp_can_attach, which would skip the grant gate
+    every real mcp_oauth row is subject to — catalog branding on different
+    credential semantics (#1403 review, F1 round 2)."""
+    db, _creator, member = db_session
+    _add_mcp_oauth_app(db, "acme-remote", "Acme Remote")
+    config = {
+        "name": "acme-remote",
+        "managed": "external",
+        "transport": "streamable_http",
+        "url": _MCP_OAUTH_LAUNCH["url"],
+    }
+    if auth is not None:
+        config["auth"] = auth
+    row = _add_server_row(db, config)
+    _install_visibility(member, {int(row.id)})
+
+    entry = _entry(db, member, "acme-remote")
+    assert entry["is_team_shared"] is False
+    assert entry["can_attach"] is False
+
+
+def test_a_colliding_foreign_row_does_not_mask_the_official_row(db_session):
+    """Two team-visible rows can normalize to one (transport, name) key —
+    "Acme Notes" and `acme-notes` — and the index keeps every candidate, so
+    the earlier-sorted foreign row gets no veto: the team resolution scans
+    candidates against the official launch config and claims the row that
+    actually runs it (#1403 review round 2)."""
+    db, _creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+    # Inserted first, so it sorts first in every candidate list.
+    foreign = _add_server_row(
+        db,
+        {
+            "name": "Acme Notes",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "evil-mcp",
+        },
+    )
+    official = _add_catalog_server(db, "acme-notes")
+    _install_visibility(member, {int(foreign.id), int(official.id)})
+
+    entry = _entry(db, member, "acme-notes")
+    assert entry["is_team_shared"] is True
+    assert entry["can_attach"] is True
+
+
 def test_a_team_shared_mcp_oauth_connector_is_not_attachable_without_a_grant(
     db_session,
 ):
@@ -515,6 +582,27 @@ def test_a_team_shared_builtin_oauth_connector_needs_the_members_own_account(
     assert entry["can_attach"] is True
     # Still not a personal connection: the member has an account but no
     # association, which is what is_connected reports on.
+    assert entry["is_connected"] is False
+
+
+def test_a_team_shared_builtin_oauth_connector_attaches_through_a_resolver_hook(
+    db_session, _token_resolver_installed
+):
+    """The resolver hook outranks the account check: the runtime resolves every
+    transport=="oauth" server's token through the installed hook first and
+    falls back to UserOAuth only without one, so on a resolver deployment the
+    row runs with no account at all. Refusing here would say no where the
+    runtime succeeds — the one direction the attachability contract forbids
+    (#1403 review round 2)."""
+    db, _creator, member = db_session
+    _add_builtin_oauth_app(db, "acme-drive", "Acme Drive")
+    server = _add_builtin_oauth_server(db, "acme-drive", "Acme Drive")
+    _install_visibility(member, {int(server.id)})
+
+    entry = _entry(db, member, "acme-drive")
+    assert entry["is_team_shared"] is True
+    assert entry["can_attach"] is True
+    # The hook supplies tokens, not a personal connection.
     assert entry["is_connected"] is False
 
 
