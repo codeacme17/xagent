@@ -93,13 +93,26 @@ export function CustomMcpForm({
   // compares against the action identity rather than "any action in flight",
   // so this exactly mirrors what each button's disabled prop already claims to
   // do — a Connect fired while a discover is running behaves as it does today.
+  // Note the residual limitation of a scalar slot: a *different* action
+  // starting still takes the slot from an in-flight one. Tracking overlaps
+  // properly needs a set, not a slot — but the slot is what the disabled props
+  // read, so widening it is a UI change, not a guard change, and is left out
+  // of #1330's scope.
   const beginOauthAction = (action: string) => {
     if (oauthActionRef.current === action) return false
     oauthActionRef.current = action
     setOauthAction(action)
     return true
   }
-  const endOauthAction = () => {
+  // Only the action that currently owns the slot may release it. The three
+  // buttons are gated on their own identity, so a discover and a connect are
+  // allowed to overlap; an unconditional clear would let whichever finished
+  // first reopen the other's guard mid-flight. (main cleared oauthAction
+  // unconditionally and had the same clobber, so this is a gap the shadow
+  // inherited rather than introduced — but the ref is what the guard now
+  // reads, so it has to be tighter than the state ever was.)
+  const endOauthAction = (action: string) => {
+    if (oauthActionRef.current !== action) return
     oauthActionRef.current = null
     if (isMountedRef.current) setOauthAction(null)
   }
@@ -266,7 +279,7 @@ export function CustomMcpForm({
       console.error("Failed to discover MCP OAuth metadata:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDiscoveryFailed'))
     } finally {
-      endOauthAction()
+      endOauthAction("discover")
     }
   }
 
@@ -345,7 +358,7 @@ export function CustomMcpForm({
       console.error("Failed to start MCP OAuth authorization:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
     } finally {
-      endOauthAction()
+      endOauthAction("connect")
     }
   }
 
@@ -371,7 +384,7 @@ export function CustomMcpForm({
       console.error("Failed to delete MCP OAuth grant:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDisconnectFailed'))
     } finally {
-      endOauthAction()
+      endOauthAction(`delete-${grantId}`)
     }
   }
 
