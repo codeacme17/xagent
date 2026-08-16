@@ -271,11 +271,20 @@ export function ConnectMcpDialog({
   // in handleSaveResponse runs while activeLocation is still the tab the form
   // was opened from ("remote" by default). Null on any failure, so callers can
   // tell "the backend did not answer" apart from "answered, entry absent".
+  //
+  // Bounded, unlike the sidebar's own loadApps(): both callers have work
+  // sequenced behind this request rather than merely rendering its result — a
+  // post-create save that still owes the user its spinner teardown and form
+  // reset, and a post-consent poll callback that owes an apps refresh. A
+  // never-settling GET would strand either one indefinitely, so it fails as a
+  // null answer on the same 30s bound the catalog connect POST uses.
   const fetchAppsByLocation = async (
     location: string,
   ): Promise<AppIntegration[] | null> => {
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${location}`)
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=${location}`, {
+        signal: AbortSignal.timeout(CATALOG_CONNECT_TIMEOUT_MS),
+      })
       if (!response.ok) return null
       return sanitizeAppIntegrations(await response.json())
     } catch (error) {
@@ -1605,7 +1614,16 @@ export function ConnectMcpDialog({
               // wouldn't even close the dialog after committing it. Disable
               // the trigger instead of letting it commit early; same signal
               // requestClose already gates on.
-              disabled={catalogConnectsInFlight > 0}
+              //
+              // isSavingCustom is the same hazard reached the other way
+              // (#1390): a select-mode save switches back to this tab as soon
+              // as it succeeds, so the footer is on screen while the
+              // attachability lookup that decides whether to add the new
+              // connector is still in flight. Committing there would snapshot
+              // the selection one entry short. Not extended to requestClose,
+              // which handleSaveResponse itself calls while this flag is still
+              // set (the tools-page self-close) — that path must keep working.
+              disabled={catalogConnectsInFlight > 0 || isSavingCustom}
               onClick={() => {
                 if (onConnectSelected) {
                   onConnectSelected(localSelectedServers);
