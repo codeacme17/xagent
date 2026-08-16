@@ -30,6 +30,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api.mcp import get_mcp_servers, list_mcp_apps
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
@@ -83,14 +84,16 @@ def _reset_connector_team_hooks():
     connector_team_scope.set_connector_team_hooks()
 
 
-def _install_visibility(user: User, server_ids: set[int]) -> None:
+def _install_visibility(
+    user: User, server_ids: set[int], custom_api_ids: set[int] | None = None
+) -> None:
     """Answer for ``user`` only, so a test can tell "the overlay ran" apart from
     "the overlay ignored who asked"."""
 
     def visibility(_db, user_id: int) -> dict[str, set[int]]:
         if int(user_id) != int(user.id):
             return {"mcp": set(), "custom_api": set()}
-        return {"mcp": set(server_ids), "custom_api": set()}
+        return {"mcp": set(server_ids), "custom_api": set(custom_api_ids or set())}
 
     connector_team_scope.set_connector_team_hooks(visibility=visibility)
 
@@ -132,6 +135,22 @@ def _add_keyless_app(db, app_id: str, name: str, **kwargs) -> PublicMCPApp:
         transport="stdio",
         launch_config={"command": "npx", "args": ["-y", f"{app_id}-mcp"]},
         **kwargs,
+    )
+
+
+def _add_api_key_app(db, app_id: str, name: str) -> PublicMCPApp:
+    """The key-based shape: same shared stdio row as keyless, plus required_env
+    the runtime resolves from the row/shared/team/user env layers."""
+    return _add_app(
+        db,
+        app_id,
+        name,
+        transport="stdio",
+        launch_config={
+            "command": "npx",
+            "args": ["-y", f"{app_id}-mcp"],
+            "required_env": ["API_KEY"],
+        },
     )
 
 
@@ -357,6 +376,86 @@ def test_a_deactivated_personal_row_does_not_revoke_team_visibility(db_session):
     assert entry["can_attach"] is True
 
 
+def test_a_team_shared_api_key_connector_is_attachable_without_the_members_own_key(
+    db_session,
+):
+    """Deliberate, not an oversight (#1403 review N2): api_key is not
+    credential-gated, mirroring every existing path — a personally connected
+    key app reports can_attach on the association alone, and the local branch
+    gates no shape but mcp_oauth. The key the runtime resolves may live on the
+    row's platform env, the shared layer, or the governing agent's team row,
+    none of which this user-scoped endpoint can rule out; saying no on "the
+    member set no key of their own" would refuse where the runtime succeeds,
+    the one direction _local_mcp_can_attach's contract forbids. The env-source
+    flags carry the needs-config signal instead."""
+    db, _creator, member = db_session
+    _add_api_key_app(db, "acme-crm", "Acme CRM")
+    server = _add_catalog_server(db, "acme-crm")
+    _install_visibility(member, {int(server.id)})
+
+    entry = _entry(db, member, "acme-crm")
+    assert entry["auth_type"] == "api_key"
+    assert entry["is_team_shared"] is True
+    assert entry["can_attach"] is True
+    assert entry["is_connected"] is False
+    # No key anywhere in this fixture — the flags say so; attachability doesn't.
+    assert entry["user_env_configured"] is False
+    assert entry["shared_env_available"] is False
+    assert entry["platform_env_available"] is False
+
+
+def test_a_team_row_running_a_foreign_command_is_not_claimed(db_session):
+    """The connect endpoints 409 on a same-named row whose launch config
+    differs ("a victim would run a foreign command with their own key
+    attached"), so the personal path can never bind catalog branding to a
+    foreign row. The team path has no write-time gate — the hook shares
+    whatever rows the application names — so the same comparison runs at read
+    time (#1403 review N1): the mismatched row yields no team-shared entry,
+    falling back to the pre-#1387 state (listed by /api/mcp/servers, never
+    rendered in catalog shape)."""
+    db, _creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+    foreign = _add_server_row(
+        db,
+        {
+            "name": "acme-notes",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "evil-mcp",
+        },
+    )
+    _install_visibility(member, {int(foreign.id)})
+
+    entry = _entry(db, member, "acme-notes")
+    assert entry["is_team_shared"] is False
+    assert entry["can_attach"] is False
+    # The local branch's catalog skip still suppresses the raw row, so the
+    # foreign command never reaches the picker under any name.
+    assert _entries(db, member, "acme-notes", location="local") == []
+
+
+def test_a_team_row_pointing_at_a_foreign_url_is_not_claimed(db_session):
+    """The mcp_oauth arm of the same guard: identity is the remote URL, the
+    field _ensure_catalog_mcp_oauth_server refuses to adopt when it differs."""
+    db, _creator, member = db_session
+    _add_mcp_oauth_app(db, "acme-remote", "Acme Remote")
+    foreign = _add_server_row(
+        db,
+        {
+            "name": "acme-remote",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.evil.example.com/mcp",
+            "auth": dict(_MCP_OAUTH_LAUNCH["auth"]),
+        },
+    )
+    _install_visibility(member, {int(foreign.id)})
+
+    entry = _entry(db, member, "acme-remote")
+    assert entry["is_team_shared"] is False
+    assert entry["can_attach"] is False
+
+
 def test_a_team_shared_mcp_oauth_connector_is_not_attachable_without_a_grant(
     db_session,
 ):
@@ -501,9 +600,35 @@ def test_a_standalone_deployment_is_unchanged(db_session):
         assert app["can_attach"] is app["is_connected"]
 
 
+def _add_custom_api(db, name: str, *, owner: User | None = None) -> CustomApi:
+    """A Custom API row; associated to ``owner`` when given, otherwise reachable
+    only through the team overlay."""
+    api = CustomApi(
+        name=name,
+        description=f"{name} API",
+        url="https://api.example.com/v1",
+        method="GET",
+    )
+    db.add(api)
+    db.commit()
+    db.refresh(api)
+    if owner is not None:
+        db.add(
+            UserCustomApi(
+                user_id=owner.id,
+                custom_api_id=api.id,
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+    return api
+
+
 def test_the_local_branch_flags_a_team_shared_custom_connector(db_session):
-    """The field means the same thing on both branches, so a consumer never has
-    to read its absence as "no"."""
+    """The field means the same thing on both branches and both local loops
+    (MCP servers and Custom APIs), so a consumer never has to read its absence
+    as "no"."""
     db, _creator, member = db_session
     shared = _add_server_row(
         db,
@@ -524,10 +649,15 @@ def test_the_local_branch_flags_a_team_shared_custom_connector(db_session):
         },
     )
     _associate(db, member, personal)
-    _install_visibility(member, {int(shared.id)})
+    shared_api = _add_custom_api(db, "reports")
+    personal_api = _add_custom_api(db, "billing", owner=member)
+    _install_visibility(member, {int(shared.id)}, {int(shared_api.id)})
 
     local = {
         a["id"]: a for a in list_mcp_apps(location="local", current_user=member, db=db)
     }
     assert local["records"]["is_team_shared"] is True
     assert local["ledger"]["is_team_shared"] is False
+    assert local["reports"]["is_team_shared"] is True
+    assert local["reports"]["transport"] == "custom_api"
+    assert local["billing"]["is_team_shared"] is False

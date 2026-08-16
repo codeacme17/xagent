@@ -2014,6 +2014,34 @@ def _local_mcp_can_authorize(
     return _local_mcp_consent_association_ok(server, user_mcp)
 
 
+def _team_row_matches_catalog_launch(app: dict, server: MCPServer) -> bool:
+    """Whether a name-matched team row really runs the app's official launch.
+
+    The connect endpoints refuse to adopt a same-named row whose configuration
+    differs (_ensure_catalog_app_server, _ensure_catalog_mcp_oauth_server:
+    "a victim would run a foreign command with their own key attached"), so the
+    personal path can never bind catalog branding to a foreign row. The team
+    path has no write-time gate -- the visibility hook shares whatever rows the
+    application names -- so the same comparison runs here, at read time, before
+    a row is rendered under the catalog's name and icon (#1403 review N1).
+
+    Transport equality is already enforced upstream: the non-oauth lookup keys
+    on ``(transport, name)``. What the lookup cannot see is the launch itself,
+    which is what each arm compares. Unknown shapes (``unconnectable``) decline
+    rather than claim -- there is no official launch to compare against.
+    """
+    launch = app.get("launch_config") or {}
+    auth_type = app.get("auth_type")
+    if auth_type in ("api_key", "keyless"):
+        return bool(
+            server.command == launch.get("command")
+            and (server.args or []) == (launch.get("args") or [])
+        )
+    if auth_type == "mcp_oauth":
+        return bool(server.url == launch.get("url"))
+    return False
+
+
 def _team_shared_server_for_app(
     app: dict,
     team_oauth_server_lookup: dict[str, list[MCPServer]],
@@ -2032,10 +2060,21 @@ def _team_shared_server_for_app(
     personal association and a team link resolves a row here too, and gets one
     entry that is connected and team-shared -- not a second entry, and not a
     connected entry that hides where the connector came from.
+
+    The non-oauth arm additionally requires the row to run the app's official
+    launch config (see _team_row_matches_catalog_launch); a same-named foreign
+    row yields no team-shared entry, falling back to the pre-#1387 state --
+    still listed by /api/mcp/servers, just never rendered in catalog shape. The
+    builtin_oauth arm needs no such check: _is_oauth_server_for_app matches on
+    the app_id/provider metadata our own provisioning writes, and the row
+    carries no caller-authored launch to misrepresent.
     """
     if app.get("auth_type") == "builtin_oauth":
         return _lookup_oauth_server_for_app(app, team_oauth_server_lookup)
-    return _non_oauth_server_for_app(app, team_non_oauth_server_lookup)
+    server = _non_oauth_server_for_app(app, team_non_oauth_server_lookup)
+    if server is not None and not _team_row_matches_catalog_launch(app, server):
+        return None
+    return server
 
 
 def _catalog_team_shared_can_attach(
@@ -2062,6 +2101,16 @@ def _catalog_team_shared_can_attach(
     unattachable and its card keeps the catalog Connect route -- "connect it for
     yourself", the same answer the ``mcp_oauth`` shape gets from
     ``_local_mcp_can_attach``'s grant term.
+
+    ``api_key`` is deliberately NOT credential-gated, mirroring every existing
+    path (a personally connected key app reports can_attach on the association
+    alone, and the local branch gates no shape but mcp_oauth). The key the
+    runtime will use may live on the row's platform env, the shared layer, or
+    -- when the team-env hook is installed -- the *governing agent's* team row,
+    which this user-scoped endpoint cannot see; refusing on "the member set no
+    key of their own" would say no where the runtime succeeds, the one
+    direction ``_local_mcp_can_attach``'s contract forbids. The env-source
+    flags (shared/platform/user_env) carry the needs-config signal instead.
     """
     if not _local_mcp_can_attach(
         server,
@@ -2177,6 +2226,23 @@ def list_mcp_apps(
 
     team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
 
+    # Rows for team-visible ids the member holds no personal association for,
+    # fetched once for the whole response: the catalog branch indexes them
+    # below and the local branch overlays them as (server, None) rows, so
+    # neither branch re-queries what the other already loaded. The filter is
+    # the local branch's own membership rule -- "in the team answer, not in
+    # user_mcp_by_server_id" -- written once so the two branches cannot
+    # resolve different row sets.
+    team_only_mcp_rows: list[MCPServer] = []
+    if team_ids["mcp"]:
+        missing_team_mcp = [
+            sid for sid in team_ids["mcp"] if sid not in user_mcp_by_server_id
+        ]
+        if missing_team_mcp:
+            team_only_mcp_rows = (
+                db.query(MCPServer).filter(MCPServer.id.in_(missing_team_mcp)).all()
+            )
+
     # The team-visible rows, indexed by the same identity rules the personal
     # lookups above use. Deliberately a *second* pair of indexes rather than
     # extra entries in the first: the personal ones answer "is this catalog app
@@ -2185,23 +2251,16 @@ def list_mcp_apps(
     # does not have. Rows the member also holds an association for are included
     # -- ``is_team_shared`` describes the connector, not the absence of a
     # personal link -- and are read from ``user_mcps`` rather than re-queried.
+    # Skipped for location=local, whose branch never consults these indexes.
     team_oauth_server_lookup: dict[str, list[MCPServer]] = {}
     team_non_oauth_server_lookup: dict[tuple[str, str], MCPServer] = {}
-    if team_ids["mcp"]:
+    if team_ids["mcp"] and location in ["remote", "all"]:
         team_servers: list[tuple[MCPServer, Optional[UserMCPServer]]] = [
             (server, None)
             for server, _um in user_mcps
             if cast(int, server.id) in team_ids["mcp"]
         ]
-        already_loaded = {cast(int, server.id) for server, _um in team_servers}
-        missing_team_mcp = [sid for sid in team_ids["mcp"] if sid not in already_loaded]
-        if missing_team_mcp:
-            team_servers.extend(
-                (server, None)
-                for server in db.query(MCPServer)
-                .filter(MCPServer.id.in_(missing_team_mcp))
-                .all()
-            )
+        team_servers.extend((server, None) for server in team_only_mcp_rows)
         team_oauth_server_lookup = _build_active_oauth_server_lookup(team_servers)
         team_non_oauth_server_lookup = _build_active_non_oauth_server_lookup(
             team_servers
@@ -2343,20 +2402,13 @@ def list_mcp_apps(
         # (#1387).
         #
         # (server, user_mcp) for a personal row; (server, None) for a
-        # team-owned connector the user holds no association for. Excluding the
-        # ids already covered personally is what keeps a member who holds both
-        # from seeing the connector twice.
+        # team-owned connector the user holds no association for -- the rows
+        # already fetched above, since team_only_mcp_rows applies this branch's
+        # exact membership rule. Excluding the ids already covered personally
+        # is what keeps a member who holds both from seeing the connector
+        # twice.
         local_mcps: list[tuple[MCPServer, UserMCPServer | None]] = list(user_mcps)
-        missing_mcp = [
-            sid for sid in team_ids["mcp"] if sid not in user_mcp_by_server_id
-        ]
-        if missing_mcp:
-            local_mcps.extend(
-                (server, None)
-                for server in db.query(MCPServer)
-                .filter(MCPServer.id.in_(missing_mcp))
-                .all()
-            )
+        local_mcps.extend((server, None) for server in team_only_mcp_rows)
 
         # Skip the rows a catalog app's entry already speaks for, resolving the
         # row's connector identity the way _catalog_app_keys defines it. The old
@@ -2382,8 +2434,8 @@ def list_mcp_apps(
         # suppressed here while the catalog entry still offers Connect, which
         # 409s on the config mismatch (_ensure_catalog_app_server) — visible and
         # fixable from the Tools page, unreachable from the picker. A team-shared
-        # catalog connector loses its only picker entry the same way, which is
-        # pre-existing for most apps and tracked in #1387.
+        # catalog connector is skipped here the same way; its entry is the
+        # catalog branch's, which recognizes the team link (#1387).
         library_keys = {key for app in library_apps for key in _catalog_app_keys(app)}
         for server, user_mcp in local_mcps:
             if library_keys.intersection(_server_catalog_keys(server)):
