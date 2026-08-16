@@ -1726,11 +1726,22 @@ def _oauth_server_lookup_keys(server: MCPServer) -> list[str]:
 
 
 def _build_active_oauth_server_lookup(
-    user_mcps: list[tuple[MCPServer, UserMCPServer]],
+    user_mcps: list[tuple[MCPServer, Optional[UserMCPServer]]],
 ) -> dict[str, list[MCPServer]]:
+    """Index oauth-transport rows by the keys a catalog app resolves them under.
+
+    ``user_mcp`` is ``None`` for a row reached through the team overlay rather
+    than a personal association, and such a row is never gated on ``is_active``:
+    that gate belongs to the personal arm alone (``connector_visible_to_user``).
+    Callers pass one population or the other, never both in one dict — a
+    personal lookup answers "connected for me", a team lookup answers "shared
+    with me", and #1387 is what happens when those two are conflated.
+    """
     lookup: dict[str, list[MCPServer]] = {}
     for server, user_mcp in user_mcps:
-        if not user_mcp.is_active or _normalize_app_key(server.transport) != "oauth":
+        if user_mcp is not None and not user_mcp.is_active:
+            continue
+        if _normalize_app_key(server.transport) != "oauth":
             continue
         for key in _oauth_server_lookup_keys(server):
             lookup.setdefault(key, []).append(server)
@@ -1753,18 +1764,18 @@ def _lookup_oauth_server_for_app(
 
 
 def _build_active_non_oauth_server_lookup(
-    user_mcps: list[tuple[MCPServer, UserMCPServer]],
+    user_mcps: list[tuple[MCPServer, Optional[UserMCPServer]]],
 ) -> dict[tuple[str, str], MCPServer]:
+    """``(transport, name)`` index of non-oauth rows. ``None`` association means
+    the row was reached through the team overlay — see the oauth twin above for
+    why that arm carries no ``is_active`` gate."""
     lookup: dict[tuple[str, str], MCPServer] = {}
     for server, user_mcp in user_mcps:
         transport = _normalize_app_key(server.transport)
         server_name = _normalize_app_key(server.name)
-        if (
-            not user_mcp.is_active
-            or not transport
-            or transport == "oauth"
-            or not server_name
-        ):
+        if user_mcp is not None and not user_mcp.is_active:
+            continue
+        if not transport or transport == "oauth" or not server_name:
             continue
         lookup.setdefault((transport, server_name), server)
     return lookup
@@ -1845,14 +1856,21 @@ def _app_user_env_configured(
     return _env_covers_required(getattr(assoc, "env", None), required)
 
 
-def _connected_non_oauth_server_for_app(
+def _non_oauth_server_for_app(
     app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
-) -> Optional[int]:
+) -> Optional[MCPServer]:
+    """The row in ``non_oauth_server_lookup`` that backs this catalog app.
+
+    The identity rule alone — transport plus one of ``_catalog_app_keys`` — with
+    no claim about *why* the row is in the lookup. What the answer means is the
+    caller's: the same rule resolves "connected for me" against the personal
+    index and "shared with me" against the team one (#1387).
+    """
     app_transport = _normalize_app_key(app.get("transport"))
     if not app_transport or app_transport == "oauth":
         return None
 
-    server = next(
+    return next(
         (
             non_oauth_server_lookup[(app_transport, app_key)]
             for app_key in _catalog_app_keys(app)
@@ -1860,6 +1878,12 @@ def _connected_non_oauth_server_for_app(
         ),
         None,
     )
+
+
+def _connected_non_oauth_server_for_app(
+    app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
+) -> Optional[int]:
+    server = _non_oauth_server_for_app(app, non_oauth_server_lookup)
     if not server:
         return None
 
@@ -1990,6 +2014,68 @@ def _local_mcp_can_authorize(
     return _local_mcp_consent_association_ok(server, user_mcp)
 
 
+def _team_shared_server_for_app(
+    app: dict,
+    team_oauth_server_lookup: dict[str, list[MCPServer]],
+    team_non_oauth_server_lookup: dict[tuple[str, str], MCPServer],
+) -> Optional[MCPServer]:
+    """The team-visible row backing this catalog app, if the member has one.
+
+    Resolved by the same two rules the catalog branch's own connected-state
+    lookups use, against team-keyed indexes instead of personal ones -- which is
+    the whole of #1387: the branch could answer "connected for me" and nothing
+    else, so a connector a team shared with a member had no entry at all (the
+    local branch drops every catalog-keyed row, deliberately, to stay free of
+    the #1346 duplicate).
+
+    Independent of connection state on purpose. A member holding *both* a
+    personal association and a team link resolves a row here too, and gets one
+    entry that is connected and team-shared -- not a second entry, and not a
+    connected entry that hides where the connector came from.
+    """
+    if app.get("auth_type") == "builtin_oauth":
+        return _lookup_oauth_server_for_app(app, team_oauth_server_lookup)
+    return _non_oauth_server_for_app(app, team_non_oauth_server_lookup)
+
+
+def _catalog_team_shared_can_attach(
+    app: dict,
+    server: MCPServer,
+    *,
+    oauth_account_lookup: dict[str, object],
+    team_mcp_ids: Collection[int],
+    active_grant_server_ids: set[int],
+    token_resolver_installed: bool,
+) -> bool:
+    """Whether a team-shared catalog entry may be selected into an agent (#1387).
+
+    ``_local_mcp_can_attach``'s rule -- visible to the runtime AND credentials
+    that plausibly resolve -- delegated rather than restated, plus the one term
+    that rule never needed: ``builtin_oauth``. A catalog-keyed row never reaches
+    the local branch, so that shape had no attachability rule anywhere.
+
+    ``builtin_oauth`` authorization is the member's own provider login, held on
+    ``UserOAuth`` and never on the shared row, so sharing the connector shares
+    no credential for it: attachable only once the member has a usable account
+    of their own, which is also the state ``is_connected`` would report if they
+    additionally held a personal association. Without one the entry stays
+    unattachable and its card keeps the catalog Connect route -- "connect it for
+    yourself", the same answer the ``mcp_oauth`` shape gets from
+    ``_local_mcp_can_attach``'s grant term.
+    """
+    if not _local_mcp_can_attach(
+        server,
+        None,
+        team_mcp_ids=team_mcp_ids,
+        active_grant_server_ids=active_grant_server_ids,
+        token_resolver_installed=token_resolver_installed,
+    ):
+        return False
+    if app.get("auth_type") != "builtin_oauth":
+        return True
+    return any(key in oauth_account_lookup for key in _oauth_keys_for_app(app))
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -2076,6 +2162,51 @@ def list_mcp_apps(
 
     token_resolver_installed = oauth_token_resolver_installed()
 
+    # Sharing a connector with a team writes a team link row and no per-member
+    # association, so every personal query above resolves nothing for every
+    # member but the creator. Resolved once for the whole response, above both
+    # branches: the local branch overlays these ids to list team-owned custom
+    # connectors (#1321), and the catalog branch resolves the same ids to
+    # recognize a team-shared *catalog* connector, which had no entry on either
+    # branch (#1387). Standalone deployments install no hook, resolve empty, and
+    # take exactly the path they always did.
+    from ..services.connector_team_scope import (
+        connector_visible_to_user,
+        visible_team_connector_ids,
+    )
+
+    team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+
+    # The team-visible rows, indexed by the same identity rules the personal
+    # lookups above use. Deliberately a *second* pair of indexes rather than
+    # extra entries in the first: the personal ones answer "is this catalog app
+    # connected for me", which only a personal association can establish, and
+    # folding a team link into that answer would report a connection the member
+    # does not have. Rows the member also holds an association for are included
+    # -- ``is_team_shared`` describes the connector, not the absence of a
+    # personal link -- and are read from ``user_mcps`` rather than re-queried.
+    team_oauth_server_lookup: dict[str, list[MCPServer]] = {}
+    team_non_oauth_server_lookup: dict[tuple[str, str], MCPServer] = {}
+    if team_ids["mcp"]:
+        team_servers: list[tuple[MCPServer, Optional[UserMCPServer]]] = [
+            (server, None)
+            for server, _um in user_mcps
+            if cast(int, server.id) in team_ids["mcp"]
+        ]
+        already_loaded = {cast(int, server.id) for server, _um in team_servers}
+        missing_team_mcp = [sid for sid in team_ids["mcp"] if sid not in already_loaded]
+        if missing_team_mcp:
+            team_servers.extend(
+                (server, None)
+                for server in db.query(MCPServer)
+                .filter(MCPServer.id.in_(missing_team_mcp))
+                .all()
+            )
+        team_oauth_server_lookup = _build_active_oauth_server_lookup(team_servers)
+        team_non_oauth_server_lookup = _build_active_non_oauth_server_lookup(
+            team_servers
+        )
+
     if location in ["remote", "all"]:
         for app in library_apps:
             if app.get("auth_type") == "builtin_oauth":
@@ -2115,6 +2246,22 @@ def list_mcp_apps(
                 )
                 app_env_source = getattr(_assoc, "env_source", None)
             is_connected = server_id is not None
+            team_server = _team_shared_server_for_app(
+                app, team_oauth_server_lookup, team_non_oauth_server_lookup
+            )
+            # Delegated to the overlay's own predicate rather than settled by
+            # the lookup hit alone. The two can disagree: the row query that
+            # fills those indexes is a SQL `IN`, which SQLite's numeric affinity
+            # lets a hook's *string* id match, while this predicate compares in
+            # Python and does not. `can_attach` below already resolves that
+            # disagreement the strict way (through _local_mcp_can_attach), so
+            # deciding the flag any other way would badge a card "Team tool"
+            # that the same response refuses to attach.
+            is_team_shared = team_server is not None and connector_visible_to_user(
+                association=None,
+                connector_id=cast(int, team_server.id),
+                team_ids=team_ids["mcp"],
+            )
             is_visible_in_connector = app.get("is_visible_in_connector", True)
 
             # Strong hide mode: hidden public apps are removed from the
@@ -2136,11 +2283,33 @@ def list_mcp_apps(
 
             app_copy = app.copy()
             app_copy["is_connected"] = is_connected
+            # A third state, distinct from is_connected on purpose (#1387).
+            # is_connected keeps answering "connected *for me*", which only a
+            # personal association establishes; a team-shared connector is
+            # usable without one, and folding the two together would claim an
+            # ownership the member does not have and hide the Connect route the
+            # oauth shapes still need.
+            app_copy["is_team_shared"] = is_team_shared
             # A catalog app the user never connected has no association row at
             # all, so there is no connector to attach -- connecting really is
             # the prerequisite. Stating that here is what stops the picker from
             # inferring it from is_custom's absence on this branch (#1347).
-            app_copy["can_attach"] = is_connected
+            # A team link is the one way that prerequisite is met without a
+            # personal association: the runtime resolves team-owned rows by the
+            # same overlay (_load_visible_runtime_connectors), so the connector
+            # really does run -- for the shapes whose credentials ride on the
+            # shared row rather than on the member (#1387).
+            app_copy["can_attach"] = is_connected or (
+                team_server is not None
+                and _catalog_team_shared_can_attach(
+                    app,
+                    team_server,
+                    oauth_account_lookup=oauth_account_lookup,
+                    team_mcp_ids=team_ids["mcp"],
+                    active_grant_server_ids=active_grant_server_ids,
+                    token_resolver_installed=token_resolver_installed,
+                )
+            )
             app_copy["can_authorize"] = False
             app_copy["shared_env_available"] = app_shared_env
             app_copy["platform_env_available"] = app_platform_env
@@ -2153,28 +2322,26 @@ def list_mcp_apps(
                 if connected_account:
                     app_copy["connected_account"] = connected_account
 
-            if status == "verified" and not app_copy["is_connected"]:
+            # The picker's status filter narrows to "connectors backing a real
+            # connection", which a team-shared one does even though no personal
+            # association records it -- withholding it here would put the
+            # connector back out of reach for any member browsing under the
+            # filter, which is the reach #1387 is about. The local branch
+            # applies no status filter at all, so this keeps the two consistent
+            # for team-shared connectors rather than splitting them again.
+            if status == "verified" and not (is_connected or is_team_shared):
                 continue
 
             results.append(app_copy)
 
     if location in ["local", "all"]:
-        # Sharing a connector with a team writes a team link row and no
-        # per-member association, so the personal queries above resolve nothing
-        # for every member but the creator. Overlay the team-owned ids the way
-        # get_mcp_servers does, or the Tools page would list a connector the
-        # picker cannot offer (#1321). Scoped to this branch on purpose: the
-        # remote branch's lookups answer "is this catalog app connected *for
-        # me*", which only a personal association can establish. Standalone
-        # deployments install no hook, resolve empty, and take the same path
-        # they always did.
-        from ..services.connector_team_scope import (
-            connector_visible_to_user,
-            visible_team_connector_ids,
-        )
-
-        team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
-
+        # Overlay the team-owned ids resolved above the way get_mcp_servers
+        # does, or the Tools page would list a connector the picker cannot
+        # offer (#1321). The catalog branch reads the same ids but never the
+        # same answer: there they establish "shared with me", a state distinct
+        # from the "connected for me" only a personal association can give
+        # (#1387).
+        #
         # (server, user_mcp) for a personal row; (server, None) for a
         # team-owned connector the user holds no association for. Excluding the
         # ids already covered personally is what keeps a member who holds both
@@ -2252,6 +2419,13 @@ def list_mcp_apps(
                 "is_local": True,
                 "server_id": server.id,
                 "is_custom": True,
+                # Same meaning the catalog branch gives it (#1387): the
+                # connector reached this member through a team link. Emitted on
+                # both branches so a consumer never has to read the field's
+                # absence as "no", and computed from the ids rather than from
+                # `user_mcp is None`, which would go false the moment a member
+                # also connected the connector for themselves.
+                "is_team_shared": cast(int, server.id) in team_ids["mcp"],
                 "can_attach": _local_mcp_can_attach(
                     server,
                     user_mcp,
@@ -2343,6 +2517,7 @@ def list_mcp_apps(
                     "is_local": True,
                     "server_id": api.id,
                     "is_custom": True,
+                    "is_team_shared": cast(int, api.id) in team_ids["custom_api"],
                     # A Custom API carries its own credentials on the row and
                     # has no OAuth consent step of any kind, so credentials
                     # never gate it and consent is never meaningful -- which is
