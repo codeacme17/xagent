@@ -455,6 +455,75 @@ def test_env_source_flags_report_the_layer_that_covers_a_team_shared_key_app(
         set_mcp_shared_env_hook(None)
 
 
+def test_a_members_own_key_flags_user_env_on_a_team_shared_key_app(db_session):
+    """The user layer: a member who additionally connected the app with their
+    own key sees user_env_configured, alongside — not instead of — the team
+    provenance."""
+    from xagent.core.utils.encryption import encrypt_env_dict
+
+    db, _creator, member = db_session
+    _add_api_key_app(db, "acme-crm", "Acme CRM")
+    server = _add_catalog_server(db, "acme-crm")
+    _associate(db, member, server)
+    assoc = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == member.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assoc.env = encrypt_env_dict({"API_KEY": "member-key"})
+    db.commit()
+    _install_visibility(member, {int(server.id)})
+
+    entry = _entry(db, member, "acme-crm")
+    assert entry["user_env_configured"] is True
+    assert entry["is_connected"] is True
+    assert entry["is_team_shared"] is True
+    assert entry["can_attach"] is True
+
+
+def test_a_partially_covered_required_env_does_not_flag_the_layer(db_session):
+    """_env_covers_required is all-or-nothing: a layer that covers one of two
+    required keys advertises nothing, so the picker never offers "use the
+    platform key" for a key set that would fail at launch."""
+    from xagent.core.utils.encryption import encrypt_env_dict
+
+    db, _creator, member = db_session
+    _add_app(
+        db,
+        "acme-crm",
+        "Acme CRM",
+        transport="stdio",
+        launch_config={
+            "command": "npx",
+            "args": ["-y", "acme-crm-mcp"],
+            "required_env": ["API_KEY", "REGION"],
+        },
+    )
+    server = _add_server_row(
+        db,
+        {
+            "name": "acme-crm",
+            "description": "A catalog app",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "acme-crm-mcp"],
+        },
+    )
+    server.env = encrypt_env_dict({"API_KEY": "platform-key"})
+    db.commit()
+    _install_visibility(member, {int(server.id)})
+
+    entry = _entry(db, member, "acme-crm")
+    assert entry["platform_env_available"] is False
+    assert entry["is_team_shared"] is True
+    # Attachability stays optimistic by contract; the flags carry the truth.
+    assert entry["can_attach"] is True
+
+
 def test_a_team_row_running_a_foreign_command_is_not_claimed(db_session):
     """The connect endpoints 409 on a same-named row whose launch config
     differs ("a victim would run a foreign command with their own key
@@ -789,7 +858,11 @@ def test_a_hook_answering_string_ids_flags_nothing_it_cannot_attach(db_session):
 
 def test_a_standalone_deployment_is_unchanged(db_session):
     """AC5: no hook installed resolves empty, so every entry keeps the
-    pre-#1387 answer — `can_attach` is exactly `is_connected`."""
+    pre-#1387 answer — `can_attach` is exactly `is_connected`, and the
+    is_team_shared field is absent entirely, keeping standalone payloads
+    identical to what they were before this change. Present-false is reserved
+    for deployments where the concept exists (hook installed, nothing shared
+    with this user)."""
     db, _creator, member = db_session
     _add_keyless_app(db, "acme-notes", "Acme Notes")
     _add_mcp_oauth_app(db, "acme-remote", "Acme Remote")
@@ -799,8 +872,28 @@ def test_a_standalone_deployment_is_unchanged(db_session):
     remote = list_mcp_apps(location="remote", current_user=member, db=db)
     assert {a["id"] for a in remote} == {"acme-notes", "acme-remote"}
     for app in remote:
-        assert app["is_team_shared"] is False
+        assert "is_team_shared" not in app
         assert app["can_attach"] is app["is_connected"]
+
+    local = list_mcp_apps(location="local", current_user=member, db=db)
+    for app in local:
+        assert "is_team_shared" not in app
+
+
+def test_an_installed_hook_answering_empty_still_emits_the_field(db_session):
+    """The field's absence means "this deployment has no team sharing", never
+    "nothing is shared with you" — an installed hook answering empty is the
+    latter, and consumers may rely on present-false to tell the two apart."""
+    db, creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+    server = _add_catalog_server(db, "acme-notes")
+    _associate(db, member, server)
+    # Hook answers only for the creator; the member gets empty sets.
+    _install_visibility(creator, {int(server.id)})
+
+    entry = _entry(db, member, "acme-notes")
+    assert entry["is_team_shared"] is False
+    assert entry["is_connected"] is True
 
 
 def _add_custom_api(db, name: str, *, owner: User | None = None) -> CustomApi:

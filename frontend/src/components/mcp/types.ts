@@ -50,8 +50,10 @@ export interface AppIntegration {
   // a connection of their own (#1387). A third state, not a synonym for
   // is_connected: the connector is usable without the viewer owning it, so the
   // card labels it as the team's and — for the shapes whose credentials are
-  // per-user — still offers the Connect route. Emitted on every entry of
-  // /api/mcp/apps, and always false where no team-visibility hook is installed.
+  // per-user — still offers the Connect route. Absent entirely on deployments
+  // without a team-visibility hook (standalone payloads stay pre-#1387);
+  // present-false means teams exist and nothing is shared with this viewer.
+  // Read absence as false, which Boolean() already does.
   is_team_shared?: boolean
   // Team-sharing status (from POST /api/connectors/status), merged in after list load.
   shared?: boolean

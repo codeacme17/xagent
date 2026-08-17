@@ -2268,11 +2268,19 @@ def list_mcp_apps(
     # branch (#1387). Standalone deployments install no hook, resolve empty, and
     # take exactly the path they always did.
     from ..services.connector_team_scope import (
+        connector_visibility_hook_installed,
         connector_visible_to_user,
         visible_team_connector_ids,
     )
 
     team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+    # is_team_shared is emitted only where the concept exists: an installed
+    # hook answering "no teams shared anything with this user" is a real
+    # present-false, while a standalone deployment gets no field at all, so
+    # its payloads stay exactly what they were before #1387 (the #1321/#1387
+    # compatibility line). Consumers already read absence as false
+    # (types.ts marks the field optional).
+    team_hook_installed = connector_visibility_hook_installed()
 
     # Rows for team-visible ids the member holds no personal association for,
     # fetched once for the whole response: the catalog branch indexes them
@@ -2421,8 +2429,10 @@ def list_mcp_apps(
             # personal association establishes; a team-shared connector is
             # usable without one, and folding the two together would claim an
             # ownership the member does not have and hide the Connect route the
-            # oauth shapes still need.
-            app_copy["is_team_shared"] = is_team_shared
+            # oauth shapes still need. Absent on standalone deployments (see
+            # team_hook_installed above).
+            if team_hook_installed:
+                app_copy["is_team_shared"] = is_team_shared
             # A catalog app the user never connected has no association row at
             # all, so there is no connector to attach -- connecting really is
             # the prerequisite. Stating that here is what stops the picker from
@@ -2548,13 +2558,17 @@ def list_mcp_apps(
                 "is_local": True,
                 "server_id": server.id,
                 "is_custom": True,
-                # Same meaning the catalog branch gives it (#1387): the
-                # connector reached this member through a team link. Emitted on
-                # both branches so a consumer never has to read the field's
-                # absence as "no", and computed from the ids rather than from
-                # `user_mcp is None`, which would go false the moment a member
-                # also connected the connector for themselves.
-                "is_team_shared": cast(int, server.id) in team_ids["mcp"],
+                # Same meaning and same presence rule as the catalog branch
+                # (#1387): the connector reached this member through a team
+                # link; absent on standalone deployments. Computed from the
+                # ids rather than from `user_mcp is None`, which would go
+                # false the moment a member also connected the connector for
+                # themselves.
+                **(
+                    {"is_team_shared": cast(int, server.id) in team_ids["mcp"]}
+                    if team_hook_installed
+                    else {}
+                ),
                 "can_attach": _local_mcp_can_attach(
                     server,
                     user_mcp,
@@ -2646,7 +2660,11 @@ def list_mcp_apps(
                     "is_local": True,
                     "server_id": api.id,
                     "is_custom": True,
-                    "is_team_shared": cast(int, api.id) in team_ids["custom_api"],
+                    **(
+                        {"is_team_shared": cast(int, api.id) in team_ids["custom_api"]}
+                        if team_hook_installed
+                        else {}
+                    ),
                     # A Custom API carries its own credentials on the row and
                     # has no OAuth consent step of any kind, so credentials
                     # never gate it and consent is never meaningful -- which is
