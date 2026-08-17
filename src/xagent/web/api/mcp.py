@@ -1733,8 +1733,33 @@ def _oauth_server_lookup_keys(server: MCPServer) -> list[str]:
     return _app_lookup_keys(server.name)
 
 
+def _team_oauth_server_lookup_keys(server: MCPServer) -> list[str]:
+    """``_oauth_server_lookup_keys`` minus the bare-provider fallback.
+
+    Providers are deliberately non-unique across apps (the meta/Instagram
+    siblings), so on the team path a row whose ``auth.app_id`` is blank or
+    absent must not be indexed under its provider: one malformed provider-only
+    row would satisfy *every* catalog app on that provider, branding them all
+    team-shared (#1403 review round 6). Team identity is the nonblank stable
+    app_id, or the row's own name for legacy rows that predate the metadata --
+    an exact match either way. The personal lookup keeps the provider fallback
+    it always had: there it answers "connected for me" against the member's own
+    rows, where over-matching moves a legacy row's tab rather than granting
+    another app's branding, and _is_oauth_server_for_app still gates the final
+    claim in both paths.
+    """
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, dict):
+        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        if auth_app_id:
+            return [auth_app_id]
+    return _app_lookup_keys(server.name)
+
+
 def _build_active_oauth_server_lookup(
     user_mcps: list[tuple[MCPServer, Optional[UserMCPServer]]],
+    *,
+    keys_for: Callable[[MCPServer], list[str]] = _oauth_server_lookup_keys,
 ) -> dict[str, list[MCPServer]]:
     """Index oauth-transport rows by the keys a catalog app resolves them under.
 
@@ -1743,7 +1768,9 @@ def _build_active_oauth_server_lookup(
     that gate belongs to the personal arm alone (``connector_visible_to_user``).
     Callers pass one population or the other, never both in one dict — a
     personal lookup answers "connected for me", a team lookup answers "shared
-    with me", and #1387 is what happens when those two are conflated.
+    with me", and #1387 is what happens when those two are conflated. The key
+    rule differs with the population too (``keys_for``): the team path indexes
+    without the bare-provider fallback (see _team_oauth_server_lookup_keys).
     """
     lookup: dict[str, list[MCPServer]] = {}
     for server, user_mcp in user_mcps:
@@ -1751,7 +1778,7 @@ def _build_active_oauth_server_lookup(
             continue
         if _normalize_app_key(server.transport) != "oauth":
             continue
-        for key in _oauth_server_lookup_keys(server):
+        for key in keys_for(server):
             lookup.setdefault(key, []).append(server)
     return lookup
 
@@ -2273,7 +2300,41 @@ def list_mcp_apps(
         visible_team_connector_ids,
     )
 
-    team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+    # The hook is optional application code, and hoisting the overlay above
+    # both branches means the default remote picker now runs it on every load
+    # -- so a raising hook or a malformed outer answer must surface as this
+    # seam's typed 503, the way resolve_team_connector_ids_or_raise already
+    # converts failures at the team-keyed boundary, not as a bare 500.
+    # Outer shape only: element-level id validation stays with the accessor
+    # (#1244), where it can land uniformly across every legacy call site.
+    try:
+        team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve team connector visibility for user %s",
+            current_user.id,
+            exc_info=True,
+        )
+        # 503 literal: this function's `status` query param shadows
+        # fastapi.status in this scope.
+        raise HTTPException(
+            status_code=503,
+            detail="Connector team scope is unavailable.",
+        ) from exc
+    if (
+        not isinstance(team_ids, dict)
+        or not isinstance(team_ids.get("mcp"), set)
+        or not isinstance(team_ids.get("custom_api"), set)
+    ):
+        logger.warning(
+            "Team visibility hook returned a malformed answer for user %s: %r",
+            current_user.id,
+            type(team_ids).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Connector team scope is unavailable.",
+        )
     # is_team_shared is emitted only where the concept exists: an installed
     # hook answering "no teams shared anything with this user" is a real
     # present-false, while a standalone deployment gets no field at all, so
@@ -2317,7 +2378,9 @@ def list_mcp_apps(
             if cast(int, server.id) in team_ids["mcp"]
         ]
         team_servers.extend((server, None) for server in team_only_mcp_rows)
-        team_oauth_server_lookup = _build_active_oauth_server_lookup(team_servers)
+        team_oauth_server_lookup = _build_active_oauth_server_lookup(
+            team_servers, keys_for=_team_oauth_server_lookup_keys
+        )
         # Read-time analog of _reject_user_owned_catalog_squat: a user-owned
         # row must not render under catalog branding even when its launch
         # currently matches -- its owner keeps edit rights and could swap in a

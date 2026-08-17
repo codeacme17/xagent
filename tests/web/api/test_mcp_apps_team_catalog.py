@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -854,6 +855,78 @@ def test_a_hook_answering_string_ids_flags_nothing_it_cannot_attach(db_session):
     entry = _entry(db, member, "acme-notes")
     assert entry["is_team_shared"] is False
     assert entry["can_attach"] is False
+
+
+def test_a_provider_only_row_does_not_brand_every_same_provider_app(db_session):
+    """Providers are non-unique across apps, so the team oauth index carries no
+    bare-provider fallback (#1403 review round 6): a row whose auth.app_id is
+    blank must not satisfy every catalog app on its provider. Only the row
+    whose stable app_id names an app claims that app; the malformed sibling
+    claims nothing."""
+    db, _creator, member = db_session
+    _add_app(db, "acme-drive", "Acme Drive", transport="oauth", provider_name="acme")
+    _add_app(db, "acme-mail", "Acme Mail", transport="oauth", provider_name="acme")
+    malformed = _add_server_row(
+        db,
+        {
+            "name": "legacy-acme",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"app_id": "   ", "provider": "acme"},
+        },
+    )
+    proper = _add_server_row(
+        db,
+        {
+            "name": "Acme Drive",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"app_id": "acme-drive", "provider": "acme"},
+        },
+    )
+    _add_oauth_account(db, member, "acme")
+    _install_visibility(member, {int(malformed.id), int(proper.id)})
+
+    assert _entry(db, member, "acme-drive")["is_team_shared"] is True
+    entry = _entry(db, member, "acme-mail")
+    assert entry["is_team_shared"] is False
+    assert entry["can_attach"] is False
+
+
+def test_a_raising_visibility_hook_yields_a_typed_503(db_session):
+    """The hook is optional application code and the default remote picker now
+    runs it on every load; a raising hook must surface as this seam's typed
+    503 (mirroring resolve_team_connector_ids_or_raise), not a bare 500
+    (#1403 review round 6)."""
+    db, _creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+
+    def raising(_db, _user_id):
+        raise RuntimeError("hook exploded")
+
+    connector_team_scope.set_connector_team_hooks(visibility=raising)
+    with pytest.raises(HTTPException) as exc_info:
+        list_mcp_apps(location="remote", current_user=member, db=db)
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [None, {"mcp": set()}, {"mcp": [1], "custom_api": set()}],
+    ids=["none", "missing-key", "list-not-set"],
+)
+def test_a_malformed_outer_hook_answer_yields_a_typed_503(db_session, answer):
+    """Outer shape only — element-level id validation stays with the accessor
+    (#1244). A hook answering something that is not {mcp: set, custom_api: set}
+    is malformed authorization input and fails loudly with the typed 503,
+    never a KeyError-shaped 500."""
+    db, _creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+    connector_team_scope.set_connector_team_hooks(visibility=lambda _db, _uid: answer)
+
+    with pytest.raises(HTTPException) as exc_info:
+        list_mcp_apps(location="remote", current_user=member, db=db)
+    assert exc_info.value.status_code == 503
 
 
 def test_a_standalone_deployment_is_unchanged(db_session):
