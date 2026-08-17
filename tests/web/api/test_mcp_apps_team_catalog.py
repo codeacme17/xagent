@@ -11,9 +11,15 @@ in the Remote tab, while `/api/mcp/servers` listed the connector all along.
 
 The fix gives the catalog branch a third state. `is_connected` still means
 "connected for me"; `is_team_shared` means "reached me through a team link";
-and `can_attach` unions the two, gated on whether the shape's credentials ride
-on the shared row (stdio/key-based: yes) or on the member (`mcp_oauth`,
-`builtin_oauth`: only once they have their own grant or account).
+and `can_attach` unions the two, gated by shape. Keyless needs no credential
+at all. `api_key` is deliberately not credential-gated: the key the runtime
+resolves may live on the row's platform env, the application-injected shared
+layer, or the governing agent's team row — none visible to this user-scoped
+endpoint — so the answer is optimistic and the env-source flags carry the
+needs-config signal. The OAuth shapes gate on the member's own credential
+(`mcp_oauth`: an active grant; `builtin_oauth`: a usable provider account),
+except where an installed token-resolver hook supplies the deployment's
+tokens out of band, which satisfies both.
 
 Fictional app ids (`acme*`) are admin-created apps, whose stored transport and
 launch_config are used as-is — built-in ids would take theirs from
@@ -138,8 +144,8 @@ def _add_app(
 
 
 def _add_keyless_app(db, app_id: str, name: str, **kwargs) -> PublicMCPApp:
-    """The shape whose credentials ride entirely on the shared row, so sharing
-    the connector really does share a working one."""
+    """The shape with no credential at all — the shared row's launch config is
+    everything, so sharing the connector really does share a working one."""
     return _add_app(
         db,
         app_id,
@@ -416,6 +422,39 @@ def test_a_team_shared_api_key_connector_is_attachable_without_the_members_own_k
     assert entry["platform_env_available"] is False
 
 
+def test_env_source_flags_report_the_layer_that_covers_a_team_shared_key_app(
+    db_session,
+):
+    """The needs-config signal the optimistic can_attach leans on: when a key
+    layer this endpoint *can* see covers required_env, the matching flag says
+    so. The platform layer is the row's own env; the shared layer is the
+    application-injected per-user hook. (The governing agent's team layer is
+    runtime-side and deliberately untested here — that basis question is
+    #1366's.)"""
+    from xagent.core.utils.encryption import encrypt_env_dict
+    from xagent.web.services.mcp_runtime import set_mcp_shared_env_hook
+
+    db, _creator, member = db_session
+    _add_api_key_app(db, "acme-crm", "Acme CRM")
+    server = _add_catalog_server(db, "acme-crm")
+    _install_visibility(member, {int(server.id)})
+
+    server.env = encrypt_env_dict({"API_KEY": "platform-key"})
+    db.commit()
+    entry = _entry(db, member, "acme-crm")
+    assert entry["platform_env_available"] is True
+    assert entry["shared_env_available"] is False
+    assert entry["can_attach"] is True
+    assert entry["is_connected"] is False
+
+    set_mcp_shared_env_hook(lambda _db, _uid: {int(server.id): {"API_KEY": "team-key"}})
+    try:
+        entry = _entry(db, member, "acme-crm")
+        assert entry["shared_env_available"] is True
+    finally:
+        set_mcp_shared_env_hook(None)
+
+
 def test_a_team_row_running_a_foreign_command_is_not_claimed(db_session):
     """The connect endpoints 409 on a same-named row whose launch config
     differs ("a victim would run a foreign command with their own key
@@ -583,6 +622,27 @@ def test_a_team_shared_builtin_oauth_connector_needs_the_members_own_account(
     # Still not a personal connection: the member has an account but no
     # association, which is what is_connected reports on.
     assert entry["is_connected"] is False
+
+
+def test_a_renamed_builtin_oauth_apps_row_still_reports_its_app_id(db_session):
+    """/api/mcp/servers enrichment resolves by stable auth.app_id (with a name
+    fallback for legacy rows), not by name alone: an admin renaming an app
+    leaves the provisioned row under the old display name, and the name-only
+    lookup reported app_id None for exactly the row the catalog entry resolves
+    through auth.app_id. The picker's selector resolution keys on this app_id
+    to map the entry back to its real row; without it, the persisted selector
+    was the new display name of a row the runtime knows by the old one — zero
+    tools, silently (#1403 review round 3)."""
+    db, _creator, member = db_session
+    _add_builtin_oauth_app(db, "acme-drive", "Acme Drive v2")
+    server = _add_builtin_oauth_server(db, "acme-drive", "Acme Drive")
+    _install_visibility(member, {int(server.id)})
+
+    listed = get_mcp_servers(current_user=member, db=db)
+    row = next(s for s in listed if s.name == "Acme Drive")
+    assert row.app_id == "acme-drive"
+    # The catalog entry keeps resolving the renamed row through auth.app_id.
+    assert _entry(db, member, "acme-drive")["is_team_shared"] is True
 
 
 def test_a_team_shared_builtin_oauth_connector_attaches_through_a_resolver_hook(

@@ -36,7 +36,7 @@ from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
-    get_app_by_name,
+    get_app_for_mcp_server,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -1539,7 +1539,15 @@ def _enrich_oauth_server_info(
     if server.transport != "oauth":
         return None, None, None
 
-    app_info = get_app_by_name(db, str(server.name))
+    # By stable identity (auth.app_id) with a name fallback for legacy rows,
+    # not by name alone: an admin renaming an app leaves its provisioned row
+    # under the old name, and a name-only lookup then reports app_id None for
+    # exactly the row the catalog resolves through auth.app_id. The picker's
+    # selector resolution keys on this app_id to map the catalog entry back to
+    # its real row (findMatchingMcpServer), so losing it here persisted the
+    # display name of a row the runtime knows by another name — a selector
+    # that silently loads zero tools (#1403 review round 3).
+    app_info = get_app_for_mcp_server(db, server)
     if not app_info:
         return None, None, None
 
