@@ -1,7 +1,7 @@
 """Monitoring management API route handlers"""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -300,9 +300,11 @@ async def get_monitoring_stats(
         )
         total_calls = llm_calls_end + tool_executions_end
 
-        # Get today's call count
-        today = datetime.now().date()
-        today_start = datetime.combine(today, datetime.min.time())
+        # Get today's call count. "Today" is the UTC day: the boundary must be
+        # in the same frame as the aware-UTC timestamps the column stores.
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         today_calls = (
             db.query(TraceEvent)
             .filter(
@@ -648,8 +650,9 @@ async def get_dashboard_stats(
         # Get total task count
         total_tasks = db.query(Task).filter(*task_filter).count()
 
-        # Get active agent count (based on tasks with recent activity)
-        recent_active_time = datetime.now().replace(
+        # Get active agent count (based on tasks with recent activity).
+        # UTC-day boundary, matching the aware-UTC ``updated_at`` column.
+        recent_active_time = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         active_agents = (
@@ -665,8 +668,11 @@ async def get_dashboard_stats(
         # Get deployed application count (temporarily set to 0, waiting for Deploy feature implementation)
         deployed_apps = 0
 
-        # Get today's call count
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Get today's call count. UTC-day boundary, matching the aware-UTC
+        # timestamps stored in ``TraceEvent.timestamp``.
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
 
         # Build TraceEvent filter conditions
         trace_event_filter = []
