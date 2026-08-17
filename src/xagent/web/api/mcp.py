@@ -2310,8 +2310,34 @@ def list_mcp_apps(
         ]
         team_servers.extend((server, None) for server in team_only_mcp_rows)
         team_oauth_server_lookup = _build_active_oauth_server_lookup(team_servers)
+        # Read-time analog of _reject_user_owned_catalog_squat: a user-owned
+        # row must not render under catalog branding even when its launch
+        # currently matches -- its owner keeps edit rights and could swap in a
+        # foreign command *after* a member attaches the officially-branded
+        # entry, which the persisted selection would keep executing. The
+        # legitimate shared row for these shapes never has an owner (catalog
+        # connects write is_owner=False; the row itself is created
+        # association-less). Non-oauth arm only, deliberately: builtin_oauth
+        # provisioning makes the first connector an owner by design
+        # (_ensure_user_mcp_server), and that row carries no caller-authored
+        # launch for the runtime to execute.
+        owned_team_ids = {
+            row[0]
+            for row in db.query(UserMCPServer.mcpserver_id)
+            .filter(
+                UserMCPServer.mcpserver_id.in_(
+                    [cast(int, server.id) for server, _um in team_servers]
+                ),
+                UserMCPServer.is_owner.is_(True),
+            )
+            .all()
+        }
         team_non_oauth_server_lookup = _build_active_non_oauth_server_lookup(
-            team_servers
+            [
+                (server, um)
+                for server, um in team_servers
+                if cast(int, server.id) not in owned_team_ids
+            ]
         )
 
     if location in ["remote", "all"]:
@@ -2404,8 +2430,11 @@ def list_mcp_apps(
             # A team link is the one way that prerequisite is met without a
             # personal association: the runtime resolves team-owned rows by the
             # same overlay (_load_visible_runtime_connectors), so the connector
-            # really does run -- for the shapes whose credentials ride on the
-            # shared row rather than on the member (#1387).
+            # really does run. Credentials are per-shape: keyless needs none,
+            # api_key resolves at runtime from the platform/shared/user/
+            # governing-team env layers, and the oauth shapes are further gated
+            # in _catalog_team_shared_can_attach on the member's own grant or
+            # account (#1387).
             app_copy["can_attach"] = is_connected or (
                 team_server is not None
                 and _catalog_team_shared_can_attach(

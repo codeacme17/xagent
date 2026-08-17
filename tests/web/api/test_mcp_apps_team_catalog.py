@@ -536,6 +536,61 @@ def test_a_team_row_with_a_foreign_auth_shape_is_not_claimed(db_session, auth):
     assert entry["can_attach"] is False
 
 
+def test_a_user_owned_row_is_not_rendered_under_catalog_branding(db_session):
+    """Read-time analog of _reject_user_owned_catalog_squat (#1403 review
+    round 4): the legitimate shared row for the non-oauth shapes never has an
+    owner, so a user-owned row squatting a catalog identity — creatable only
+    before the app was seeded — must not be officialized even while its launch
+    happens to match: its owner keeps edit rights and could swap in a foreign
+    command *after* a member attaches the branded entry. Falls back to the
+    pre-#1387 state (Tools page only)."""
+    db, creator, member = db_session
+    _add_keyless_app(db, "acme-notes", "Acme Notes")
+    squatter = _add_catalog_server(db, "acme-notes")
+    db.add(
+        UserMCPServer(
+            user_id=creator.id,
+            mcpserver_id=squatter.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    _install_visibility(member, {int(squatter.id)})
+
+    entry = _entry(db, member, "acme-notes")
+    assert entry["is_team_shared"] is False
+    assert entry["can_attach"] is False
+    assert _entries(db, member, "acme-notes", location="local") == []
+
+
+def test_an_owned_builtin_oauth_row_keeps_its_team_entry(db_session):
+    """The owner filter is scoped to the non-oauth arm on purpose:
+    builtin_oauth provisioning makes the first connector an owner by design
+    (_ensure_user_mcp_server writes is_owner=True), so filtering that arm
+    would break every legitimately team-shared builtin_oauth connector."""
+    db, creator, member = db_session
+    _add_builtin_oauth_app(db, "acme-drive", "Acme Drive")
+    server = _add_builtin_oauth_server(db, "acme-drive", "Acme Drive")
+    db.add(
+        UserMCPServer(
+            user_id=creator.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    _add_oauth_account(db, member, "acme-drive")
+    _install_visibility(member, {int(server.id)})
+
+    entry = _entry(db, member, "acme-drive")
+    assert entry["is_team_shared"] is True
+    assert entry["can_attach"] is True
+
+
 def test_a_colliding_foreign_row_does_not_mask_the_official_row(db_session):
     """Two team-visible rows can normalize to one (transport, name) key —
     "Acme Notes" and `acme-notes` — and the index keeps every candidate, so
