@@ -1370,6 +1370,7 @@ async def test_agent_publish_of_a_new_collection_survives_a_config_read_failure(
 async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_key(
     tmp_path,
     caplog,
+    monkeypatch,
 ):
     """A restore failure must reach the log in full and the model in redacted form.
 
@@ -1386,6 +1387,7 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     """
     import logging
 
+    from xagent.core.tools.core.RAG_tools import kb as kb_module
     from xagent.web.services.managed_file_ref import DurableStorageOperationError
 
     storage_key = "users/7/uploads/file-1/notes.txt"
@@ -1417,6 +1419,17 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
 
     def fake_get_db():
         yield from _fake_db_generator(db)
+
+    # Same isolation as the sibling tests in this file. Without it the test
+    # still passes, but only because ``agent_collection_exists`` swallows
+    # non-``ValueError`` exceptions and reports True -- i.e. it would be
+    # leaning on real KB storage being unreachable rather than on a stub.
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_file_kb"))
+    coordinator = KBCoordinator(
+        storage_shim=_FakeStorageShim(metadata_store),
+        operation_compatibility=_RecordingOperationFacade(),
+    )
+    monkeypatch.setattr(kb_module, "get_kb_coordinator", lambda: coordinator)
 
     logger_name = "xagent.core.tools.adapters.vibe.file_ingestion_tool"
     with (

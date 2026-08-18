@@ -12,6 +12,7 @@ investigation in #1467.
 
 from __future__ import annotations
 
+import ast
 import io
 import logging
 from pathlib import Path
@@ -33,7 +34,9 @@ from xagent.web.services.managed_file_ref import (
 
 from .conftest import _direct_db_session, _setup_admin
 
-pytestmark = pytest.mark.usefixtures("_test_db")
+# Not module-wide: only the end-to-end upload test touches the database. The
+# other tests drive the helper directly and would pay a schema create/drop for
+# nothing.
 
 
 @pytest.fixture()
@@ -209,6 +212,7 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_test_db")
 async def test_upload_durable_write_failure_logs_the_provider_cause(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -296,3 +300,122 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
     assert "owner_user_id=7" in rendered
     assert "file_ids=8ac1f2" in rendered
     _assert_cause_chain_recorded(rendered)
+
+
+# Every ``_raise_durable_storage_unavailable`` call site in files.py, with the
+# fields it is expected to carry. N2 in review -- the signed-redirect site
+# shipping with no identifier -- was invisible because only two sites had
+# assertions; this sweep is what makes the set itself the contract.
+_FAULT_SITES = (
+    ("signed durable redirect", ("file_id",)),
+    ("upload", ()),
+    ("download", ("file_id",)),
+    ("preview", ("file_id",)),
+    ("pptx preview", ("file_id",)),
+    ("public download", ("file_id",)),
+    ("public preview", ("file_id",)),
+    ("public preview task asset", ("file_id",)),
+    ("durable cleanup before row delete", ("file_id", "storage_key")),
+)
+
+
+def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
+    """The nine labels are a closed set of bounded, aggregatable values.
+
+    ``upload`` carries no identifier by design: it is a batch-registration path
+    with no single file_id. Every other site identifies its subject.
+    """
+    tree = ast.parse(Path(files_api.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_raise_durable_storage_unavailable"
+    ]
+    # Parsed rather than grepped: a substring count also matches the ``def``
+    # line, and a label is only a contract if the count is exact.
+    assert len(calls) == len(_FAULT_SITES), (
+        f"{len(calls)} call sites but {len(_FAULT_SITES)} labels declared -- "
+        "add the new site to _FAULT_SITES with the fields it should carry"
+    )
+
+    declared = {label for label, _ in _FAULT_SITES}
+    passed = {
+        node.args[1].value
+        for node in calls
+        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+    }
+    # Every label is a plain literal, so it stays a bounded, aggregatable value
+    # -- an f-string here is how the storage key first became part of a label.
+    assert passed == declared, f"labels drifted: {passed ^ declared}"
+
+    for node in calls:
+        expected = dict(_FAULT_SITES)[node.args[1].value]
+        assert tuple(kw.arg for kw in node.keywords) == expected, (
+            f"site {node.args[1].value!r} passes "
+            f"{[kw.arg for kw in node.keywords]}, expected {list(expected)}"
+        )
+
+
+@pytest.mark.parametrize(("label", "expected_fields"), _FAULT_SITES)
+def test_fault_site_renders_its_label_and_fields(
+    caplog: pytest.LogCaptureFixture,
+    label: str,
+    expected_fields: tuple[str, ...],
+) -> None:
+    """Each site's label and field set must survive into the log line."""
+    fields = {name: f"value-for-{name}" for name in expected_fields}
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), label, **fields
+            )
+
+    assert raised.value.status_code == 503
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert f"during {label}" in rendered
+    for name in expected_fields:
+        assert f"{name}=value-for-{name}" in rendered
+    _assert_cause_chain_recorded(rendered)
+
+
+def test_field_values_cannot_forge_a_log_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A newline in a client-supplied field must not start a new record.
+
+    ``/v1/*`` renders the request's ``files`` list, an unvalidated ``list[str]``,
+    so a caller cannot be relied on to have checked (CWE-117).
+    """
+    forged = "ok,\n2026-01-01 00:00:00 ERROR    xagent.web - FABRICATED entry"
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException):
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), "upload", file_ids=forged
+            )
+
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    message_line = rendered.splitlines()[0]
+    assert "FABRICATED" in message_line, "the value must survive, escaped"
+    assert "\\n" in message_line
+    assert not any(line.startswith("2026-01-01") for line in rendered.splitlines()), (
+        "the injected text must not stand as its own record"
+    )
+
+
+def test_an_overlong_field_value_is_truncated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One field must not be able to crowd out the rest of the line."""
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException):
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), "upload", file_ids="x" * 5000
+            )
+
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert "...[truncated]" in rendered
+    assert len(rendered.splitlines()[0]) < 1000

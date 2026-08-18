@@ -327,7 +327,9 @@ def _durable_redirect_response(
     except DurableObjectIntegrityError as exc:
         raise _file_integrity_failed() from exc
     except DurableStorageOperationError as exc:
-        _raise_durable_storage_unavailable(exc, "signed durable redirect")
+        _raise_durable_storage_unavailable(
+            exc, "signed durable redirect", file_id=file_ref.record.file_id
+        )
 
     if not signed_url:
         return None

@@ -1561,11 +1561,11 @@ class TestFileManagement:
         # hand-built label is the point: a drift in what the endpoint passes --
         # a wrong variable, a dropped field -- would otherwise be invisible.
         fault_lines = [
-            logging.Formatter("%(message)s").format(record)
-            for record in caplog.records
-            if record.name == "xagent.web.api.files"
-            and record.levelno == logging.WARNING
-            and "durable cleanup before row delete" in record.getMessage()
+            logging.Formatter("%(message)s").format(entry)
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and entry.levelno == logging.WARNING
+            and "durable cleanup before row delete" in entry.getMessage()
         ]
         assert len(fault_lines) == 1, caplog.records
         rendered = fault_lines[0]

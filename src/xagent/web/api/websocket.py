@@ -125,6 +125,10 @@ from ..services.hot_path_cache import (
     task_cache_ttl_seconds,
     web_task_history_key,
 )
+from ..services.managed_file_ref import (
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -6453,8 +6457,10 @@ async def _handle_chat_message_unserialized(
         logger.error(f"Connection error handling chat message: {e}")
         raise
     except Exception as e:
-        # Other errors, re-raise
-        logger.error(f"Unexpected error handling chat message: {e}")
+        # Other errors, re-raise. ``exc_info`` because this arm absorbs any
+        # wrapped fault -- a durable-storage one included -- whose cause
+        # otherwise never reaches a log (#1467).
+        logger.error(f"Unexpected error handling chat message: {e}", exc_info=True)
         await finish_delivery_failure(str(e))
         raise
 
@@ -7351,6 +7357,14 @@ async def websocket_chat_endpoint(
 
     except WebSocketDisconnect:
         pass
+    except DurableStorageOperationError as exc:
+        # Must precede the RuntimeError arm below, which this subclasses. A
+        # storage fault reaching here would otherwise be logged as "Connection
+        # error in WebSocket" and swallowed -- mislabelled and cause-less on
+        # the very path #1467 was filed about. Still swallowed, as before:
+        # the socket is going away regardless and the client has already been
+        # answered; only the diagnosis changes.
+        log_durable_storage_fault(logger, "websocket chat turn", exc, task_id=task_id)
     except (ConnectionError, RuntimeError) as e:
         # Connection error
         logger.error(f"Connection error in WebSocket: {e}")

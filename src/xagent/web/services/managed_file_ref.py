@@ -47,6 +47,27 @@ class DurableObjectMissingError(FileNotFoundError):
     """Raised when a registered file has no local copy or durable object."""
 
 
+# Rendered fields sit in a plain-text log line, so a value carrying a newline
+# would start what reads as a new, fully-formatted record (CWE-117). Some of
+# these values are client-supplied -- ``/v1/*`` passes the ``files`` list from
+# the request body, which is an unvalidated ``list[str]`` -- so a caller cannot
+# be relied on to have checked. Sanitising here covers every field at every
+# site, including ones added later.
+_LOG_VALUE_TRANSLATION = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
+
+# Long enough for a UUID list of realistic size, short enough that one field
+# cannot crowd out the rest of the line.
+_MAX_LOG_VALUE_LENGTH = 256
+
+
+def _sanitize_log_value(value: object) -> str:
+    """Flatten a field value to one bounded, single-line token."""
+    text = str(value).translate(_LOG_VALUE_TRANSLATION)
+    if len(text) > _MAX_LOG_VALUE_LENGTH:
+        return f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
+    return text
+
+
 def log_durable_storage_fault(
     target_logger: logging.Logger,
     operation: str,
@@ -55,8 +76,19 @@ def log_durable_storage_fault(
 ) -> None:
     """Record a durable-storage fault with its full cause chain.
 
-    One implementation for every consumer of ``DurableStorageOperationError``,
-    so no site can log the fault without its cause. The wraps in this module
+    The single implementation for every site that reports a durable-storage
+    fault *as such*, so none of them can log it without its cause.
+
+    That is narrower than "every consumer of ``DurableStorageOperationError``",
+    and the difference matters: the class is a ``RuntimeError``, so broad
+    ``except Exception`` / ``except RuntimeError`` arms elsewhere absorb it
+    without ever naming it -- in the chat path, knowledge-base refresh, and
+    workspace file resolution. Those arms cannot route through this function,
+    because they handle every exception type; they carry ``exc_info`` of their
+    own instead. Anything added later that reports this fault specifically
+    belongs here.
+
+    The wraps in this module
     keep only the storage key in their message; the provider error class, the
     HTTP status, and throttle vs. timeout vs. rejected credentials live in
     ``__cause__`` and nowhere else, and none of the envelopes these faults
@@ -76,7 +108,9 @@ def log_durable_storage_fault(
     diagnosed from.
     """
     rendered = "".join(
-        f" {name}={value}" for name, value in fields.items() if value is not None
+        f" {name}={_sanitize_log_value(value)}"
+        for name, value in fields.items()
+        if value is not None
     )
     target_logger.warning(
         "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
