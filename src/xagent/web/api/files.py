@@ -114,9 +114,30 @@ file_router = APIRouter(prefix="/api/files", tags=["files"])
 
 
 def _durable_storage_unavailable() -> HTTPException:
+    """The upload was refused and everything it staged has been rolled back.
+
+    Clients treat 503 from this endpoint as proof that no side effect
+    survived, and retry on it. Only raise it once compensation has actually
+    succeeded - see ``_durable_storage_outcome_unknown`` for the other case.
+    """
     return HTTPException(
         status_code=503,
         detail="Durable storage is temporarily unavailable",
+    )
+
+
+def _durable_storage_outcome_unknown() -> HTTPException:
+    """Storage failed and the rollback of what it staged also failed.
+
+    Rows or objects may survive, so this must not be a status the client
+    replays; a retry would duplicate whatever the compensation left behind.
+    """
+    return HTTPException(
+        status_code=500,
+        detail=(
+            "The upload could not be completed or rolled back. "
+            "Refresh the conversation before trying again."
+        ),
     )
 
 
@@ -477,6 +498,7 @@ async def store_uploaded_files(
     registrations: list[LocalUploadRegistration] = []
     previews: dict[str, Any] = {}
     completed = False
+    durable_storage_refused = False
 
     try:
         # Off-turn (this runs outside the ExecutionScopeContext/
@@ -588,6 +610,7 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
+        durable_storage_refused = True
         logger.warning("Durable storage unavailable during upload: %s", exc)
         raise _durable_storage_unavailable() from exc
     finally:
@@ -615,12 +638,22 @@ async def store_uploaded_files(
                     await drain_async_task_cancellation_safe(cleanup_worker)
 
             cleanup_task = asyncio.create_task(_cleanup())
+            compensated = True
             try:
                 await drain_async_task_cancellation_safe(cleanup_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                compensated = False
                 logger.exception("Failed to compensate cancelled/failed upload")
+
+            # 503 is the client's licence to replay the whole batch, so it may
+            # only escape when the rollback actually succeeded. Downgrading a
+            # failed rollback to an unknown outcome keeps a retry from
+            # duplicating whatever survived. Other in-flight failures keep
+            # their own status: they are not statuses the client replays.
+            if durable_storage_refused and not compensated:
+                raise _durable_storage_outcome_unknown()
 
     if single_file_mode:
         first_file = uploaded_files[0]

@@ -143,10 +143,22 @@ function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
-export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
+export interface ApiRequestPolicy {
+  /**
+   * Whether a thrown fetch may be replayed by the shared transport retry.
+   * Callers that own replay themselves - non-idempotent writes such as file
+   * upload - pass false so a request that may already have committed is not
+   * silently re-sent underneath them.
+   */
+  replayTransportFailures?: boolean
+}
+export async function apiRequest(url: string, options: RequestInit = {}, { replayTransportFailures = true }: ApiRequestPolicy = {}): Promise<Response> {
   const session = readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
-  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
+  const authorized = withBearer(options, session.accessToken)
+  const response = replayTransportFailures
+    ? await fetchWithRetry(url, authorized)
+    : await fetch(url, authorized)
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {

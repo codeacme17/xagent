@@ -27,18 +27,39 @@ export function isRetriableUploadStatus(status: number): boolean {
   return RETRIABLE_UPLOAD_STATUSES.has(status)
 }
 
+/**
+ * Whether a failed upload provably stored nothing.
+ *
+ * `refused` means the server rejected the request outright, so the caller may
+ * offer a plain retry. `unknown` means the bytes may have landed without the
+ * client learning the id - a gateway 5xx, or a success body it could not
+ * read - and resubmitting the same draft could duplicate the file.
+ */
+export type UploadOutcome = "refused" | "unknown"
+
+export function uploadOutcomeForStatus(status: number): UploadOutcome {
+  if (status >= 400 && status < 500) return "refused"
+  return isRetriableUploadStatus(status) ? "refused" : "unknown"
+}
+
 export class UploadRequestError extends Error {
   readonly status: number | null
   readonly retriable: boolean
+  readonly outcome: UploadOutcome
 
   constructor(
     message: string,
-    { status, retriable }: { status: number | null; retriable: boolean },
+    {
+      status,
+      retriable,
+      outcome,
+    }: { status: number | null; retriable: boolean; outcome: UploadOutcome },
   ) {
     super(message)
     this.name = "UploadRequestError"
     this.status = status
     this.retriable = retriable
+    this.outcome = outcome
   }
 }
 

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { isRetriableUploadStatus, UploadRequestError, withUploadRetry } from "@/lib/upload-retry"
+import { isRetriableUploadStatus, uploadOutcomeForStatus, UploadRequestError, withUploadRetry } from "@/lib/upload-retry"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -1176,6 +1176,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
     preparationsRef.current.set(clientMessageId, claim)
 
+    // True only while attachments are being uploaded, so the catch below can
+    // tell "the upload may have landed" from "nothing left this client".
+    let uploadPhase = false
     try {
       const messageData: Record<string, unknown> = {
         type: 'chat',
@@ -1185,6 +1188,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       if (files && files.length > 0) {
+        uploadPhase = true
         if (!currentTaskId) {
           throw deliveryError("File delivery requires a task-bound connection.", "not_sent")
         }
@@ -1221,13 +1225,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             filesToUpload.forEach(file => formData.append('files', file))
             formData.append('task_type', 'task')
             formData.append('task_id', currentTaskId.toString())
-            const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${tokenRef.current ?? localStorage.getItem('token') ?? ''}`,
+            const response = await apiRequest(
+              `${getUploadApiUrl()}/api/files/upload`,
+              {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${tokenRef.current ?? localStorage.getItem('token') ?? ''}`,
+                },
+                body: formData,
               },
-              body: formData,
-            })
+              // This call owns replay. `apiRequest`'s transport retry would
+              // re-send a request that may already have committed, and the
+              // status policy here could then replay the batch on top of it.
+              { replayTransportFailures: false },
+            )
             const parsed = await parseApiResponse(response)
             if (!response.ok || !isJsonRecord(parsed.data)) {
               throw new UploadRequestError(
@@ -1238,6 +1249,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 {
                   status: response.status,
                   retriable: !response.ok && isRetriableUploadStatus(response.status),
+                  outcome: uploadOutcomeForStatus(response.status),
                 },
               )
             }
@@ -1272,6 +1284,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         messageData.files = [...preUploadedFiles, ...uploadedFiles]
+        uploadPhase = false
       }
 
       if (
@@ -1353,9 +1366,18 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       return delivery
     } catch (error) {
       if (error instanceof MessageDeliveryError) throw error
+      // An upload that was refused stored nothing, so the draft is safe to
+      // send again. Anything else that failed mid-upload - a gateway 5xx, an
+      // unreadable success body, a dropped request - may have stored the file
+      // under an id this client never learned, and resubmitting the same draft
+      // would duplicate it. Report that as an unknown outcome so the sender is
+      // not invited to retry.
+      const uploadOutcome = uploadPhase
+        ? error instanceof UploadRequestError ? error.outcome : "unknown"
+        : "refused"
       throw deliveryError(
         error instanceof Error ? error.message : String(error),
-        "not_sent",
+        uploadOutcome === "unknown" ? "outcome_unknown" : "not_sent",
         false,
         error instanceof UploadRequestError,
       )

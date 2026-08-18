@@ -6,6 +6,7 @@ import {
 } from "@/lib/api-wrapper"
 import {
   isRetriableUploadStatus,
+  uploadOutcomeForStatus,
   UploadRequestError,
   withUploadRetry,
   type UploadRetryOptions,
@@ -73,6 +74,9 @@ export async function uploadPublicChatFile({
         {
           status: response.status,
           retriable: !response.ok && isRetriableUploadStatus(response.status),
+          // An unreadable success body is the ambiguous case: the file may be
+          // stored under an id this client never learned.
+          outcome: uploadOutcomeForStatus(response.status),
         },
       )
     }
@@ -85,5 +89,10 @@ export async function uploadPublicChatFile({
     }
   }
 
-  return withUploadRetry(sendUpload, retry)
+  const uploaded = await withUploadRetry(sendUpload, retry)
+  // Stamp the id onto this file as soon as it lands, not after the caller's
+  // `Promise.all` settles: a sibling's failure rejects the aggregate, and a
+  // draft resubmitted without this would upload these bytes a second time.
+  ;(file as File & { file_id?: string }).file_id = uploaded.file_id
+  return uploaded
 }

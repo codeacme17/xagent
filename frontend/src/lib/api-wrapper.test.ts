@@ -849,3 +849,40 @@ describe("api-wrapper auth refresh", () => {
     }
   })
 })
+
+describe("api-wrapper transport replay policy", () => {
+  const user = { id: "1", username: "alice", email: null, is_admin: false }
+
+  beforeEach(() => {
+    localStorage.clear()
+    vi.restoreAllMocks()
+    mockNavigatorLocks()
+  })
+
+  it("replays a dropped request by default", async () => {
+    writeAuthCache(user, "access", "refresh", 120, 240)
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+
+    await expect(apiRequest("http://api.local/thing", { method: "POST" }))
+      .resolves.toMatchObject({ status: 200 })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("leaves replay to the caller when it owns the retry policy", async () => {
+    // A non-idempotent write - file upload - may already have committed when
+    // the transport drops, so the shared retry must not re-send it underneath
+    // a caller that decides replay from the response status itself.
+    writeAuthCache(user, "access", "refresh", 120, 240)
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValue(new TypeError("Failed to fetch"))
+
+    await expect(apiRequest(
+      "http://api.local/api/files/upload",
+      { method: "POST" },
+      { replayTransportFailures: false },
+    )).rejects.toThrow("Failed to fetch")
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})

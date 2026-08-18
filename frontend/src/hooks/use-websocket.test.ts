@@ -206,6 +206,60 @@ describe("useWebSocket message delivery", () => {
     expect(file.file_id).toBe("file-7")
   })
 
+  it("reports an ambiguous batch upload as an unknown outcome", async () => {
+    // A gateway timeout means the upstream got the request; the file may be
+    // stored under an id this client never learned, so the sender must not be
+    // told the draft is safe to send again.
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => uploadResponse({ detail: "Gateway timeout" }, 504),
+    )
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "batch-ambiguous",
+    )).rejects.toMatchObject({
+      disposition: "outcome_unknown",
+      userFacing: true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(MockWebSocket.instances[0].send).not.toHaveBeenCalled()
+  })
+
+  it("reports a dropped batch upload as an unknown outcome", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Failed to fetch"))
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "batch-dropped",
+    )).rejects.toMatchObject({ disposition: "outcome_unknown" })
+  })
+
+  it("keeps a pre-upload failure reported as never sent", async () => {
+    // Nothing left this client, so the draft really is safe to resend.
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      autoConnect: false,
+    }))
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "pre-upload",
+    )).rejects.toMatchObject({ disposition: "not_sent" })
+  })
+
   it("does not replay the default batch upload for a permanent rejection", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
       async () => uploadResponse({ detail: "File is too large" }, 413),
@@ -238,6 +292,7 @@ describe("useWebSocket message delivery", () => {
       new UploadRequestError("Durable storage is temporarily unavailable", {
         status: 503,
         retriable: true,
+        outcome: "refused",
       }),
     ))
     const { result } = renderHook(() => useWebSocket({

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import {
   isRetriableUploadStatus,
+  uploadOutcomeForStatus,
   UploadRequestError,
   withUploadRetry,
 } from "./upload-retry"
@@ -10,6 +11,7 @@ const retriableError = (status: number) =>
   new UploadRequestError("Storage unavailable", {
     status,
     retriable: isRetriableUploadStatus(status),
+    outcome: uploadOutcomeForStatus(status),
   })
 
 describe("withUploadRetry", () => {
@@ -111,5 +113,23 @@ describe("withUploadRetry", () => {
       sleep: () => new Promise<void>(() => {}),
     })).rejects.toThrow("connection changed")
     expect(perform).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("uploadOutcomeForStatus", () => {
+  it("treats a refusal as proof that nothing was stored", () => {
+    // 4xx is the server declining the request; 503 is the upload endpoint
+    // answering only after it rolled back what it had staged.
+    for (const status of [400, 401, 413, 422, 429, 503]) {
+      expect(uploadOutcomeForStatus(status)).toBe("refused")
+    }
+  })
+
+  it("treats anything else as possibly stored", () => {
+    // A proxy reached the upstream (502/504), the server failed after
+    // committing (500), or the success body could not be read (200).
+    for (const status of [200, 500, 502, 504]) {
+      expect(uploadOutcomeForStatus(status)).toBe("unknown")
+    }
   })
 })

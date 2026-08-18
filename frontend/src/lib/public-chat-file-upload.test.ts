@@ -152,3 +152,58 @@ describe("uploadPublicChatFile transient failures", () => {
     })).rejects.toThrow(UPLOAD_ERROR_MESSAGES.proxy)
   })
 })
+
+describe("uploadPublicChatFile partial batches", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const upload = (file: File) => uploadPublicChatFile({
+    url: "http://api.local/api/widget/files/upload",
+    accessToken: "guest-token",
+    file,
+    taskType: "task",
+    fallbackError: "Upload failed",
+  })
+
+  it("keeps a completed file's id when a sibling in the same batch fails", async () => {
+    // The widget transport uploads one request per file under Promise.all, so
+    // a sibling's rejection must not lose what already landed.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, request) => {
+      const sent = (request?.body as FormData).get("file") as File
+      return sent.name === "good.txt"
+        ? new Response(JSON.stringify({ success: true, file_id: "file-good" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+        : new Response(JSON.stringify({ detail: "File is too large" }), {
+          status: 413,
+          headers: { "Content-Type": "application/json" },
+        })
+    })
+    const good = new File(["ok"], "good.txt") as File & { file_id?: string }
+    const bad = new File(["nope"], "bad.txt") as File & { file_id?: string }
+
+    await expect(Promise.all([upload(good), upload(bad)]))
+      .rejects.toThrow("File is too large")
+
+    expect(good.file_id).toBe("file-good")
+    expect(bad.file_id).toBeUndefined()
+  })
+
+  it("reports an unreadable success body as a possibly stored upload", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const file = new File(["ok"], "good.txt") as File & { file_id?: string }
+
+    const failure = await upload(file).catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(UploadRequestError)
+    expect(failure).toMatchObject({ outcome: "unknown" })
+    expect(file.file_id).toBeUndefined()
+  })
+})
