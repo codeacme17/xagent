@@ -31,7 +31,7 @@ from xagent.web.services.managed_file_ref import (
     ManagedFileRef,
 )
 
-from .conftest import _admin_headers, _direct_db_session
+from .conftest import _direct_db_session, _setup_admin
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
@@ -139,13 +139,18 @@ def _warning_matching(
     return matches[0]
 
 
-def _assert_cause_chain_recorded(rendered: str) -> None:
-    """The provider fault -- class and message -- must be in the log text."""
+def _assert_cause_chain_recorded(rendered: str, *, wrap_message: bool = True) -> None:
+    """The provider fault -- class and message -- must be in the log text.
+
+    ``wrap_message=False`` for the delete path, whose exception was never
+    wrapped by ``ManagedFileRef`` and so carries no storage key of its own.
+    """
     assert _ProviderThrottled.__name__ in rendered
     assert _PROVIDER_MESSAGE in rendered
-    # The wrap's own message (and with it the storage key) is the anchor an
-    # operator greps for; it must not be dropped in favour of the cause.
-    assert _STORAGE_KEY in rendered
+    if wrap_message:
+        # The wrap's own message (and with it the storage key) is the anchor an
+        # operator greps for; it must not be dropped in favour of the cause.
+        assert _STORAGE_KEY in rendered
 
 
 def test_durable_storage_unavailable_logs_cause_and_keeps_body_detail_free(
@@ -154,22 +159,23 @@ def test_durable_storage_unavailable_logs_cause_and_keeps_body_detail_free(
     """The shared 503 helper is where all nine file-API sites get their log.
 
     Asserting on the helper rather than on each endpoint is deliberate: the
-    exception is now a required positional argument, so a call site physically
-    cannot skip it, which leaves the helper's own body as the only place the
-    chain can still be dropped.
+    exception is a required positional argument and the helper is ``NoReturn``,
+    so a call site can neither skip the cause nor log without raising. That
+    leaves the helper's own body as the only place the chain can be dropped.
     """
     fault = _wrapped_fault()
 
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
-        response = files_api._durable_storage_unavailable(fault, "download")
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(fault, "download")
 
-    assert isinstance(response, HTTPException)
-    assert response.status_code == 503
+    assert raised.value.status_code == 503
     # Scope segments in the key can encode end-user identity, so the body
     # stays the fixed message -- the detail is server-side only.
-    assert response.detail == _UNAVAILABLE_DETAIL
-    assert _STORAGE_KEY not in str(response.detail)
-    assert _PROVIDER_MESSAGE not in str(response.detail)
+    assert raised.value.detail == _UNAVAILABLE_DETAIL
+    assert _STORAGE_KEY not in str(raised.value.detail)
+    assert _PROVIDER_MESSAGE not in str(raised.value.detail)
+    assert raised.value.__cause__ is fault
 
     rendered = _sole_warning(caplog, files_api.logger.name)
     assert "Durable storage unavailable during download" in rendered
@@ -182,22 +188,24 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
     """The delete path hands over the raw provider exception, not a wrap.
 
     ``delete_file`` catches ``Exception`` around the durable cleanup rather
-    than a ``DurableStorageOperationError``, so the helper has to classify and
-    log something that was never wrapped. Before #1467 that site logged the
-    storage key and discarded the exception entirely.
+    than a ``DurableStorageOperationError``, so the helper has to log something
+    that was never wrapped by ``ManagedFileRef``. Before #1467 that site logged
+    the storage key and discarded the exception entirely.
     """
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
-        response = files_api._durable_storage_unavailable(
-            _ProviderThrottled(_PROVIDER_MESSAGE),
-            f"{files_api.DELETE_CLEANUP_OPERATION} ({_STORAGE_KEY})",
-        )
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(
+                _ProviderThrottled(_PROVIDER_MESSAGE),
+                "durable cleanup before row delete",
+                storage_key=_STORAGE_KEY,
+            )
 
-    assert response.status_code == 503
+    assert raised.value.status_code == 503
     rendered = _sole_warning(caplog, files_api.logger.name)
-    assert files_api.DELETE_CLEANUP_OPERATION in rendered
-    assert _ProviderThrottled.__name__ in rendered
-    assert _PROVIDER_MESSAGE in rendered
-    assert _STORAGE_KEY in rendered
+    assert "durable cleanup before row delete" in rendered
+    # The key is a named field, not part of the bounded operation label.
+    assert f"storage_key={_STORAGE_KEY}" in rendered
+    _assert_cause_chain_recorded(rendered, wrap_message=False)
 
 
 @pytest.mark.asyncio
@@ -213,7 +221,8 @@ async def test_upload_durable_write_failure_logs_the_provider_cause(
     the reported 503 bursts were observed.
     """
     upload_root = isolated_upload_storage
-    _admin_headers()
+    # Side effect only: lays down the admin row the upload is attributed to.
+    _setup_admin()
     db = _direct_db_session()
     try:
         user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
@@ -280,6 +289,10 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
     assert _PROVIDER_MESSAGE not in raised.value.message
 
     rendered = _warning_matching(
-        caplog, v1_tasks.logger.name, "resolving turn attachments: task_id=42"
+        caplog, v1_tasks.logger.name, "during turn attachment resolution"
     )
+    assert "task_id=42" in rendered
+    # The create path has task_id=None, so these carry identification there.
+    assert "owner_user_id=7" in rendered
+    assert "file_ids=8ac1f2" in rendered
     _assert_cause_chain_recorded(rendered)

@@ -1364,3 +1364,92 @@ async def test_agent_publish_of_a_new_collection_survives_a_config_read_failure(
     assert json.loads(save_kwargs["config_json"])["embedding_model_id"] == (
         DEFAULT_EMBEDDING_MODEL_ID
     )
+
+
+@pytest.mark.asyncio
+async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_key(
+    tmp_path,
+    caplog,
+):
+    """A restore failure must reach the log in full and the model in redacted form.
+
+    Two separate obligations meet in this one except-branch (#1467):
+
+    * the provider fault only exists in ``__cause__``, and no envelope this
+      path produces carries a traceback, so the log line is its only record;
+    * the error string is joined into the tool result, so it reaches the model
+      and the conversation transcript -- and the wrap's message embeds the
+      storage key, whose scope segments encode the owning user's id.
+
+    Interpolating the exception into that string satisfied the first obligation
+    while violating the second.
+    """
+    import logging
+
+    from xagent.web.services.managed_file_ref import DurableStorageOperationError
+
+    storage_key = "users/7/uploads/file-1/notes.txt"
+    provider_message = "SlowDown: Please reduce your request rate (status 503)"
+
+    class _ProviderThrottled(RuntimeError):
+        pass
+
+    def fail_restore(_record):
+        provider_exc = _ProviderThrottled(provider_message)
+        raise DurableStorageOperationError(
+            f"Failed to restore durable object: {storage_key}"
+        ) from provider_exc
+
+    source_file = tmp_path / "notes.txt"
+    source_file.write_text("hello", encoding="utf-8")
+    file_record = SimpleNamespace(
+        user_id=7,
+        filename="notes.txt",
+        storage_path=str(source_file),
+        file_id="file-1",
+    )
+
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = [file_record]
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    logger_name = "xagent.core.tools.adapters.vibe.file_ingestion_tool"
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            side_effect=fail_restore,
+        ),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=7, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is False
+
+    # The model-facing half: named, but stripped of anything identifying.
+    assert "Failed to restore notes.txt from durable storage" in result["message"]
+    assert storage_key not in result["message"]
+    assert "users/7" not in result["message"]
+    assert provider_message not in result["message"]
+
+    # The log half: the whole chain, provider class included.
+    records = [
+        logging.Formatter("%(message)s").format(record)
+        for record in caplog.records
+        if record.name == logger_name and record.levelno == logging.WARNING
+    ]
+    assert len(records) == 1, caplog.records
+    rendered = records[0]
+    assert "during knowledge-base file restore" in rendered
+    assert "file_id=file-1" in rendered
+    assert storage_key in rendered
+    assert "_ProviderThrottled" in rendered
+    assert provider_message in rendered

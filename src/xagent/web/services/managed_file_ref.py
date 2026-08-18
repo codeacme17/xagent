@@ -47,6 +47,42 @@ class DurableObjectMissingError(FileNotFoundError):
     """Raised when a registered file has no local copy or durable object."""
 
 
+def log_durable_storage_fault(
+    target_logger: logging.Logger,
+    operation: str,
+    exc: Exception,
+    **fields: object,
+) -> None:
+    """Record a durable-storage fault with its full cause chain.
+
+    One implementation for every consumer of ``DurableStorageOperationError``,
+    so no site can log the fault without its cause. The wraps in this module
+    keep only the storage key in their message; the provider error class, the
+    HTTP status, and throttle vs. timeout vs. rejected credentials live in
+    ``__cause__`` and nowhere else, and none of the envelopes these faults
+    become -- FastAPI's ``HTTPException``, the ``/v1/*`` error body, a tool
+    result -- carries a traceback. ``exc_info`` is the only thing that gets the
+    chain into a log (#1467).
+
+    ``target_logger`` is the caller's logger rather than this module's, so a
+    line stays attributed to the endpoint or tool that produced it.
+
+    ``operation`` must be a bounded label -- a small fixed set of values, so it
+    stays aggregatable. Per-request identifiers belong in ``fields``, which is
+    rendered as ``key=value`` pairs *in the message*: the deployed formatter is
+    ``"%(asctime)s %(levelname)-8s %(name)s - %(message)s"``
+    (see web/logging_config.py), which never renders ``extra``, so anything
+    passed that way would be invisible in exactly the logs an incident is
+    diagnosed from.
+    """
+    rendered = "".join(
+        f" {name}={value}" for name, value in fields.items() if value is not None
+    )
+    target_logger.warning(
+        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
+    )
+
+
 class DurableStorageOperationError(RuntimeError):
     """Raised when durable object storage is unavailable for an operation."""
 
@@ -614,12 +650,18 @@ class ManagedFileRef:
             # backend-mediated access.
             raise
         except Exception as exc:
+            # ``exc_info`` for the same reason as everywhere else on this
+            # path: this fault is swallowed -- the caller only sees ``False``
+            # and silently falls back to backend-mediated delivery -- so this
+            # line is the only record of it, and ``error=%s`` alone drops the
+            # exception class and the cause chain (#1467).
             logger.warning(
                 "Falling back to backend-mediated durable access because content "
                 "hash is unavailable: file_id=%s storage_key=%s error=%s",
                 getattr(self.record, "file_id", None),
                 self.storage_key,
                 exc,
+                exc_info=exc,
             )
             return False
 

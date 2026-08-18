@@ -123,6 +123,7 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.services.managed_file_ref import (
             DurableStorageOperationError,
             ensure_uploaded_file_local_path,
+            log_durable_storage_fault,
         )
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
@@ -188,16 +189,20 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 source_path = ensure_uploaded_file_local_path(record)
             except DurableStorageOperationError as exc:
-                # The message below reaches the model; the provider fault only
-                # exists in ``__cause__``, so log the chain too (#1467).
-                logger.warning(
-                    "Durable storage unavailable while restoring file for "
-                    "ingestion: file_id=%s",
-                    record.file_id,
-                    exc_info=exc,
+                log_durable_storage_fault(
+                    logger,
+                    "knowledge-base file restore",
+                    exc,
+                    file_id=record.file_id,
                 )
+                # Deliberately does NOT interpolate ``exc``. This string is
+                # joined into the tool result, so it reaches the model and the
+                # conversation transcript -- and ``str(exc)`` is the wrap's
+                # message, which carries the storage key, whose scope segments
+                # encode the owning user's id. The provider detail belongs in
+                # the log line above, which is server-side only.
                 errors.append(
-                    f"Failed to restore {record.filename} from durable storage: {exc}"
+                    f"Failed to restore {record.filename} from durable storage"
                 )
                 continue
             if not source_path.exists():

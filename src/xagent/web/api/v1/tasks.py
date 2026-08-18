@@ -76,7 +76,10 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
-from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.managed_file_ref import (
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -230,13 +233,18 @@ def _resolve_turn_files_or_400(
         )
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
-        # ``exc_info`` because the wrap carries only the storage key and the
-        # V1ApiError envelope reaches the client without a traceback, so this
-        # is the only place the provider fault gets recorded (#1467).
-        logger.warning(
-            "Durable storage unavailable while resolving turn attachments: task_id=%s",
-            task_id,
-            exc_info=exc,
+        # The V1ApiError envelope reaches the client without a traceback, so
+        # this log line is the only record of the provider fault (#1467).
+        # ``task_id`` is None on the create path -- one of this function's two
+        # callers, not an edge case -- so the owner and the requested ids carry
+        # the identification there.
+        log_durable_storage_fault(
+            logger,
+            "turn attachment resolution",
+            exc,
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            file_ids=",".join(file_ids),
         )
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR,

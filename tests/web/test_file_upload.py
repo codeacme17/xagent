@@ -1,5 +1,6 @@
 """Test file upload API functionality - Fixed for multi-tenant architecture"""
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -1510,7 +1511,7 @@ class TestFileManagement:
         assert unrelated_cache.exists()
 
     def test_delete_file_keeps_record_when_durable_cleanup_fails(
-        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
     ):
         """Durable cleanup failure should not orphan the object by deleting the row."""
         from xagent.core.file_storage.storage import FsspecFileStorage
@@ -1549,10 +1550,32 @@ class TestFileManagement:
 
         monkeypatch.setattr(FsspecFileStorage, "delete", fail_target_delete)
 
-        response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
 
         assert response.status_code == 503
         assert local_path.exists()
+
+        # End-to-end on the message this endpoint actually composes (#1467).
+        # Asserting through the request rather than by calling the helper with a
+        # hand-built label is the point: a drift in what the endpoint passes --
+        # a wrong variable, a dropped field -- would otherwise be invisible.
+        fault_lines = [
+            logging.Formatter("%(message)s").format(record)
+            for record in caplog.records
+            if record.name == "xagent.web.api.files"
+            and record.levelno == logging.WARNING
+            and "durable cleanup before row delete" in record.getMessage()
+        ]
+        assert len(fault_lines) == 1, caplog.records
+        rendered = fault_lines[0]
+        assert f"file_id={file_id}" in rendered
+        assert f"storage_key={storage_key}" in rendered
+        # The cause chain, not just its str(), so the provider class survives.
+        assert "RuntimeError" in rendered
+        assert "simulated durable delete failure" in rendered
+        # The 503 body stays detail-free: the key must not reach the client.
+        assert storage_key not in response.text
         db = next(test_app.dependency_overrides[get_db]())
         try:
             assert (
