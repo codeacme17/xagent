@@ -44,6 +44,43 @@ const isFileActionSelection = (
   ? isFileActionOption(option)
   : isFileActionValue(value)
 
+type SendDisposition = "not_sent" | "rejected" | "outcome_unknown"
+
+/**
+ * Delivery failures carry whether the turn definitely never reached the agent.
+ * Plain errors (local validation, unexpected throws) carry nothing, and are
+ * left unqualified rather than guessed at: telling a visitor to resubmit a
+ * turn that may have landed is worse than saying nothing.
+ */
+const readSendDisposition = (error: unknown): SendDisposition | null => {
+  if (typeof error !== "object" || error === null || !("disposition" in error)) {
+    return null
+  }
+  const disposition = (error as { disposition: unknown }).disposition
+  return disposition === "not_sent"
+    || disposition === "rejected"
+    || disposition === "outcome_unknown"
+    ? disposition
+    : null
+}
+
+/**
+ * Only the reasons the sender can act on — the backend's rejection text, an
+ * upload response detail — are shown as-is. Connection plumbing messages stay
+ * behind the localized string: they are English diagnostics, and a widget
+ * visitor is not the audience for them.
+ */
+const readSendReason = (error: unknown): string => {
+  if (
+    typeof error !== "object"
+    || error === null
+    || (error as { userFacing?: unknown }).userFacing !== true
+  ) {
+    return ""
+  }
+  return error instanceof Error ? error.message.trim() : ""
+}
+
 export function ClarificationForm({
   interactions,
   messageId,
@@ -68,6 +105,7 @@ export function ClarificationForm({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active)
   const [isOpen, setIsOpen] = useState(active)
+  const [sendFailure, setSendFailure] = useState<{ message: string; hint: string | null } | null>(null)
 
   useEffect(() => {
     if (active) {
@@ -154,6 +192,7 @@ export function ClarificationForm({
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
+    setSendFailure(null)
   }
 
   const handleSubmit = async () => {
@@ -246,6 +285,7 @@ export function ClarificationForm({
 
     try {
       setIsSubmitting(true)
+      setSendFailure(null)
       // If textMessage is empty but we have files, send a generic message?
       const outboundFiles = filesDisabled ? [] : files
       const finalMessage = textMessage || (outboundFiles.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
@@ -263,7 +303,21 @@ export function ClarificationForm({
       }
     } catch (error) {
       console.error("Failed to send clarification response", error)
-      toast.error(t("chatPage.clarification.sendError"))
+      // The rejection reason ("a previous guidance message is still being
+      // applied", the upload failure detail) is the only actionable part of
+      // the failure; the fixed string is a last resort.
+      const detail = readSendReason(error)
+      const disposition = readSendDisposition(error)
+      const failure = {
+        message: detail || t("chatPage.clarification.sendError"),
+        hint: disposition === "outcome_unknown"
+          ? t("chatPage.clarification.sendOutcomeUnknown")
+          : disposition === "not_sent" || disposition === "rejected"
+            ? t("chatPage.clarification.sendNotSent")
+            : null,
+      }
+      setSendFailure(failure)
+      toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
     } finally {
       setIsSubmitting(false)
     }
@@ -498,6 +552,15 @@ export function ClarificationForm({
             )
           ))}
         </div>
+
+        {sendFailure && (
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+            <div>{sendFailure.message}</div>
+            {sendFailure.hint && (
+              <div className="mt-1 text-xs text-destructive/80">{sendFailure.hint}</div>
+            )}
+          </div>
+        )}
 
         <div className="pt-2 flex gap-2">
           <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>

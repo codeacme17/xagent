@@ -1,3 +1,16 @@
+import {
+  getUploadErrorMessage,
+  isJsonRecord,
+  parseApiResponse,
+  UPLOAD_ERROR_MESSAGES,
+} from "@/lib/api-wrapper"
+import {
+  isRetriableUploadStatus,
+  UploadRequestError,
+  withUploadRetry,
+  type UploadRetryOptions,
+} from "@/lib/upload-retry"
+
 export interface PublicChatUploadedFile {
   file_id: string
   name?: string
@@ -12,15 +25,19 @@ interface UploadPublicChatFileOptions {
   taskType: string
   taskId?: number | string | null
   fallbackError: string
+  retry?: UploadRetryOptions
 }
 
-interface PublicChatUploadResponse {
-  success?: boolean
-  file_id?: unknown
-  detail?: unknown
-  message?: unknown
-}
-
+/**
+ * Uploads one file for the widget/share chat.
+ *
+ * Deliberately uses `fetch` rather than `apiRequest`: public visitors carry a
+ * guest token, so the shared 401 handling (which redirects to /login) does not
+ * apply here.
+ *
+ * One request carries exactly one file, so a bounded retry of a refused
+ * request cannot duplicate a sibling file that already landed.
+ */
 export async function uploadPublicChatFile({
   url,
   accessToken,
@@ -28,35 +45,45 @@ export async function uploadPublicChatFile({
   taskType,
   taskId,
   fallbackError,
+  retry,
 }: UploadPublicChatFileOptions): Promise<PublicChatUploadedFile> {
-  const formData = new FormData()
-  formData.append("file", file)
-  formData.append("task_type", taskType)
-  if (taskId != null) {
-    formData.append("task_id", taskId.toString())
+  const sendUpload = async (): Promise<PublicChatUploadedFile> => {
+    const formData = new FormData()
+    formData.append("file", file)
+    formData.append("task_type", taskType)
+    if (taskId != null) {
+      formData.append("task_id", taskId.toString())
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${accessToken}` },
+      body: formData,
+    })
+    const parsed = await parseApiResponse(response)
+    const data = isJsonRecord(parsed.data) ? parsed.data : null
+    const fileId = typeof data?.file_id === "string" ? data.file_id : null
+
+    if (!response.ok || data?.success !== true || !fileId) {
+      throw new UploadRequestError(
+        getUploadErrorMessage(response, parsed, {
+          generic: fallbackError,
+          ...UPLOAD_ERROR_MESSAGES,
+        }),
+        {
+          status: response.status,
+          retriable: !response.ok && isRetriableUploadStatus(response.status),
+        },
+      )
+    }
+
+    return {
+      file_id: fileId,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+    }
   }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${accessToken}` },
-    body: formData,
-  })
-  const data = await response.json().catch(() => null) as PublicChatUploadResponse | null
-  const fileId = typeof data?.file_id === "string" ? data.file_id : null
-
-  if (!response.ok || data?.success !== true || !fileId) {
-    const backendMessage = typeof data?.detail === "string"
-      ? data.detail
-      : typeof data?.message === "string"
-        ? data.message
-        : null
-    throw new Error(backendMessage || fallbackError)
-  }
-
-  return {
-    file_id: fileId,
-    name: file.name,
-    size: file.size,
-    type: file.type,
-  }
+  return withUploadRetry(sendUpload, retry)
 }

@@ -28,6 +28,8 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/files-disabled-presentation.ts",
+        "src/lib/public-chat-file-upload.ts",
+        "src/lib/upload-retry.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
         "src/components/layout/sidebar.tsx",
@@ -64,6 +66,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/lib/files-disabled-presentation.ts": {
           statements: 85, branches: 80, functions: 90, lines: 85,
+        },
+        "src/lib/public-chat-file-upload.ts": {
+          statements: 95, branches: 90, functions: 100, lines: 95,
+        },
+        "src/lib/upload-retry.ts": {
+          statements: 95, branches: 90, functions: 90, lines: 95,
         },
         "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
         "src/contexts/presentation-capabilities.tsx": {
@@ -152,6 +160,8 @@ export default defineConfig({
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
+      "src/lib/public-chat-file-upload.test.ts",
+      "src/lib/upload-retry.test.ts",
     ],
   },
 })

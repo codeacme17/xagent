@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { isRetriableUploadStatus, UploadRequestError, withUploadRetry } from "@/lib/upload-retry"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -54,16 +55,26 @@ export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unkn
 export class MessageDeliveryError extends Error {
   readonly disposition: MessageDeliveryDisposition
   readonly retryWithNewId: boolean
+  /**
+   * Whether `message` explains the failure in terms the sender can act on —
+   * the server's rejection text, or an upload response detail. The remaining
+   * messages describe connection plumbing ("the connection changed before
+   * delivery") and are diagnostics: callers show their own localized string
+   * for those rather than putting internal English in front of a visitor.
+   */
+  readonly userFacing: boolean
 
   constructor(
     message: string,
     disposition: MessageDeliveryDisposition,
     retryWithNewId = false,
+    userFacing = false,
   ) {
     super(message)
     this.name = "MessageDeliveryError"
     this.disposition = disposition
     this.retryWithNewId = retryWithNewId
+    this.userFacing = userFacing
   }
 }
 
@@ -71,7 +82,8 @@ const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
   retryWithNewId = false,
-) => new MessageDeliveryError(message, disposition, retryWithNewId)
+  userFacing = false,
+) => new MessageDeliveryError(message, disposition, retryWithNewId, userFacing)
 
 export type WebSocketCredentialOwner =
   | {
@@ -887,6 +899,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     ? "rejected"
                     : "outcome_unknown",
                   data.retry_with_new_id === true,
+                  typeof data.message === "string" && data.message.trim() !== "",
                 ))
               }
             }
@@ -1197,7 +1210,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             claim.cancellation,
           ])
         } else if (filesToUpload.length > 0) {
-          const uploadRequest = (async () => {
+          // One request carries the whole batch, so a retry re-sends every
+          // file in it. That is only safe for statuses that mean the request
+          // was refused outright — `isRetriableUploadStatus` draws that line —
+          // and the 503 the upload endpoint raises for durable storage
+          // compensates its partial registrations before answering, so the
+          // retry cannot land duplicates of the files that had staged.
+          const sendUpload = async () => {
             const formData = new FormData()
             filesToUpload.forEach(file => formData.append('files', file))
             formData.append('task_type', 'task')
@@ -1211,10 +1230,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             })
             const parsed = await parseApiResponse(response)
             if (!response.ok || !isJsonRecord(parsed.data)) {
-              throw deliveryError(getUploadErrorMessage(response, parsed, {
-                generic: 'Upload failed',
-                ...UPLOAD_ERROR_MESSAGES,
-              }), "not_sent")
+              throw new UploadRequestError(
+                getUploadErrorMessage(response, parsed, {
+                  generic: 'Upload failed',
+                  ...UPLOAD_ERROR_MESSAGES,
+                }),
+                {
+                  status: response.status,
+                  retriable: !response.ok && isRetriableUploadStatus(response.status),
+                },
+              )
             }
             const data = parsed.data
             return data.success && Array.isArray(data.files)
@@ -1229,8 +1254,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   type: typeof file.mime_type === 'string' ? file.mime_type : '',
                 }))
               : []
-          })()
-          uploadedFiles = await Promise.race([uploadRequest, claim.cancellation])
+          }
+          uploadedFiles = await Promise.race([
+            withUploadRetry(sendUpload, { cancellation: claim.cancellation }),
+            claim.cancellation,
+          ])
         }
         messageData.files = [...preUploadedFiles, ...uploadedFiles]
       }
@@ -1317,6 +1345,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       throw deliveryError(
         error instanceof Error ? error.message : String(error),
         "not_sent",
+        false,
+        error instanceof UploadRequestError,
       )
     } finally {
       if (preparationsRef.current.get(clientMessageId) === claim) {
