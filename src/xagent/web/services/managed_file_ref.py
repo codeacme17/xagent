@@ -27,6 +27,7 @@ from ...core.file_storage import (
     ScopedFileStorage,
     StorageKeyScopeError,
     StoredObject,
+    classify_provider_fault,
     get_user_file_storage,
 )
 from ...core.file_storage.keys import (
@@ -126,6 +127,12 @@ def log_durable_storage_fault(
     the logs an incident is read from. Values are escaped and bounded because
     some are client-supplied; that bounds the fields, not the whole record,
     whose ``exc_info`` text the formatter still renders verbatim (#1516).
+
+    The classified provider fault is appended so a burst of these can be
+    aggregated by cause -- one throttle reads very differently from a thousand,
+    and both differ from a rejected credential. ``retryable=False`` there is a
+    diagnostic claim, not a routing one: every fault in this family still
+    answers the same status.
     """
     # One record per fault instance: a wrap can cross several arms that each
     # legitimately report it, and the mark is what makes them safe to write
@@ -152,7 +159,11 @@ def log_durable_storage_fault(
     # tests to match on, pinned against this line by
     # ``test_the_exported_prefix_is_the_one_the_helper_emits``.
     target_logger.warning(
-        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
+        "Durable storage unavailable during %s%s %s",
+        operation,
+        rendered,
+        classify_provider_fault(exc).as_log_fields(),
+        exc_info=exc,
     )
     # Marked only after the record is emitted: if emission raised, the fault
     # would stay unmarked for a later arm to report, instead of being

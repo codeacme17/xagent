@@ -126,7 +126,6 @@ async def _create_knowledge_base_from_file_impl(
             ensure_uploaded_file_local_path,
             log_durable_storage_fault,
         )
-        from ....file_storage import classify_provider_fault
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
             IngestionConfig,
