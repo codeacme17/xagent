@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import errno
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Iterator
 
 # Provider error codes worth another attempt: throttles, server-side
 # transients, and aborted-in-flight requests. Sourced from the S3 error
@@ -248,14 +248,24 @@ def _classify_one(exc: BaseException) -> ProviderFault | None:
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
         error = response.get("Error")
+        # Every value read out of ``response`` is untrusted: this module
+        # deliberately duck-types the botocore shape so foreign backends still
+        # classify, which means a library that follows the shape only loosely
+        # can put anything here. Narrowing each one to the type this function
+        # actually uses -- rather than guarding at the point of use -- keeps a
+        # nested dict or list out of both the set lookups below (unhashable,
+        # and a raised TypeError here would replace the caller's 503 with an
+        # unhandled 500 precisely while an incident is being diagnosed) and out
+        # of the log field, where ``str()`` of a dict is noise, not a code.
         code = error.get("Code") if isinstance(error, dict) else None
+        code = code if isinstance(code, str) and code else None
         metadata = response.get("ResponseMetadata")
         status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
         status = status if isinstance(status, int) else None
-        if code or status is not None:
+        if code is not None or status is not None:
             return ProviderFault(
                 provider_class=provider_class,
-                code=str(code) if code else None,
+                code=code,
                 http_status=status,
                 retryable=_retryable_from_code(code, status),
             )
@@ -282,7 +292,12 @@ def _classify_one(exc: BaseException) -> ProviderFault | None:
     return None
 
 
-def _retryable_from_code(code: Any, status: int | None) -> bool | None:
+def _retryable_from_code(code: str | None, status: int | None) -> bool | None:
+    """Decide from the provider code, falling back to the HTTP status.
+
+    ``code`` is already narrowed to ``str | None`` by the caller, which is what
+    makes the set lookups below safe rather than a hazard.
+    """
     if code in _RETRYABLE_CODES:
         return True
     if code in _PERMANENT_CODES:
