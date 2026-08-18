@@ -188,6 +188,14 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 source_path = ensure_uploaded_file_local_path(record)
             except DurableStorageOperationError as exc:
+                # The message below reaches the model; the provider fault only
+                # exists in ``__cause__``, so log the chain too (#1467).
+                logger.warning(
+                    "Durable storage unavailable while restoring file for "
+                    "ingestion: file_id=%s",
+                    record.file_id,
+                    exc_info=exc,
+                )
                 errors.append(
                     f"Failed to restore {record.filename} from durable storage: {exc}"
                 )

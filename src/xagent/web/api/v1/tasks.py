@@ -230,6 +230,14 @@ def _resolve_turn_files_or_400(
         )
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
+        # ``exc_info`` because the wrap carries only the storage key and the
+        # V1ApiError envelope reaches the client without a traceback, so this
+        # is the only place the provider fault gets recorded (#1467).
+        logger.warning(
+            "Durable storage unavailable while resolving turn attachments: task_id=%s",
+            task_id,
+            exc_info=exc,
+        )
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR,
             503,

@@ -113,7 +113,45 @@ logger = logging.getLogger(__name__)
 file_router = APIRouter(prefix="/api/files", tags=["files"])
 
 
-def _durable_storage_unavailable() -> HTTPException:
+# The operation label for the durable cleanup ``delete_file`` runs before it
+# drops the metadata row. Named rather than inlined so the one log message this
+# change *renames* (it replaced "Failed to clean up durable file before
+# deleting row") has a single definition that alerting can be re-keyed to, and
+# so its test cannot drift from the string the endpoint actually emits.
+DELETE_CLEANUP_OPERATION = "durable cleanup before row delete"
+
+
+def _durable_storage_unavailable(exc: BaseException, operation: str) -> HTTPException:
+    """Record the provider fault, then answer the retryable 503.
+
+    Logging belongs here rather than at each call site because the 503 is the
+    only thing that leaves the process: every site raises this ``from exc``,
+    but FastAPI's default ``HTTPException`` handler never logs a traceback, so
+    without this line the fault that actually failed is lost. And the wrap in
+    ``ManagedFileRef`` keeps only the storage key in its message -- the
+    provider error class, the HTTP status, throttle vs. timeout vs. rejected
+    credentials all live in ``__cause__`` and nowhere else. ``exc_info``
+    is what carries that chain into the log (see #1467).
+
+    ``exc`` is typed ``BaseException`` because not every site wraps first: the
+    delete path catches the raw provider exception directly.
+
+    Level is ``warning``, not ``error``: this classification *is* the claim
+    that the fault is transient and worth retrying, which is the same reason
+    the response is 503. Permanent namespace-authority faults are meant to be
+    excluded from it upstream (``_NAMESPACE_AUTHORITY_ERRORS`` in
+    services/managed_file_ref.py) and logged at ``error`` by the app-wide
+    handler in web/app.py. ``delete_file`` is the one caller that does not
+    honour that split -- its bare ``except Exception`` folds a
+    ``StorageKeyScopeError`` in here, so a permanent fault is answered 503 and
+    logged as transient. That is pre-existing and tracked in #1473, not a
+    property of this helper.
+
+    The detail stays server-side. ``str(exc)`` carries the storage key, whose
+    scope segments can encode end-user identity, so the response body remains
+    the fixed message -- the same split web/app.py makes for the 500 it owns.
+    """
+    logger.warning("Durable storage unavailable during %s", operation, exc_info=exc)
     return HTTPException(
         status_code=503,
         detail="Durable storage is temporarily unavailable",
@@ -305,7 +343,7 @@ def _durable_redirect_response(
     except DurableObjectIntegrityError as exc:
         raise _file_integrity_failed() from exc
     except DurableStorageOperationError as exc:
-        raise _durable_storage_unavailable() from exc
+        raise _durable_storage_unavailable(exc, "signed durable redirect") from exc
 
     if not signed_url:
         return None
@@ -588,8 +626,7 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        logger.warning("Durable storage unavailable during upload: %s", exc)
-        raise _durable_storage_unavailable() from exc
+        raise _durable_storage_unavailable(exc, "upload") from exc
     finally:
         if not completed:
 
@@ -1460,7 +1497,7 @@ async def download_file(
                     },
                 )
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(exc, "download") from exc
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
@@ -1769,7 +1806,7 @@ async def preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(exc, "preview") from exc
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
@@ -1858,7 +1895,7 @@ async def preview_pptx_as_pdf(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(exc, "pptx preview") from exc
             except DurableObjectMissingError:
                 # Durable record points at nothing; fall back to whatever
                 # is on disk (or 404 below if it's gone too).
@@ -1950,7 +1987,7 @@ async def public_download_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(exc, "public download") from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
         else:
@@ -2016,7 +2053,7 @@ async def public_preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(exc, "public preview") from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
@@ -2060,7 +2097,9 @@ async def public_preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(
+                    exc, "public preview task asset"
+                ) from exc
             except DurableObjectMissingError:
                 target_path = asset_ref.local_path
             _ensure_under_uploads(target_path, owner_user_id)
@@ -2130,11 +2169,9 @@ async def delete_file(
                     storage_key
                 )
             except Exception as exc:
-                logger.warning(
-                    "Failed to clean up durable file before deleting row: %s",
-                    storage_key,
-                )
-                raise _durable_storage_unavailable() from exc
+                raise _durable_storage_unavailable(
+                    exc, f"{DELETE_CLEANUP_OPERATION} ({storage_key})"
+                ) from exc
 
         db.delete(file_record)
         db.commit()
