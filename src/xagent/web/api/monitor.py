@@ -258,7 +258,12 @@ async def get_monitoring_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Get monitoring statistics"""
+    """Get monitoring statistics.
+
+    The daily fields (``todayCalls``, ``activeModels``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
     try:
         from ..models.task import TraceEvent
 
@@ -638,7 +643,12 @@ async def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Get dashboard statistics"""
+    """Get dashboard statistics.
+
+    The daily fields (``todayCalls``, ``activeAgents``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
     try:
         from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 
@@ -650,15 +660,19 @@ async def get_dashboard_stats(
         # Get total task count
         total_tasks = db.query(Task).filter(*task_filter).count()
 
-        # Get active agent count (based on tasks with recent activity).
-        # UTC-day boundary, matching the aware-UTC ``updated_at`` column.
-        recent_active_time = datetime.now(timezone.utc).replace(
+        # Start of the current UTC day, in the same frame as the aware-UTC
+        # ``Task.updated_at`` and ``TraceEvent.timestamp`` columns. Read the
+        # clock once: two reads either side of midnight would leave a single
+        # response reporting one metric for yesterday and the other for today.
+        today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+
+        # Get active agent count (based on tasks with recent activity)
         active_agents = (
             db.query(Task)
             .filter(
-                Task.updated_at >= recent_active_time,
+                Task.updated_at >= today_start,
                 task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING]),
                 *task_filter,
             )
@@ -667,12 +681,6 @@ async def get_dashboard_stats(
 
         # Get deployed application count (temporarily set to 0, waiting for Deploy feature implementation)
         deployed_apps = 0
-
-        # Get today's call count. UTC-day boundary, matching the aware-UTC
-        # timestamps stored in ``TraceEvent.timestamp``.
-        today_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
 
         # Build TraceEvent filter conditions
         trace_event_filter = []
@@ -683,6 +691,7 @@ async def get_dashboard_stats(
                 )
             )
 
+        # Get today's call count
         today_calls = (
             db.query(TraceEvent)
             .filter(

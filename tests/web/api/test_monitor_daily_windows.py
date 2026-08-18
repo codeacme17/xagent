@@ -15,17 +15,19 @@ off-by-one at the boundary. Rows are seeded just before and just after UTC
 midnight so the correct window is told apart from both the naive-local one
 and a window that simply counts everything.
 
-The SQLite path is enough here: the sqlite dialect drops the UTC offset at
-bind time on both the stored rows and the query boundary, so the comparison
-happens in UTC wall-clock on both sides exactly when the boundary is built
-in UTC -- and lands a day off when it is built from local time. The
-session-``TimeZone``-dependent coercion PostgreSQL applies to a naive
-literal lives in the sibling ``test_monitor_postgresql.py`` suite's domain.
+This file covers the SQLite path, where the dialect drops the UTC offset at
+bind time on both the stored rows and the query boundary: the comparison
+then happens in UTC wall-clock on both sides exactly when the boundary is
+built in UTC, and lands a day off when it is built from local time. The
+other half of the story -- the session-``TimeZone``-dependent coercion
+PostgreSQL applies to a naive literal -- is pinned by
+``test_monitor_postgresql.py``, which reuses the same frozen clock and
+instants from ``monitor_daily_window_shared``.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 from sqlalchemy.orm import Session
@@ -36,40 +38,19 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 
 from .conftest import _direct_db_session
+from .monitor_daily_window_shared import (
+    UTC_TODAY_EARLY,
+    UTC_TODAY_LATE,
+    UTC_YESTERDAY_LATE,
+    FrozenDatetime,
+)
 
 pytestmark = pytest.mark.usefixtures("_test_db")
-
-# 18:00 UTC on a UTC+8 server: the local wall clock reads 02:00 on the
-# *next* calendar day. A naive-local "today" boundary is therefore
-# 2026-08-18 00:00 while the correct UTC boundary is 2026-08-17 00:00 --
-# a full-day gap no seeded row can straddle by accident.
-_NOW_UTC = datetime(2026, 8, 17, 18, 0, tzinfo=timezone.utc)
-_NOW_LOCAL_NAIVE = datetime(2026, 8, 18, 2, 0)
-
-_UTC_TODAY_EARLY = datetime(2026, 8, 17, 0, 1, tzinfo=timezone.utc)
-_UTC_TODAY_LATE = datetime(2026, 8, 17, 17, 0, tzinfo=timezone.utc)
-_UTC_YESTERDAY_LATE = datetime(2026, 8, 16, 23, 59, tzinfo=timezone.utc)
-
-
-class _FrozenDatetime(datetime):
-    """``datetime`` whose ``now()`` is pinned to ``_NOW_UTC``.
-
-    The naive branch returns what a UTC+8 server's wall clock would show at
-    that instant, so the pre-fix call sites reproduce the skew
-    deterministically instead of only when the test happens to run between
-    16:00 and 24:00 UTC.
-    """
-
-    @classmethod
-    def now(cls, tz=None):  # type: ignore[override]
-        if tz is None:
-            return _NOW_LOCAL_NAIVE
-        return _NOW_UTC.astimezone(tz)
 
 
 @pytest.fixture
 def _utc_plus_8_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(monitor_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(monitor_module, "datetime", FrozenDatetime)
 
 
 def _seed_admin(db: Session) -> User:
@@ -105,16 +86,16 @@ def _seed_boundary_straddling_events(db: Session, task: Task) -> None:
         (
             "yesterday-llm",
             "llm_call_start",
-            _UTC_YESTERDAY_LATE,
+            UTC_YESTERDAY_LATE,
             {"model_name": "stale-model"},
         ),
         (
             "today-llm",
             "llm_call_start",
-            _UTC_TODAY_EARLY,
+            UTC_TODAY_EARLY,
             {"model_name": "fresh-model"},
         ),
-        ("today-tool", "tool_execution_start", _UTC_TODAY_LATE, None),
+        ("today-tool", "tool_execution_start", UTC_TODAY_LATE, None),
     ]:
         db.add(
             TraceEvent(
@@ -138,7 +119,7 @@ async def test_stats_today_window_is_the_utc_day(_utc_plus_8_server: None) -> No
     db = _direct_db_session()
     try:
         admin = _seed_admin(db)
-        task = _seed_task(db, admin, title="stats-task", updated_at=_UTC_TODAY_LATE)
+        task = _seed_task(db, admin, title="stats-task", updated_at=UTC_TODAY_LATE)
         _seed_boundary_straddling_events(db, task)
 
         stats = await get_monitoring_stats(db=db, current_user=admin)
@@ -160,10 +141,10 @@ async def test_dashboard_windows_are_the_utc_day(_utc_plus_8_server: None) -> No
     try:
         admin = _seed_admin(db)
         stale_task = _seed_task(
-            db, admin, title="stale-task", updated_at=_UTC_YESTERDAY_LATE
+            db, admin, title="stale-task", updated_at=UTC_YESTERDAY_LATE
         )
         fresh_task = _seed_task(
-            db, admin, title="fresh-task", updated_at=_UTC_TODAY_LATE
+            db, admin, title="fresh-task", updated_at=UTC_TODAY_LATE
         )
         del stale_task  # seeded for its updated_at; nothing else to assert on
         _seed_boundary_straddling_events(db, fresh_task)
