@@ -243,3 +243,49 @@ def test_a_non_dict_response_attribute_is_ignored() -> None:
     # Fell through the unusable ``.response`` and kept descending.
     assert fault.code == "ECONNRESET"
     assert fault.retryable is True
+
+
+def test_a_non_string_code_cannot_crash_the_diagnostic_path() -> None:
+    """An unhashable ``Code`` must not turn a handled 503 into an unhandled 500.
+
+    This module duck-types botocore's shape so foreign backends still classify,
+    which means a library following that shape loosely can put a dict or list
+    under ``Code``. Feeding one to a ``frozenset`` lookup raises
+    ``TypeError: unhashable type``, and because classification runs *inside* the
+    caller's ``except`` block while it builds the 503, that TypeError would
+    escape and replace the response -- losing the diagnosis exactly when an
+    incident is being investigated.
+    """
+    for bad_code in ({"nested": "value"}, ["SlowDown"], object(), 503):
+        exc = _s3_chain(OSError(errno.EIO, "x"), None, None)
+        # Reach past the helper to plant a value botocore would never send.
+        client_error = exc.__cause__.__cause__  # type: ignore[union-attr]
+        client_error.response["Error"]["Code"] = bad_code  # type: ignore[attr-defined]
+
+        fault = classify_provider_fault(exc)
+
+        # Unusable code is dropped rather than stringified into the log field.
+        assert fault.code is None, bad_code
+        assert fault.retryable is None, bad_code
+
+
+def test_a_non_string_code_still_defers_to_the_http_status() -> None:
+    """Dropping an unusable code must not discard the status beside it."""
+    exc = _s3_chain(OSError(errno.EIO, "x"), None, 503)
+    client_error = exc.__cause__.__cause__  # type: ignore[union-attr]
+    client_error.response["Error"]["Code"] = {"nested": "value"}  # type: ignore[attr-defined]
+
+    fault = classify_provider_fault(exc)
+
+    assert fault.code is None
+    assert fault.http_status == 503
+    assert fault.retryable is True
+
+
+def test_an_empty_code_is_treated_as_absent() -> None:
+    exc = _s3_chain(OSError(errno.EIO, "x"), "", 500)
+
+    fault = classify_provider_fault(exc)
+
+    assert fault.code is None
+    assert fault.retryable is True
