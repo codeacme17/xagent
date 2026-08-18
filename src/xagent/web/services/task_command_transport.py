@@ -856,6 +856,12 @@ def contended_defer_retry_seconds(defer_count: int) -> float:
 
     Contention clears on its own but not within a single re-poll, so the wait
     grows instead of hammering the claim query every second.
+
+    The exponent needs no ceiling of its own: ``defer_count`` cannot exceed
+    ``MAX_COMMAND_DEFERS`` because the deferral above that is terminal, so the
+    largest power reached is small, and clamping it against a literal would
+    stop the window tracking ``MAX_COMMAND_DEFER_RETRY_SECONDS`` if that cap
+    is ever raised.
     """
 
     return float(min(2 ** max(defer_count + 1, 1), MAX_COMMAND_DEFER_RETRY_SECONDS))
