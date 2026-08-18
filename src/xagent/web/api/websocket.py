@@ -322,6 +322,34 @@ def _client_message_id(value: Any) -> str | None:
     return normalized
 
 
+# Exception text can carry file paths, SQL fragments, provider payloads and
+# other internals. It reaches anonymous widget/share visitors through both the
+# error bubble and the message_rejected ack, so an *incidental* validation
+# failure only ever surfaces as this fixed string; the detail stays in the log.
+#
+# Agent RuntimeError text is deliberately left alone: surfacing it to the sender
+# is an existing, tested contract (tests/web/api/test_websocket_owner_actor.py),
+# and narrowing it is a product decision rather than a redaction bug.
+CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
+
+
+class ClientVisibleValidationError(ValueError):
+    """A validation failure whose text was written for the end user.
+
+    Raise this - never a bare ValueError - when the message itself is the
+    actionable answer ("authentication required"). Everything else reaching the
+    validation handler is treated as incidental and redacted.
+    """
+
+
+def _client_safe_validation_message(error: Exception) -> str:
+    return (
+        str(error)
+        if isinstance(error, ClientVisibleValidationError)
+        else CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
 async def send_message_delivery(
     websocket: WebSocket,
     *,
@@ -5748,13 +5776,15 @@ async def _handle_chat_message_unserialized(
         authorized_task_id: int | None = None
 
         if user is None:
-            raise ValueError("User authentication required for task access")
+            raise ClientVisibleValidationError(
+                "User authentication required for task access"
+            )
         if not isinstance(user_message, str):
-            raise TypeError("Chat message must be a string")
+            raise ClientVisibleValidationError("Chat message must be a string")
         if not isinstance(raw_context, dict):
-            raise TypeError("Chat context must be an object")
+            raise ClientVisibleValidationError("Chat context must be an object")
         if not isinstance(raw_files, list):
-            raise TypeError("Chat files must be a list")
+            raise ClientVisibleValidationError("Chat files must be a list")
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6381,8 +6411,10 @@ async def _handle_chat_message_unserialized(
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
-            message = f"Data validation error: {str(e)}"
-            logger.error(f"Data validation error in agent execution: {e}")
+            message = _client_safe_validation_message(e)
+            logger.error(
+                "Data validation error in agent execution: %s", e, exc_info=True
+            )
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6410,7 +6442,7 @@ async def _handle_chat_message_unserialized(
         except RuntimeError as e:
             # Runtime error
             message = f"Runtime error: {str(e)}"
-            logger.error(f"Runtime error in agent execution: {e}")
+            logger.error("Runtime error in agent execution: %s", e, exc_info=True)
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6564,7 +6596,9 @@ async def handle_execute_task(
         user = message_data.get("user")
         authorized_task_id: int | None = None
         if not user:
-            raise ValueError("User authentication required for task execution")
+            raise ClientVisibleValidationError(
+                "User authentication required for task execution"
+            )
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -6621,8 +6655,8 @@ async def handle_execute_task(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation and format error
-        message = f"Data validation error: {str(e)}"
-        logger.error(f"Data validation error in task execution: {e}")
+        message = _client_safe_validation_message(e)
+        logger.error("Data validation error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -6648,7 +6682,7 @@ async def handle_execute_task(
     except RuntimeError as e:
         # Runtime error
         message = f"Runtime error: {str(e)}"
-        logger.error(f"Runtime error in task execution: {e}")
+        logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(

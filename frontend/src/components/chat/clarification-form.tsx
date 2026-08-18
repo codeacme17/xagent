@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import { Interaction } from "@/contexts/app-context-chat"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -12,6 +12,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
+import { generateClientMessageId } from "@/lib/utils"
 
 interface ClarificationFormProps {
   message?: string
@@ -106,6 +107,13 @@ export function ClarificationForm({
   const [isSubmitted, setIsSubmitted] = useState(!active)
   const [isOpen, setIsOpen] = useState(active)
   const [sendFailure, setSendFailure] = useState<{ message: string; hint: string | null } | null>(null)
+  // An unresolved submission keeps its client message id, so a retry lands on
+  // the server's existing claim instead of opening a second turn. Cleared on
+  // success, and when the server explicitly asks for a fresh id.
+  const deliveryAttemptRef = useRef<string | null>(null)
+  // Set when the turn's outcome is unknown: it may already be running, so the
+  // visitor must reload rather than submit a second one.
+  const [resubmitBlocked, setResubmitBlocked] = useState(false)
 
   useEffect(() => {
     if (active) {
@@ -192,6 +200,7 @@ export function ClarificationForm({
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
+    if (resubmitBlocked) return
     setSendFailure(null)
   }
 
@@ -293,9 +302,16 @@ export function ClarificationForm({
       if (onSend) {
         await onSend(finalMessage, outboundFiles, metadata);
       } else if (sendMessage) {
-        await sendMessage(finalMessage, { force: true, metadata }, outboundFiles)
+        const clientMessageId = deliveryAttemptRef.current ?? generateClientMessageId()
+        deliveryAttemptRef.current = clientMessageId
+        await sendMessage(
+          finalMessage,
+          { force: true, metadata, clientMessageId },
+          outboundFiles,
+        )
       }
 
+      deliveryAttemptRef.current = null
       setIsSubmitted(true)
       setIsOpen(false)
       if (!onSend && dispatch) {
@@ -316,6 +332,14 @@ export function ClarificationForm({
             ? t("chatPage.clarification.sendNotSent")
             : null,
       }
+      if (
+        error
+        && typeof error === "object"
+        && (error as { retryWithNewId?: unknown }).retryWithNewId === true
+      ) {
+        deliveryAttemptRef.current = null
+      }
+      setResubmitBlocked(disposition === "outcome_unknown")
       setSendFailure(failure)
       toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
     } finally {
@@ -563,7 +587,7 @@ export function ClarificationForm({
         )}
 
         <div className="pt-2 flex gap-2">
-          <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
+          <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted || resubmitBlocked}>
             {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
           </Button>
         </div>

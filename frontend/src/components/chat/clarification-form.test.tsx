@@ -358,3 +358,96 @@ describe("ClarificationForm delivery failures", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
   })
 })
+
+describe("ClarificationForm resubmission safety", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  const deliveryError = (
+    message: string,
+    disposition: string,
+    extra: Record<string, unknown> = {},
+  ) => Object.assign(new Error(message), { disposition, userFacing: true, ...extra })
+
+  const renderForm = () => render(
+    <ClarificationForm
+      interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+    />,
+  )
+
+  const submit = () => fireEvent.click(
+    screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+  )
+
+  const sentIds = () => appContextMock.sendMessage.mock.calls.map(
+    ([, config]) => (config as { clientMessageId?: string })?.clientMessageId,
+  )
+
+  it("stops a second submission while the turn's outcome is unknown", async () => {
+    appContextMock.sendMessage.mockRejectedValue(
+      deliveryError("The task is busy applying an earlier answer.", "outcome_unknown"),
+    )
+    renderForm()
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeDisabled())
+    // Editing an answer must not talk the visitor back into resubmitting.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Shanghai" } })
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeDisabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendOutcomeUnknown",
+    )
+    expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it("retries an unresolved submission under its original client message id", async () => {
+    appContextMock.sendMessage.mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent"),
+    )
+    renderForm()
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentIds()
+    expect(first).toBeTruthy()
+    expect(second).toBe(first)
+  })
+
+  it("mints a fresh client message id when the server asks for one", async () => {
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "Message id was already used for different content or files.",
+      "rejected",
+      { retryWithNewId: true },
+    ))
+    renderForm()
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentIds()
+    expect(first).toBeTruthy()
+    expect(second).not.toBe(first)
+  })
+})

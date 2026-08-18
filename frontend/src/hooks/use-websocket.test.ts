@@ -165,6 +165,71 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  const uploadResponse = (body: unknown, status: number) => new Response(
+    JSON.stringify(body),
+    { status, headers: { "Content-Type": "application/json" } },
+  )
+
+  it("retries the default batch upload when storage refuses it, then stamps the ids", async () => {
+    // No injected uploader: this drives the FormData/apiRequest/parser branch
+    // that the transport-injected tests never reach.
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async () => uploadResponse(
+        { detail: "Durable storage is temporarily unavailable" },
+        503,
+      ))
+      .mockImplementationOnce(async () => uploadResponse(
+        { success: true, files: [{ file_id: "file-7", filename: "evidence.txt" }] },
+        200,
+      ))
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    const file = new File(["evidence"], "evidence.txt") as File & { file_id?: string }
+
+    const delivery = result.current.sendChatMessage("answer", [file], false, "batch-retry")
+    await waitFor(() => expect(socket.send).toHaveBeenCalledTimes(1))
+    act(() => socket.receive({
+      type: "message_accepted",
+      client_message_id: "batch-retry",
+      turn_id: "turn-7",
+    }))
+
+    await expect(delivery).resolves.toMatchObject({ turn_id: "turn-7" })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string).files).toEqual([
+      { file_id: "file-7", name: "evidence.txt", size: 0, type: "" },
+    ])
+    // Stamped back onto the caller's File, so resubmitting the same draft
+    // sends the reference instead of the bytes.
+    expect(file.file_id).toBe("file-7")
+  })
+
+  it("does not replay the default batch upload for a permanent rejection", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => uploadResponse({ detail: "File is too large" }, 413),
+    )
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+    const file = new File(["evidence"], "evidence.txt") as File & { file_id?: string }
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [file],
+      false,
+      "batch-permanent",
+    )).rejects.toMatchObject({
+      message: "File is too large",
+      disposition: "not_sent",
+      userFacing: true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(file.file_id).toBeUndefined()
+    expect(MockWebSocket.instances[0].send).not.toHaveBeenCalled()
+  })
+
   it("keeps an upload failure's own reason user facing through delivery", async () => {
     // The clarification form only shows a failure reason that is marked user
     // facing; an upload detail loses its marker if this wrapping regresses,

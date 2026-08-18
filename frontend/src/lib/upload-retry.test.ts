@@ -19,7 +19,8 @@ describe("withUploadRetry", () => {
       .mockRejectedValueOnce(retriableError(503))
       .mockResolvedValueOnce("uploaded")
 
-    await expect(withUploadRetry(perform, { sleep })).resolves.toBe("uploaded")
+    await expect(withUploadRetry(perform, { sleep, random: () => 1 }))
+      .resolves.toBe("uploaded")
     expect(perform).toHaveBeenCalledTimes(2)
     expect(sleep).toHaveBeenCalledWith(400)
   })
@@ -28,11 +29,19 @@ describe("withUploadRetry", () => {
     const sleep = vi.fn<(ms: number) => Promise<void>>(async () => {})
     const perform = vi.fn().mockRejectedValue(retriableError(503))
 
-    await expect(withUploadRetry(perform, { sleep })).rejects.toThrow(
-      "Storage unavailable",
-    )
+    await expect(withUploadRetry(perform, { sleep, random: () => 1 }))
+      .rejects.toThrow("Storage unavailable")
     expect(perform).toHaveBeenCalledTimes(3)
     expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([400, 800])
+  })
+
+  it("spreads retries with full jitter so a fleet does not march in lockstep", async () => {
+    const sleep = vi.fn<(ms: number) => Promise<void>>(async () => {})
+    const perform = vi.fn().mockRejectedValue(retriableError(503))
+
+    await expect(withUploadRetry(perform, { sleep, random: () => 0.25 }))
+      .rejects.toThrow("Storage unavailable")
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([100, 200])
   })
 
   it("does not retry a client-side rejection", async () => {
@@ -46,16 +55,21 @@ describe("withUploadRetry", () => {
     expect(sleep).not.toHaveBeenCalled()
   })
 
-  it("does not retry a gateway timeout, whose outcome is unknown", async () => {
-    const sleep = vi.fn(async () => {})
-    const perform = vi.fn().mockRejectedValue(retriableError(504))
+  it.each([502, 504])(
+    "does not retry a %i, whose outcome is unknown",
+    async (status) => {
+      // Both mean a proxy reached the upstream and could not get a usable
+      // answer back, so the upload may already have landed.
+      const sleep = vi.fn(async () => {})
+      const perform = vi.fn().mockRejectedValue(retriableError(status))
 
-    await expect(withUploadRetry(perform, { sleep })).rejects.toThrow(
-      "Storage unavailable",
-    )
-    expect(perform).toHaveBeenCalledTimes(1)
-    expect(sleep).not.toHaveBeenCalled()
-  })
+      await expect(withUploadRetry(perform, { sleep })).rejects.toThrow(
+        "Storage unavailable",
+      )
+      expect(perform).toHaveBeenCalledTimes(1)
+      expect(sleep).not.toHaveBeenCalled()
+    },
+  )
 
   it("does not retry a rejected request whose outcome is unknown", async () => {
     const sleep = vi.fn(async () => {})

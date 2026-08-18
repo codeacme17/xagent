@@ -1260,6 +1260,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             claim.cancellation,
           ])
         }
+        // Stamp the ids back onto the caller's File objects. A draft that is
+        // resubmitted after the turn was rejected (or after any later failure)
+        // then travels as `preUploadedFiles` instead of uploading the same
+        // bytes again and leaving a duplicate behind. Order is only trusted
+        // when the server answered for exactly the files that were sent.
+        if (uploadedFiles.length === filesToUpload.length) {
+          uploadedFiles.forEach((uploaded, index) => {
+            if (uploaded.file_id) filesToUpload[index].file_id = uploaded.file_id
+          })
+        }
+
         messageData.files = [...preUploadedFiles, ...uploadedFiles]
       }
 
