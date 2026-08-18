@@ -181,9 +181,10 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
 ) -> None:
     """The delete path hands over the raw provider exception, not a wrap.
 
-    ``delete_file`` catches ``Exception`` around the durable cleanup, so the
-    helper's parameter is typed ``BaseException``; before #1467 that site
-    logged the storage key and discarded the exception entirely.
+    ``delete_file`` catches ``Exception`` around the durable cleanup rather
+    than a ``DurableStorageOperationError``, so the helper has to classify and
+    log something that was never wrapped. Before #1467 that site logged the
+    storage key and discarded the exception entirely.
     """
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
         response = files_api._durable_storage_unavailable(

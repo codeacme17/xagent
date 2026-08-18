@@ -121,7 +121,7 @@ file_router = APIRouter(prefix="/api/files", tags=["files"])
 DELETE_CLEANUP_OPERATION = "durable cleanup before row delete"
 
 
-def _durable_storage_unavailable(exc: BaseException, operation: str) -> HTTPException:
+def _durable_storage_unavailable(exc: Exception, operation: str) -> HTTPException:
     """Record the provider fault, then answer the retryable 503.
 
     Logging belongs here rather than at each call site because the 503 is the
@@ -133,8 +133,16 @@ def _durable_storage_unavailable(exc: BaseException, operation: str) -> HTTPExce
     credentials all live in ``__cause__`` and nowhere else. ``exc_info``
     is what carries that chain into the log (see #1467).
 
-    ``exc`` is typed ``BaseException`` because not every site wraps first: the
-    delete path catches the raw provider exception directly.
+    ``exc`` is ``Exception``, not ``BaseException``, and the narrowing is load
+    bearing rather than cosmetic. Every caller catches either
+    ``DurableStorageOperationError`` (a ``RuntimeError``) or, on the delete
+    path, a bare ``Exception`` -- so ``Exception`` is the true domain. Keeping
+    it that narrow makes mypy reject a future caller that widens its ``except``
+    and hands over an ``asyncio.CancelledError`` or ``KeyboardInterrupt``,
+    which must never be reported as storage unavailability: a cancelled or
+    interrupted request has not established that the object store is unwell,
+    and answering 503 would tell the client to retry something that was
+    deliberately stopped.
 
     Level is ``warning``, not ``error``: this classification *is* the claim
     that the fault is transient and worth retrying, which is the same reason
