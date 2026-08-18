@@ -893,6 +893,34 @@ def test_a_provider_only_row_does_not_brand_every_same_provider_app(db_session):
     assert entry["can_attach"] is False
 
 
+def test_a_provider_named_row_does_not_brand_every_same_provider_app(db_session):
+    """The collision the provider-key removal alone cannot close (#1403 review
+    round 7): a malformed row *named* the provider string itself lands under
+    that key through its own name. The team matcher therefore accepts exact
+    identity only — a nonblank auth.app_id equal to the app's id, or a name
+    among the app's own catalog keys — never the provider metadata the personal
+    matcher tolerates, so this row brands nothing."""
+    db, _creator, member = db_session
+    _add_app(db, "acme-drive", "Acme Drive", transport="oauth", provider_name="acme")
+    _add_app(db, "acme-mail", "Acme Mail", transport="oauth", provider_name="acme")
+    row = _add_server_row(
+        db,
+        {
+            "name": "acme",
+            "managed": "external",
+            "transport": "oauth",
+            "auth": {"app_id": "   ", "provider": "acme"},
+        },
+    )
+    _add_oauth_account(db, member, "acme")
+    _install_visibility(member, {int(row.id)})
+
+    for app_id in ("acme-drive", "acme-mail"):
+        entry = _entry(db, member, app_id)
+        assert entry["is_team_shared"] is False
+        assert entry["can_attach"] is False
+
+
 def test_a_raising_visibility_hook_yields_a_typed_503(db_session):
     """The hook is optional application code and the default remote picker now
     runs it on every load; a raising hook must surface as this seam's typed

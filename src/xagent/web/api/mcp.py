@@ -1784,7 +1784,10 @@ def _build_active_oauth_server_lookup(
 
 
 def _lookup_oauth_server_for_app(
-    app: dict, oauth_server_lookup: dict[str, list[MCPServer]]
+    app: dict,
+    oauth_server_lookup: dict[str, list[MCPServer]],
+    *,
+    matches: Callable[[MCPServer, dict], bool] = _is_oauth_server_for_app,
 ) -> Optional[MCPServer]:
     seen_servers: set[int] = set()
     for key in _app_lookup_keys(app.get("id"), app.get("provider"), app.get("name")):
@@ -1793,9 +1796,35 @@ def _lookup_oauth_server_for_app(
             if marker in seen_servers:
                 continue
             seen_servers.add(marker)
-            if _is_oauth_server_for_app(server, app):
+            if matches(server, app):
                 return server
     return None
+
+
+def _is_team_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
+    """``_is_oauth_server_for_app`` without the provider-metadata acceptance.
+
+    The team index already refuses to key rows by bare provider
+    (_team_oauth_server_lookup_keys), but a row *named* the provider string
+    itself (name "acme", blank app_id, provider "acme") lands under that key
+    through its name — and the shared matcher would then accept it for every
+    same-provider app via its provider metadata (#1403 review round 7). On the
+    team path identity must be exact: a nonblank ``auth.app_id`` equal to the
+    app's id, or a row name that is one of the app's own catalog keys. The
+    personal matcher keeps its provider tolerance, where the population is the
+    member's own rows and over-matching is cosmetic.
+    """
+    if server.transport != "oauth":
+        return False
+
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, dict):
+        auth_app_id = _normalize_app_key(auth.get("app_id"))
+        if auth_app_id:
+            return auth_app_id == _normalize_app_key(app.get("id"))
+
+    server_name = _normalize_app_key(server.name)
+    return bool(server_name and server_name in _catalog_app_keys(app))
 
 
 def _build_active_non_oauth_server_lookup(
@@ -2126,12 +2155,16 @@ def _team_shared_server_for_app(
     would mask the app's own row behind it. A key with no matching candidate
     yields no team-shared entry, falling back to the pre-#1387 state -- still
     listed by /api/mcp/servers, just never rendered in catalog shape. The
-    builtin_oauth arm needs no such check: _is_oauth_server_for_app matches on
-    the app_id/provider metadata our own provisioning writes, and the row
-    carries no caller-authored launch to misrepresent.
+    builtin_oauth arm needs no launch check -- the row carries no
+    caller-authored launch to misrepresent -- but matches on exact identity
+    only (_is_team_oauth_server_for_app): a nonblank auth.app_id equal to the
+    app's id, or a row named one of the app's own catalog keys, never the
+    provider metadata the personal matcher tolerates.
     """
     if app.get("auth_type") == "builtin_oauth":
-        return _lookup_oauth_server_for_app(app, team_oauth_server_lookup)
+        return _lookup_oauth_server_for_app(
+            app, team_oauth_server_lookup, matches=_is_team_oauth_server_for_app
+        )
     return next(
         (
             server
@@ -2507,7 +2540,8 @@ def list_mcp_apps(
             # api_key resolves at runtime from the platform/shared/user/
             # governing-team env layers, and the oauth shapes are further gated
             # in _catalog_team_shared_can_attach on the member's own grant or
-            # account (#1387).
+            # account -- or on an installed token-resolver hook, which supplies
+            # the deployment's tokens out of band and satisfies both (#1387).
             app_copy["can_attach"] = is_connected or (
                 team_server is not None
                 and _catalog_team_shared_can_attach(
