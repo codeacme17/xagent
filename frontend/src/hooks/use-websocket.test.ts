@@ -7,6 +7,7 @@ import {
   useWebSocket,
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
+import { UploadRequestError } from "@/lib/upload-retry"
 import { AUTH_CACHE_KEY, readAuthCache, readAuthSessionSnapshot, type AuthSessionSnapshot } from "@/lib/auth-cache"
 
 const authState = vi.hoisted(() => ({
@@ -161,6 +162,36 @@ describe("useWebSocket message delivery", () => {
     await expect(result.current.sendChatMessage("keep this draft")).rejects.toMatchObject({
       message: "Message not sent: the connection is not ready.",
       disposition: "not_sent",
+    })
+  })
+
+  it("keeps an upload failure's own reason user facing through delivery", async () => {
+    // The clarification form only shows a failure reason that is marked user
+    // facing; an upload detail loses its marker if this wrapping regresses,
+    // and the visitor drops back to the generic "Failed to send response".
+    const uploadFiles = vi.fn(() => Promise.reject(
+      new UploadRequestError("Durable storage is temporarily unavailable", {
+        status: 503,
+        retriable: true,
+      }),
+    ))
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "upload-detail",
+    )).rejects.toMatchObject({
+      message: "Durable storage is temporarily unavailable",
+      disposition: "not_sent",
+      userFacing: true,
     })
   })
 
