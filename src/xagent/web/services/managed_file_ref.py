@@ -27,9 +27,9 @@ from ...core.file_storage import (
     ScopedFileStorage,
     StorageKeyScopeError,
     StoredObject,
-    classify_provider_fault,
     get_user_file_storage,
 )
+from ...core.file_storage.faults import classify_provider_fault
 from ...core.file_storage.keys import (
     build_task_output_storage_key as build_task_output_storage_key,
 )
@@ -148,9 +148,15 @@ def log_durable_storage_fault(
         if exc.storage_key and "storage_key" not in fields:
             fields = {**fields, "storage_key": exc.storage_key}
 
+    # One renderer for both the caller's identifiers and the classified fault,
+    # so escaping and layout are decided in a single place. Values from the
+    # classifier are sanitised on the same terms as request identifiers: a
+    # provider ``Code`` is read out of a duck-typed response dict, so a
+    # loosely-conforming backend could put a space or newline in it.
+    merged = {**fields, **classify_provider_fault(exc).as_fields()}
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
-        for name, value in fields.items()
+        for name, value in merged.items()
         if value is not None
     )
     # The prefix stays a literal in the template, not an argument: this repo
@@ -159,11 +165,7 @@ def log_durable_storage_fault(
     # tests to match on, pinned against this line by
     # ``test_the_exported_prefix_is_the_one_the_helper_emits``.
     target_logger.warning(
-        "Durable storage unavailable during %s%s %s",
-        operation,
-        rendered,
-        classify_provider_fault(exc).as_log_fields(),
-        exc_info=exc,
+        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
     )
     # Marked only after the record is emitted: if emission raised, the fault
     # would stay unmarked for a later arm to report, instead of being

@@ -12,8 +12,16 @@ from __future__ import annotations
 
 import errno
 
-from xagent.core.file_storage import ProviderFault, classify_provider_fault
-from xagent.web.services.managed_file_ref import DurableStorageOperationError
+from xagent.core.file_storage.faults import ProviderFault, classify_provider_fault
+
+
+class DurableStorageOperationError(RuntimeError):
+    """Stands in for the real wrap; the classifier does not special-case it.
+
+    Deliberately local rather than imported from ``web.services`` -- a core-layer
+    test should not need a web-layer import to exercise a chain walk, and using
+    the real class would imply the classifier recognises it, which it does not.
+    """
 
 
 def _client_error(code: str | None, status: int | None) -> Exception:
@@ -129,7 +137,10 @@ def test_local_backend_errnos_split_by_whether_waiting_helps() -> None:
     full.__cause__ = OSError(errno.ENOSPC, "No space left on device")
     # Permanent on purpose: retrying a full disk only amplifies load.
     assert classify_provider_fault(full).retryable is False
-    assert classify_provider_fault(full).code == "ENOSPC"
+    # An OS errno lands in its own field, never mixed into the provider-code
+    # vocabulary: "ENOSPC" and "SlowDown" come from different namespaces.
+    assert classify_provider_fault(full).errno_name == "ENOSPC"
+    assert classify_provider_fault(full).code is None
 
 
 def test_http_status_decides_when_no_code_is_recognized() -> None:
@@ -179,24 +190,34 @@ def test_context_is_followed_when_from_was_omitted() -> None:
         fault = classify_provider_fault(raised)
 
     assert fault.retryable is True
-    assert fault.code == "ECONNREFUSED"
+    assert fault.errno_name == "ECONNREFUSED"
 
 
-def test_log_fields_render_only_what_is_known() -> None:
-    """A ``None`` field must not appear as the string ``None`` in a log line."""
-    rendered = ProviderFault(provider_class="WeirdBackendError").as_log_fields()
-    assert rendered == "provider_class=WeirdBackendError"
+def test_unknown_retryability_is_stated_rather_than_omitted() -> None:
+    """``retryable=unknown`` must be visible, not silently absent.
 
-    rendered = ProviderFault(
-        provider_class="ClientError",
-        code="SlowDown",
-        http_status=503,
-        retryable=True,
-    ).as_log_fields()
-    assert rendered == (
-        "provider_class=ClientError provider_code=SlowDown "
-        "provider_http_status=503 retryable=True"
-    )
+    Dropping the field would make an unclassified fault indistinguishable from
+    a log line written before classification existed -- and the whole point of
+    the tri-state is that "unrecognised" reads differently from "permanent".
+    """
+    fields = ProviderFault(provider_class="WeirdBackendError").as_fields()
+
+    assert fields["provider_class"] == "WeirdBackendError"
+    assert fields["retryable"] == "unknown"
+    # Unknown sub-fields stay None for the renderer to drop.
+    assert fields["provider_code"] is None
+    assert fields["provider_errno"] is None
+
+
+def test_fields_keep_provider_and_os_vocabularies_apart() -> None:
+    fields = ProviderFault(
+        provider_class="ClientError", code="SlowDown", http_status=503, retryable=True
+    ).as_fields()
+
+    assert fields["provider_code"] == "SlowDown"
+    assert fields["provider_errno"] is None
+    assert fields["provider_http_status"] == 503
+    assert fields["retryable"] is True
 
 
 def test_a_suppressed_context_is_not_classified() -> None:
@@ -241,7 +262,7 @@ def test_a_non_dict_response_attribute_is_ignored() -> None:
     fault = classify_provider_fault(wrap)
 
     # Fell through the unusable ``.response`` and kept descending.
-    assert fault.code == "ECONNRESET"
+    assert fault.errno_name == "ECONNRESET"
     assert fault.retryable is True
 
 
@@ -289,3 +310,102 @@ def test_an_empty_code_is_treated_as_absent() -> None:
 
     assert fault.code is None
     assert fault.retryable is True
+
+
+def test_response_outranks_a_coarser_errno_higher_in_the_chain() -> None:
+    """s3fs collapses three distinct S3 codes onto one errno; recover them.
+
+    ``translate_boto_error`` maps ``SlowDown``, ``ServiceUnavailable`` and
+    ``OperationAborted`` all to ``OSError(EBUSY)``. Stopping at the first
+    classifiable link therefore rendered them byte-for-byte identically as
+    ``provider_errno=EBUSY`` -- destroying exactly the throttle-vs-outage
+    distinction this module exists to draw. The deeper ``.response`` has to win
+    regardless of position.
+
+    Driven through the installed s3fs so the test tracks the backend's real
+    mapping rather than a guess about it.
+    """
+    from s3fs.errors import translate_boto_error
+
+    seen = {}
+    for code, status in (
+        ("SlowDown", 503),
+        ("ServiceUnavailable", 503),
+        ("OperationAborted", 409),
+    ):
+        wrap = DurableStorageOperationError(
+            "Failed to write durable object: users/7/uploads/abc/report.txt"
+        )
+        wrap.__cause__ = translate_boto_error(_client_error(code, status))
+        fault = classify_provider_fault(wrap)
+        assert fault.code == code, f"{code} was reported as {fault.code}"
+        assert fault.http_status == status
+        seen[code] = fault.as_fields()
+
+    # The whole point: three inputs, three distinguishable outputs.
+    rendered = [tuple(sorted(fields.items())) for fields in seen.values()]
+    assert len(set(rendered)) == 3
+
+
+def test_errno_is_still_used_when_no_response_exists_anywhere() -> None:
+    """Dropping errno precedence must not drop errno classification."""
+    wrap = DurableStorageOperationError("Failed to write durable object: k")
+    wrap.__cause__ = OSError(errno.ECONNRESET, "Connection reset by peer")
+
+    fault = classify_provider_fault(wrap)
+
+    assert fault.errno_name == "ECONNRESET"
+    assert fault.retryable is True
+
+
+def test_classification_never_raises_out_of_a_diagnostic_path() -> None:
+    """A foreign exception must not be able to crash the classifier.
+
+    Callers are inside an ``except`` block on their way to a 503, so anything
+    thrown here replaces a handled answer with an unhandled 500 -- losing the
+    diagnosis precisely when it is being read.
+    """
+
+    class HostileResponse(Exception):
+        @property
+        def response(self) -> object:
+            raise RuntimeError("response property blew up")
+
+    class HostileErrno(Exception):
+        @property
+        def errno(self) -> object:
+            raise RuntimeError("errno property blew up")
+
+    for hostile in (HostileResponse("x"), HostileErrno("x")):
+        wrap = DurableStorageOperationError("Failed to write durable object: k")
+        wrap.__cause__ = hostile
+
+        fault = classify_provider_fault(wrap)
+
+        assert fault.provider_class == type(hostile).__name__
+        assert fault.retryable is None
+
+
+def test_a_boolean_http_status_is_rejected() -> None:
+    """``bool`` subclasses ``int``; it must not render as a status."""
+    exc = _s3_chain(OSError(errno.EIO, "x"), "SomeNewS3Code", None)
+    client_error = exc.__cause__.__cause__  # type: ignore[union-attr]
+    client_error.response["ResponseMetadata"] = {"HTTPStatusCode": True}  # type: ignore[attr-defined]
+
+    fault = classify_provider_fault(exc)
+
+    assert fault.http_status is None
+
+
+def test_clock_skew_is_permanent_and_conflict_is_retryable() -> None:
+    """Two corrections to the code tables, pinned so they do not drift back.
+
+    ``RequestTimeTooSkewed`` cannot resolve by retrying -- the clock has to be
+    fixed -- while ``OperationAborted`` is documented by AWS as a conflicting
+    concurrent operation to try again.
+    """
+    skewed = _s3_chain(OSError(errno.EIO, "x"), "RequestTimeTooSkewed", 403)
+    assert classify_provider_fault(skewed).retryable is False
+
+    aborted = _s3_chain(OSError(errno.EIO, "x"), "OperationAborted", 409)
+    assert classify_provider_fault(aborted).retryable is True
