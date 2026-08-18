@@ -40,7 +40,9 @@ from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
     COMMAND_PENDING,
+    DEFAULT_COMMAND_DEFER_RETRY_SECONDS,
     DISPATCHER_IDLE_SECONDS,
+    MAX_COMMAND_DEFER_RETRY_SECONDS,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
@@ -53,6 +55,7 @@ from xagent.web.services.task_command_transport import (
     _claim_heartbeat,
     claim_task_command,
     classify_task_command_conflict,
+    contended_defer_retry_seconds,
     defer_task_command,
     dispatch_one_task_command,
     dispatch_task_command_promptly,
@@ -2783,3 +2786,125 @@ def test_enqueue_notifies_only_after_commit(db_session, monkeypatch) -> None:
     )
 
     assert order == ["commit", "notify"]
+
+
+def _deferred_command(db_session, command_id: str):
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id=command_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="runner-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+    return enqueued.command_id
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        # A re-poll of a handoff that should already have settled.
+        (None, DEFAULT_COMMAND_DEFER_RETRY_SECONDS),
+        (8.0, 8.0),
+        # Never tighter than the default, never wider than the failure cap.
+        (0.1, DEFAULT_COMMAND_DEFER_RETRY_SECONDS),
+        (600.0, MAX_COMMAND_DEFER_RETRY_SECONDS),
+    ],
+)
+def test_deferral_reschedule_window_is_bounded(
+    db_session,
+    requested: float | None,
+    expected: float,
+) -> None:
+    """A site waiting on a live holder can widen its own retry, within bounds."""
+
+    command_db_id = _deferred_command(db_session, f"defer-window-{requested}")
+
+    before = datetime.utcnow()
+    assert defer_task_command(
+        command_db_id,
+        "runner-a",
+        "resume slot held",
+        retry_after_seconds=requested,
+    )
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, command_db_id)
+    assert stored is not None
+    assert stored.status == COMMAND_PENDING
+    assert stored.defer_count == 1
+    # The row is claimable again only once the window has elapsed, so the
+    # reschedule is what paces the retry.
+    delay = (stored.claim_expires_at - before).total_seconds()
+    assert expected - 1.0 <= delay <= expected + 1.0
+    assert (
+        claim_task_command(
+            db_session,
+            runner_id="runner-a",
+            command_db_id=command_db_id,
+        )
+        is None
+    )
+
+
+def test_contended_defer_backoff_grows_and_stops_at_the_failure_cap() -> None:
+    windows = [contended_defer_retry_seconds(count) for count in range(0, 8)]
+
+    assert windows[0] == 2.0
+    assert windows[:5] == [2.0, 4.0, 8.0, 16.0, 30.0]
+    assert all(later >= earlier for earlier, later in zip(windows, windows[1:]))
+    assert max(windows) == MAX_COMMAND_DEFER_RETRY_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_applies_the_deferrals_own_retry_window(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without this, every deferral inherits the tight default re-poll."""
+
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    command_db_id = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="defer-window-dispatch",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    ).command_id
+    observed: list[float | None] = []
+    real_defer = task_command_transport_module.defer_task_command
+
+    def recording_defer(*args, **kwargs):
+        observed.append(kwargs.get("retry_after_seconds"))
+        return real_defer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "defer_task_command",
+        recording_defer,
+    )
+
+    async def execute(_command: ClaimedTaskCommand) -> None:
+        raise TaskCommandDeferred("resume slot held", retry_after_seconds=16.0)
+
+    assert await dispatch_one_task_command(execute, command_db_id=command_db_id)
+
+    assert observed == [16.0]
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, command_db_id)
+    assert stored is not None
+    assert stored.status == COMMAND_PENDING
