@@ -68,36 +68,32 @@ _RETRYABLE_CODES = frozenset(
     }
 )
 
-# Codes that stay broken until a human changes configuration, permissions, or
-# the request itself. Retrying these is the failure mode #1467 set out to make
-# diagnosable: the client sees an indefinitely retryable 503 for a condition
-# that will never clear on its own.
+# Permanent causes worth naming even without an HTTP status.
+#
+# Trimmed to credential/configuration faults, on review: every 4xx code here
+# would already be called permanent by ``_retryable_from_status``, so the table
+# only decides when a response carries no ``ResponseMetadata`` -- which a
+# strictly-conforming botocore response always does, but a loosely-conforming
+# backend need not. These are the ones whose verdict an operator most needs to
+# be right in that case: retrying a rejected credential forever is the failure
+# mode #1467 set out to make diagnosable, and it is worth one frozenset to be
+# certain of it. Codes whose only information was their own status are gone.
 _PERMANENT_CODES = frozenset(
     {
         "AccessDenied",
         "AccountProblem",
         "AllAccessDisabled",
-        "AuthorizationHeaderMalformed",
         "CredentialsNotSupported",
-        "EntityTooLarge",
         "ExpiredToken",
         "InvalidAccessKeyId",
-        "InvalidBucketName",
-        "InvalidObjectState",
-        "InvalidRequest",
         "InvalidSecurity",
         "InvalidToken",
-        "KMS.DisabledException",
-        "MethodNotAllowed",
         "NoSuchBucket",
-        "NotImplemented",
         "SignatureDoesNotMatch",
         "TokenRefreshRequired",
     }
 )
 
-# Transport-level botocore/urllib3 faults, which carry no ``.response``.
-# Matched on class name for the same reason the codes are duck-typed.
 # The first five are exactly ``s3fs.core.S3_RETRYABLE_ERRORS`` -- the set the
 # installed backend itself retries on -- so anything reaching us wearing one of
 # those names has already exhausted the backend's own attempts.
