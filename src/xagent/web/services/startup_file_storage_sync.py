@@ -22,7 +22,11 @@ from ...core.file_storage import (
 from ...core.file_storage.keys import build_upload_storage_key
 from ..models.database import release_db_connection_if_clean
 from ..models.uploaded_file import UploadedFile
-from .managed_file_ref import ManagedFileRef
+from .managed_file_ref import (
+    DurableStorageOperationError,
+    ManagedFileRef,
+    log_durable_storage_fault,
+)
 from .uploaded_file_store import (
     StagedUploadedFile,
     UploadedFileStore,
@@ -268,6 +272,21 @@ def _sync_registered_files(
                         adopt_result = ManagedFileRef(
                             candidate, storage=user_storage
                         ).adopt_existing_object(expected_key)
+                    except DurableStorageOperationError as exc:
+                        # Named before the bare arm below so an adoption failure
+                        # gets the classified provider fields, not just a
+                        # traceback -- the stat/content-hash raise sites in
+                        # ``adopt_existing_object`` are the ones #1467 asked to
+                        # cover, and this is their only caller.
+                        failed += 1
+                        log_durable_storage_fault(
+                            logger,
+                            "startup durable adoption",
+                            exc,
+                            file_id=candidate.file_id,
+                            storage_key=expected_key,
+                        )
+                        continue
                     except Exception:
                         failed += 1
                         logger.exception(

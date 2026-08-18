@@ -26,9 +26,9 @@ from ...core.file_storage import (
     ScopedFileStorage,
     StorageKeyScopeError,
     StoredObject,
-    classify_provider_fault,
     get_user_file_storage,
 )
+from ...core.file_storage.faults import classify_provider_fault
 from ...core.file_storage.keys import (
     build_task_output_storage_key as build_task_output_storage_key,
 )
@@ -143,17 +143,19 @@ def log_durable_storage_fault(
         # is strictly better than not logging.
         pass
 
+    # One renderer for both the caller's identifiers and the classified fault,
+    # so escaping and layout are decided in a single place. Values from the
+    # classifier are sanitised on the same terms as request identifiers: a
+    # provider ``Code`` is read out of a duck-typed response dict, so a
+    # loosely-conforming backend could put a space or newline in it.
+    merged = {**fields, **classify_provider_fault(exc).as_fields()}
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
-        for name, value in fields.items()
+        for name, value in merged.items()
         if value is not None
     )
     target_logger.warning(
-        "Durable storage unavailable during %s%s %s",
-        operation,
-        rendered,
-        classify_provider_fault(exc).as_log_fields(),
-        exc_info=exc,
+        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
     )
 
 
