@@ -5,15 +5,18 @@ from .factory import (
     get_unscoped_file_storage,
     get_user_file_storage,
 )
+from .faults import ProviderFault, classify_provider_fault
 from .scoped import ScopedFileStorage, StorageKeyScopeError
 from .storage import FsspecFileStorage, normalize_storage_key
 from .types import StoredObject
 
 __all__ = [
     "FsspecFileStorage",
+    "ProviderFault",
     "ScopedFileStorage",
     "StorageKeyScopeError",
     "StoredObject",
+    "classify_provider_fault",
     "get_file_storage_backend",
     "get_unscoped_file_storage",
     "get_user_file_storage",
