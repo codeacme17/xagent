@@ -290,9 +290,11 @@ def test_a_non_dict_auth_payload_is_replaced_wholesale(seeded_engine):
     assert auth == {"app_id": "acme-drive", "provider": "acme"}
 
 
-def test_offline_sql_mode_emits_nothing(seeded_engine):
-    """A data migration cannot read rows through a MockConnection; the offline
-    branch is a documented no-op for both dialects."""
+def test_offline_sql_mode_raises_instead_of_stamping(seeded_engine):
+    """Alembic emits alembic_version bookkeeping even for an empty migration
+    body, so a silent offline no-op would advance the version while touching
+    no row — permanently skipping the backfill on the next online upgrade.
+    The offline branch must fail loudly instead, for both dialects."""
     from io import StringIO
 
     module = _migration_module()
@@ -302,9 +304,98 @@ def test_offline_sql_mode_emits_nothing(seeded_engine):
             dialect_name=dialect,
             opts={"as_sql": True, "output_buffer": output},
         )
-        with Operations.context(migration_context):
+        with (
+            Operations.context(migration_context),
+            pytest.raises(RuntimeError, match="offline"),
+        ):
             module.upgrade()
         assert output.getvalue() == ""
+
+
+def test_duplicate_exact_names_are_ambiguous_and_resolve_nothing(seeded_engine):
+    """Two OAuth apps sharing one exact display name poison that name key: an
+    auth-less row under it stays untouched rather than being stamped with
+    whichever app happened to be seeded first."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": None,
+            },
+            {
+                "app_id": "acme-drive-eu",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": None,
+            },
+        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": None}],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] is None
+
+
+def test_a_non_string_app_id_is_malformed_and_restamped(seeded_engine):
+    """get_app_for_mcp_server rejects a non-string auth.app_id outright, so a
+    row carrying one is permanently unresolvable — it must stay a candidate
+    and a successful name match overwrites the malformed value."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": {"app_id": 123}}],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)["Acme Drive"]
+    assert auth == {"app_id": "acme-drive", "provider": "acme"}
+
+
+def test_identities_are_matched_raw_never_trimmed(seeded_engine):
+    """Identities are opaque and every read path compares them exactly, so the
+    migration must not trim: a padded catalog app_id is stamped verbatim
+    (that raw value is what get_app_by_id can resolve), and a
+    whitespace-variant row name does not match at all — under-matching leaves
+    the name-fallback shim in charge."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": " acme-drive ",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {"name": "Acme Drive", "transport": "oauth", "auth": None},
+            {"name": "Acme Drive ", "transport": "oauth", "auth": None},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Drive"] == {"app_id": " acme-drive ", "provider": "acme"}
+    assert auth["Acme Drive "] is None
 
 
 def test_non_oauth_shapes_are_never_candidates(seeded_engine):

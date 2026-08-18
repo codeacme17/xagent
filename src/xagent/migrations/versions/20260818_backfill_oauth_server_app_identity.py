@@ -16,7 +16,16 @@ This migration stamps the identity while the name still matches, which
 is the only moment it can be derived safely:
 
 - Candidates are ``mcp_servers`` rows with ``transport = 'oauth'`` whose
-  ``auth`` is missing, not a dict, or lacks a nonblank ``app_id``.
+  ``auth`` is missing, not a dict, or lacks a nonblank *string* ``app_id``
+  — a non-string value (e.g. an integer) is malformed metadata the read
+  path rejects outright, so such a row stays a candidate and a successful
+  match overwrites the malformed value.
+- Identities are opaque and matched/stored as **raw strings**, never
+  trimmed or coerced: every read path compares them exactly, and stamping
+  a trimmed variant of a padded catalog id would write a value the exact
+  lookup can never resolve. Whitespace-variant names therefore do not
+  match — under-matching leaves the name-fallback shim in charge, which
+  loses nothing.
 - Each is matched against ``public_mcp_apps`` (builtin apps are seeded
   into that table too) by exact display name, the same value
   ``_ensure_user_mcp_server`` named the row after. If the name resolves
@@ -42,9 +51,12 @@ is the only moment it can be derived safely:
   already carrying a nonblank ``app_id`` are not candidates at all, so
   re-running the migration is a no-op (idempotent).
 
-Offline (``--sql``) mode emits nothing: a data migration must read rows,
-which a MockConnection cannot. Run it online; the schema is untouched
-either way.
+Offline (``--sql``) mode **raises** instead of no-opping: Alembic emits
+the ``alembic_version`` bookkeeping even for an empty migration body, so
+a silently-skipped offline run would advance the version while touching
+no row — and a later online upgrade would then skip this revision
+forever. Failing loudly forces the one correct path: run this revision
+online. The schema is untouched either way.
 
 The downgrade is a deliberate no-op. Removing ``auth.app_id`` would need
 to distinguish stamped rows from rows the post-metadata writer created,
@@ -69,16 +81,35 @@ branch_labels = None
 depends_on = None
 
 
-def _normalized(value: object) -> str:
-    return str(value).strip() if value is not None else ""
+def _nonblank_str(value: object) -> str | None:
+    """The value itself when it is a str with non-whitespace content, else None.
+
+    Raw, never trimmed or coerced: identities are opaque and every downstream
+    comparison is exact (``get_app_by_id`` compares ``PublicMCPApp.app_id``
+    directly; ``get_app_for_mcp_server`` rejects a non-string ``auth.app_id``).
+    Stamping a trimmed variant of a padded catalog id would write a value the
+    exact lookup can never resolve — strictly worse than not stamping. This
+    helper decides only *whether* a usable string exists; the string used for
+    matching and for storage is always the raw one.
+    """
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def upgrade() -> None:
     if op.get_context().as_sql:
-        # Data-only migration: offline (--sql) generation runs against a
-        # MockConnection that cannot read rows, and there is no schema change
-        # to emit. Documented in the module docstring.
-        return
+        # Fail loudly rather than no-op: returning here would still let
+        # Alembic emit the alembic_version bookkeeping, so an operator who
+        # applies the generated --sql script advances the version while no
+        # row was read or updated — and a later online upgrade then skips
+        # this revision forever, leaving the legacy rows unstamped.
+        raise RuntimeError(
+            "20260818_backfill_oauth_server_app_identity is a data migration "
+            "and cannot run in offline (--sql) mode: applying generated SQL "
+            "would advance alembic_version without performing the backfill. "
+            "Run `alembic upgrade` online for this revision."
+        )
 
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -106,18 +137,21 @@ def upgrade() -> None:
     # Exact display name -> app, and provider -> apps, for OAuth apps only.
     # Both maps refuse ambiguity rather than guessing: two same-named OAuth
     # apps drop the name key entirely, and a provider shared by more than one
-    # app resolves nothing (the meta/Instagram case).
+    # app resolves nothing (the meta/Instagram case). Keys and stored values
+    # are the raw strings — identities are opaque, and every read path
+    # compares them exactly. Only ``transport`` is folded, because it is a
+    # shape enum, not an identity (mirroring classify_app_auth).
     apps_by_name: dict[str, tuple[str, str | None] | None] = {}
     apps_by_provider: dict[str, tuple[str, str | None] | None] = {}
     for app_row in bind.execute(sa.select(public_mcp_apps)).mappings():
-        if _normalized(app_row["transport"]).lower() != "oauth":
+        if str(app_row["transport"] or "").strip().lower() != "oauth":
             continue
-        app_id = _normalized(app_row["app_id"])
+        app_id = _nonblank_str(app_row["app_id"])
         if not app_id:
             continue
-        provider = _normalized(app_row["provider_name"]) or None
+        provider = _nonblank_str(app_row["provider_name"])
         entry = (app_id, provider)
-        name = _normalized(app_row["name"])
+        name = _nonblank_str(app_row["name"])
         if name:
             apps_by_name[name] = None if name in apps_by_name else entry
         if provider:
@@ -134,11 +168,16 @@ def upgrade() -> None:
 
     for row in candidates:
         auth = row["auth"] if isinstance(row["auth"], dict) else None
-        if auth is not None and _normalized(auth.get("app_id")):
+        # Already-stamped means a nonblank *string* app_id — the only shape
+        # the read path accepts (get_app_for_mcp_server rejects a non-string
+        # app_id outright). A non-string or blank value is malformed metadata
+        # that leaves the row permanently unresolvable, so such a row stays a
+        # candidate and a successful match overwrites the malformed value.
+        if auth is not None and _nonblank_str(auth.get("app_id")):
             continue
-        row_provider = _normalized(auth.get("provider")) if auth is not None else ""
+        row_provider = _nonblank_str(auth.get("provider")) if auth is not None else None
 
-        resolved = apps_by_name.get(_normalized(row["name"]))
+        resolved = apps_by_name.get(str(row["name"]) if row["name"] else "")
         if (
             resolved is not None
             and row_provider
@@ -160,7 +199,7 @@ def upgrade() -> None:
         app_id, provider = resolved
         new_auth = dict(auth or {})
         new_auth["app_id"] = app_id
-        if provider and not _normalized(new_auth.get("provider")):
+        if provider and not _nonblank_str(new_auth.get("provider")):
             new_auth["provider"] = provider
         bind.execute(
             sa.update(mcp_servers)
