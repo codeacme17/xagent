@@ -26,6 +26,7 @@ from ...core.file_storage import (
     ScopedFileStorage,
     StorageKeyScopeError,
     StoredObject,
+    classify_provider_fault,
     get_user_file_storage,
 )
 from ...core.file_storage.keys import (
@@ -105,6 +106,12 @@ def log_durable_storage_fault(
     ``target_logger`` is the caller's logger rather than this module's, so a
     line stays attributed to the endpoint or tool that produced it.
 
+    The classified provider fault is appended so a burst of these can be
+    aggregated by cause -- one throttle reads very differently from a thousand,
+    and both differ from a rejected credential. ``retryable=False`` there is a
+    diagnostic claim, not a routing one: every fault in this family still
+    answers the same status.
+
     Field values are escaped and bounded, because some are client-supplied.
     That covers the fields *this* function renders -- it does **not** make the
     record as a whole unforgeable: the formatter renders ``exc_info`` verbatim,
@@ -142,7 +149,11 @@ def log_durable_storage_fault(
         if value is not None
     )
     target_logger.warning(
-        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
+        "Durable storage unavailable during %s%s %s",
+        operation,
+        rendered,
+        classify_provider_fault(exc).as_log_fields(),
+        exc_info=exc,
     )
 
 
