@@ -21,16 +21,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     BackgroundTaskManager,
     ResumeReservationOutcome,
     _execute_durable_task_command,
     _handle_chat_message_unserialized,
     execute_durable_task_command,
+    report_terminal_task_command,
 )
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_PENDING,
+)
 from xagent.web.services.task_command_transport import (
     MAX_COMMAND_DEFERS,
     ClaimedTaskCommand,
@@ -396,8 +404,11 @@ async def test_only_a_resend_safe_deferral_asks_the_sender_to_resend(
 
     in_flight = await notice_for(TaskCommandDeferred("waiting for injection"))
     assert in_flight is not None
-    assert "waiting for injection" in in_flight
-    assert "send it again" not in in_flight
+    # No internal wait reason, and no instruction that could duplicate work
+    # an in-flight injection is about to commit.
+    assert "waiting for injection" not in in_flight
+    assert "may already have been applied" in in_flight
+    assert "Please send it again" not in in_flight
 
     # Below the budget nothing is terminal yet, so nothing is announced.
     assert (
@@ -495,3 +506,140 @@ async def test_a_deferred_message_is_delivered_once_the_reservation_clears(
     assert "_durable_command_error" not in second
     agent.post_user_message.assert_awaited_once()
     assert agent.post_user_message.await_args.kwargs["turn_id"] == "form-turn"
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_delivery_is_not_reported_as_safe_to_resend(
+    db_session,
+) -> None:
+    """A retry whose payload an earlier attempt already claimed may have landed.
+
+    ``recovered_delivery`` only appears from the second durable attempt onward,
+    which is why this needs ``_durable_attempt_count`` rather than a first send.
+    """
+
+    owner = _user(db_session, "recovered-delivery-owner")
+    task = _live_task(db_session, int(owner.id))
+    turn_id = "recovered-turn"
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            message_type="user_message",
+            content="here is the form response",
+            turn_id=turn_id,
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+
+    message_data = _durable_payload(owner, turn_id)
+    message_data["_durable_attempt_count"] = 2
+    message_data["_durable_target_run_id"] = "live-run"
+
+    with patch(
+        "xagent.web.api.websocket.background_task_manager",
+        _contended_manager(ResumeReservationOutcome.RESERVATION_HELD),
+    ):
+        await _send_live_message(task, message_data)
+
+    assert message_data["_durable_command_defer"] == turn_id
+    assert message_data["_durable_command_defer_unsafe"] == turn_id
+
+    command = _message_command(task, owner, turn_id)
+    with (
+        patch(
+            "xagent.web.api.websocket._handle_chat_message_unserialized",
+            new=AsyncMock(
+                side_effect=lambda _ws, _tid, data: data.update(message_data)
+            ),
+        ),
+        patch.object(
+            websocket_api.manager,
+            "connections_for_task",
+            return_value=[SimpleNamespace()],
+        ),
+        pytest.raises(TaskCommandDeferred) as exc_info,
+    ):
+        await _execute_durable_task_command(command)
+
+    assert exc_info.value.resend_safe is False
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_deferral_closes_out_the_standing_delivery(
+    db_session,
+) -> None:
+    """Otherwise a same-id retry recovers it and loops on "still being applied".
+
+    This is the hazard the checkpoint-read branch already guards against; a
+    deferral that runs out of budget has to close the row the same way.
+    """
+
+    owner = _user(db_session, "terminal-delivery-owner")
+    task = _live_task(db_session, int(owner.id))
+    turn_id = "exhausted-turn"
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            message_type="user_message",
+            content="here is the form response",
+            turn_id=turn_id,
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+
+    command = _message_command(task, owner, turn_id)
+    with patch(
+        "xagent.web.api.websocket.manager", MagicMock(broadcast_to_task=AsyncMock())
+    ):
+        await report_terminal_task_command(command, "this message was not applied")
+
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_that_already_progressed_is_left_alone(
+    db_session,
+) -> None:
+    """The command is terminal, but this delivery really was dispatched."""
+
+    owner = _user(db_session, "dispatched-delivery-owner")
+    task = _live_task(db_session, int(owner.id))
+    turn_id = "dispatched-turn"
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            message_type="user_message",
+            content="here is the form response",
+            turn_id=turn_id,
+            delivery_status=DELIVERY_DISPATCHED,
+        )
+    )
+    db_session.commit()
+
+    command = _message_command(task, owner, turn_id)
+    with patch(
+        "xagent.web.api.websocket.manager", MagicMock(broadcast_to_task=AsyncMock())
+    ):
+        await report_terminal_task_command(command, "this message was not applied")
+
+    db_session.expire_all()
+    stored = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == turn_id)
+        .one()
+    )
+    assert stored.delivery_status == DELIVERY_DISPATCHED

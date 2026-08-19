@@ -1629,16 +1629,17 @@ async def shutdown_event() -> None:
 
     flush_langfuse()
 
-    if _task_command_dispatcher_task is not None:
-        from .services.task_command_transport import (
-            set_terminal_command_notifier,
-            stop_task_command_dispatcher,
-        )
+    from .services.task_command_transport import (
+        set_terminal_command_notifier,
+        stop_task_command_dispatcher,
+    )
 
+    if _task_command_dispatcher_task is not None:
         await stop_task_command_dispatcher()
-        # The next lifespan may bind a different app instance, so the reporter
-        # must not outlive the dispatcher that uses it.
-        set_terminal_command_notifier(None)
+    # Cleared unconditionally: the reporter is registered before the dispatcher
+    # starts, so a startup that fails in between would otherwise leave it bound
+    # to an app instance the next lifespan replaces.
+    set_terminal_command_notifier(None)
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)

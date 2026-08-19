@@ -2945,3 +2945,103 @@ async def test_exhausted_contention_records_that_a_resend_is_safe(db_session) ->
     assert stored is not None
     assert stored.status == COMMAND_FAILED
     assert stored.result == {"resend_safe": True}
+
+
+@pytest.mark.asyncio
+async def test_a_raised_resend_flag_reaches_the_stored_row(db_session) -> None:
+    """The flag has to survive the dispatcher, not just ``defer_task_command``.
+
+    Nothing else covers this hop, so hardcoding the dispatcher's read of
+    ``exc.resend_safe`` would otherwise go unnoticed.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+
+    for command_id, resend_safe in (("carries-safe", True), ("carries-unsafe", False)):
+        enqueued = enqueue_task_command(
+            db_session,
+            task_id=int(task.id),
+            actor_user_id=int(user.id),
+            command_id=command_id,
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+        db_session.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.id == enqueued.command_id
+        ).update({TaskExecutionCommand.defer_count: MAX_COMMAND_DEFERS - 1})
+        db_session.commit()
+
+        async def execute(_command: ClaimedTaskCommand, flag=resend_safe) -> None:
+            raise TaskCommandDeferred("resume slot held", resend_safe=flag)
+
+        assert await dispatch_one_task_command(
+            execute,
+            command_db_id=enqueued.command_id,
+        )
+        db_session.expire_all()
+        stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+        assert stored is not None
+        assert stored.status == COMMAND_FAILED
+        assert stored.result == {"resend_safe": resend_safe}
+
+
+@pytest.mark.asyncio
+async def test_a_non_terminal_disposition_is_never_announced(db_session) -> None:
+    """A landed-but-not-terminal write means the command is still going to run.
+
+    ``persisted`` alone is not enough to announce a command as finished, so
+    this isolates ``terminal`` from it.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    notices: list[str] = []
+
+    async def notifier(_command: ClaimedTaskCommand, message: str) -> None:
+        notices.append(message)
+
+    async def execute(_command: ClaimedTaskCommand) -> None:
+        exc = TaskCommandDeferred("still waiting")
+        exc.terminal_client_message = "this command was not applied"
+        raise exc
+
+    async def dispatch_with(command_id: str, terminal: bool) -> None:
+        enqueued = enqueue_task_command(
+            db_session,
+            task_id=int(task.id),
+            actor_user_id=int(user.id),
+            command_id=command_id,
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+        with patch.object(
+            task_command_transport_module,
+            "defer_task_command",
+            return_value=CommandDispositionResult(persisted=True, terminal=terminal),
+        ):
+            assert await dispatch_one_task_command(
+                execute,
+                command_db_id=enqueued.command_id,
+            )
+
+    set_terminal_command_notifier(notifier)
+    try:
+        await dispatch_with("landed-not-terminal", terminal=False)
+        assert notices == []
+
+        # A later command for the same task cannot be claimed while an earlier
+        # one is unfinished, so clear the first before the terminal case.
+        db_session.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.command_id == "landed-not-terminal"
+        ).update({TaskExecutionCommand.status: COMMAND_COMPLETED})
+        db_session.commit()
+
+        await dispatch_with("landed-terminal", terminal=True)
+        assert notices == ["this command was not applied"]
+    finally:
+        set_terminal_command_notifier(None)

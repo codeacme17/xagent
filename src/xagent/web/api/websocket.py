@@ -8228,11 +8228,7 @@ async def _execute_durable_task_command(
             # that never reached an injection, which is what makes a resend
             # safe if the budget is exhausted.
             raise TaskCommandDeferred(
-                str(
-                    message_data.get("_durable_command_defer_reason")
-                    or f"Message {command.command_id} is waiting for the "
-                    "live-control resume slot"
-                ),
+                str(message_data["_durable_command_defer_reason"]),
                 resend_safe=(
                     message_data.get("_durable_command_defer_unsafe")
                     != command.command_id
@@ -8324,22 +8320,52 @@ async def _execute_durable_task_command(
 
 def _terminal_command_error_text(
     command: ClaimedTaskCommand,
-    error: BaseException | str,
+    error: BaseException,
 ) -> str:
     return f"Task command {command.kind.value} failed: {error}"
+
+
+def _fail_terminal_message_delivery(command: ClaimedTaskCommand) -> None:
+    """Close out a message delivery the transport has finished retrying.
+
+    Without this the ``TaskChatMessage`` row keeps its ``DELIVERY_PENDING``
+    status after the command is failed, so a retry with the same
+    ``client_message_id`` recovers that standing delivery and loops on "still
+    being applied" -- the hazard the checkpoint-read branch already guards
+    against. The transition is monotonic, so a delivery that really was
+    dispatched keeps its status.
+    """
+
+    transition = mark_user_message_delivery_sync(
+        command.task_id,
+        command.command_id,
+        DELIVERY_FAILED,
+    )
+    if transition.outcome == "conflict":
+        logger.info(
+            "Left delivery for message %s at %s; the command is terminal but "
+            "the delivery had already progressed",
+            command.command_id,
+            transition.status,
+        )
 
 
 async def report_terminal_task_command(
     command: ClaimedTaskCommand,
     message: str,
 ) -> None:
-    """Tell a task's clients about a command the transport confirmed terminal.
+    """Close out a command the transport confirmed terminal, and say so.
 
     Registered with the transport rather than called from the executor: only
     the dispatcher knows the final state actually landed, and a claim lost to
-    another runner must not be reported as a drop.
+    another runner must not be reported as a drop -- nor have its standing
+    delivery failed, since that runner may still apply it.
     """
 
+    if command.kind is TaskCommandKind.MESSAGE:
+        await run_db_io_cancellation_safe(
+            lambda: _fail_terminal_message_delivery(command)
+        )
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
@@ -8354,37 +8380,39 @@ async def report_terminal_task_command(
 
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
-    error: BaseException | str,
+    error: BaseException,
 ) -> None:
-    await manager.broadcast_to_task(
-        {
-            "type": "agent_error",
-            "message": _terminal_command_error_text(command, error),
-            "task_id": command.task_id,
-            "command_id": command.command_id,
-            "timestamp": datetime.now(timezone.utc).timestamp(),
-        },
-        command.task_id,
+    await report_terminal_task_command(
+        command,
+        _terminal_command_error_text(command, error),
     )
 
 
-def _exhausted_deferral_error(
+def _exhausted_deferral_notice(
     command: ClaimedTaskCommand,
     exc: TaskCommandDeferred,
-) -> BaseException | str:
+) -> str:
     """Report the last deferral as a drop, not as something still pending.
 
-    Only for a deferral that never reached an injection. A message can also
-    defer with its commit outcome unknown, or while an injection it already
-    started is in flight; telling that sender to resend would duplicate work
-    that is committed or on its way, since a resend mints a fresh id.
+    Only a deferral that never reached an injection may ask for a resend. A
+    message can also defer with its commit outcome unknown, or while an
+    injection it already started is in flight; telling that sender to resend
+    would duplicate work that is committed or on its way, since a resend mints
+    a fresh id. Those still get a sentence of their own rather than the
+    internal wait reason.
     """
 
-    if command.kind is not TaskCommandKind.MESSAGE or not exc.resend_safe:
-        return exc
+    if command.kind is not TaskCommandKind.MESSAGE:
+        return _terminal_command_error_text(command, exc)
+    if exc.resend_safe:
+        return (
+            "the task stayed busy for too long, so this message was not "
+            "applied. Please send it again."
+        )
     return (
-        "the task stayed busy for too long, so this message was not applied. "
-        "Please send it again."
+        "the task stayed busy for too long. This message may already have "
+        "been applied, so it was not sent again -- please check the "
+        "conversation before resending."
     )
 
 
@@ -8397,7 +8425,7 @@ async def execute_durable_task_command(
         return await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
-            exc.terminal_client_message = str(_exhausted_deferral_error(command, exc))
+            exc.terminal_client_message = _exhausted_deferral_notice(command, exc)
         raise
     except TaskCommandRejected as exc:
         # A rejection is terminal on the first hit, and on the durable path the
