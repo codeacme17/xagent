@@ -297,7 +297,7 @@ describe("ClarificationForm delivery failures", () => {
     expect(screen.getByRole("textbox")).toHaveValue("Beijing")
   })
 
-  it("warns instead of inviting a resubmit when the outcome is unknown", async () => {
+  it("tells the sender a delivery it could not confirm is safe to repeat", async () => {
     const onSend = vi.fn().mockRejectedValue(deliveryError(
       "The task is busy applying an earlier answer.",
       "outcome_unknown",
@@ -309,6 +309,22 @@ describe("ClarificationForm delivery failures", () => {
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         "The task is busy applying an earlier answer.",
+        { description: "chatPage.clarification.sendDeliveryUnconfirmed" },
+      )
+    })
+  })
+
+  it("asks for a reload only when an attachment may need reconciling", async () => {
+    const onSend = vi.fn().mockRejectedValue(Object.assign(
+      new Error("The upload could not be completed or rolled back."),
+      { disposition: "outcome_unknown", userFacing: true, requiresReconciliation: true },
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "The upload could not be completed or rolled back.",
         { description: "chatPage.clarification.sendOutcomeUnknown" },
       )
     })
@@ -436,7 +452,12 @@ describe("ClarificationForm resubmission safety", () => {
     expect(screen.getByRole("button", {
       name: "chatPage.clarification.submit",
     })).toBeEnabled()
+    // The copy must match the state: submitting again is safe here, so it
+    // must not tell the visitor to reload first.
     expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendDeliveryUnconfirmed",
+    )
+    expect(screen.getByRole("alert")).not.toHaveTextContent(
       "chatPage.clarification.sendOutcomeUnknown",
     )
 

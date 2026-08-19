@@ -284,6 +284,55 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("keeps the server's refusal when a reconnect interrupts the backoff", async () => {
+    // A 503 is a refusal the endpoint already rolled back. Losing that to a
+    // reconnect during the wait would lock the form on the exact failure this
+    // retry exists for.
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => uploadResponse({ detail: "Durable storage is temporarily unavailable" }, 503),
+    )
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+    const preparing = hook.result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "cancelled-in-backoff",
+    )
+    // Let the first attempt settle so the retry is asleep, not on the wire.
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+
+    act(() => MockWebSocket.instances[0].triggerClose(4001))
+
+    await expect(preparing).rejects.toMatchObject({
+      disposition: "not_sent",
+      requiresReconciliation: false,
+    })
+  })
+
+  it("rejects a batch response that does not account for every file", async () => {
+    // All-or-nothing endpoint: a short list means the response cannot be
+    // read, not that the turn should go out without its attachments.
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => uploadResponse(
+        { success: true, files: [{ file_id: "file-1" }] },
+        200,
+      ),
+    )
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["a"], "a.txt"), new File(["b"], "b.txt")],
+      false,
+      "batch-short",
+    )).rejects.toMatchObject({ disposition: "outcome_unknown" })
+    expect(MockWebSocket.instances[0].send).not.toHaveBeenCalled()
+  })
+
   it("keeps ownership loss outside an upload reported as never sent", async () => {
     const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))

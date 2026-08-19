@@ -333,13 +333,21 @@ export function ClarificationForm({
       // the failure; the fixed string is a last resort.
       const detail = readSendReason(error)
       const disposition = readSendDisposition(error)
+      const needsReconciliation = typeof error === "object"
+        && error !== null
+        && (error as { requiresReconciliation?: unknown }).requiresReconciliation === true
       const failure = {
         message: detail || t("chatPage.clarification.sendError"),
-        hint: disposition === "outcome_unknown"
+        // Only an attachment that may have landed needs a reload. An unknown
+        // delivery outcome keeps its client message id, so submitting again
+        // is safe and the copy must not say otherwise.
+        hint: needsReconciliation
           ? t("chatPage.clarification.sendOutcomeUnknown")
-          : disposition === "not_sent" || disposition === "rejected"
-            ? t("chatPage.clarification.sendNotSent")
-            : null,
+          : disposition === "outcome_unknown"
+            ? t("chatPage.clarification.sendDeliveryUnconfirmed")
+            : disposition === "not_sent" || disposition === "rejected"
+              ? t("chatPage.clarification.sendNotSent")
+              : null,
       }
       if (
         error
@@ -348,11 +356,7 @@ export function ClarificationForm({
       ) {
         deliveryAttemptRef.current = null
       }
-      setResubmitBlocked(
-        typeof error === "object"
-        && error !== null
-        && (error as { requiresReconciliation?: unknown }).requiresReconciliation === true,
-      )
+      setResubmitBlocked(needsReconciliation)
       setSendFailure(failure)
       toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
     } finally {

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { isRetriableUploadStatus, uploadOutcomeForStatus, UploadRequestError, withUploadRetry } from "@/lib/upload-retry"
+import { isRetriableUploadStatus, uploadOutcomeForStatus, UploadRequestError, withUploadRetry, type UploadOutcome } from "@/lib/upload-retry"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -1199,6 +1199,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     // True only while attachments are being uploaded, so the catch below can
     // tell "the upload may have landed" from "nothing left this client".
     let uploadPhase = false
+    // True only while a request is actually on the wire. Between attempts the
+    // retry is asleep in backoff, and nothing is in flight to be uncertain
+    // about.
+    let uploadRequestInFlight = false
+    // The last thing the server actually told us about this upload. A 503 is
+    // a refusal it already rolled back, and that stays true even if the
+    // submission is superseded before the next attempt starts.
+    let lastUploadOutcome: UploadOutcome | null = null
     try {
       const messageData: Record<string, unknown> = {
         type: 'chat',
@@ -1226,11 +1234,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
 
         if (filesToUpload.length > 0 && uploadFiles) {
+          // An injected uploader owns its own retry loop, so this side cannot
+          // see the gaps between its attempts: treat the whole call as live.
+          uploadRequestInFlight = true
           uploadedFiles = await Promise.race([
             uploadFiles(filesToUpload, {
               taskId: currentTaskId,
               taskType: 'task',
-            }),
+            }).finally(() => { uploadRequestInFlight = false }),
             claim.cancellation,
           ])
         } else if (filesToUpload.length > 0) {
@@ -1241,6 +1252,19 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // compensates its partial registrations before answering, so the
           // retry cannot land duplicates of the files that had staged.
           const sendUpload = async () => {
+            uploadRequestInFlight = true
+            try {
+              return await sendUploadRequest()
+            } catch (error) {
+              if (error instanceof UploadRequestError) {
+                lastUploadOutcome = error.outcome
+              }
+              throw error
+            } finally {
+              uploadRequestInFlight = false
+            }
+          }
+          const sendUploadRequest = async () => {
             const formData = new FormData()
             filesToUpload.forEach(file => formData.append('files', file))
             formData.append('task_type', 'task')
@@ -1274,7 +1298,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               )
             }
             const data = parsed.data
-            return data.success && Array.isArray(data.files)
+            const accepted = data.success && Array.isArray(data.files)
               ? data.files
                 .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
                   isJsonRecord(file) && typeof file.file_id === 'string'
@@ -1286,6 +1310,23 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   type: typeof file.mime_type === 'string' ? file.mime_type : '',
                 }))
               : []
+            if (accepted.length !== filesToUpload.length) {
+              // The endpoint is all-or-nothing, so a short or unreadable list
+              // is a response we cannot interpret - not a licence to deliver
+              // the turn with the attachments quietly missing.
+              throw new UploadRequestError(
+                getUploadErrorMessage(response, parsed, {
+                  generic: 'Upload failed',
+                  ...UPLOAD_ERROR_MESSAGES,
+                }),
+                {
+                  status: response.status,
+                  retriable: false,
+                  outcome: uploadOutcomeForStatus(response.status),
+                },
+              )
+            }
+            return accepted
           }
           uploadedFiles = await Promise.race([
             withUploadRetry(sendUpload, { cancellation: claim.cancellation }),
@@ -1391,9 +1432,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       // superseded while bytes were still moving - may have stored the file
       // under an id this client never learned, and resubmitting the same draft
       // would duplicate it.
-      const uploadOutcome = uploadPhase
-        ? error instanceof UploadRequestError ? error.outcome : "unknown"
-        : "refused"
+      const uploadOutcome: UploadOutcome = !uploadPhase
+        ? "refused"
+        : error instanceof UploadRequestError
+          ? error.outcome
+          // Superseded mid-upload. If a request was on the wire its fate is
+          // genuinely unknown; if the retry was only sleeping between
+          // attempts, the server's last word still stands.
+          : uploadRequestInFlight
+            ? "unknown"
+            : lastUploadOutcome ?? "unknown"
       if (error instanceof MessageDeliveryError) {
         // Ownership loss is built with a fixed "not_sent" before anyone knows
         // what the upload did. Re-decide it here, where that is known.

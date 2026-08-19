@@ -317,6 +317,7 @@ const en = {
       sendError: "Failed to send response",
       sendNotSent: "Your answers were kept — you can submit again.",
       sendOutcomeUnknown: "Your response may already have been submitted. Reload the conversation before submitting again.",
+      sendDeliveryUnconfirmed: "We could not confirm the response was received. Submitting again is safe — it will not create a second answer.",
       selectOption: "Select an option",
       selectOptions: "Select options",
       acceptedFormats: "Accepted formats",
