@@ -267,21 +267,67 @@ def _chain(exc: BaseException) -> Iterator[BaseException]:
             current = current.__context__
 
 
-# 4xx codes that are nonetheless worth retrying: a throttle, a server-side
-# timeout, and a conflicting concurrent operation.
-_RETRYABLE_4XX = frozenset({408, 409, 429})
+# Statuses whose retry semantics are guaranteed, as an allowlist rather than
+# ranges. A range says "everything in 5xx is transient", which is a claim about
+# statuses nobody has looked at: 505 (version not supported) and 508 (loop
+# detected) are permanent, and an unrecognised 409 can be either -- a
+# concurrent-operation conflict clears itself, a `BucketNotEmpty` never does.
+# Reporting those as retryable is a wrong verdict, not a missing one, and a
+# wrong verdict is worse than ``unknown`` for something whose entire job is to
+# tell an operator whether waiting can help.
+#
+# A code that *is* recognised still decides on its own and outranks this, which
+# is how `OperationAborted` stays retryable at 409 (see ``_RETRYABLE_CODES``).
+_RETRYABLE_STATUSES = frozenset(
+    {
+        408,  # request timeout, server-side
+        429,  # too many requests
+        500,  # internal error
+        502,  # bad gateway
+        503,  # service unavailable
+        504,  # gateway timeout
+        509,  # bandwidth limit exceeded (non-standard, used by some providers)
+    }
+)
+
+# Statuses that are definitely permanent and might otherwise be read as
+# transient because of their 5xx range.
+_PERMANENT_STATUSES = frozenset(
+    {
+        # Unambiguous 4xx: no amount of waiting changes the answer. Listed
+        # rather than covered by a range, because 408/409/429 sit in the same
+        # range and are not permanent at all.
+        400,  # bad request
+        401,  # unauthorized
+        403,  # forbidden
+        404,  # not found
+        405,  # method not allowed
+        411,  # length required
+        413,  # payload too large
+        414,  # URI too long
+        415,  # unsupported media type
+        416,  # range not satisfiable
+        # 5xx that read as transient because of their range, but are not.
+        501,  # not implemented -- this backend cannot do it, ever
+        505,  # HTTP version not supported
+        508,  # loop detected
+    }
+)
 
 
 def _retryable_from_status(status: int) -> bool | None:
-    if status in _RETRYABLE_4XX:
+    """Classify from an HTTP status, or return ``None`` when it does not say.
+
+    Deliberately does not fall back to "4xx means permanent". A 4xx from an
+    unrecognised code is usually permanent, but ``usually`` is not what this
+    field claims, and the codes worth acting on are in the tables above.
+    """
+    if status in _RETRYABLE_STATUSES:
         return True
-    # 501 is a permanent "this backend cannot do that", unlike its 5xx peers.
-    if status == 501:
+    if status in _PERMANENT_STATUSES:
         return False
-    if 500 <= status <= 599:
-        return True
-    if 400 <= status <= 499:
-        return False
+    # Everything else -- an unrecognised 409, a 5xx nobody has classified --
+    # is exactly the case this field must not guess at.
     return None
 
 

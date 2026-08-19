@@ -143,6 +143,43 @@ def test_local_backend_errnos_split_by_whether_waiting_helps() -> None:
     assert classify_provider_fault(full).code is None
 
 
+def test_an_ambiguous_status_says_unknown_rather_than_guessing() -> None:
+    """A wrong verdict is worse than no verdict for this field.
+
+    The old rule was "5xx except 501 is retryable, 4xx is not", which is a claim
+    about statuses nobody has looked at. 505 and 508 are permanent despite being
+    5xx, and an unrecognised 409 can be either -- a concurrent-operation
+    conflict clears itself, ``BucketNotEmpty`` never does. Since the field
+    exists to tell an operator whether waiting can help, guessing is the one
+    thing it must not do.
+    """
+    for status in (409, 507, 599):
+        exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", status)
+        fault = classify_provider_fault(exc)
+        assert fault.retryable is None, f"status {status} should not be guessed"
+        assert fault.http_status == status
+
+    for status in (505, 508):
+        exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", status)
+        assert classify_provider_fault(exc).retryable is False, status
+
+    # Unambiguous 4xx keep their verdict -- dropping them would trade a wrong
+    # answer for a missing one, which is not the trade being made here.
+    for status in (401, 403, 404, 413):
+        exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", status)
+        assert classify_provider_fault(exc).retryable is False, status
+
+
+def test_a_recognized_code_outranks_an_ambiguous_status() -> None:
+    """``OperationAborted`` is a 409 that AWS documents as retryable."""
+    exc = _s3_chain(OSError(errno.EIO, "x"), "OperationAborted", 409)
+    assert classify_provider_fault(exc).retryable is True
+
+    # ...while an unrecognised code at the same status stays unknown.
+    exc = _s3_chain(OSError(errno.EIO, "x"), "BucketNotEmpty", 409)
+    assert classify_provider_fault(exc).retryable is None
+
+
 def test_http_status_decides_when_no_code_is_recognized() -> None:
     for status, expected in ((429, True), (500, True), (503, True), (501, False)):
         exc = _s3_chain(OSError(errno.EIO, "x"), None, status)
