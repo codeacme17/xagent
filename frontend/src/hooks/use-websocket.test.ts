@@ -291,7 +291,13 @@ describe("useWebSocket message delivery", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(
       async () => uploadResponse({ detail: "Durable storage is temporarily unavailable" }, 503),
     )
-    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    const hook = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      // Hold the backoff open, so the reconnect below lands between attempts
+      // rather than racing the production jitter.
+      uploadRetry: { sleep: () => new Promise<void>(() => {}) },
+    }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     act(() => MockWebSocket.instances[0].open())
     const preparing = hook.result.current.sendChatMessage(
@@ -300,7 +306,6 @@ describe("useWebSocket message delivery", () => {
       false,
       "cancelled-in-backoff",
     )
-    // Let the first attempt settle so the retry is asleep, not on the wire.
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
 
     act(() => MockWebSocket.instances[0].triggerClose(4001))
@@ -309,6 +314,37 @@ describe("useWebSocket message delivery", () => {
       disposition: "not_sent",
       requiresReconciliation: false,
     })
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not let a refusal vouch for a later attempt that died on the wire", async () => {
+    // Attempt one is refused and rolled back; attempt two dies mid-request and
+    // may have committed. The second attempt must not inherit the first's
+    // clean bill of health.
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async () => uploadResponse(
+        { detail: "Durable storage is temporarily unavailable" },
+        503,
+      ))
+      .mockImplementationOnce(async () => { throw new TypeError("Failed to fetch") })
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadRetry: { sleep: async () => {} },
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    await expect(result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "dropped-on-retry",
+    )).rejects.toMatchObject({
+      disposition: "outcome_unknown",
+      requiresReconciliation: true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it("rejects a batch response that does not account for every file", async () => {
@@ -352,20 +388,25 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
-  it("keeps a pre-upload failure reported as never sent", async () => {
-    // Nothing left this client, so the draft really is safe to resend.
-    const { result } = renderHook(() => useWebSocket({
-      url: "ws://localhost",
-      taskId: 1,
-      autoConnect: false,
-    }))
+  it("keeps a refused upload reported as never sent", async () => {
+    // The server declined and kept nothing, so the draft really is safe to
+    // resend - the one upload failure that must not ask for reconciliation.
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => uploadResponse({ detail: "File is too large" }, 413),
+    )
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
 
     await expect(result.current.sendChatMessage(
       "answer",
       [new File(["evidence"], "evidence.txt")],
       false,
-      "pre-upload",
-    )).rejects.toMatchObject({ disposition: "not_sent" })
+      "refused-upload",
+    )).rejects.toMatchObject({
+      disposition: "not_sent",
+      requiresReconciliation: false,
+    })
   })
 
   it("does not replay the default batch upload for a permanent rejection", async () => {

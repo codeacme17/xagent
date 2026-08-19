@@ -108,9 +108,12 @@ export function ClarificationForm({
   const [isOpen, setIsOpen] = useState(active)
   const [sendFailure, setSendFailure] = useState<{ message: string; hint: string | null } | null>(null)
   // An unresolved submission keeps its client message id, so a retry lands on
-  // the server's existing claim instead of opening a second turn. Cleared on
-  // success, and when the server explicitly asks for a fresh id.
-  const deliveryAttemptRef = useRef<string | null>(null)
+  // the server's existing claim instead of opening a second turn. `unknown`
+  // records that the previous attempt's fate was undecided - a fresh id is
+  // then never safe to mint, because the first turn may still be landing.
+  const deliveryAttemptRef = useRef<
+    { clientMessageId: string; unknown: boolean } | null
+  >(null)
   // Set only when a resubmit could duplicate something the server cannot
   // deduplicate - an attachment that may have landed under an id this client
   // never learned. An unknown *delivery* outcome does not block: the retry
@@ -311,8 +314,15 @@ export function ClarificationForm({
       if (onSend) {
         await onSend(finalMessage, outboundFiles, metadata);
       } else if (sendMessage) {
-        const clientMessageId = deliveryAttemptRef.current ?? generateClientMessageId()
-        deliveryAttemptRef.current = clientMessageId
+        const previousAttempt = deliveryAttemptRef.current
+        const clientMessageId = previousAttempt?.clientMessageId
+          ?? generateClientMessageId()
+        // Reusing an id carries its history: an attempt whose fate was
+        // undecided stays undecided until something settles it.
+        deliveryAttemptRef.current = {
+          clientMessageId,
+          unknown: previousAttempt?.unknown ?? false,
+        }
         await sendMessage(
           finalMessage,
           { force: true, metadata, clientMessageId },
@@ -336,12 +346,32 @@ export function ClarificationForm({
       const needsReconciliation = typeof error === "object"
         && error !== null
         && (error as { requiresReconciliation?: unknown }).requiresReconciliation === true
+      const previousWasUnknown = deliveryAttemptRef.current?.unknown === true
+      const serverAsksForNewId = Boolean(
+        error
+        && typeof error === "object"
+        && (error as { retryWithNewId?: unknown }).retryWithNewId === true,
+      )
+      // A fresh id opens a new turn. That is only safe when the previous
+      // attempt definitively did not land: after an undecided one, the server
+      // asking for a new id means our answer *did* reach it under the old one,
+      // and minting another would answer the same question twice.
+      if (serverAsksForNewId && !previousWasUnknown) {
+        deliveryAttemptRef.current = null
+      } else if (deliveryAttemptRef.current) {
+        deliveryAttemptRef.current = {
+          ...deliveryAttemptRef.current,
+          unknown: previousWasUnknown || disposition === "outcome_unknown",
+        }
+      }
+      const mustReconcile = needsReconciliation
+        || (serverAsksForNewId && previousWasUnknown)
       const failure = {
         message: detail || t("chatPage.clarification.sendError"),
         // Only an attachment that may have landed needs a reload. An unknown
         // delivery outcome keeps its client message id, so submitting again
         // is safe and the copy must not say otherwise.
-        hint: needsReconciliation
+        hint: mustReconcile
           ? t("chatPage.clarification.sendOutcomeUnknown")
           : disposition === "outcome_unknown"
             ? t("chatPage.clarification.sendDeliveryUnconfirmed")
@@ -349,14 +379,7 @@ export function ClarificationForm({
               ? t("chatPage.clarification.sendNotSent")
               : null,
       }
-      if (
-        error
-        && typeof error === "object"
-        && (error as { retryWithNewId?: unknown }).retryWithNewId === true
-      ) {
-        deliveryAttemptRef.current = null
-      }
-      setResubmitBlocked(needsReconciliation)
+      setResubmitBlocked(mustReconcile)
       setSendFailure(failure)
       toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
     } finally {

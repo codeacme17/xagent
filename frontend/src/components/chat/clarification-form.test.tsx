@@ -537,3 +537,87 @@ describe("ClarificationForm resubmission safety", () => {
     expect(second).not.toBe(first)
   })
 })
+
+describe("ClarificationForm undecided deliveries", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  const submit = () => fireEvent.click(
+    screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+  )
+
+  const sentIds = () => appContextMock.sendMessage.mock.calls.map(
+    ([, config]) => (config as { clientMessageId?: string })?.clientMessageId,
+  )
+
+  it("never mints a new id after an undecided attempt reached the server", async () => {
+    // The server only asks for a new id when a claim already exists under the
+    // old one - which means the undecided answer did land. Minting another
+    // would answer the same question twice.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(Object.assign(
+        new Error("The message is still being applied. Please retry shortly."),
+        { disposition: "outcome_unknown", userFacing: true },
+      ))
+      .mockRejectedValueOnce(Object.assign(
+        new Error("Message id was already used for different content or files."),
+        { disposition: "rejected", userFacing: true, retryWithNewId: true },
+      ))
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+      />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    // The form invites this: an unconfirmed delivery leaves Submit enabled.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Shanghai" } })
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentIds()
+    expect(second).toBe(first)
+    // Nothing further may be sent: the answer is in an unresolved state only a
+    // reload can settle.
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeDisabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendOutcomeUnknown",
+    )
+  })
+
+  it("still mints a new id when the server refuses one that never landed", async () => {
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(Object.assign(
+        new Error("Message id was already used for different content or files."),
+        { disposition: "rejected", userFacing: true, retryWithNewId: true },
+      ))
+      .mockResolvedValueOnce(undefined)
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+      />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentIds()
+    expect(second).not.toBe(first)
+  })
+})

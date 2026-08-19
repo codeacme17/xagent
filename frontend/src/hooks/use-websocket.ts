@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { isRetriableUploadStatus, uploadOutcomeForStatus, UploadRequestError, withUploadRetry, type UploadOutcome } from "@/lib/upload-retry"
+import { isRetriableUploadStatus, uploadOutcomeForStatus, UploadRequestError, withUploadRetry, type UploadOutcome, type UploadRetryOptions } from "@/lib/upload-retry"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -104,6 +104,97 @@ const deliveryError = (
   userFacing,
   requiresReconciliation,
 )
+
+type UploadedFileRef = { file_id: string; name?: string; size?: number; type?: string }
+
+/**
+ * What an upload attempt ended up doing, decided where the evidence is.
+ *
+ * The classification is returned rather than reconstructed from flags by a
+ * distant catch: every failure exits through one of these two shapes, so a
+ * case cannot go unclassified by omission.
+ */
+type UploadStepResult =
+  | { ok: true; files: UploadedFileRef[] }
+  | { ok: false; outcome: UploadOutcome; error: Error }
+
+/**
+ * Runs one upload - with the shared bounded retry when the caller owns it -
+ * and reports whether the bytes provably never landed.
+ *
+ * `refused` means the server rejected the request and kept nothing, so the
+ * draft may be sent again as-is. `unknown` means it may have stored the file
+ * under an id this client never learned: a gateway 5xx, an unreadable body, a
+ * dropped request, or ownership lost while a request was on the wire.
+ */
+const runUpload = async (
+  perform: () => Promise<UploadedFileRef[]>,
+  cancellation: Promise<never>,
+  retry?: UploadRetryOptions,
+): Promise<UploadStepResult> => {
+  // Scoped to this upload, so no later reader can see a stale value.
+  let inFlight = false
+  let lastRefusal: UploadOutcome | null = null
+  const attempt = async () => {
+    // Each attempt starts having said nothing. Without this, a dropped
+    // request on attempt two would inherit attempt one's refusal and be
+    // reported as safe to resend.
+    lastRefusal = null
+    inFlight = true
+    try {
+      return await perform()
+    } catch (error) {
+      if (error instanceof UploadRequestError) lastRefusal = error.outcome
+      throw error
+    } finally {
+      inFlight = false
+    }
+  }
+
+  try {
+    const files = await Promise.race([
+      withUploadRetry(attempt, { ...retry, cancellation }),
+      cancellation,
+    ])
+    return { ok: true, files }
+  } catch (error) {
+    const outcome: UploadOutcome = error instanceof UploadRequestError
+      ? error.outcome
+      // Not the upload's own error, so ownership was lost. A request still on
+      // the wire has an unknown fate; a retry only sleeping between attempts
+      // leaves the server's last word standing.
+      : inFlight
+        ? "unknown"
+        : lastRefusal ?? "unknown"
+    return { ok: false, outcome, error: error as Error }
+  }
+}
+
+/** Turns a failed upload into the delivery error the caller should throw. */
+const unwrapUpload = (result: UploadStepResult): UploadedFileRef[] => {
+  if (result.ok) return result.files
+  const { error, outcome } = result
+  const unknown = outcome === "unknown"
+  if (error instanceof MessageDeliveryError) {
+    // Ownership loss carries a disposition fixed before the upload's fate was
+    // known. Keep everything else about it and correct only that.
+    if (!unknown || error.disposition !== "not_sent") throw error
+    throw deliveryError(
+      error.message,
+      "outcome_unknown",
+      error.retryWithNewId,
+      error.userFacing,
+      true,
+    )
+  }
+  throw deliveryError(
+    error.message,
+    unknown ? "outcome_unknown" : "not_sent",
+    false,
+    error instanceof UploadRequestError,
+    unknown,
+  )
+}
 
 export type WebSocketCredentialOwner =
   | {
@@ -241,6 +332,12 @@ export interface UseWebSocketOptions {
   token?: string
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  /**
+   * Seam for the upload backoff schedule. Production leaves it unset and gets
+   * jittered delays; tests pin `sleep`/`random` so a retry's timing is not a
+   * race they have to win.
+   */
+  uploadRetry?: UploadRetryOptions
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
@@ -271,6 +368,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     token,
     buildWebSocketUrl,
     uploadFiles,
+    uploadRetry,
     connection: connectionOption,
     deliveryGeneration = 0,
     onConnectionClose,
@@ -1196,17 +1294,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
     preparationsRef.current.set(clientMessageId, claim)
 
-    // True only while attachments are being uploaded, so the catch below can
-    // tell "the upload may have landed" from "nothing left this client".
-    let uploadPhase = false
-    // True only while a request is actually on the wire. Between attempts the
-    // retry is asleep in backoff, and nothing is in flight to be uncertain
-    // about.
-    let uploadRequestInFlight = false
-    // The last thing the server actually told us about this upload. A 503 is
-    // a refusal it already rolled back, and that stays true even if the
-    // submission is superseded before the next attempt starts.
-    let lastUploadOutcome: UploadOutcome | null = null
     try {
       const messageData: Record<string, unknown> = {
         type: 'chat',
@@ -1216,7 +1303,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       if (files && files.length > 0) {
-        uploadPhase = true
         if (!currentTaskId) {
           throw deliveryError("File delivery requires a task-bound connection.", "not_sent")
         }
@@ -1235,15 +1321,29 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
         if (filesToUpload.length > 0 && uploadFiles) {
           // An injected uploader owns its own retry loop, so this side cannot
-          // see the gaps between its attempts: treat the whole call as live.
-          uploadRequestInFlight = true
-          uploadedFiles = await Promise.race([
-            uploadFiles(filesToUpload, {
-              taskId: currentTaskId,
-              taskType: 'task',
-            }).finally(() => { uploadRequestInFlight = false }),
+          // see the gaps between its attempts: the whole call is one attempt.
+          const attempt = () => uploadFiles(filesToUpload, {
+            taskId: currentTaskId,
+            taskType: 'task',
+          }).then(uploaded => {
+            if (uploaded.length !== filesToUpload.length) {
+              // Same 1:1 requirement the default path enforces. No shipped
+              // transport can return a short list today, but the contract is
+              // stated nowhere, so assert it rather than deliver a turn whose
+              // attachments quietly went missing.
+              throw new UploadRequestError('Upload failed', {
+                status: null,
+                retriable: false,
+                outcome: "unknown",
+              })
+            }
+            return uploaded
+          })
+          uploadedFiles = unwrapUpload(await runUpload(
+            attempt,
             claim.cancellation,
-          ])
+            uploadRetry,
+          ))
         } else if (filesToUpload.length > 0) {
           // One request carries the whole batch, so a retry re-sends every
           // file in it. That is only safe for statuses that mean the request
@@ -1251,19 +1351,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // and the 503 the upload endpoint raises for durable storage
           // compensates its partial registrations before answering, so the
           // retry cannot land duplicates of the files that had staged.
-          const sendUpload = async () => {
-            uploadRequestInFlight = true
-            try {
-              return await sendUploadRequest()
-            } catch (error) {
-              if (error instanceof UploadRequestError) {
-                lastUploadOutcome = error.outcome
-              }
-              throw error
-            } finally {
-              uploadRequestInFlight = false
-            }
-          }
           const sendUploadRequest = async () => {
             const formData = new FormData()
             filesToUpload.forEach(file => formData.append('files', file))
@@ -1328,10 +1415,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             }
             return accepted
           }
-          uploadedFiles = await Promise.race([
-            withUploadRetry(sendUpload, { cancellation: claim.cancellation }),
+          uploadedFiles = unwrapUpload(await runUpload(
+            sendUploadRequest,
             claim.cancellation,
-          ])
+            uploadRetry,
+          ))
         }
         // Stamp the ids back onto the caller's File objects. A draft that is
         // resubmitted after the turn was rejected (or after any later failure)
@@ -1345,7 +1433,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         messageData.files = [...preUploadedFiles, ...uploadedFiles]
-        uploadPhase = false
       }
 
       if (
@@ -1426,49 +1513,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       return delivery
     } catch (error) {
-      // An upload that was refused stored nothing, so the draft is safe to
-      // send again. Anything else that failed mid-upload - a gateway 5xx, an
-      // unreadable success body, a dropped request, or this attempt being
-      // superseded while bytes were still moving - may have stored the file
-      // under an id this client never learned, and resubmitting the same draft
-      // would duplicate it.
-      const uploadOutcome: UploadOutcome = !uploadPhase
-        ? "refused"
-        : error instanceof UploadRequestError
-          ? error.outcome
-          // Superseded mid-upload. If a request was on the wire its fate is
-          // genuinely unknown; if the retry was only sleeping between
-          // attempts, the server's last word still stands.
-          : uploadRequestInFlight
-            ? "unknown"
-            : lastUploadOutcome ?? "unknown"
-      if (error instanceof MessageDeliveryError) {
-        // Ownership loss is built with a fixed "not_sent" before anyone knows
-        // what the upload did. Re-decide it here, where that is known.
-        if (uploadOutcome !== "unknown" || error.disposition !== "not_sent") {
-          throw error
-        }
-        throw deliveryError(
-          error.message,
-          "outcome_unknown",
-          error.retryWithNewId,
-          error.userFacing,
-          true,
-        )
-      }
+      if (error instanceof MessageDeliveryError) throw error
       throw deliveryError(
         error instanceof Error ? error.message : String(error),
-        uploadOutcome === "unknown" ? "outcome_unknown" : "not_sent",
-        false,
-        error instanceof UploadRequestError,
-        uploadOutcome === "unknown",
+        "not_sent",
       )
     } finally {
       if (preparationsRef.current.get(clientMessageId) === claim) {
         preparationsRef.current.delete(clientMessageId)
       }
     }
-  }, [isCurrentOwner, uploadFiles])
+  }, [isCurrentOwner, uploadFiles, uploadRetry])
 
   const getCurrentTaskConnection = useCallback(() => {
     const connection = connectionRef.current
