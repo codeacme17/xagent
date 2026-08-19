@@ -164,10 +164,21 @@ def test_an_ambiguous_status_says_unknown_rather_than_guessing() -> None:
         assert classify_provider_fault(exc).retryable is False, status
 
     # Unambiguous 4xx keep their verdict -- dropping them would trade a wrong
-    # answer for a missing one, which is not the trade being made here.
-    for status in (401, 403, 404, 413):
+    # answer for a missing one, which is not the trade being made here. The
+    # list is deliberately wide: an earlier revision enumerated ten permanent
+    # 4xx and let the other forty fall through to ``None``, discarding correct
+    # verdicts while describing itself as conservative. 410 and 412 are the
+    # ones that caught it -- 412 is S3's ``PreconditionFailed``.
+    for status in (401, 402, 403, 404, 406, 410, 412, 413, 422, 428, 431, 451):
         exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", status)
         assert classify_provider_fault(exc).retryable is False, status
+
+    # 409 is the sole ambiguous 4xx, and 429 must not be swept in with it:
+    # it is unconditionally retryable, answered before the 4xx default.
+    exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", 409)
+    assert classify_provider_fault(exc).retryable is None
+    exc = _s3_chain(OSError(errno.EIO, "x"), "SomeUnlistedCode", 429)
+    assert classify_provider_fault(exc).retryable is True
 
 
 def test_a_recognized_code_outranks_an_ambiguous_status() -> None:
