@@ -322,6 +322,52 @@ def _client_message_id(value: Any) -> str | None:
     return normalized
 
 
+# Exception text can carry file paths, SQL fragments, provider payloads and
+# other internals. It reaches anonymous widget/share visitors through both the
+# error bubble and the message_rejected ack, so an *incidental* validation
+# failure only ever surfaces as this fixed string; the detail stays in the log.
+#
+# Agent RuntimeError text is deliberately left alone: surfacing it to the sender
+# is an existing, tested contract (tests/web/api/test_websocket_owner_actor.py),
+# and narrowing it is a product decision rather than a redaction bug.
+CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
+
+
+class ClientVisibleError(Exception):
+    """Marker: this exception's text was written for the end user.
+
+    Raise a subclass - never a bare builtin - when the message itself is the
+    actionable answer ("authentication required", "access denied"). Everything
+    else reaching a client-facing handler is treated as incidental and
+    redacted, so forgetting the marker fails closed.
+    """
+
+
+class ClientVisibleValidationError(ClientVisibleError, ValueError):
+    """A validation failure whose text is safe to show the sender."""
+
+
+class ClientVisiblePermissionError(ClientVisibleError, PermissionError):
+    """An authorization refusal whose text is safe to show the sender."""
+
+
+def client_safe_error_message(error: Exception) -> str:
+    """The only way an exception may become text a chat client can see.
+
+    Every ``message_rejected`` and ``error`` payload that this module builds
+    from an exception *at a direct call site* goes through here.
+    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces that for
+    the shapes it recognizes; payloads assembled by a helper, spread into a
+    dict, or forwarded through a wrapper are not yet covered and still carry
+    raw text - see #1497.
+    """
+    return (
+        str(error)
+        if isinstance(error, ClientVisibleError)
+        else CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
 async def send_message_delivery(
     websocket: WebSocket,
     *,
@@ -2446,7 +2492,7 @@ async def execute_task_background(
                 )
             )
         if snapshot is None:
-            raise ValueError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(f"Task {task_id} not found")
 
         context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
@@ -4860,7 +4906,7 @@ def _claim_user_message_delivery_isolated(
                     db=db,
                 )
                 if missing:
-                    raise ValueError(
+                    raise ClientVisibleValidationError(
                         "Files are no longer bindable: " + ", ".join(missing)
                     )
             claim_snapshot = _snapshot_user_message_delivery(claim)
@@ -4973,11 +5019,12 @@ async def handle_chat_message(
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
-            message=str(exc),
+            message=client_safe_error_message(exc),
             rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": client_safe_error_message(exc)},
+            websocket,
         )
         return
     if enqueued is None:
@@ -5040,7 +5087,7 @@ def _enqueue_websocket_task_command_sync(
                 return None
             raise ValueError(f"Task {task_id} not found")
         if not actor_is_admin and int(task.user_id) != actor_user_id:
-            raise PermissionError(
+            raise ClientVisiblePermissionError(
                 f"Access denied: Task {task_id} does not belong to you"
             )
         if kind == TaskCommandKind.MESSAGE:
@@ -5104,7 +5151,9 @@ async def _enqueue_websocket_task_command(
 ) -> EnqueuedTaskCommand | None:
     user = message_data.get("user")
     if user is None:
-        raise ValueError("User authentication required for task command")
+        raise ClientVisibleValidationError(
+            "User authentication required for task command"
+        )
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
     # into the JSON inbox. The consumer re-resolves the actor by id.
@@ -5748,13 +5797,15 @@ async def _handle_chat_message_unserialized(
         authorized_task_id: int | None = None
 
         if user is None:
-            raise ValueError("User authentication required for task access")
+            raise ClientVisibleValidationError(
+                "User authentication required for task access"
+            )
         if not isinstance(user_message, str):
-            raise TypeError("Chat message must be a string")
+            raise ClientVisibleValidationError("Chat message must be a string")
         if not isinstance(raw_context, dict):
-            raise TypeError("Chat context must be an object")
+            raise ClientVisibleValidationError("Chat context must be an object")
         if not isinstance(raw_files, list):
-            raise TypeError("Chat files must be a list")
+            raise ClientVisibleValidationError("Chat files must be a list")
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6381,8 +6432,10 @@ async def _handle_chat_message_unserialized(
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
-            message = f"Data validation error: {str(e)}"
-            logger.error(f"Data validation error in agent execution: {e}")
+            message = client_safe_error_message(e)
+            logger.error(
+                "Data validation error in agent execution: %s", e, exc_info=True
+            )
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6410,7 +6463,7 @@ async def _handle_chat_message_unserialized(
         except RuntimeError as e:
             # Runtime error
             message = f"Runtime error: {str(e)}"
-            logger.error(f"Runtime error in agent execution: {e}")
+            logger.error("Runtime error in agent execution: %s", e, exc_info=True)
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6437,16 +6490,17 @@ async def _handle_chat_message_unserialized(
                 )
         except Exception as e:
             # Other unknown errors, re-raise
-            logger.error(f"Unexpected error in agent execution: {e}")
-            await finish_delivery_failure(str(e))
+            logger.error("Unexpected error in agent execution: %s", e, exc_info=True)
+            await finish_delivery_failure(client_safe_error_message(e))
             raise
 
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
-        logger.error(f"Message format error: {e}")
-        await finish_delivery_failure(f"Message format error: {str(e)}")
+        logger.error("Message format error: %s", e, exc_info=True)
+        message = client_safe_error_message(e)
+        await finish_delivery_failure(message)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Message format error: {str(e)}"}, websocket
+            {"type": "error", "message": message}, websocket
         )
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
@@ -6454,8 +6508,8 @@ async def _handle_chat_message_unserialized(
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error handling chat message: {e}")
-        await finish_delivery_failure(str(e))
+        logger.error("Unexpected error handling chat message: %s", e, exc_info=True)
+        await finish_delivery_failure(client_safe_error_message(e))
         raise
 
 
@@ -6564,7 +6618,9 @@ async def handle_execute_task(
         user = message_data.get("user")
         authorized_task_id: int | None = None
         if not user:
-            raise ValueError("User authentication required for task execution")
+            raise ClientVisibleValidationError(
+                "User authentication required for task execution"
+            )
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -6621,8 +6677,8 @@ async def handle_execute_task(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation and format error
-        message = f"Data validation error: {str(e)}"
-        logger.error(f"Data validation error in task execution: {e}")
+        message = client_safe_error_message(e)
+        logger.error("Data validation error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -6648,7 +6704,7 @@ async def handle_execute_task(
     except RuntimeError as e:
         # Runtime error
         message = f"Runtime error: {str(e)}"
-        logger.error(f"Runtime error in task execution: {e}")
+        logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -7390,7 +7446,7 @@ async def handle_intervention(
         # Data validation error
         logger.error(f"Data validation error in intervention: {e}")
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
@@ -7418,7 +7474,8 @@ async def handle_pause_task(
         )
     except (PermissionError, ValueError) as exc:
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": client_safe_error_message(exc)},
+            websocket,
         )
         return
     assert enqueued is not None
@@ -7646,7 +7703,7 @@ async def _handle_pause_task_unserialized(
         message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error pausing task {task_id}: {e}")
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
@@ -7675,7 +7732,8 @@ async def handle_resume_task(
         )
     except (PermissionError, ValueError) as exc:
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": client_safe_error_message(exc)},
+            websocket,
         )
         return
     assert enqueued is not None
@@ -8035,7 +8093,7 @@ async def _handle_resume_task_unserialized(
         message_data["_durable_command_error"] = str(e)
         logger.error(f"Data validation error resuming task {task_id}: {e}")
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
