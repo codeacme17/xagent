@@ -6532,10 +6532,45 @@ async def _handle_chat_message_unserialized(
         # Connection error
         logger.error(f"Connection error handling chat message: {e}")
         raise
+    except DurableObjectIntegrityError:
+        # Attachment preparation runs in this outer scope (see the
+        # ``_prepare_websocket_turn_sync`` call above), *before* the inner
+        # agent-execution try. So a stored-file fault surfaces here, not in the
+        # arms guarding that inner block -- which is why the fixed detail has to
+        # be applied at this level too.
+        #
+        # Corruption is permanent: the copy has to be replaced, so the client is
+        # told that rather than to retry. No exception text goes outbound; the
+        # integrity ERROR with both checksums is already logged where it is
+        # raised.
+        await finish_delivery_failure(
+            "A stored file for this message failed its integrity check "
+            "and must be re-uploaded."
+        )
+        raise
+    except DurableStorageOperationError as exc:
+        # Same scope reasoning as above. ``str(exc)`` is the wrap's message and
+        # carries the storage key, whose scope segments encode the owning user's
+        # id -- it must not reach a socket frame, a persisted rejection, or a
+        # broadcast, any more than it may reach an HTTP body or a model (#1467).
+        #
+        # Logging here rather than leaving it to the endpoint arm: the
+        # durable-command route invokes this handler directly and never reaches
+        # that arm. Double-recording is prevented at the logger, which marks the
+        # fault, so both arms are safe to write independently.
+        log_durable_storage_fault(
+            logger,
+            "websocket chat turn preparation",
+            exc,
+            task_id=task_id,
+        )
+        await finish_delivery_failure(
+            "File storage is temporarily unavailable. Please try again."
+        )
+        raise
     except Exception as e:
         # Other errors, re-raise. ``exc_info`` because this arm absorbs any
-        # wrapped fault -- a durable-storage one included -- whose cause
-        # otherwise never reaches a log (#1467).
+        # wrapped fault whose cause otherwise never reaches a log (#1467).
         logger.error(f"Unexpected error handling chat message: {e}", exc_info=True)
         await finish_delivery_failure(str(e))
         raise

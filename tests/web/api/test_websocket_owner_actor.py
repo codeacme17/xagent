@@ -3752,3 +3752,89 @@ async def test_resume_non_owner_non_admin_is_refused(db_session) -> None:
     # Authorized away before any runtime is built; an error is sent back.
     assert "task_owner_user_id" not in captured
     ws_manager.send_personal_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
+    db_session,
+    caplog,
+) -> None:
+    """A stored-file fault must not send the storage key to the client.
+
+    Attachment preparation runs in the handler's *outer* scope, so this fault
+    surfaces before the inner agent-execution arms and was answered with
+    ``str(exc)`` -- whose wrap text is
+    ``Failed to restore durable object: users/<id>/uploads/...``, embedding the
+    owning user's id. Same defect as the model-facing leak in #1467, one
+    transport over, which is why the invariant is asserted per egress: frame,
+    persisted rejection, and broadcast.
+    """
+    import logging
+
+    from xagent.web.services.managed_file_ref import DurableStorageOperationError
+
+    owner = _user(db_session, "durable-leak-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    storage_key = f"users/{owner_id}/uploads/8ac1f2/quarterly-report.xlsx"
+
+    class _ProviderThrottled(RuntimeError):
+        pass
+
+    def failing_prepare(**_kwargs):
+        wrap = DurableStorageOperationError(
+            f"Failed to restore durable object: {storage_key}"
+        )
+        wrap.__cause__ = _ProviderThrottled("SlowDown: reduce your request rate")
+        raise wrap
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch(
+            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            side_effect=failing_prepare,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        with pytest.raises(DurableStorageOperationError):
+            await _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "with an attachment",
+                    "client_message_id": "durable-leak-probe",
+                    "user": SimpleNamespace(id=owner_id, is_admin=False),
+                    "files": ["8ac1f2"],
+                },
+            )
+
+    # Every outbound egress: nothing may carry the key or the provider text.
+    outbound = [
+        str(call) for call in ws_manager.send_personal_message.await_args_list
+    ] + [str(call) for call in ws_manager.broadcast_to_task.await_args_list]
+    for payload in outbound:
+        assert storage_key not in payload
+        assert f"users/{owner_id}" not in payload
+        assert "Failed to restore durable object" not in payload
+        assert "SlowDown" not in payload
+
+    # The server-side record keeps the whole chain, exactly once.
+    fault_lines = [
+        logging.Formatter("%(message)s").format(entry)
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ]
+    assert len(fault_lines) == 1, fault_lines
+    assert "during websocket chat turn preparation" in fault_lines[0]
+    assert storage_key in fault_lines[0]
+    assert "_ProviderThrottled" in fault_lines[0]

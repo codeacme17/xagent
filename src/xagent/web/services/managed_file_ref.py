@@ -105,6 +105,13 @@ def log_durable_storage_fault(
     ``target_logger`` is the caller's logger rather than this module's, so a
     line stays attributed to the endpoint or tool that produced it.
 
+    Field values are escaped and bounded, because some are client-supplied.
+    That covers the fields *this* function renders -- it does **not** make the
+    record as a whole unforgeable: the formatter renders ``exc_info`` verbatim,
+    so a newline in a provider exception message still produces a physical
+    continuation line. Closing that needs the formatter itself and is tracked in
+    #1516; do not read the sanitising below as a stronger guarantee than it is.
+
     ``operation`` must be a bounded label -- a small fixed set of values, so it
     stays aggregatable. Per-request identifiers belong in ``fields``, which is
     rendered as ``key=value`` pairs *in the message*: the deployed formatter is
@@ -113,6 +120,22 @@ def log_durable_storage_fault(
     passed that way would be invisible in exactly the logs an incident is
     diagnosed from.
     """
+    # One record per fault instance, whatever the nesting. A durable fault can
+    # pass through more than one handler that legitimately wants to report it --
+    # a request-scoped arm that answers the client, and an endpoint-scoped arm
+    # that catches whatever escaped -- and both calling this would log the same
+    # cause twice. Marking the exception is what makes each arm safe to write
+    # independently, instead of every new arm having to know which other arm
+    # might already have run.
+    if getattr(exc, "_durable_fault_logged", False):
+        return
+    try:
+        exc._durable_fault_logged = True  # type: ignore[attr-defined]
+    except Exception:
+        # A provider exception using __slots__ cannot be marked; logging twice
+        # is strictly better than not logging.
+        pass
+
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
         for name, value in fields.items()
