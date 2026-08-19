@@ -3888,10 +3888,13 @@ class ResumeReservationOutcome(enum.Enum):
     # coordinator may also be mid-flight applying this very turn, so nothing
     # here may tell the sender their message was dropped.
     COORDINATOR_RUNNING = "coordinator_running"
-    # This process is draining. Another runner can take the work. Only the
-    # legacy socket path observes this: the dispatcher is cancelled before
-    # ``BackgroundTaskManager.shutdown`` sets the flag, so a durable command
-    # is not executing by the time this becomes true.
+    # This process is draining. Another runner can take the work. In practice
+    # only the legacy socket path observes this, because the dispatcher is
+    # awaited-cancelled before ``BackgroundTaskManager.shutdown`` sets the flag,
+    # so no durable command is mid-execution by then. It is still treated as
+    # deferrable rather than rejected: that ordering is a property of the
+    # lifespan, not of this module, and deferring is the safe reading if it
+    # ever changes.
     SHUTTING_DOWN = "shutting_down"
 
 
@@ -5982,6 +5985,11 @@ async def _handle_chat_message_unserialized(
                             f"Message {turn_id} is waiting for the live-control "
                             f"resume slot ({reservation.value})"
                         )
+                        if recovered_delivery is not None:
+                            # An earlier attempt already claimed this payload and
+                            # may have injected it, so this one cannot claim the
+                            # work provably never landed.
+                            message_data["_durable_command_defer_unsafe"] = turn_id
                         return
                     await finish_delivery(
                         False,
@@ -8225,7 +8233,10 @@ async def _execute_durable_task_command(
                     or f"Message {command.command_id} is waiting for the "
                     "live-control resume slot"
                 ),
-                resend_safe=True,
+                resend_safe=(
+                    message_data.get("_durable_command_defer_unsafe")
+                    != command.command_id
+                ),
             )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise TaskCommandDeferred(
@@ -8311,6 +8322,36 @@ async def _execute_durable_task_command(
     }
 
 
+def _terminal_command_error_text(
+    command: ClaimedTaskCommand,
+    error: BaseException | str,
+) -> str:
+    return f"Task command {command.kind.value} failed: {error}"
+
+
+async def report_terminal_task_command(
+    command: ClaimedTaskCommand,
+    message: str,
+) -> None:
+    """Tell a task's clients about a command the transport confirmed terminal.
+
+    Registered with the transport rather than called from the executor: only
+    the dispatcher knows the final state actually landed, and a claim lost to
+    another runner must not be reported as a drop.
+    """
+
+    await manager.broadcast_to_task(
+        {
+            "type": "agent_error",
+            "message": message,
+            "task_id": command.task_id,
+            "command_id": command.command_id,
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+        },
+        command.task_id,
+    )
+
+
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
     error: BaseException | str,
@@ -8318,7 +8359,7 @@ async def _broadcast_terminal_command_error(
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
-            "message": (f"Task command {command.kind.value} failed: {error}"),
+            "message": _terminal_command_error_text(command, error),
             "task_id": command.task_id,
             "command_id": command.command_id,
             "timestamp": datetime.now(timezone.utc).timestamp(),
@@ -8356,22 +8397,18 @@ async def execute_durable_task_command(
         return await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
-            await _broadcast_terminal_command_error(
-                command,
-                _exhausted_deferral_error(command, exc),
-            )
+            exc.terminal_client_message = str(_exhausted_deferral_error(command, exc))
         raise
     except TaskCommandRejected as exc:
-        # Rejections are terminal on the first hit. On the durable path the
+        # A rejection is terminal on the first hit, and on the durable path the
         # handler's own reply never reaches the client -- ``finish_delivery``
         # suppresses the socket send once the enqueue already acked -- so
         # without this the sender is left with a message that silently never
         # applied. This does not re-enable a submitted clarification form on
-        # its own; that needs a pushed task-status event (see the follow-up
-        # issue) because the frontend drops a late rejection for an id it has
-        # already resolved.
+        # its own; that needs a pushed task-status event (#1500), because the
+        # frontend drops a late rejection for an id it already resolved.
         if command.kind is TaskCommandKind.MESSAGE:
-            await _broadcast_terminal_command_error(command, exc)
+            exc.terminal_client_message = _terminal_command_error_text(command, exc)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:

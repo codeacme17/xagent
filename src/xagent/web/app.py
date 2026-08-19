@@ -1572,9 +1572,18 @@ async def startup_event() -> None:
 
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
-    from .api.websocket import execute_durable_task_command
-    from .services.task_command_transport import start_task_command_dispatcher
+    from .api.websocket import (
+        execute_durable_task_command,
+        report_terminal_task_command,
+    )
+    from .services.task_command_transport import (
+        set_terminal_command_notifier,
+        start_task_command_dispatcher,
+    )
 
+    # A command's clients are told it is finished only once the dispatcher has
+    # confirmed the terminal write, so register that reporter before consuming.
+    set_terminal_command_notifier(report_terminal_task_command)
     global _task_command_dispatcher_task
     _task_command_dispatcher_task = start_task_command_dispatcher(
         execute_durable_task_command
@@ -1621,9 +1630,15 @@ async def shutdown_event() -> None:
     flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
-        from .services.task_command_transport import stop_task_command_dispatcher
+        from .services.task_command_transport import (
+            set_terminal_command_notifier,
+            stop_task_command_dispatcher,
+        )
 
         await stop_task_command_dispatcher()
+        # The next lifespan may bind a different app instance, so the reporter
+        # must not outlive the dispatcher that uses it.
+        set_terminal_command_notifier(None)
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)

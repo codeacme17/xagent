@@ -50,8 +50,11 @@ MAX_COMMAND_FAILURES = 5
 MAX_COMMAND_DEFERS = 60
 # A deferred command is non-terminal, and ``_unfinished_earlier_command`` blocks
 # every later command for the same task on it, so widening this reschedule
-# delays an unrelated pause or cancel behind a command that is only re-polling.
-# The A2A cancel route waits synchronously for 10s, which sets the ceiling.
+# multiplies the delay an unrelated pause or cancel inherits from a command
+# that is only re-polling. A fully deferred command still holds the queue for
+# up to MAX_COMMAND_DEFERS of these windows, which is already well past the
+# A2A cancel route's 10s synchronous wait -- so this stays as tight as the
+# re-poll allows rather than being sized against that deadline.
 COMMAND_DEFER_RETRY_SECONDS = 1.0
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
@@ -85,6 +88,9 @@ class TaskCommandDeferred(RuntimeError):
     def __init__(self, message: str, *, resend_safe: bool = False) -> None:
         super().__init__(message)
         self.resend_safe = resend_safe
+        # Set by an executor that wants this text shown only once the row is
+        # confirmed terminal. See ``dispatch_one_task_command``.
+        self.terminal_client_message: str | None = None
 
 
 class TaskCommandRejected(RuntimeError):
@@ -93,6 +99,7 @@ class TaskCommandRejected(RuntimeError):
     def __init__(self, message: str, *, reason: str | None = None) -> None:
         super().__init__(message)
         self.reason = reason
+        self.terminal_client_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +209,23 @@ class TaskCommandStateSnapshot:
         if self.rejection_reason is None:
             return {}
         return {"rejection_reason": self.rejection_reason}
+
+
+@dataclass(frozen=True)
+class CommandDispositionResult:
+    """Whether a final-state write landed, and whether it was terminal.
+
+    Truthiness stays "the write landed" so existing callers read unchanged.
+    ``terminal`` is what lets a caller wait for the row to really be finished
+    before telling a user their command will never be applied: a lost claim or
+    an unresolved heartbeat leaves the command for another runner to retry.
+    """
+
+    persisted: bool
+    terminal: bool = False
+
+    def __bool__(self) -> bool:
+        return self.persisted
 
 
 @dataclass(frozen=True)
@@ -781,7 +805,7 @@ def fail_task_command(
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
-) -> bool:
+) -> CommandDispositionResult:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
     from ..models.database import get_session_local
@@ -803,7 +827,7 @@ def fail_task_command(
             )
         snapshot = snapshot_query.first()
         if snapshot is None:
-            return False
+            return CommandDispositionResult(persisted=False)
         observed_failure_count = int(snapshot.failure_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         failure_count = observed_failure_count + 1
@@ -839,10 +863,10 @@ def fail_task_command(
         )
         db.commit()
         if updated != 1:
-            return False
+            return CommandDispositionResult(persisted=False)
     if not terminal:
         notify_task_command_dispatcher()
-    return True
+    return CommandDispositionResult(persisted=True, terminal=terminal)
 
 
 def defer_task_command(
@@ -851,7 +875,8 @@ def defer_task_command(
     reason: str,
     *,
     expected_attempt_count: int | None = None,
-) -> bool:
+    resend_safe: bool = False,
+) -> CommandDispositionResult:
     """Release a claim for retry without consuming the failure budget."""
 
     from ..models.database import get_session_local
@@ -873,7 +898,7 @@ def defer_task_command(
             )
         snapshot = snapshot_query.first()
         if snapshot is None:
-            return False
+            return CommandDispositionResult(persisted=False)
         observed_defer_count = int(snapshot.defer_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         defer_count = observed_defer_count + 1
@@ -908,16 +933,24 @@ def defer_task_command(
                     ),
                     TaskExecutionCommand.updated_at: now,
                     TaskExecutionCommand.completed_at: now if terminal else None,
+                    # A reconnecting or polling client never sees the live
+                    # broadcast, so the "safe to resend" classification has to
+                    # survive on the row, the way a rejection reason does.
+                    **(
+                        {TaskExecutionCommand.result: {"resend_safe": resend_safe}}
+                        if terminal
+                        else {}
+                    ),
                 },
                 synchronize_session=False,
             )
         )
         db.commit()
         if updated != 1:
-            return False
+            return CommandDispositionResult(persisted=False)
     if not terminal:
         notify_task_command_dispatcher()
-    return True
+    return CommandDispositionResult(persisted=True, terminal=terminal)
 
 
 def retry_failed_task_command(
@@ -983,7 +1016,34 @@ def task_has_live_foreign_runner(
 
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
-CommandDisposition = Callable[[], bool]
+CommandDisposition = Callable[[], CommandDispositionResult | bool]
+TerminalCommandNotifier = Callable[["ClaimedTaskCommand", str], Awaitable[None]]
+_terminal_command_notifier: TerminalCommandNotifier | None = None
+
+
+def set_terminal_command_notifier(notifier: TerminalCommandNotifier | None) -> None:
+    """Register who tells a client that a command reached a terminal state."""
+
+    global _terminal_command_notifier
+    _terminal_command_notifier = notifier
+
+
+async def notify_terminal_task_command(
+    command: "ClaimedTaskCommand",
+    message: str,
+) -> None:
+    notifier = _terminal_command_notifier
+    if notifier is None:
+        return
+    try:
+        await notifier(command, message)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to report terminal task command %s to its clients",
+            command.command_id,
+        )
+
+
 _dispatcher_wakeup: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
 _dispatcher_loop: asyncio.AbstractEventLoop | None = None
@@ -1002,11 +1062,11 @@ async def _persist_task_command_disposition(
     *,
     disposition: str,
     operation: CommandDisposition,
-) -> bool:
+) -> CommandDispositionResult:
     """Persist one final state without retrying an exhausted pool checkout."""
 
     try:
-        persisted = await run_db_io_cancellation_safe(operation)
+        outcome = await run_db_io_cancellation_safe(operation)
     except Exception as exc:  # noqa: BLE001
         if not is_database_pool_timeout(exc):
             raise
@@ -1024,15 +1084,20 @@ async def _persist_task_command_disposition(
             exc,
             exc_info=True,
         )
-        return False
-    if not persisted:
+        return CommandDispositionResult(persisted=False)
+    resolved = (
+        outcome
+        if isinstance(outcome, CommandDispositionResult)
+        else CommandDispositionResult(persisted=bool(outcome), terminal=bool(outcome))
+    )
+    if not resolved.persisted:
         logger.warning(
             "Lost claim while persisting task command %s disposition=%s attempt=%s",
             command.id,
             disposition,
             command.attempt_count,
         )
-    return persisted
+    return resolved
 
 
 async def dispatch_one_task_command(
@@ -1056,6 +1121,7 @@ async def dispatch_one_task_command(
     )
     disposition_name: str | None = None
     disposition_operation: CommandDisposition | None = None
+    terminal_client_message: str | None = None
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
@@ -1066,24 +1132,28 @@ async def dispatch_one_task_command(
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
+        deferral_resend_safe = exc.resend_safe
+        terminal_client_message = exc.terminal_client_message
 
-        def persist_deferral() -> bool:
+        def persist_deferral() -> CommandDispositionResult:
             return defer_task_command(
                 command.id,
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
+                resend_safe=deferral_resend_safe,
             )
 
         disposition_name = "defer_task_command"
         disposition_operation = persist_deferral
     except TaskCommandRejected as exc:
         error = str(exc)
+        terminal_client_message = exc.terminal_client_message
         rejection_result = (
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
 
-        def persist_rejection() -> bool:
+        def persist_rejection() -> CommandDispositionResult:
             return fail_task_command(
                 command.id,
                 runner_id,
@@ -1121,7 +1191,7 @@ async def dispatch_one_task_command(
             )
             error = str(exc)
 
-            def persist_failure() -> bool:
+            def persist_failure() -> CommandDispositionResult:
                 return fail_task_command(
                     command.id,
                     runner_id,
@@ -1164,11 +1234,21 @@ async def dispatch_one_task_command(
             )
             return True
         if disposition_name is not None and disposition_operation is not None:
-            await _persist_task_command_disposition(
+            outcome = await _persist_task_command_disposition(
                 command,
                 disposition=disposition_name,
                 operation=disposition_operation,
             )
+            # Only now is it true that nothing will retry this command. Saying
+            # so earlier can contradict itself: a lost claim or an unresolved
+            # heartbeat leaves the row for another runner, which may still
+            # apply the very work the sender was told to send again.
+            if (
+                terminal_client_message is not None
+                and outcome.persisted
+                and outcome.terminal
+            ):
+                await notify_terminal_task_command(command, terminal_client_message)
         return True
 
 

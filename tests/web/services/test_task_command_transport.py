@@ -45,6 +45,7 @@ from xagent.web.services.task_command_transport import (
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
+    CommandDispositionResult,
     TaskCommandConflictKind,
     TaskCommandDeferred,
     TaskCommandKind,
@@ -64,6 +65,7 @@ from xagent.web.services.task_command_transport import (
     notify_task_command_dispatcher,
     renew_task_command_claim,
     retry_failed_task_command,
+    set_terminal_command_notifier,
     stage_task_command,
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
@@ -607,14 +609,19 @@ async def test_final_command_deferral_is_broadcast(db_session) -> None:
         defer_count=MAX_COMMAND_DEFERS - 1,
     )
 
+    # The executor only marks the text. Emitting it here would claim the
+    # command is finished before the row says so, and a claim lost to another
+    # runner still gets retried.
     with patch.object(
         websocket_api.manager,
         "broadcast_to_task",
         new=AsyncMock(),
     ) as broadcast:
-        with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        with pytest.raises(TaskCommandDeferred, match="active task lease owner") as exc:
             await execute_durable_task_command(command)
-        broadcast.assert_awaited_once()
+        broadcast.assert_not_awaited()
+    assert exc.value.terminal_client_message is not None
+    assert "active task lease owner" in exc.value.terminal_client_message
 
 
 @pytest.mark.asyncio
@@ -849,7 +856,7 @@ async def test_real_failures_use_a_separate_bounded_budget(db_session) -> None:
     row.failure_count = MAX_COMMAND_FAILURES - 1
     db_session.commit()
 
-    assert fail_task_command(command.command_id, "runner-a", "still broken") is True
+    assert fail_task_command(command.command_id, "runner-a", "still broken")
     db_session.expire_all()
     row = db_session.get(TaskExecutionCommand, command.command_id)
     assert row is not None
@@ -2827,7 +2834,7 @@ def test_deferral_reschedules_on_the_fixed_window(db_session) -> None:
     assert stored.status == COMMAND_PENDING
     assert stored.defer_count == 1
     delay = (stored.claim_expires_at - before).total_seconds()
-    assert 0 < delay <= COMMAND_DEFER_RETRY_SECONDS + 0.5
+    assert delay == pytest.approx(COMMAND_DEFER_RETRY_SECONDS, abs=0.2)
     assert (
         claim_task_command(
             db_session,
@@ -2855,3 +2862,86 @@ def test_exhausted_deferral_budget_clears_the_reschedule(db_session) -> None:
     assert stored.status == COMMAND_FAILED
     assert stored.claim_expires_at is None
     assert "exceeded retry budget" in stored.error
+
+
+@pytest.mark.asyncio
+async def test_terminal_notice_waits_for_the_confirmed_write(db_session) -> None:
+    """Telling a sender their command is finished must not outrun the row.
+
+    ``fail_task_command`` returns False on a lost claim, and the heartbeat path
+    can skip the write entirely -- either way another runner reclaims and may
+    still apply the work. A notice sent before the write can therefore be
+    contradicted by the command succeeding.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="terminal-notice",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    notices: list[tuple[str, str]] = []
+
+    async def notifier(command: ClaimedTaskCommand, message: str) -> None:
+        notices.append((command.command_id, message))
+
+    async def execute(_command: ClaimedTaskCommand) -> None:
+        exc = TaskCommandRejected("run rotated", reason="stale_run")
+        exc.terminal_client_message = "this command was not applied"
+        raise exc
+
+    set_terminal_command_notifier(notifier)
+    try:
+        assert await dispatch_one_task_command(
+            execute,
+            command_db_id=enqueued.command_id,
+        )
+        assert notices == [("terminal-notice", "this command was not applied")]
+
+        # A disposition that could not land must stay silent: the command is
+        # left for another runner rather than finished.
+        notices.clear()
+        db_session.expire_all()
+        assert retry_failed_task_command(db_session, enqueued.command_id)
+        with patch.object(
+            task_command_transport_module,
+            "fail_task_command",
+            return_value=CommandDispositionResult(persisted=False),
+        ):
+            assert await dispatch_one_task_command(
+                execute,
+                command_db_id=enqueued.command_id,
+            )
+        assert notices == []
+    finally:
+        set_terminal_command_notifier(None)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_contention_records_that_a_resend_is_safe(db_session) -> None:
+    """A polling client cannot see the live notice, so the row has to say it."""
+
+    command_db_id = _deferred_command(db_session, "resend-safe-row")
+    db_session.query(TaskExecutionCommand).filter(
+        TaskExecutionCommand.id == command_db_id
+    ).update({TaskExecutionCommand.defer_count: MAX_COMMAND_DEFERS - 1})
+    db_session.commit()
+
+    assert defer_task_command(
+        command_db_id,
+        "runner-a",
+        "resume slot held",
+        resend_safe=True,
+    ).terminal
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, command_db_id)
+    assert stored is not None
+    assert stored.status == COMMAND_FAILED
+    assert stored.result == {"resend_safe": True}
