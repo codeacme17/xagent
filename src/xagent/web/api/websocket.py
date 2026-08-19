@@ -129,7 +129,6 @@ from ..services.hot_path_cache import (
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
-    MAX_COMMAND_DEFER_RETRY_SECONDS,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
@@ -138,7 +137,6 @@ from ..services.task_command_transport import (
     TaskCommandKind,
     TaskCommandRejected,
     TaskCommandTaskMissing,
-    contended_defer_retry_seconds,
     dispatch_task_command_promptly,
     enqueue_task_command,
     task_has_live_foreign_runner,
@@ -3878,7 +3876,7 @@ class BackgroundTaskCancelOutcome:
     requested: bool
 
 
-class ResumeReservationOutcome(str, enum.Enum):
+class ResumeReservationOutcome(enum.Enum):
     """Result of trying to take the single live-control resume slot."""
 
     RESERVED = "reserved"
@@ -3886,32 +3884,37 @@ class ResumeReservationOutcome(str, enum.Enum):
     # coordinator yet. This window is short and always self-clearing.
     RESERVATION_HELD = "reservation_held"
     # A resume coordinator is already running for this task. It lasts as long
-    # as the execution does, so waiting for it is not a bounded retry.
+    # as the execution does, so waiting for it is not a bounded retry. The
+    # coordinator may also be mid-flight applying this very turn, so nothing
+    # here may tell the sender their message was dropped.
     COORDINATOR_RUNNING = "coordinator_running"
-    # This process is draining. Another runner can take the work.
+    # This process is draining. Another runner can take the work. Only the
+    # legacy socket path observes this: the dispatcher is cancelled before
+    # ``BackgroundTaskManager.shutdown`` sets the flag, so a durable command
+    # is not executing by the time this becomes true.
     SHUTTING_DOWN = "shutting_down"
 
 
-# Contention that clears without anyone resending the message. Everything else
-# has to be reported to the sender.
-DEFERRABLE_RESUME_CONTENTION = frozenset(
-    {
-        ResumeReservationOutcome.RESERVATION_HELD,
-        ResumeReservationOutcome.SHUTTING_DOWN,
-    }
-)
-
-
 def _resume_contention_rejection(outcome: ResumeReservationOutcome) -> str:
-    """Name the cause the sender actually hit, and that nothing was applied."""
+    """Report the cause the sender hit, without inviting a duplicate send.
+
+    Only a lost reservation is safe to resend: it never reached an injection.
+    A running coordinator may be applying this same turn, and a resend would
+    inject a second copy into the run.
+    """
 
     if outcome is ResumeReservationOutcome.COORDINATOR_RUNNING:
         return (
-            "This task is already running, so your message was not applied. "
-            "Please send it again once the task is waiting for you."
+            "This task is still applying an earlier message. Please wait for "
+            "it to finish rather than sending again."
+        )
+    if outcome is ResumeReservationOutcome.SHUTTING_DOWN:
+        return (
+            "This server is restarting, so your message was not applied. "
+            "Please send it again in a moment."
         )
     return (
-        "The task is busy applying an earlier message, so your message was "
+        "The task is busy starting an earlier message, so your message was "
         "not applied. Please send it again."
     )
 
@@ -3928,9 +3931,7 @@ class BackgroundTaskManager:
         # too early creates a cycle: the original execution waits for the new
         # resume task while that resume task waits for the original execution.
         self.resume_tasks: Dict[int, asyncio.Task] = {}
-        # task_id -> monotonic timestamp the reservation was taken, so a
-        # caller that defers on contention can report the holder's age.
-        self._resume_reservations: Dict[int, float] = {}
+        self._resume_reservations: set[int] = set()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -3996,7 +3997,7 @@ class BackgroundTaskManager:
         existing = self.resume_tasks.get(task_id)
         if existing is not None and not existing.done():
             return ResumeReservationOutcome.COORDINATOR_RUNNING
-        self._resume_reservations[task_id] = time.monotonic()
+        self._resume_reservations.add(task_id)
         return ResumeReservationOutcome.RESERVED
 
     def reserve_resume(self, task_id: int) -> bool:
@@ -4004,28 +4005,20 @@ class BackgroundTaskManager:
 
         return self.try_reserve_resume(task_id) is ResumeReservationOutcome.RESERVED
 
-    def resume_reservation_age(self, task_id: int) -> float | None:
-        """Seconds the current reservation has been held, for logging only."""
-
-        reserved_at = self._resume_reservations.get(task_id)
-        if reserved_at is None:
-            return None
-        return max(time.monotonic() - reserved_at, 0.0)
-
     def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
-        self._resume_reservations.pop(task_id, None)
+        self._resume_reservations.discard(task_id)
         self.resume_tasks[task_id] = task
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:
         if self._shutting_down:
             return
-        self._resume_reservations.pop(task_id, None)
+        self._resume_reservations.discard(task_id)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4104,7 +4097,7 @@ class BackgroundTaskManager:
         if not self._shutting_down:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
-            self._resume_reservations.pop(task_id, None)
+            self._resume_reservations.discard(task_id)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -5966,39 +5959,29 @@ async def _handle_chat_message_unserialized(
                 assert agent_service is not None
                 reservation = background_task_manager.try_reserve_resume(task_id)
                 if reservation is not ResumeReservationOutcome.RESERVED:
-                    if (
-                        suppress_delivery_ack
-                        and reservation in DEFERRABLE_RESUME_CONTENTION
-                    ):
+                    deferrable = reservation in (
+                        ResumeReservationOutcome.RESERVATION_HELD,
+                        ResumeReservationOutcome.SHUTTING_DOWN,
+                    )
+                    if suppress_delivery_ack and deferrable:
                         # The durable command owns the retry here. Failing the
                         # delivery would burn the whole budget inside seconds
                         # over a condition that clears on its own, and nothing
-                        # would ever re-dispatch the message.
-                        holder_age = background_task_manager.resume_reservation_age(
-                            task_id
-                        )
+                        # would ever re-dispatch the message. Neither cause
+                        # reached an injection, so the message is safe to
+                        # resend if the budget does run out.
                         logger.info(
                             "Deferring message %s for task %s: resume slot "
-                            "unavailable (%s), holder age %s",
+                            "unavailable (%s)",
                             turn_id,
                             task_id,
                             reservation.value,
-                            "unknown" if holder_age is None else f"{holder_age:.1f}s",
                         )
                         message_data["_durable_command_defer"] = turn_id
                         message_data["_durable_command_defer_reason"] = (
                             f"Message {turn_id} is waiting for the live-control "
                             f"resume slot ({reservation.value})"
                         )
-                        if reservation is ResumeReservationOutcome.SHUTTING_DOWN:
-                            # This process will not free the slot at all, so
-                            # ramping up from a short retry only spends claims
-                            # that keep the task's later commands queued behind
-                            # this one. Wait the full window and let the next
-                            # runner take it.
-                            message_data["_durable_command_defer_after"] = (
-                                MAX_COMMAND_DEFER_RETRY_SECONDS
-                            )
                         return
                     await finish_delivery(
                         False,
@@ -8233,21 +8216,16 @@ async def _execute_durable_task_command(
         )
         if message_data.get("_durable_command_defer") == command.command_id:
             # Resume-slot contention is transient, so it reschedules instead of
-            # spending the failure budget. Unless the handler asked for a
-            # specific window, the wait grows with each deferral because a live
-            # holder does not clear within one re-poll.
-            requested_defer_after = message_data.get("_durable_command_defer_after")
+            # spending the failure budget. The handler only defers on causes
+            # that never reached an injection, which is what makes a resend
+            # safe if the budget is exhausted.
             raise TaskCommandDeferred(
                 str(
                     message_data.get("_durable_command_defer_reason")
                     or f"Message {command.command_id} is waiting for the "
                     "live-control resume slot"
                 ),
-                retry_after_seconds=(
-                    float(requested_defer_after)
-                    if isinstance(requested_defer_after, (int, float))
-                    else contended_defer_retry_seconds(command.defer_count)
-                ),
+                resend_safe=True,
             )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise TaskCommandDeferred(
@@ -8335,7 +8313,7 @@ async def _execute_durable_task_command(
 
 async def _broadcast_terminal_command_error(
     command: ClaimedTaskCommand,
-    error: BaseException,
+    error: BaseException | str,
 ) -> None:
     await manager.broadcast_to_task(
         {
@@ -8352,17 +8330,18 @@ async def _broadcast_terminal_command_error(
 def _exhausted_deferral_error(
     command: ClaimedTaskCommand,
     exc: TaskCommandDeferred,
-) -> BaseException:
+) -> BaseException | str:
     """Report the last deferral as a drop, not as something still pending.
 
-    The deferral reason describes a wait, which is the wrong thing to show
-    once the budget is gone: the sender saw their message accepted, no
-    transcript row was ever written for it, and only a resend recovers it.
+    Only for a deferral that never reached an injection. A message can also
+    defer with its commit outcome unknown, or while an injection it already
+    started is in flight; telling that sender to resend would duplicate work
+    that is committed or on its way, since a resend mints a fresh id.
     """
 
-    if command.kind is not TaskCommandKind.MESSAGE:
+    if command.kind is not TaskCommandKind.MESSAGE or not exc.resend_safe:
         return exc
-    return TaskCommandDeferred(
+    return (
         "the task stayed busy for too long, so this message was not applied. "
         "Please send it again."
     )
@@ -8382,9 +8361,17 @@ async def execute_durable_task_command(
                 _exhausted_deferral_error(command, exc),
             )
         raise
-    except TaskCommandRejected:
-        # Rejections come from handlers that already expose their durable
-        # domain-level outcome. The dispatcher makes them terminal immediately.
+    except TaskCommandRejected as exc:
+        # Rejections are terminal on the first hit. On the durable path the
+        # handler's own reply never reaches the client -- ``finish_delivery``
+        # suppresses the socket send once the enqueue already acked -- so
+        # without this the sender is left with a message that silently never
+        # applied. This does not re-enable a submitted clarification form on
+        # its own; that needs a pushed task-status event (see the follow-up
+        # issue) because the frontend drops a late rejection for an id it has
+        # already resolved.
+        if command.kind is TaskCommandKind.MESSAGE:
+            await _broadcast_terminal_command_error(command, exc)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:

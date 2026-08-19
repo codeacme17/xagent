@@ -48,12 +48,11 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
 MAX_COMMAND_DEFERS = 60
-# Most deferrals re-poll a handoff that is expected to settle immediately, and
-# a deferred command blocks every later command for the same task, so the
-# default reschedule stays tight. Sites that wait on a genuinely slower
-# condition pass their own backoff through ``TaskCommandDeferred``.
-DEFAULT_COMMAND_DEFER_RETRY_SECONDS = 1.0
-MAX_COMMAND_DEFER_RETRY_SECONDS = 30.0
+# A deferred command is non-terminal, and ``_unfinished_earlier_command`` blocks
+# every later command for the same task on it, so widening this reschedule
+# delays an unrelated pause or cancel behind a command that is only re-polling.
+# The A2A cancel route waits synchronously for 10s, which sets the ceiling.
+COMMAND_DEFER_RETRY_SECONDS = 1.0
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
 
@@ -78,19 +77,14 @@ class TaskCommandTaskMissing(ValueError):
 class TaskCommandDeferred(RuntimeError):
     """The command is durable but its downstream handoff is still pending.
 
-    ``retry_after_seconds`` lets a site that knows its wait is slower than a
-    re-poll widen its own reschedule without changing the cadence every other
-    deferral inherits.
+    ``resend_safe`` marks the deferrals whose work provably has not been
+    applied, so an exhausted budget can tell the sender to resend without
+    risking a duplicate of something already committed or in flight.
     """
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        retry_after_seconds: float | None = None,
-    ) -> None:
+    def __init__(self, message: str, *, resend_safe: bool = False) -> None:
         super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
+        self.resend_safe = resend_safe
 
 
 class TaskCommandRejected(RuntimeError):
@@ -851,42 +845,17 @@ def fail_task_command(
     return True
 
 
-def contended_defer_retry_seconds(defer_count: int) -> float:
-    """Back off like the failure path when a deferral waits on a live holder.
-
-    Contention clears on its own but not within a single re-poll, so the wait
-    grows instead of hammering the claim query every second.
-
-    The exponent needs no ceiling of its own: ``defer_count`` cannot exceed
-    ``MAX_COMMAND_DEFERS`` because the deferral above that is terminal, so the
-    largest power reached is small, and clamping it against a literal would
-    stop the window tracking ``MAX_COMMAND_DEFER_RETRY_SECONDS`` if that cap
-    is ever raised.
-    """
-
-    return float(min(2 ** max(defer_count + 1, 1), MAX_COMMAND_DEFER_RETRY_SECONDS))
-
-
 def defer_task_command(
     command_db_id: int,
     runner_id: str,
     reason: str,
     *,
     expected_attempt_count: int | None = None,
-    retry_after_seconds: float | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
     from ..models.database import get_session_local
 
-    retry_after = (
-        DEFAULT_COMMAND_DEFER_RETRY_SECONDS
-        if retry_after_seconds is None
-        else min(
-            max(float(retry_after_seconds), DEFAULT_COMMAND_DEFER_RETRY_SECONDS),
-            MAX_COMMAND_DEFER_RETRY_SECONDS,
-        )
-    )
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
@@ -933,7 +902,9 @@ def defer_task_command(
                     ),
                     TaskExecutionCommand.claimed_by: None,
                     TaskExecutionCommand.claim_expires_at: (
-                        None if terminal else now + timedelta(seconds=retry_after)
+                        None
+                        if terminal
+                        else now + timedelta(seconds=COMMAND_DEFER_RETRY_SECONDS)
                     ),
                     TaskExecutionCommand.updated_at: now,
                     TaskExecutionCommand.completed_at: now if terminal else None,
@@ -1095,7 +1066,6 @@ async def dispatch_one_task_command(
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
-        deferral_retry_after = exc.retry_after_seconds
 
         def persist_deferral() -> bool:
             return defer_task_command(
@@ -1103,7 +1073,6 @@ async def dispatch_one_task_command(
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
-                retry_after_seconds=deferral_retry_after,
             )
 
         disposition_name = "defer_task_command"

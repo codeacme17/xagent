@@ -8,8 +8,9 @@ ever re-dispatched it, so the task stayed in ``WAITING_FOR_USER`` with the
 pending tool call unrun (#1469).
 
 Contention is not one condition. A held reservation and a draining process both
-clear on their own; a running resume coordinator lasts as long as the execution
-does. Only the first two are worth waiting for.
+clear on their own and never reached an injection. A running resume coordinator
+lasts as long as the execution does, and may be applying this very turn, so it
+is neither deferrable nor safe to tell the sender to resend.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     BackgroundTaskManager,
     ResumeReservationOutcome,
@@ -32,12 +32,11 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_command_transport import (
-    MAX_COMMAND_DEFER_RETRY_SECONDS,
     MAX_COMMAND_DEFERS,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
-    contended_defer_retry_seconds,
+    TaskCommandRejected,
 )
 
 
@@ -81,13 +80,38 @@ def _live_task(db, owner_id: int) -> Task:
 def _contended_manager(outcome: ResumeReservationOutcome) -> MagicMock:
     bg_mgr = MagicMock()
     bg_mgr.try_reserve_resume.return_value = outcome
-    bg_mgr.resume_reservation_age.return_value = 3.5
     bg_mgr.running_tasks.get.return_value = None
     return bg_mgr
 
 
-async def _send_live_message(task: Task, owner: User, message_data: dict) -> MagicMock:
-    """Drive the handler down to the live-control branch and return ws manager."""
+def _message_command(
+    task: Task, owner: User, command_id: str, **kwargs
+) -> ClaimedTaskCommand:
+    return ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=command_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload={"type": "chat_message", "client_message_id": command_id},
+        target_run_id="live-run",
+        attempt_count=kwargs.pop("attempt_count", 1),
+        **kwargs,
+    )
+
+
+def _durable_payload(owner: User, turn_id: str) -> dict:
+    return {
+        "message": "here is the form response",
+        "client_message_id": turn_id,
+        "user": owner,
+        "files": [],
+        "_durable_ack_sent": True,
+    }
+
+
+async def _send_live_message(task: Task, message_data: dict) -> MagicMock:
+    """Drive the handler down to the live-control branch; return the ws manager."""
 
     agent = MagicMock()
     agent.supports_live_control.return_value = True
@@ -118,8 +142,6 @@ async def test_try_reserve_resume_separates_the_three_contention_causes() -> Non
     manager = BackgroundTaskManager()
 
     assert manager.try_reserve_resume(1) is ResumeReservationOutcome.RESERVED
-    age = manager.resume_reservation_age(1)
-    assert age is not None and age >= 0.0
 
     # Held by an injection that has not registered its coordinator yet.
     assert manager.try_reserve_resume(1) is ResumeReservationOutcome.RESERVATION_HELD
@@ -129,8 +151,6 @@ async def test_try_reserve_resume_separates_the_three_contention_causes() -> Non
     coordinator = asyncio.ensure_future(running)
     try:
         manager.register_reserved_resume(1, coordinator)
-        # The reservation is consumed, so there is no holder age to report.
-        assert manager.resume_reservation_age(1) is None
         assert (
             manager.try_reserve_resume(1)
             is ResumeReservationOutcome.COORDINATOR_RUNNING
@@ -144,26 +164,28 @@ async def test_try_reserve_resume_separates_the_three_contention_causes() -> Non
 
 
 @pytest.mark.asyncio
-async def test_held_reservation_defers_the_durable_message_instead_of_failing_it(
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        ResumeReservationOutcome.RESERVATION_HELD,
+        ResumeReservationOutcome.SHUTTING_DOWN,
+    ],
+)
+async def test_self_clearing_contention_defers_the_durable_message(
     db_session,
+    outcome: ResumeReservationOutcome,
 ) -> None:
     """The #1469 regression: a transient hold must not burn the failure budget."""
 
-    owner = _user(db_session, "contention-owner")
+    owner = _user(db_session, f"contention-owner-{outcome.value}")
     task = _live_task(db_session, int(owner.id))
-    message_data = {
-        "message": "here is the form response",
-        "client_message_id": "form-turn",
-        "user": owner,
-        "files": [],
-        "_durable_ack_sent": True,
-    }
+    message_data = _durable_payload(owner, "form-turn")
 
     with patch(
         "xagent.web.api.websocket.background_task_manager",
-        _contended_manager(ResumeReservationOutcome.RESERVATION_HELD),
+        _contended_manager(outcome),
     ):
-        ws_manager = await _send_live_message(task, owner, message_data)
+        ws_manager = await _send_live_message(task, message_data)
 
     assert message_data["_durable_command_defer"] == "form-turn"
     # A durable error is what made the command terminal within seconds.
@@ -176,54 +198,103 @@ async def test_held_reservation_defers_the_durable_message_instead_of_failing_it
 
 
 @pytest.mark.asyncio
-async def test_a_draining_process_defers_so_another_runner_can_take_the_message(
+async def test_a_contended_message_defers_through_the_real_executor(
     db_session,
 ) -> None:
-    owner = _user(db_session, "draining-owner")
+    """Handler and executor wired together, rather than each mocking the other."""
+
+    owner = _user(db_session, "integration-owner")
     task = _live_task(db_session, int(owner.id))
-    message_data = {
-        "message": "sent while this process drains",
-        "client_message_id": "drain-turn",
-        "user": owner,
-        "files": [],
-        "_durable_ack_sent": True,
-    }
+    command = _message_command(task, owner, "form-turn")
+    command.payload.update(
+        {"message": "here is the form response", "files": [], "_durable_ack_sent": True}
+    )
 
-    with patch(
-        "xagent.web.api.websocket.background_task_manager",
-        _contended_manager(ResumeReservationOutcome.SHUTTING_DOWN),
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch(
+            "xagent.web.api.websocket.manager",
+            MagicMock(
+                broadcast_to_task=AsyncMock(),
+                send_personal_message=AsyncMock(),
+                connections_for_task=MagicMock(return_value=[SimpleNamespace()]),
+            ),
+        ),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch(
+            "xagent.web.api.websocket.background_task_manager",
+            _contended_manager(ResumeReservationOutcome.RESERVATION_HELD),
+        ),
+        pytest.raises(TaskCommandDeferred) as exc_info,
     ):
-        await _send_live_message(task, owner, message_data)
+        await _execute_durable_task_command(command)
 
-    assert message_data["_durable_command_defer"] == "drain-turn"
-    assert "_durable_command_error" not in message_data
+    assert "resume slot" in str(exc_info.value)
+    # Nothing was injected, so an exhausted budget may ask for a resend.
+    assert exc_info.value.resend_safe is True
+    agent.post_user_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_running_coordinator_still_rejects_and_says_it_was_not_applied(
+async def test_a_running_coordinator_is_rejected_without_inviting_a_resend(
     db_session,
 ) -> None:
-    """Waiting on a live execution is not a bounded retry, so the sender is told."""
+    """The coordinator may be applying this same turn, so a resend duplicates."""
 
     owner = _user(db_session, "coordinator-owner")
     task = _live_task(db_session, int(owner.id))
-    message_data = {
-        "message": "arrives mid-execution",
-        "client_message_id": "late-turn",
-        "user": owner,
-        "files": [],
-        "_durable_ack_sent": True,
-    }
+    message_data = _durable_payload(owner, "late-turn")
 
     with patch(
         "xagent.web.api.websocket.background_task_manager",
         _contended_manager(ResumeReservationOutcome.COORDINATOR_RUNNING),
     ):
-        await _send_live_message(task, owner, message_data)
+        await _send_live_message(task, message_data)
 
     assert "_durable_command_defer" not in message_data
-    assert "was not applied" in message_data["_durable_command_error"]
-    assert "already running" in message_data["_durable_command_error"]
+    error = message_data["_durable_command_error"]
+    assert "still applying an earlier message" in error
+    assert "rather than sending again" in error
+    assert "was not applied" not in error
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_message_is_broadcast_instead_of_failing_silently(
+    db_session,
+) -> None:
+    """The handler's own reply cannot reach the client on the durable path.
+
+    ``finish_delivery`` suppresses the socket send once the enqueue acked, so
+    without a broadcast the sender is left with a message that never applied
+    and no signal at all.
+    """
+
+    owner = _user(db_session, "silent-reject-owner")
+    task = _live_task(db_session, int(owner.id))
+    command = _message_command(task, owner, "rejected-message")
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.api.websocket._execute_durable_task_command",
+            new=AsyncMock(side_effect=TaskCommandRejected("could not be applied")),
+        ),
+        pytest.raises(TaskCommandRejected),
+    ):
+        await execute_durable_task_command(command)
+
+    broadcast = ws_manager.broadcast_to_task.await_args.args[0]
+    assert broadcast["type"] == "agent_error"
+    assert "could not be applied" in broadcast["message"]
 
 
 @pytest.mark.asyncio
@@ -245,7 +316,7 @@ async def test_a_message_without_a_durable_command_is_rejected_not_deferred(
         "xagent.web.api.websocket.background_task_manager",
         _contended_manager(ResumeReservationOutcome.RESERVATION_HELD),
     ):
-        ws_manager = await _send_live_message(task, owner, message_data)
+        ws_manager = await _send_live_message(task, message_data)
 
     assert "_durable_command_defer" not in message_data
     rejections = [
@@ -255,130 +326,111 @@ async def test_a_message_without_a_durable_command_is_rejected_not_deferred(
     ]
     assert len(rejections) == 1
     assert rejections[0]["rejection_outcome"] == "not_accepted"
-    assert "was not applied" in rejections[0]["message"]
-    # Nothing is running yet -- only a held reservation, so saying the task is
-    # already running would name the wrong cause.
-    assert "busy applying an earlier message" in rejections[0]["message"]
+    # Nothing is running yet -- only a held reservation, so naming a running
+    # task would report the wrong cause.
+    assert "busy starting an earlier message" in rejections[0]["message"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("defer_count", [0, 1, 4, 20])
-async def test_the_executor_reschedules_a_contended_message_with_backoff(
-    db_session,
-    defer_count: int,
-) -> None:
-    owner = _user(db_session, f"executor-owner-{defer_count}")
-    task = _live_task(db_session, int(owner.id))
-    command = ClaimedTaskCommand(
-        id=1,
-        task_id=int(task.id),
-        actor_user_id=int(owner.id),
-        command_id="contended-message",
-        kind=TaskCommandKind.MESSAGE,
-        payload={"type": "chat_message", "client_message_id": "contended-message"},
-        target_run_id="live-run",
-        attempt_count=defer_count + 1,
-        defer_count=defer_count,
-    )
-
-    async def mark_deferred(_websocket, _task_id, message_data: dict) -> None:
-        message_data["_durable_command_defer"] = "contended-message"
-        message_data["_durable_command_defer_reason"] = "resume slot held"
-
-    with (
-        patch.object(
-            websocket_api.manager,
-            "connections_for_task",
-            return_value=[SimpleNamespace()],
-        ),
-        patch(
-            "xagent.web.api.websocket._handle_chat_message_unserialized",
-            new=AsyncMock(side_effect=mark_deferred),
-        ),
-        pytest.raises(TaskCommandDeferred) as exc_info,
-    ):
-        await _execute_durable_task_command(command)
-
-    assert "resume slot held" in str(exc_info.value)
-    assert exc_info.value.retry_after_seconds == contended_defer_retry_seconds(
-        defer_count
-    )
-    # The wait grows with each deferral rather than re-polling every second.
-    assert contended_defer_retry_seconds(defer_count) >= 2.0
-    assert contended_defer_retry_seconds(defer_count) <= 30.0
-
-
-@pytest.mark.asyncio
-async def test_a_draining_process_waits_the_full_window_before_retrying(
+async def test_a_draining_process_tells_the_legacy_sender_to_retry_shortly(
     db_session,
 ) -> None:
-    """Ramping up from a short retry only queues the task's later commands."""
-
-    owner = _user(db_session, "drain-window-owner")
+    owner = _user(db_session, "draining-legacy-owner")
     task = _live_task(db_session, int(owner.id))
     message_data = {
         "message": "sent while this process drains",
-        "client_message_id": "drain-window-turn",
+        "client_message_id": "drain-turn",
         "user": owner,
         "files": [],
-        "_durable_ack_sent": True,
     }
 
     with patch(
         "xagent.web.api.websocket.background_task_manager",
         _contended_manager(ResumeReservationOutcome.SHUTTING_DOWN),
     ):
-        await _send_live_message(task, owner, message_data)
+        ws_manager = await _send_live_message(task, message_data)
 
-    assert (
-        message_data["_durable_command_defer_after"] == MAX_COMMAND_DEFER_RETRY_SECONDS
+    rejection = next(
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
     )
-
-    command = ClaimedTaskCommand(
-        id=1,
-        task_id=int(task.id),
-        actor_user_id=int(owner.id),
-        command_id="drain-window-turn",
-        kind=TaskCommandKind.MESSAGE,
-        payload=dict(message_data),
-        target_run_id="live-run",
-        attempt_count=1,
-    )
-
-    with (
-        patch.object(
-            websocket_api.manager,
-            "connections_for_task",
-            return_value=[SimpleNamespace()],
-        ),
-        patch(
-            "xagent.web.api.websocket._handle_chat_message_unserialized",
-            new=AsyncMock(),
-        ),
-        pytest.raises(TaskCommandDeferred) as exc_info,
-    ):
-        await _execute_durable_task_command(command)
-
-    assert exc_info.value.retry_after_seconds == MAX_COMMAND_DEFER_RETRY_SECONDS
+    assert "server is restarting" in rejection["message"]
 
 
 @pytest.mark.asyncio
-async def test_the_last_deferral_tells_the_sender_the_message_was_dropped(
+async def test_only_a_resend_safe_deferral_asks_the_sender_to_resend(
     db_session,
 ) -> None:
-    """A wait is the wrong thing to report once nothing will retry again."""
+    """A message can also defer while an injection it started is in flight.
+
+    Telling that sender to resend would duplicate work already on its way,
+    because a resend mints a fresh id rather than matching the pending one.
+    """
 
     owner = _user(db_session, "exhausted-owner")
+    task = _live_task(db_session, int(owner.id))
+
+    async def broadcast_for(exc: TaskCommandDeferred, **overrides) -> str:
+        command = _message_command(
+            task,
+            owner,
+            "exhausted-message",
+            defer_count=overrides.pop("defer_count", MAX_COMMAND_DEFERS - 1),
+        )
+        ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+        with (
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket._execute_durable_task_command",
+                new=AsyncMock(side_effect=exc),
+            ),
+            pytest.raises(TaskCommandDeferred),
+        ):
+            await execute_durable_task_command(command)
+        if not ws_manager.broadcast_to_task.await_args_list:
+            return ""
+        return str(ws_manager.broadcast_to_task.await_args.args[0]["message"])
+
+    resend_safe = await broadcast_for(
+        TaskCommandDeferred("resume slot held", resend_safe=True)
+    )
+    assert "was not applied" in resend_safe
+    assert "Please send it again" in resend_safe
+    # The internal wait reason must not be what the sender is left with.
+    assert "resume slot held" not in resend_safe
+
+    in_flight = await broadcast_for(TaskCommandDeferred("waiting for injection"))
+    assert "waiting for injection" in in_flight
+    assert "send it again" not in in_flight
+
+    # Below the budget nothing is terminal yet, so nothing is broadcast.
+    assert (
+        await broadcast_for(
+            TaskCommandDeferred("resume slot held", resend_safe=True),
+            defer_count=0,
+        )
+        == ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_non_message_deferral_keeps_its_own_exhaustion_text(
+    db_session,
+) -> None:
+    """Only a message send has a resend for the sender to perform."""
+
+    owner = _user(db_session, "pause-exhausted-owner")
     task = _live_task(db_session, int(owner.id))
     command = ClaimedTaskCommand(
         id=1,
         task_id=int(task.id),
         actor_user_id=int(owner.id),
-        command_id="exhausted-message",
-        kind=TaskCommandKind.MESSAGE,
-        payload={"type": "chat_message", "client_message_id": "exhausted-message"},
+        command_id="pause-command",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
         target_run_id="live-run",
-        attempt_count=MAX_COMMAND_DEFERS,
+        attempt_count=1,
         defer_count=MAX_COMMAND_DEFERS - 1,
     )
     ws_manager = MagicMock(broadcast_to_task=AsyncMock())
@@ -387,15 +439,14 @@ async def test_the_last_deferral_tells_the_sender_the_message_was_dropped(
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.api.websocket._execute_durable_task_command",
-            new=AsyncMock(side_effect=TaskCommandDeferred("resume slot held")),
+            new=AsyncMock(
+                side_effect=TaskCommandDeferred("waiting for the lease owner")
+            ),
         ),
         pytest.raises(TaskCommandDeferred),
     ):
         await execute_durable_task_command(command)
 
     broadcast = ws_manager.broadcast_to_task.await_args.args[0]
-    assert broadcast["type"] == "agent_error"
-    assert "was not applied" in broadcast["message"]
-    assert "Please send it again" in broadcast["message"]
-    # The internal wait reason must not be what the sender is left with.
-    assert "resume slot held" not in broadcast["message"]
+    assert "waiting for the lease owner" in broadcast["message"]
+    assert "send it again" not in broadcast["message"]
