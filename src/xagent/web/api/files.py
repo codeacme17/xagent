@@ -499,6 +499,7 @@ async def store_uploaded_files(
     previews: dict[str, Any] = {}
     completed = False
     durable_storage_refused = False
+    registrations_rolled_back = False
 
     try:
         # Off-turn (this runs outside the ExecutionScopeContext/
@@ -617,6 +618,7 @@ async def store_uploaded_files(
         if not completed:
 
             async def _cleanup() -> None:
+                nonlocal registrations_rolled_back
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: compensate_registered_uploads_sync(
@@ -626,6 +628,7 @@ async def store_uploaded_files(
                             )
                         )
                     )
+                    registrations_rolled_back = True
                 finally:
 
                     def _delete_local_paths() -> None:
@@ -638,13 +641,11 @@ async def store_uploaded_files(
                     await drain_async_task_cancellation_safe(cleanup_worker)
 
             cleanup_task = asyncio.create_task(_cleanup())
-            compensated = True
             try:
                 await drain_async_task_cancellation_safe(cleanup_task)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                compensated = False
                 logger.exception("Failed to compensate cancelled/failed upload")
 
             # 503 is the client's licence to replay the whole batch, so it may
@@ -652,7 +653,11 @@ async def store_uploaded_files(
             # failed rollback to an unknown outcome keeps a retry from
             # duplicating whatever survived. Other in-flight failures keep
             # their own status: they are not statuses the client replays.
-            if durable_storage_refused and not compensated:
+            #
+            # Only the *registration* rollback decides this. A staged temp file
+            # that could not be unlinked leaves no row for a retry to
+            # duplicate, so it must not cost the client its replay.
+            if durable_storage_refused and not registrations_rolled_back:
                 raise _durable_storage_outcome_unknown()
 
     if single_file_mode:

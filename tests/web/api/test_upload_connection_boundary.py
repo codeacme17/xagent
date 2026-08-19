@@ -990,8 +990,16 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("compensation_fails", "expected_status"),
-    [(False, 503), (True, 500)],
+    ("compensation_fails", "expected_status", "expected_detail"),
+    [
+        (False, 503, "Durable storage is temporarily unavailable"),
+        (
+            True,
+            500,
+            "The upload could not be completed or rolled back. "
+            "Refresh the conversation before trying again.",
+        ),
+    ],
     ids=["compensated", "compensation-failed"],
 )
 async def test_durable_storage_503_only_escapes_when_rollback_succeeded(
@@ -999,6 +1007,7 @@ async def test_durable_storage_503_only_escapes_when_rollback_succeeded(
     isolated_upload_storage,
     compensation_fails: bool,
     expected_status: int,
+    expected_detail: str,
 ) -> None:
     """Clients replay 503, so it may only mean "nothing was retained".
 
@@ -1040,3 +1049,101 @@ async def test_durable_storage_503_only_escapes_when_rollback_succeeded(
         )
 
     assert raised.value.status_code == expected_status
+    # The client shows this detail verbatim, so it is part of the contract.
+    assert raised.value.detail == expected_detail
+
+
+@pytest.mark.asyncio
+async def test_failed_compensation_alone_does_not_rewrite_another_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+) -> None:
+    """The downgrade is for the replayable status only.
+
+    A failure the client never replays keeps its own error even when the
+    rollback also fails - otherwise every failed cleanup would masquerade as
+    an unknown *upload* outcome.
+    """
+    _upload_root, _object_root = isolated_upload_storage
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+    finally:
+        db.close()
+
+    def fail_registration(_registrations) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("registration failed")
+
+    def fail_compensation(_claims) -> None:  # type: ignore[no-untyped-def]
+        raise DurableStorageOperationError("storage cleanup unavailable")
+
+    monkeypatch.setattr(files_api, "register_local_uploads_sync", fail_registration)
+    monkeypatch.setattr(
+        files_api, "compensate_registered_uploads_sync", fail_compensation
+    )
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(
+                    filename="unrelated-failure.txt",
+                    file=io.BytesIO(b"payload"),
+                    headers={"content-type": "text/plain"},
+                )
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_unlinkable_staged_file_does_not_cost_the_client_its_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+) -> None:
+    """A staged temp file leaves no row, so failing to unlink it is not doubt.
+
+    Only the registration rollback decides whether 503 may escape; conflating
+    the two would tell a visitor to reload over an orphaned temp file.
+    """
+    _upload_root, _object_root = isolated_upload_storage
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+    finally:
+        db.close()
+
+    def fail_registration(_registrations) -> None:  # type: ignore[no-untyped-def]
+        raise DurableStorageOperationError("durable write unavailable")
+
+    def fail_delete(_path) -> None:  # type: ignore[no-untyped-def]
+        raise OSError("device busy")
+
+    monkeypatch.setattr(files_api, "register_local_uploads_sync", fail_registration)
+    monkeypatch.setattr(
+        files_api, "compensate_registered_uploads_sync", lambda _claims: None
+    )
+    monkeypatch.setattr(files_api, "_delete_staged_upload", fail_delete)
+
+    with pytest.raises(HTTPException) as raised:
+        await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(
+                    filename="unlinkable.txt",
+                    file=io.BytesIO(b"payload"),
+                    headers={"content-type": "text/plain"},
+                )
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+
+    assert raised.value.status_code == 503
