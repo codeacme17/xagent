@@ -3766,8 +3766,16 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
     ``str(exc)`` -- whose wrap text is
     ``Failed to restore durable object: users/<id>/uploads/...``, embedding the
     owning user's id. Same defect as the model-facing leak in #1467, one
-    transport over, which is why the invariant is asserted per egress: frame,
-    persisted rejection, and broadcast.
+    transport over.
+
+    What this proves is the *rejection frame*: it asserts one was sent, so the
+    negative assertions below cannot pass over an empty list. The broadcast
+    assertion is defence in depth -- this path does not broadcast, so it holds
+    vacuously and exists to fail if a future edit starts. The persisted
+    rejection is not reached: ``finish_delivery_failure`` only writes when
+    ``delivery_claimed`` is set, and that comes from
+    ``preparation.delivery_claimed``, which never gets assigned when preparation
+    is what raised. Do not read this test as covering all three egresses.
     """
     import logging
 
@@ -3817,10 +3825,16 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
                 },
             )
 
+    # The rejection frame must actually have gone out, or every negative
+    # assertion below would hold over nothing and this test would pass while
+    # answering the client with anything at all.
+    frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
+    assert any("message_rejected" in frame for frame in frames), frames
+
     # Every outbound egress: nothing may carry the key or the provider text.
-    outbound = [
-        str(call) for call in ws_manager.send_personal_message.await_args_list
-    ] + [str(call) for call in ws_manager.broadcast_to_task.await_args_list]
+    outbound = frames + [
+        str(call) for call in ws_manager.broadcast_to_task.await_args_list
+    ]
     for payload in outbound:
         assert storage_key not in payload
         assert f"users/{owner_id}" not in payload

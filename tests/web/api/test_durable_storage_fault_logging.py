@@ -92,6 +92,20 @@ class _ProviderThrottled(RuntimeError):
     """Stand-in for the boto/S3 error class the wrap discards."""
 
 
+class _HostileProviderError(RuntimeError):
+    """A provider exception whose non-dunder attribute reads raise.
+
+    Dunder lookups are left alone so ``traceback`` can still render the object;
+    the point is only that reading an attribute the helper invents is not safe
+    on a foreign exception.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise RuntimeError(f"attribute access is not supported: {name}")
+
+
 def _wrapped_fault() -> DurableStorageOperationError:
     """Build a fault shaped exactly like ``ManagedFileRef``'s wraps.
 
@@ -211,6 +225,33 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
     _assert_cause_chain_recorded(rendered, wrap_message=False)
 
 
+def test_a_provider_exception_that_rejects_attribute_reads_is_still_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The one-record-per-fault marker must not become the outcome.
+
+    Pairs with the test above: because the delete path hands over an unwrapped
+    provider exception, ``exc`` can be a foreign object, and the marker read
+    ``getattr(exc, ..., False)`` absorbs ``AttributeError`` only. Anything else a
+    ``__getattr__`` raises would propagate out of the helper -- from inside an
+    ``except`` block -- replacing the intended 503-with-a-log with an unhandled
+    500 that loses the fault. That is #1467's own failure mode, reintroduced by
+    the code meant to report it.
+    """
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(
+                _HostileProviderError(_PROVIDER_MESSAGE),
+                "durable cleanup before row delete",
+                storage_key=_STORAGE_KEY,
+            )
+
+    assert raised.value.status_code == 503
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert _HostileProviderError.__name__ in rendered
+    assert _PROVIDER_MESSAGE in rendered
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_test_db")
 async def test_upload_durable_write_failure_logs_the_provider_cause(
@@ -319,6 +360,27 @@ _FAULT_SITES = (
 )
 
 
+def _identifiers(expression: ast.expr) -> set[str]:
+    """Every name and attribute the expression reads.
+
+    ``file_ref.record.file_id`` yields ``file_ref``, ``record`` and ``file_id``,
+    so a field may be bound to a bare variable or reached through attributes --
+    what it may not be is bound to something of an unrelated name.
+
+    This does make the field name part of the call site's vocabulary: a new site
+    whose source is spelled differently (``file_id=row.id``) has to read it
+    through a local of the field's own name. That is the point -- the alternative
+    is a check that cannot tell ``file_id=file_id`` from ``file_id=storage_key``.
+    """
+    found: set[str] = set()
+    for node in ast.walk(expression):
+        if isinstance(node, ast.Name):
+            found.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            found.add(node.attr)
+    return found
+
+
 def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
     """The nine labels are a closed set of bounded, aggregatable values.
 
@@ -351,11 +413,24 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
     assert passed == declared, f"labels drifted: {passed ^ declared}"
 
     for node in calls:
-        expected = dict(_FAULT_SITES)[node.args[1].value]
+        label = node.args[1].value
+        expected = dict(_FAULT_SITES)[label]
         assert tuple(kw.arg for kw in node.keywords) == expected, (
-            f"site {node.args[1].value!r} passes "
+            f"site {label!r} passes "
             f"{[kw.arg for kw in node.keywords]}, expected {list(expected)}"
         )
+        # Names alone are not the contract. ``file_id=storage_key`` declares the
+        # right field and renders the wrong value, which is invisible both here
+        # and to the sweep below -- that one supplies its own placeholder values
+        # and never reads the call site. Requiring the bound expression to read
+        # something of the same name is what ties the label to the variable.
+        for keyword in node.keywords:
+            assert keyword.arg is not None, f"site {label!r} uses **kwargs"
+            assert keyword.arg in _identifiers(keyword.value), (
+                f"site {label!r} binds {keyword.arg}= to "
+                f"{ast.unparse(keyword.value)!r}, which never reads "
+                f"{keyword.arg} -- the field name and the value must agree"
+            )
 
 
 @pytest.mark.parametrize(("label", "expected_fields"), _FAULT_SITES)

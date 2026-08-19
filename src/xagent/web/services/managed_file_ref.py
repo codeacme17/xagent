@@ -127,13 +127,22 @@ def log_durable_storage_fault(
     # cause twice. Marking the exception is what makes each arm safe to write
     # independently, instead of every new arm having to know which other arm
     # might already have run.
-    if getattr(exc, "_durable_fault_logged", False):
-        return
+    #
+    # Both the read and the write are best-effort, because ``exc`` is not always
+    # one of this module's wraps: the delete path hands over the raw provider
+    # exception. A foreign object may use ``__slots__`` and reject the mark, and
+    # its ``__getattr__`` may raise something ``getattr``'s default does not
+    # absorb -- the default covers ``AttributeError`` only. Neither may become
+    # the outcome: this runs inside an ``except`` block, so an exception escaping
+    # here replaces a handled 503-with-a-log with an unhandled 500 that loses the
+    # fault, which is #1467's own failure mode. Logging twice is strictly better.
+    # (A ``BaseException`` from the same read still escapes; widening these
+    # guards module-wide is #1517.)
     try:
+        if getattr(exc, "_durable_fault_logged", False):
+            return
         exc._durable_fault_logged = True  # type: ignore[attr-defined]
     except Exception:
-        # A provider exception using __slots__ cannot be marked; logging twice
-        # is strictly better than not logging.
         pass
 
     rendered = "".join(
