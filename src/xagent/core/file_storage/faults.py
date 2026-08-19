@@ -290,24 +290,18 @@ _RETRYABLE_STATUSES = frozenset(
     }
 )
 
-# Statuses that are definitely permanent and might otherwise be read as
-# transient because of their 5xx range.
-_PERMANENT_STATUSES = frozenset(
+# 4xx statuses whose retry semantics are genuinely ambiguous, so neither the
+# default below nor a guess applies. 409 is the case that prompted this: a
+# concurrent-operation conflict clears itself, while ``BucketNotEmpty`` at the
+# same status never does, and only the provider code can tell them apart.
+# 429 is deliberately absent: it is unconditionally retryable and answered by
+# _RETRYABLE_STATUSES above, so listing it here would be unreachable.
+_AMBIGUOUS_4XX = frozenset({409})
+
+# 5xx statuses that are permanent despite their range, which is the direction a
+# range rule gets wrong: it reads the whole 5xx block as transient.
+_PERMANENT_5XX = frozenset(
     {
-        # Unambiguous 4xx: no amount of waiting changes the answer. Listed
-        # rather than covered by a range, because 408/409/429 sit in the same
-        # range and are not permanent at all.
-        400,  # bad request
-        401,  # unauthorized
-        403,  # forbidden
-        404,  # not found
-        405,  # method not allowed
-        411,  # length required
-        413,  # payload too large
-        414,  # URI too long
-        415,  # unsupported media type
-        416,  # range not satisfiable
-        # 5xx that read as transient because of their range, but are not.
         501,  # not implemented -- this backend cannot do it, ever
         505,  # HTTP version not supported
         508,  # loop detected
@@ -318,16 +312,27 @@ _PERMANENT_STATUSES = frozenset(
 def _retryable_from_status(status: int) -> bool | None:
     """Classify from an HTTP status, or return ``None`` when it does not say.
 
-    Deliberately does not fall back to "4xx means permanent". A 4xx from an
-    unrecognised code is usually permanent, but ``usually`` is not what this
-    field claims, and the codes worth acting on are in the tables above.
+    The 4xx and 5xx halves get opposite defaults, because their ranges carry
+    opposite information. A 4xx describes the request, so absent a reason to
+    think otherwise it cannot be fixed by waiting -- 410 and 412 are permanent
+    whether or not anyone thought to list them. A 5xx describes the server, and
+    only the specific codes below are known to be permanent; the rest of that
+    range says nothing an operator can act on.
+
+    Listing the *exceptions* rather than the permanent members is what keeps
+    this honest: an earlier revision enumerated ten permanent 4xx and let the
+    other forty fall through to ``None``, which discarded correct verdicts
+    while claiming to be conservative.
     """
     if status in _RETRYABLE_STATUSES:
         return True
-    if status in _PERMANENT_STATUSES:
+    if 400 <= status <= 499:
+        # Ambiguous ones need the provider code, which has already had its say
+        # by the time we get here.
+        return None if status in _AMBIGUOUS_4XX else False
+    if status in _PERMANENT_5XX:
         return False
-    # Everything else -- an unrecognised 409, a 5xx nobody has classified --
-    # is exactly the case this field must not guess at.
+    # An unclassified 5xx is exactly what this field must not guess at.
     return None
 
 
