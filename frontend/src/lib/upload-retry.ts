@@ -63,11 +63,12 @@ export class UploadRequestError extends Error {
   }
 }
 
+/** Total attempts, including the first one. */
+const MAX_ATTEMPTS = 3
+/** Ceiling for the wait before the second attempt; doubles after that. */
+const BASE_DELAY_MS = 400
+
 export interface UploadRetryOptions {
-  /** Total attempts, including the first one. */
-  attempts?: number
-  /** Delay before the second attempt; doubles for each further attempt. */
-  baseDelayMs?: number
   /**
    * Rejects when the caller no longer owns the upload (connection swapped,
    * message superseded). Aborts the backoff wait instead of letting a dead
@@ -85,25 +86,22 @@ const defaultSleep = (ms: number) =>
 export async function withUploadRetry<T>(
   perform: () => Promise<T>,
   {
-    attempts = 3,
-    baseDelayMs = 400,
     cancellation,
     sleep = defaultSleep,
     random = Math.random,
   }: UploadRetryOptions = {},
 ): Promise<T> {
-  const totalAttempts = Math.max(1, attempts)
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await perform()
     } catch (error) {
       const retriable =
         error instanceof UploadRequestError && error.retriable
-      if (!retriable || attempt >= totalAttempts) throw error
+      if (!retriable || attempt >= MAX_ATTEMPTS) throw error
       // Full jitter. A storage outage fails every in-flight upload at once,
       // and the widget fans out one request per file, so a fixed schedule
       // would march the whole fleet back onto the endpoint in lockstep.
-      const delay = Math.round(random() * baseDelayMs * 2 ** (attempt - 1))
+      const delay = Math.round(random() * BASE_DELAY_MS * 2 ** (attempt - 1))
       const wait = sleep(delay)
       await (cancellation ? Promise.race([wait, cancellation]) : wait)
     }

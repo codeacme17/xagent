@@ -92,7 +92,7 @@ describe("withUploadRetry", () => {
       const perform = vi.fn()
         .mockRejectedValueOnce(retriableError(503))
         .mockResolvedValueOnce("uploaded")
-      const upload = withUploadRetry(perform, { attempts: 2 })
+      const upload = withUploadRetry(perform)
 
       await vi.advanceTimersByTimeAsync(400)
 
