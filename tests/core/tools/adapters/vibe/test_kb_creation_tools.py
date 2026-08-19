@@ -1466,3 +1466,78 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     assert storage_key in rendered
     assert "_ProviderThrottled" in rendered
     assert provider_message in rendered
+
+
+@pytest.mark.asyncio
+async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
+    tmp_path,
+    caplog,
+    monkeypatch,
+):
+    """A checksum mismatch must not be reported as a transient outage.
+
+    ``DurableObjectIntegrityError`` subclasses ``DurableStorageOperationError``,
+    so a parent-only catch sends permanent corruption through the durable-fault
+    logger and adds a "Durable storage unavailable" WARNING on top of the
+    integrity ERROR already recorded where it is raised. That reads as an outage
+    to whatever watches for one, and buries the real diagnosis.
+    """
+    import logging
+
+    from xagent.core.tools.core.RAG_tools import kb as kb_module
+    from xagent.web.services.managed_file_ref import (
+        FILE_INTEGRITY_REUPLOAD_MESSAGE,
+        DurableObjectIntegrityError,
+    )
+
+    def fail_restore(_record):
+        raise DurableObjectIntegrityError(FILE_INTEGRITY_REUPLOAD_MESSAGE)
+
+    source_file = tmp_path / "notes.txt"
+    source_file.write_text("hello", encoding="utf-8")
+    file_record = SimpleNamespace(
+        user_id=7,
+        filename="notes.txt",
+        storage_path=str(source_file),
+        file_id="file-1",
+    )
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = [file_record]
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_file_kb"))
+    coordinator = KBCoordinator(
+        storage_shim=_FakeStorageShim(metadata_store),
+        operation_compatibility=_RecordingOperationFacade(),
+    )
+    monkeypatch.setattr(kb_module, "get_kb_coordinator", lambda: coordinator)
+
+    logger_name = "xagent.core.tools.adapters.vibe.file_ingestion_tool"
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            side_effect=fail_restore,
+        ),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=7, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is False
+    assert "integrity check" in result["message"]
+
+    outage_lines = [
+        entry
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ]
+    assert outage_lines == [], "permanent corruption must not read as an outage"

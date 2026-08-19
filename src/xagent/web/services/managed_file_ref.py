@@ -82,11 +82,17 @@ def log_durable_storage_fault(
     That is narrower than "every consumer of ``DurableStorageOperationError``",
     and the difference matters: the class is a ``RuntimeError``, so broad
     ``except Exception`` / ``except RuntimeError`` arms elsewhere absorb it
-    without ever naming it -- in the chat path, knowledge-base refresh, and
-    workspace file resolution. Those arms cannot route through this function,
-    because they handle every exception type; they carry ``exc_info`` of their
-    own instead. Anything added later that reports this fault specifically
-    belongs here.
+    without ever naming it -- agent-service setup in web/api/chat.py,
+    knowledge-base refresh in web/api/kb.py, and workspace file resolution in
+    core/workspace.py. Those arms cannot route through this function, because
+    they handle every exception type; each carries ``exc_info`` so the chain
+    survives there, but none of them produces the fields this function renders.
+
+    So the accurate claim is about *naming*, not about coverage: a site that
+    reports this fault as a durable-storage fault does it here, and a site that
+    merely absorbs it keeps its own traceback. Anything added later in the first
+    category belongs here. Do not restate this as "every consumer" -- that was
+    the wording it replaced, and it was false.
 
     The wraps in this module
     keep only the storage key in their message; the provider error class, the

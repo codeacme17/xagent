@@ -121,6 +121,7 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.models.database import get_db
         from .....web.models.uploaded_file import UploadedFile
         from .....web.services.managed_file_ref import (
+            DurableObjectIntegrityError,
             DurableStorageOperationError,
             ensure_uploaded_file_local_path,
             log_durable_storage_fault,
@@ -188,6 +189,19 @@ async def _create_knowledge_base_from_file_impl(
         for record in file_records:
             try:
                 source_path = ensure_uploaded_file_local_path(record)
+            except DurableObjectIntegrityError:
+                # Must precede the parent arm below, which this subclasses. A
+                # checksum mismatch is permanent corruption, already recorded
+                # at ERROR with both checksums by ``_raise_integrity_error``.
+                # Routing it through the durable-fault logger would add a
+                # "Durable storage unavailable" WARNING on top, which reads as
+                # a transient outage and can trip the alerts that watch for one
+                # -- burying the corruption diagnosis under a wrong one.
+                errors.append(
+                    f"Stored copy of {record.filename} failed its integrity "
+                    "check and must be re-uploaded"
+                )
+                continue
             except DurableStorageOperationError as exc:
                 log_durable_storage_fault(
                     logger,

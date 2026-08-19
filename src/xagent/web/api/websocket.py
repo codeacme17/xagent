@@ -126,6 +126,7 @@ from ..services.hot_path_cache import (
     web_task_history_key,
 )
 from ..services.managed_file_ref import (
+    DurableObjectIntegrityError,
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
@@ -6411,10 +6412,85 @@ async def _handle_chat_message_unserialized(
                     },
                     websocket,
                 )
+        except DurableObjectIntegrityError:
+            # Precedes the durable-fault arm below, which this subclasses. A
+            # checksum mismatch is permanent corruption, already recorded at
+            # ERROR with both checksums where it is raised, so it must not also
+            # be logged as a transient outage. It still owes the client an
+            # answer, and a distinct one: retrying cannot help, the stored copy
+            # has to be replaced. No exception text goes outbound either way.
+            message = (
+                "A stored file for this message failed its integrity check "
+                "and must be re-uploaded."
+            )
+            if not await finish_delivery_failure(message):
+                return
+            timestamp = datetime.now(timezone.utc).timestamp()
+            if authorized_task_id is not None:
+                error_payload = await _read_task_error_payload_offloop(
+                    authorized_task_id,
+                    message,
+                )
+                await manager.broadcast_to_task(
+                    {**error_payload, "timestamp": timestamp},
+                    authorized_task_id,
+                )
+            else:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": message,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
+        except DurableStorageOperationError as exc:
+            # Must precede the RuntimeError arm below, which this subclasses.
+            # This is the selected-file attachment path: the fault arrives here
+            # first, is answered to the client, and is swallowed -- so this is
+            # both the only place its provider cause can be recorded and the
+            # last place its text could escape.
+            #
+            # The outbound message is fixed rather than ``str(exc)``: the wrap
+            # carries the storage key, whose scope segments encode the owning
+            # user's id, and that must not travel to a socket client any more
+            # than it may reach an HTTP body or a model (#1467). It is also the
+            # sole logging owner for this path -- the fault does not re-raise,
+            # so the endpoint-level arm never sees it and cannot double-record.
+            log_durable_storage_fault(
+                logger,
+                "websocket agent execution",
+                exc,
+                task_id=authorized_task_id,
+            )
+            message = (
+                "A stored file for this message could not be read. Please try again."
+            )
+            if not await finish_delivery_failure(message):
+                return
+            timestamp = datetime.now(timezone.utc).timestamp()
+            if authorized_task_id is not None:
+                error_payload = await _read_task_error_payload_offloop(
+                    authorized_task_id,
+                    message,
+                )
+                await manager.broadcast_to_task(
+                    {**error_payload, "timestamp": timestamp},
+                    authorized_task_id,
+                )
+            else:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": message,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
         except RuntimeError as e:
             # Runtime error
             message = f"Runtime error: {str(e)}"
-            logger.error(f"Runtime error in agent execution: {e}")
+            logger.error(f"Runtime error in agent execution: {e}", exc_info=True)
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -7356,6 +7432,12 @@ async def websocket_chat_endpoint(
                 )
 
     except WebSocketDisconnect:
+        pass
+    except DurableObjectIntegrityError:
+        # Precedes the parent arm: permanent corruption, already recorded at
+        # ERROR with both checksums where it is raised, so it must not also be
+        # logged as a transient outage. Swallowed exactly as the parent arm
+        # swallows -- the socket is going away either way.
         pass
     except DurableStorageOperationError as exc:
         # Must precede the RuntimeError arm below, which this subclasses. A
