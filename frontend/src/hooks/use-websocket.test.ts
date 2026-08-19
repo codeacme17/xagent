@@ -244,6 +244,65 @@ describe("useWebSocket message delivery", () => {
     )).rejects.toMatchObject({ disposition: "outcome_unknown" })
   })
 
+  it("re-decides ownership loss during an upload as an unknown outcome", async () => {
+    // The cancellation error is built with a fixed "not_sent" before anyone
+    // knows what the upload did. A reconnect while bytes are still moving is
+    // exactly when that is wrong: the file may land moments later.
+    const upload = deferred<Array<{ file_id: string }>>()
+    let reconnect!: () => void
+    const hook = renderHook(() => {
+      const webSocket = useWebSocket({
+        url: "ws://localhost",
+        taskId: 1,
+        uploadFiles: vi.fn(() => upload.promise),
+        onConnectionClose: () => {
+          reconnect()
+          return "handled" as const
+        },
+      })
+      reconnect = webSocket.connect
+      return webSocket
+    })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+    const preparing = hook.result.current.sendChatMessage(
+      "answer",
+      [new File(["evidence"], "evidence.txt")],
+      false,
+      "cancelled-mid-upload",
+    )
+
+    act(() => MockWebSocket.instances[0].triggerClose(4001))
+
+    await expect(preparing).rejects.toMatchObject({
+      disposition: "outcome_unknown",
+      requiresReconciliation: true,
+    })
+    await act(async () => {
+      upload.resolve([{ file_id: "late-upload" }])
+      await Promise.resolve()
+    })
+  })
+
+  it("keeps ownership loss outside an upload reported as never sent", async () => {
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+    const pending = hook.result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "cancelled-no-upload",
+    )
+    await waitFor(() => expect(MockWebSocket.instances[0].send).toHaveBeenCalled())
+
+    act(() => MockWebSocket.instances[0].triggerClose(4001))
+
+    await expect(pending).rejects.toMatchObject({
+      requiresReconciliation: false,
+    })
+  })
+
   it("keeps a pre-upload failure reported as never sent", async () => {
     // Nothing left this client, so the draft really is safe to resend.
     const { result } = renderHook(() => useWebSocket({

@@ -111,14 +111,23 @@ export function ClarificationForm({
   // the server's existing claim instead of opening a second turn. Cleared on
   // success, and when the server explicitly asks for a fresh id.
   const deliveryAttemptRef = useRef<string | null>(null)
-  // Set when the turn's outcome is unknown: it may already be running, so the
-  // visitor must reload rather than submit a second one.
+  // Set only when a resubmit could duplicate something the server cannot
+  // deduplicate - an attachment that may have landed under an id this client
+  // never learned. An unknown *delivery* outcome does not block: the retry
+  // reuses the same client message id, so the server adjudicates it.
   const [resubmitBlocked, setResubmitBlocked] = useState(false)
 
   useEffect(() => {
     if (active) {
+      // A new clarification round reuses this component instance on the live
+      // turn render path, so every per-submission guard has to be cleared -
+      // otherwise round 1's block, or its client message id, leaks into
+      // round 2's answer.
       setIsSubmitted(false)
       setIsOpen(true)
+      setResubmitBlocked(false)
+      setSendFailure(null)
+      deliveryAttemptRef.current = null
     }
   }, [active])
 
@@ -339,7 +348,11 @@ export function ClarificationForm({
       ) {
         deliveryAttemptRef.current = null
       }
-      setResubmitBlocked(disposition === "outcome_unknown")
+      setResubmitBlocked(
+        typeof error === "object"
+        && error !== null
+        && (error as { requiresReconciliation?: unknown }).requiresReconciliation === true,
+      )
       setSendFailure(failure)
       toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
     } finally {

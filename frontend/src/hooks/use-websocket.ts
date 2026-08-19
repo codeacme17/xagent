@@ -63,18 +63,31 @@ export class MessageDeliveryError extends Error {
    * for those rather than putting internal English in front of a visitor.
    */
   readonly userFacing: boolean
+  /**
+   * Whether resubmitting the same draft could duplicate a *side effect the
+   * server cannot deduplicate* - in practice, an attachment that may have
+   * landed under an id this client never learned.
+   *
+   * An unknown *delivery* outcome does not qualify: the turn keeps its
+   * client message id, so a resubmit lands on the server's existing claim
+   * instead of opening a second turn. Only an unknown *upload* outcome needs
+   * a human to reconcile, because uploaded bytes have no such guard.
+   */
+  readonly requiresReconciliation: boolean
 
   constructor(
     message: string,
     disposition: MessageDeliveryDisposition,
     retryWithNewId = false,
     userFacing = false,
+    requiresReconciliation = false,
   ) {
     super(message)
     this.name = "MessageDeliveryError"
     this.disposition = disposition
     this.retryWithNewId = retryWithNewId
     this.userFacing = userFacing
+    this.requiresReconciliation = requiresReconciliation
   }
 }
 
@@ -83,7 +96,14 @@ const deliveryError = (
   disposition: MessageDeliveryDisposition,
   retryWithNewId = false,
   userFacing = false,
-) => new MessageDeliveryError(message, disposition, retryWithNewId, userFacing)
+  requiresReconciliation = false,
+) => new MessageDeliveryError(
+  message,
+  disposition,
+  retryWithNewId,
+  userFacing,
+  requiresReconciliation,
+)
 
 export type WebSocketCredentialOwner =
   | {
@@ -1365,21 +1385,35 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       return delivery
     } catch (error) {
-      if (error instanceof MessageDeliveryError) throw error
       // An upload that was refused stored nothing, so the draft is safe to
       // send again. Anything else that failed mid-upload - a gateway 5xx, an
-      // unreadable success body, a dropped request - may have stored the file
+      // unreadable success body, a dropped request, or this attempt being
+      // superseded while bytes were still moving - may have stored the file
       // under an id this client never learned, and resubmitting the same draft
-      // would duplicate it. Report that as an unknown outcome so the sender is
-      // not invited to retry.
+      // would duplicate it.
       const uploadOutcome = uploadPhase
         ? error instanceof UploadRequestError ? error.outcome : "unknown"
         : "refused"
+      if (error instanceof MessageDeliveryError) {
+        // Ownership loss is built with a fixed "not_sent" before anyone knows
+        // what the upload did. Re-decide it here, where that is known.
+        if (uploadOutcome !== "unknown" || error.disposition !== "not_sent") {
+          throw error
+        }
+        throw deliveryError(
+          error.message,
+          "outcome_unknown",
+          error.retryWithNewId,
+          error.userFacing,
+          true,
+        )
+      }
       throw deliveryError(
         error instanceof Error ? error.message : String(error),
         uploadOutcome === "unknown" ? "outcome_unknown" : "not_sent",
         false,
         error instanceof UploadRequestError,
+        uploadOutcome === "unknown",
       )
     } finally {
       if (preparationsRef.current.get(clientMessageId) === claim) {

@@ -354,10 +354,12 @@ class ClientVisiblePermissionError(ClientVisibleError, PermissionError):
 def client_safe_error_message(error: Exception) -> str:
     """The only way an exception may become text a chat client can see.
 
-    Every ``message_rejected`` and ``error`` payload built from an exception
-    goes through here, so adding a new ``except`` branch cannot reintroduce
-    raw text by accident. ``tests/web/api/test_websocket_client_safe_errors.py``
-    asserts that no producer bypasses it.
+    Every ``message_rejected`` and ``error`` payload that this module builds
+    from an exception *at a direct call site* goes through here.
+    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces that for
+    the shapes it recognizes; payloads assembled by a helper, spread into a
+    dict, or forwarded through a wrapper are not yet covered and still carry
+    raw text - see #1497.
     """
     return (
         str(error)

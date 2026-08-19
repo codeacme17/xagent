@@ -240,7 +240,16 @@ def _is_client_safe(expr: ast.expr) -> bool:
 
 
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
-    """Exception text may only reach a chat client through the chokepoint."""
+    """Exception text may not reach a client through the *recognized* shapes.
+
+    Scope, stated honestly: this walks direct calls to the producers in
+    ``PRODUCERS`` and ``{"type": "error", ...}`` dict *literals* passed to
+    ``send_personal_message``/``broadcast_to_task``. It does NOT follow
+    dict-spread payloads, payloads built by a helper and passed as a call, or
+    wrapper functions that forward a raw argument into a producer. Those
+    shapes leak today and are tracked in #1497 - do not read a passing run as
+    "nothing can reach a client raw".
+    """
     source = Path(websocket_api.__file__).read_text()
     tree = ast.parse(source)
     parents = _parents(tree)

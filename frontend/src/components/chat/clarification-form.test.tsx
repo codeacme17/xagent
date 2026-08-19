@@ -384,6 +384,7 @@ describe("ClarificationForm resubmission safety", () => {
     />,
   )
 
+
   const submit = () => fireEvent.click(
     screen.getByRole("button", { name: "chatPage.clarification.submit" }),
   )
@@ -392,10 +393,14 @@ describe("ClarificationForm resubmission safety", () => {
     ([, config]) => (config as { clientMessageId?: string })?.clientMessageId,
   )
 
-  it("stops a second submission while the turn's outcome is unknown", async () => {
-    appContextMock.sendMessage.mockRejectedValue(
-      deliveryError("The task is busy applying an earlier answer.", "outcome_unknown"),
-    )
+  it("stops a second submission when an attachment may already have landed", async () => {
+    // Uploaded bytes have no server-side dedup, so this is the one case a
+    // human has to reconcile before sending the draft again.
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "The upload could not be completed or rolled back.",
+      "outcome_unknown",
+      { requiresReconciliation: true },
+    ))
     renderForm()
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
 
@@ -413,6 +418,66 @@ describe("ClarificationForm resubmission safety", () => {
       "chatPage.clarification.sendOutcomeUnknown",
     )
     expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it("lets an unknown delivery outcome be retried under the same id", async () => {
+    // A reconnect during ack-wait is an ordinary event. The turn keeps its
+    // client message id, so the server adjudicates a duplicate instead of the
+    // form locking the visitor out until they reload the page.
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "Message delivery was not acknowledged. Your draft was kept.",
+      "outcome_unknown",
+    ))
+    renderForm()
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeEnabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendOutcomeUnknown",
+    )
+
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+    const [first, second] = sentIds()
+    expect(second).toBe(first)
+  })
+
+  it("clears a previous round's block when the form is asked again", async () => {
+    // The live turn render path keeps one instance across clarification
+    // rounds, so a stale block would silently disable round two.
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "The upload could not be completed or rolled back.",
+      "outcome_unknown",
+      { requiresReconciliation: true },
+    ))
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} active />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    submit()
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeDisabled())
+
+    rerender(<ClarificationForm interactions={interactions} active={false} />)
+    rerender(<ClarificationForm interactions={interactions} active />)
+
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeEnabled()
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    appContextMock.sendMessage.mockResolvedValue(undefined)
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Shanghai" } })
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+    const [first, second] = sentIds()
+    expect(second).not.toBe(first)
   })
 
   it("retries an unresolved submission under its original client message id", async () => {
