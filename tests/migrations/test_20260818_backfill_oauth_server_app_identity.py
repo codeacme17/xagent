@@ -25,6 +25,7 @@ What must hold:
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from types import ModuleType
 
@@ -784,6 +785,31 @@ def test_two_provider_only_rows_resolve_deterministically(seeded_engine):
     assert auth["orphan-b"] == {"provider": "acme"}
 
 
+def test_a_mixed_case_transport_row_is_still_a_candidate(seeded_engine):
+    """Transport is a shape enum, not an identity, and every reader folds its
+    case (classify_app_auth, _normalize_app_key). A row stored "OAuth" is
+    builtin_oauth to all of them, so the candidate filter must see it too --
+    otherwise the one shape the backfill exists for is invisible to it."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[{"name": "Acme Drive", "transport": "OAuth", "auth": None}],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {"app_id": "acme-drive"}
+
+
 def test_downgrade_is_a_no_op(seeded_engine):
     """Documented as irreversible: the downgrade must not attempt to strip
     stamps it cannot tell apart from the writer's own."""
@@ -844,9 +870,11 @@ def test_non_oauth_shapes_are_never_candidates(seeded_engine):
 
 
 def _postgres_url() -> str | None:
-    import os
-
-    return os.environ.get("XAGENT_TEST_POSTGRES_URL")
+    # Both spellings, matching the sibling migration suites: CI sets the first,
+    # while a local run may already export the second.
+    return os.getenv("XAGENT_TEST_POSTGRES_URL") or os.getenv(
+        "POSTGRES_TEST_DATABASE_URL"
+    )
 
 
 @pytest.fixture

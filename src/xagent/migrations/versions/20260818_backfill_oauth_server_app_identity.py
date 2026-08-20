@@ -52,8 +52,11 @@ can be derived safely:
   whitespace/case variants are producible — they simply do not match here,
   and under-matching leaves the name-fallback shim in charge.
 - Each is matched against ``public_mcp_apps`` (builtin apps are seeded
-  into that table too) by exact display name, the same value
-  ``_ensure_user_mcp_server`` named the row after. If the name resolves
+  into that table too) by exact display name -- the stored column, which is
+  the value ``_ensure_user_mcp_server`` named the row after *unless* a
+  builtin's stored name has drifted from the code registry
+  ``_app_to_dict`` serves it from, in which case this simply does not match
+  and the row is left alone. If the name resolves
   nothing -- including when it is *ambiguous*, i.e. shared by two OAuth
   apps -- and the row's ``auth.provider`` names exactly one OAuth app,
   that app is used instead. Providers are non-unique across apps (the
@@ -129,6 +132,8 @@ Create Date: 2026-08-18
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from typing import NamedTuple
 
 import sqlalchemy as sa
 from alembic import op
@@ -138,8 +143,23 @@ logger = logging.getLogger(__name__)
 # revision identifiers, used by Alembic.
 revision: str = "20260818_backfill_oauth_server_app_identity"
 down_revision: str | None = "20260818_seed_jira_mcp_app"
-branch_labels = None
-depends_on = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+class _CatalogApp(NamedTuple):
+    """The identity fields the backfill reads off a catalog app row."""
+
+    app_id: str
+    provider: str | None
+
+
+class _Candidate(NamedTuple):
+    """An oauth row still needing a stamp, with its usable stored provider."""
+
+    row: sa.RowMapping
+    auth: dict
+    provider: str | None
 
 
 def _nonblank_str(value: object) -> str | None:
@@ -205,8 +225,10 @@ def upgrade() -> None:
     # the identity paths compare them exactly. Only ``transport`` is folded,
     # because it is a shape enum rather than an identity -- and a little more
     # tolerantly than classify_app_auth, which lowercases without stripping.
-    apps_by_name: dict[str, tuple[str, str | None] | None] = {}
-    apps_by_provider: dict[str, tuple[str, str | None] | None] = {}
+    apps_by_name: dict[str, _CatalogApp] = {}
+    apps_by_provider: dict[str, _CatalogApp] = {}
+    ambiguous_names: set[str] = set()
+    ambiguous_providers: set[str] = set()
     names_of_other_shapes: set[str] = set()
     for app_row in bind.execute(sa.select(public_mcp_apps)).mappings():
         if str(app_row["transport"] or "").strip().lower() != "oauth":
@@ -223,12 +245,16 @@ def upgrade() -> None:
         if not app_id:
             continue
         provider = _nonblank_str(app_row["provider_name"])
-        entry = (app_id, provider)
+        entry = _CatalogApp(app_id, provider)
         name = _nonblank_str(app_row["name"])
         if name:
-            apps_by_name[name] = None if name in apps_by_name else entry
+            if name in apps_by_name:
+                ambiguous_names.add(name)
+            apps_by_name[name] = entry
         if provider:
-            apps_by_provider[provider] = None if provider in apps_by_provider else entry
+            if provider in apps_by_provider:
+                ambiguous_providers.add(provider)
+            apps_by_provider[provider] = entry
 
     # Materialized before the loop: the loop UPDATEs the same table, and
     # stepping a live pysqlite cursor across a mutating table has formally
@@ -239,7 +265,7 @@ def upgrade() -> None:
     candidates = (
         bind.execute(
             sa.select(mcp_servers)
-            .where(mcp_servers.c.transport == "oauth")
+            .where(sa.func.lower(sa.func.trim(mcp_servers.c.transport)) == "oauth")
             .order_by(mcp_servers.c.id)
         )
         .mappings()
@@ -256,7 +282,7 @@ def upgrade() -> None:
     # name fallback, this migration is irreversible (downgrade is a no-op),
     # and destroying a value we do not have to is the wrong default for a
     # data migration. NULL auth is the primary target and is not that case.
-    pending: list[tuple[sa.RowMapping, dict, str | None]] = []
+    pending: list[_Candidate] = []
     already_stamped: set[str] = set()
     for row in candidates:
         raw_auth = row["auth"]
@@ -283,7 +309,7 @@ def upgrade() -> None:
                 row["id"],
             )
             continue
-        pending.append((row, auth, _nonblank_str(raw_provider)))
+        pending.append(_Candidate(row, auth, _nonblank_str(raw_provider)))
 
     # Two passes so one app is never stamped onto two rows, and so which row
     # wins is decided by evidence rather than by row order. Name evidence is
@@ -305,22 +331,36 @@ def upgrade() -> None:
     # the same identity to the next-best row.
     resolutions: dict[int, str] = {}
     claimed: set[str] = set(already_stamped)
-    deferred: list[tuple[sa.RowMapping, dict, str]] = []
+    deferred: list[_Candidate] = []
 
-    for row, auth, provider in pending:
-        row_name = str(row["name"]) if row["name"] else ""
+    def claim(candidate: _Candidate, app: _CatalogApp) -> None:
+        """Record the stamp, or refuse it because the identity is taken."""
+        if app.app_id in claimed:
+            logger.warning(
+                "%s: app_id %r is already carried by another row; leaving "
+                "mcp_servers row %s to its pre-migration name fallback",
+                revision,
+                app.app_id,
+                candidate.row["id"],
+            )
+            return
+        claimed.add(app.app_id)
+        resolutions[int(candidate.row["id"])] = app.app_id
+
+    for candidate in pending:
+        row_name = str(candidate.row["name"]) if candidate.row["name"] else ""
         if row_name in names_of_other_shapes:
             # The name belongs to an app of another transport. That is
             # evidence about *this* row, not an absence of evidence, so it
             # refuses outright instead of falling through to the provider
             # fallback -- which would stamp it with an unrelated app's id.
             continue
-        resolved = apps_by_name.get(row_name)
-        if resolved is None:
-            if provider:
-                deferred.append((row, auth, provider))
+        app = None if row_name in ambiguous_names else apps_by_name.get(row_name)
+        if app is None:
+            if candidate.provider:
+                deferred.append(candidate)
             continue
-        if provider and resolved[1] and provider != resolved[1]:
+        if candidate.provider and app.provider and candidate.provider != app.provider:
             # The row's own provider contradicts the name-resolved app -- the
             # same conflict _ensure_server_matches_oauth_app refuses with a
             # ValueError. Stamping the name's app_id would create a row *no*
@@ -331,36 +371,20 @@ def upgrade() -> None:
             # contradiction is information: two signals disagree, and picking
             # either one would be a guess.
             continue
-        if resolved[0] in claimed:
-            logger.warning(
-                "%s: app_id %r is already carried by another row; leaving "
-                "mcp_servers row %s to its pre-migration name fallback",
-                revision,
-                resolved[0],
-                row["id"],
-            )
-            continue
-        claimed.add(resolved[0])
-        resolutions[int(row["id"])] = resolved[0]
+        claim(candidate, app)
 
-    for row, auth, provider in deferred:
-        resolved = apps_by_provider.get(provider)
-        if resolved is None:
+    for candidate in deferred:
+        provider = candidate.provider
+        assert provider is not None  # only providers reach the deferred list
+        if provider in ambiguous_providers:
             continue
-        if resolved[0] in claimed:
-            logger.warning(
-                "%s: app_id %r is already carried by another row; leaving "
-                "mcp_servers row %s to its pre-migration name fallback",
-                revision,
-                resolved[0],
-                row["id"],
-            )
-            continue
-        claimed.add(resolved[0])
-        resolutions[int(row["id"])] = resolved[0]
+        app = apps_by_provider.get(provider)
+        if app is not None:
+            claim(candidate, app)
 
     stamped = 0
-    for row, auth, _provider in pending:
+    for candidate in pending:
+        row, auth = candidate.row, candidate.auth
         app_id = resolutions.get(int(row["id"]))
         if app_id is None:
             continue
