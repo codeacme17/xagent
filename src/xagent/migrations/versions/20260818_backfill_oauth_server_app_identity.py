@@ -71,6 +71,12 @@ can be derived safely:
   at all before ``cb724dbb`` -- carries no provider to fall back to. A
   provider-keyed pass would defend nothing real, and it was the only place
   where two rows could compete for one identity.
+- This migration cannot stop a *future* rename from recreating the
+  condition: ``_ensure_user_mcp_server`` still looks its row up by display
+  name, so the next connect after a rename creates a second row that the
+  unconditional writer stamps with the same ``app_id``. That write-path
+  root cause is tracked in #1569; what follows is only about not creating
+  the condition here.
 - An app already carried by another row is never handed to a second one.
   ``_ensure_user_mcp_server`` creates a *new* row when a rename makes the
   old one unfindable, so orphan pairs for one app are this migration's own
