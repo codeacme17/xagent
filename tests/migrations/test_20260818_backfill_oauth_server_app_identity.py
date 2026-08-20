@@ -8,14 +8,18 @@ so no full alembic history replay is needed).
 What must hold:
 
 - an auth-less oauth row named exactly after an OAuth app is stamped with
-  that app's ``app_id`` (and ``provider`` when the app has one);
+  that app's ``app_id`` -- and only that: no ``provider`` is written;
 - a provider-only row (blank/absent ``app_id``) is stamped through its
   provider when exactly one OAuth app uses that provider, and left alone
   when the provider is ambiguous — providers are non-unique across apps;
 - rows already carrying a nonblank ``app_id`` are untouched (idempotence);
 - rows resolving to nothing (orphans, non-oauth-app name matches) are left
   exactly as they were, preserving the name-fallback shim's behavior;
-- non-oauth-transport server rows are never candidates.
+- non-oauth-transport server rows are never candidates, and neither are
+  rows whose whole ``auth`` payload is a non-dict or whose stored
+  ``provider`` is present but unusable;
+- one ``app_id`` never lands on two rows -- including when the colliding
+  partner was stamped before the run, or by an earlier run.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 TARGET_REVISION = "20260818_backfill_oauth_server_app_identity"
 
@@ -124,7 +128,7 @@ def test_an_auth_less_row_is_stamped_by_exact_display_name(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)["Acme Drive"]
-    assert auth == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth == {"app_id": "acme-drive"}
 
 
 def test_a_provider_only_row_is_stamped_when_the_provider_is_unambiguous(
@@ -267,10 +271,11 @@ def test_a_provider_conflict_refuses_the_name_match(seeded_engine):
     assert _auth_by_name(engine, metadata)["Acme Drive"] == {"provider": "other"}
 
 
-def test_a_non_dict_auth_payload_is_replaced_wholesale(seeded_engine):
-    """Garbage (a scalar/list auth on an oauth row) is replaced by the stamped
-    identity, matching the provisioning writer, which discards non-dict auth
-    the same way."""
+def test_a_non_dict_auth_payload_is_left_alone(seeded_engine):
+    """Garbage (a scalar/list auth on an oauth row) is not a candidate: such a
+    row resolves fine today through the name fallback, and this migration is
+    irreversible, so destroying a value it does not have to touch is the wrong
+    default."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -290,8 +295,7 @@ def test_a_non_dict_auth_payload_is_replaced_wholesale(seeded_engine):
 
     _run_upgrade(engine)
 
-    auth = _auth_by_name(engine, metadata)["Acme Drive"]
-    assert auth == {"app_id": "acme-drive", "provider": "acme"}
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == "garbage-string"
 
 
 def test_offline_sql_mode_raises_instead_of_stamping():
@@ -369,7 +373,7 @@ def test_a_non_string_app_id_is_malformed_and_restamped(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)["Acme Drive"]
-    assert auth == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth == {"app_id": "acme-drive"}
 
 
 def test_identities_are_matched_raw_never_trimmed(seeded_engine):
@@ -399,7 +403,7 @@ def test_identities_are_matched_raw_never_trimmed(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive"] == {"app_id": " acme-drive ", "provider": "acme"}
+    assert auth["Acme Drive"] == {"app_id": " acme-drive "}
     assert auth["Acme Drive "] is None
 
 
@@ -439,7 +443,7 @@ def test_one_app_is_never_stamped_onto_two_rows(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["Acme Drive"] == {"app_id": "acme-drive"}
     assert auth["Acme Drive (old)"] == {"provider": "acme"}
 
 
@@ -471,7 +475,7 @@ def test_name_evidence_wins_regardless_of_row_order(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["Acme Drive"] == {"app_id": "acme-drive"}
     assert auth["Acme Drive (old)"] == {"provider": "acme"}
 
 
@@ -567,9 +571,10 @@ def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine)
     assert auth["Cased App"] == {"app_id": "cased-app"}
 
 
-def test_a_blank_provider_is_filled_while_unrelated_keys_survive(seeded_engine):
-    """A whitespace-only provider counts as absent and is replaced, and
-    everything else in the auth dict is carried through untouched."""
+def test_unrelated_auth_keys_survive_the_stamp(seeded_engine):
+    """Only app_id is added: everything already in the auth dict -- including
+    a blank provider and an encrypted secret -- is carried through
+    untouched."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -595,9 +600,213 @@ def test_a_blank_provider_is_filled_while_unrelated_keys_survive(seeded_engine):
 
     assert _auth_by_name(engine, metadata)["Acme Drive"] == {
         "app_id": "acme-drive",
-        "provider": "acme",
+        "provider": "  ",
         "access_token": "encrypted-blob",
     }
+
+
+def test_a_pre_stamped_row_blocks_a_second_row_claiming_its_app(seeded_engine):
+    """The collision the two-pass fix alone did not close: the partner row was
+    stamped *before* this run (by the writer, or by an earlier run), so it
+    never enters the candidate set. Its identity must still be claimed, or the
+    orphan gets the same app_id and _lookup_oauth_server_for_app picks between
+    them nondeterministically."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive v2",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            # Already carries the identity — the row the writer created on
+            # rename, and not a candidate.
+            {
+                "name": "Acme Drive v2",
+                "transport": "oauth",
+                "auth": {"app_id": "acme-drive", "provider": "acme"},
+            },
+            # The orphan left under the old name; only its provider resolves.
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            },
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Drive v2"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["Acme Drive"] == {"provider": "acme"}
+
+
+def test_a_stamp_survives_a_rerun_unchanged(seeded_engine):
+    """Idempotence across runs, not just within one: run 1 stamps the name
+    match, and run 2 -- which is what a downgrade (a no-op) plus upgrade
+    produces -- must neither restamp it nor hand its identity to the orphan
+    that lost the first time."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {"name": "Acme Drive", "transport": "oauth", "auth": None},
+            {
+                "name": "Acme Drive (old)",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            },
+        ],
+    )
+
+    _run_upgrade(engine)
+    after_first = _auth_by_name(engine, metadata)
+
+    module = _migration_module()
+    module.downgrade()
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata) == after_first
+    assert after_first["Acme Drive"] == {"app_id": "acme-drive"}
+    assert after_first["Acme Drive (old)"] == {"provider": "acme"}
+
+
+def test_a_name_owned_by_a_non_oauth_app_refuses_the_provider_fallback(
+    seeded_engine,
+):
+    """A name matching a *non-OAuth* app is evidence about this row, not an
+    absence of evidence. Treating the two alike would let the row fall through
+    to the provider fallback and be stamped with an unrelated app's id."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-notes",
+                "name": "Acme Notes",
+                "transport": "stdio",
+                "provider_name": "acme",
+            },
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            },
+        ],
+        servers=[
+            {
+                "name": "Acme Notes",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Notes"] == {"provider": "acme"}
+
+
+def test_a_malformed_non_string_provider_refuses_the_row(seeded_engine):
+    """A provider that is not a string at all cannot be compared by the
+    conflict gate, and _is_oauth_server_for_app would reject the row against
+    any app once stamped — so a stamp buys nothing and the row is left
+    alone."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": ["acme"]},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {"provider": ["acme"]}
+
+
+def test_two_provider_only_rows_resolve_deterministically(seeded_engine):
+    """A tie the evidence cannot break: two unstamped rows whose only signal
+    is the same provider. Exactly one may be stamped, and candidates are read
+    ordered by id so it is the same one on every run and every backend."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {"name": "orphan-a", "transport": "oauth", "auth": {"provider": "acme"}},
+            {"name": "orphan-b", "transport": "oauth", "auth": {"provider": "acme"}},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["orphan-a"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["orphan-b"] == {"provider": "acme"}
+
+
+def test_downgrade_is_a_no_op(seeded_engine):
+    """Documented as irreversible: the downgrade must not attempt to strip
+    stamps it cannot tell apart from the writer's own."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": None}],
+    )
+    _run_upgrade(engine)
+    before = _auth_by_name(engine, metadata)
+
+    _migration_module().downgrade()
+
+    assert _auth_by_name(engine, metadata) == before
 
 
 def test_non_oauth_shapes_are_never_candidates(seeded_engine):
@@ -632,3 +841,84 @@ def test_non_oauth_shapes_are_never_candidates(seeded_engine):
     with engine.connect() as conn:
         rows = conn.execute(sa.select(servers)).all()
     assert all(row.auth is None for row in rows)
+
+
+def _postgres_url() -> str | None:
+    import os
+
+    return os.environ.get("XAGENT_TEST_POSTGRES_URL")
+
+
+@pytest.fixture
+def postgres_seeded_engine():
+    """The same two tables on a real PostgreSQL server.
+
+    The chain-level CI job upgrades an *empty* database, so without this the
+    backfill's data path would never run on PostgreSQL at all -- and JSON
+    round-tripping and the ordered read are exactly the parts that could
+    differ from SQLite.
+    """
+    url = _postgres_url()
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    engine = create_engine(url)
+    metadata = _pre_migration_metadata()
+    with engine.begin() as conn:
+        for table in ("mcp_servers", "public_mcp_apps"):
+            conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+    metadata.create_all(bind=engine)
+    try:
+        yield engine, metadata
+    finally:
+        with engine.begin() as conn:
+            for table in ("mcp_servers", "public_mcp_apps"):
+                conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+        engine.dispose()
+
+
+@pytest.mark.postgresql
+def test_the_backfill_runs_on_postgresql(postgres_seeded_engine):
+    """Stamp, refusal and collision behavior on the real backend: the JSON
+    write round-trips, and the pre-stamped partner still blocks the orphan."""
+    engine, metadata = postgres_seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            },
+            {
+                "app_id": "acme-mail",
+                "name": "Acme Mail",
+                "transport": "oauth",
+                "provider_name": "mail",
+            },
+        ],
+        servers=[
+            {"name": "Acme Mail", "transport": "oauth", "auth": None},
+            {
+                "name": "Acme Drive v2",
+                "transport": "oauth",
+                "auth": {"app_id": "acme-drive", "provider": "acme"},
+            },
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            },
+            {"name": "orphan", "transport": "oauth", "auth": None},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Mail"] == {"app_id": "acme-mail"}
+    assert auth["Acme Drive v2"] == {"app_id": "acme-drive", "provider": "acme"}
+    # Its app_id is already carried by the row above.
+    assert auth["Acme Drive"] == {"provider": "acme"}
+    assert auth["orphan"] is None
