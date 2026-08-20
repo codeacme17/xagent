@@ -135,9 +135,18 @@ PRODUCERS: dict[str, int | None] = {
 
 # The one deliberate exception: agent RuntimeError text is surfaced to the
 # sender by an existing, tested contract. Narrowing it is a product decision,
-# tracked in #1479 - not a hole to be quietly widened. Any *other* raw
-# expression reaching a producer must fail this test.
-ALLOWED_RAW_MESSAGE_SOURCES = {"f'Runtime error: {str(e)}'"}  # ast.unparse form
+# tracked in #1479 - not a hole to be quietly widened.
+#
+# Anchored to (enclosing function, expression), not to the expression alone:
+# keying on source text blesses the string everywhere it is ever pasted,
+# including into a *validation* branch, which is not what #1479 describes.
+ALLOWED_RAW_MESSAGES = {
+    ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
+    ("handle_execute_task", "f'Runtime error: {str(e)}'"),
+    ("handle_intervention", "f'Runtime error: {str(e)}'"),
+    ("_handle_pause_task_unserialized", "f'Runtime error: {str(e)}'"),
+    ("_handle_resume_task_unserialized", "f'Runtime error: {str(e)}'"),
+}
 
 
 def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
@@ -170,11 +179,23 @@ def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
     return None
 
 
+# ``send_text`` takes a serialized payload, so the dict sits one call deeper.
+ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
+
+
+def _unwrap_serializer(expr: ast.expr) -> ast.expr:
+    """``json.dumps(payload)`` -> ``payload``; anything else unchanged."""
+    if isinstance(expr, ast.Call) and _called_name(expr) == "dumps" and expr.args:
+        return expr.args[0]
+    return expr
+
+
 def _error_payload_message(node: ast.Call) -> ast.expr | None:
     """The message of an ``{"type": "error", ...}`` payload, if this is one."""
-    if _called_name(node) not in {"send_personal_message", "broadcast_to_task"}:
+    if _called_name(node) not in ERROR_PAYLOAD_SINKS:
         return None
-    for argument in (*node.args, *(kw.value for kw in node.keywords)):
+    for raw in (*node.args, *(kw.value for kw in node.keywords)):
+        argument = _unwrap_serializer(raw)
         if not isinstance(argument, ast.Dict):
             continue
         keys = {
@@ -257,13 +278,15 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     tree = ast.parse(source)
     parents = _parents(tree)
 
-    checked = 0
+    checked_producers = 0
+    checked_error_payloads = 0
     offenders: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = _called_name(node)
-        if name in PRODUCERS:
+        is_producer = name in PRODUCERS
+        if is_producer:
             expr = _message_expression(node, PRODUCERS[name])
         else:
             # The error bubble renders in the same conversation as the
@@ -272,7 +295,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
             name = f"{name}(error payload)"
         if expr is None:
             continue
-        checked += 1
+        if is_producer:
+            checked_producers += 1
+        else:
+            checked_error_payloads += 1
         scopes = _enclosing_functions(node, parents)
         if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
             continue
@@ -284,16 +310,27 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         if not candidates:
             offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
             continue
+        enclosing = next(
+            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
+            "<module>",
+        )
         for candidate in candidates:
             if _is_client_safe(candidate):
                 continue
-            if ast.unparse(candidate) in ALLOWED_RAW_MESSAGE_SOURCES:
+            if (enclosing, ast.unparse(candidate)) in ALLOWED_RAW_MESSAGES:
                 continue
             offenders.append(
                 f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
             )
 
-    assert checked >= 20, f"the producers moved; only {checked} call sites matched"
+    # Pinned near the actual counts (23 / 23 at the time of writing) so that
+    # a producer disappearing from the sweep trips this before it trips a user.
+    assert checked_producers >= 21, (
+        f"the producers moved; only {checked_producers} matched"
+    )
+    assert checked_error_payloads >= 21, (
+        f"the error payloads moved; only {checked_error_payloads} matched"
+    )
     assert not offenders, (
         "raw text can reach a chat client; route it through "
         "client_safe_error_message: " + "; ".join(sorted(set(offenders)))
@@ -385,3 +422,37 @@ async def test_redacted_enqueue_failure_still_reaches_the_log(
     assert records, f"{handler_name} redacted the failure without logging it"
     assert any(SECRET in record.getMessage() for record in records)
     assert any(record.exc_info is not None for record in records)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_level", "expects_traceback"),
+    [
+        (
+            websocket_api.ClientVisibleValidationError("User authentication required"),
+            logging.WARNING,
+            False,
+        ),
+        (ValueError(f"incidental fault at {SECRET}"), logging.ERROR, True),
+    ],
+    ids=["curated", "incidental"],
+)
+def test_log_level_follows_the_marker_not_the_call_site(
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    expected_level: int,
+    expects_traceback: bool,
+) -> None:
+    """A curated refusal is routine; only an incidental fault earns a traceback.
+
+    Without the split, any visitor could make the server dump a stack on
+    demand by sending an unauthenticated frame in a loop.
+    """
+    with caplog.at_level(logging.DEBUG, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            error, "Pause command rejected for task %s: %s", 7
+        )
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert record.levelno == expected_level
+    assert (record.exc_info is not None) is expects_traceback
+    assert "task 7" in record.getMessage()

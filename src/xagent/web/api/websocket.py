@@ -368,6 +368,24 @@ def client_safe_error_message(error: Exception) -> str:
     )
 
 
+def log_client_facing_failure(error: Exception, template: str, *args: object) -> None:
+    """Record a failure whose text the client will not see in full.
+
+    A ``ClientVisibleError`` is an answer written for the sender - an
+    unauthenticated frame, a task that no longer exists - so it is routine
+    and gets no traceback; otherwise any visitor could emit stack dumps on
+    demand. Anything else is incidental, and once its text is redacted the
+    traceback is the only record left.
+
+    ``template`` ends in the ``%s`` that receives ``error``; ``args`` fill the
+    placeholders before it.
+    """
+    if isinstance(error, ClientVisibleError):
+        logger.warning(template, *args, error)
+    else:
+        logger.error(template, *args, error, exc_info=True)
+
+
 async def send_message_delivery(
     websocket: WebSocket,
     *,
@@ -5013,9 +5031,7 @@ async def handle_chat_message(
             allow_missing_task=True,
         )
     except (PermissionError, ValueError) as exc:
-        logger.error(
-            "Chat command rejected for task %s: %s", task_id, exc, exc_info=True
-        )
+        log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
         await send_message_delivery(
             websocket,
@@ -6493,7 +6509,8 @@ async def _handle_chat_message_unserialized(
                 )
         except Exception as e:
             # Other unknown errors, re-raise
-            logger.error("Unexpected error in agent execution: %s", e, exc_info=True)
+            # Re-raised: the outermost handler owns the traceback.
+            logger.error("Unexpected error in agent execution: %s", e)
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
@@ -6511,7 +6528,8 @@ async def _handle_chat_message_unserialized(
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error("Unexpected error handling chat message: %s", e, exc_info=True)
+        # Re-raised: the outermost handler owns the traceback.
+        logger.error("Unexpected error handling chat message: %s", e)
         await finish_delivery_failure(client_safe_error_message(e))
         raise
 
@@ -6732,7 +6750,7 @@ async def handle_execute_task(
             )
     except Exception as e:
         # Other unknown errors, re-raise
-        logger.error(f"Unexpected error in task execution: {e}")
+        logger.error("Unexpected error in task execution: %s", e)
         raise
 
 
@@ -7453,13 +7471,13 @@ async def handle_intervention(
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error in intervention: {e}")
+        logger.error("Runtime error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error in intervention: {e}")
+        logger.error("Unexpected error in intervention: %s", e)
         raise
 
 
@@ -7476,11 +7494,8 @@ async def handle_pause_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
-        logger.error(
-            "Pause command rejected for task %s: %s",
-            task_id,
-            exc,
-            exc_info=True,
+        log_client_facing_failure(
+            exc, "Pause command rejected for task %s: %s", task_id
         )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(exc)},
@@ -7718,14 +7733,14 @@ async def _handle_pause_task_unserialized(
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error pausing task {task_id}: {e}")
+        logger.error("Runtime error pausing task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error pausing task {task_id}: {e}")
+        logger.error("Unexpected error pausing task %s: %s", task_id, e)
         raise
 
 
@@ -7742,11 +7757,8 @@ async def handle_resume_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
-        logger.error(
-            "Resume command rejected for task %s: %s",
-            task_id,
-            exc,
-            exc_info=True,
+        log_client_facing_failure(
+            exc, "Resume command rejected for task %s: %s", task_id
         )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(exc)},
@@ -8116,14 +8128,14 @@ async def _handle_resume_task_unserialized(
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error resuming task {task_id}: {e}")
+        logger.error("Runtime error resuming task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error resuming task {task_id}: {e}")
+        logger.error("Unexpected error resuming task %s: %s", task_id, e)
         raise
 
 
@@ -8802,8 +8814,10 @@ clarification questions as plain assistant text.
                 logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
-        logger.error(f"Error handling builder chat: {e}", exc_info=True)
-        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        logger.error("Error handling builder chat: %s", e, exc_info=True)
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+        )
 
 
 @ws_router.websocket("/ws/build/preview")
@@ -8886,7 +8900,9 @@ async def websocket_build_preview_endpoint(
                     json.dumps(
                         {
                             "type": "error",
-                            "message": f"Unknown message type: {message_type}",
+                            # Not echoed back: matches the main loop at the
+                            # "Unknown message type" site above.
+                            "message": "Unknown message type",
                         }
                     )
                 )
