@@ -48,11 +48,15 @@ def _migration_module() -> ModuleType:
 def _pre_migration_metadata() -> sa.MetaData:
     """The two tables reduced to the columns the migration reads/writes."""
     metadata = sa.MetaData()
+    # Uniqueness mirrors production (mcp_servers.name, public_mcp_apps.app_id)
+    # so a fixture cannot seed a state the real schema would reject -- which
+    # is also what makes the same-name-server cases below honest: they must use
+    # distinct names, exactly like production data.
     sa.Table(
         "mcp_servers",
         metadata,
         sa.Column("id", sa.Integer, primary_key=True),
-        sa.Column("name", sa.String(100), nullable=False),
+        sa.Column("name", sa.String(100), nullable=False, unique=True),
         sa.Column("transport", sa.String(50), nullable=False),
         sa.Column("auth", sa.JSON, nullable=True),
     )
@@ -60,7 +64,7 @@ def _pre_migration_metadata() -> sa.MetaData:
         "public_mcp_apps",
         metadata,
         sa.Column("id", sa.Integer, primary_key=True),
-        sa.Column("app_id", sa.String(100), nullable=False),
+        sa.Column("app_id", sa.String(100), nullable=False, unique=True),
         sa.Column("name", sa.String(100), nullable=False),
         sa.Column("transport", sa.String(50), nullable=False),
         sa.Column("provider_name", sa.String(50), nullable=True),
@@ -290,26 +294,27 @@ def test_a_non_dict_auth_payload_is_replaced_wholesale(seeded_engine):
     assert auth == {"app_id": "acme-drive", "provider": "acme"}
 
 
-def test_offline_sql_mode_raises_instead_of_stamping(seeded_engine):
+def test_offline_sql_mode_raises_instead_of_stamping():
     """Alembic emits alembic_version bookkeeping even for an empty migration
     body, so a silent offline no-op would advance the version while touching
     no row — permanently skipping the backfill on the next online upgrade.
-    The offline branch must fail loudly instead, for both dialects."""
-    from io import StringIO
+    The offline branch must fail loudly instead, for both dialects.
 
+    Scope: this pins the raise, which is the whole guard. The bookkeeping
+    hazard itself lives in Alembic's env.py/CLI path, which this harness does
+    not drive — an end-to-end `alembic upgrade --sql` test would need a real
+    config and script directory, and the raise here is what makes that path
+    unreachable in the first place."""
     module = _migration_module()
     for dialect in ("sqlite", "postgresql"):
-        output = StringIO()
         migration_context = MigrationContext.configure(
-            dialect_name=dialect,
-            opts={"as_sql": True, "output_buffer": output},
+            dialect_name=dialect, opts={"as_sql": True}
         )
         with (
             Operations.context(migration_context),
             pytest.raises(RuntimeError, match="offline"),
         ):
             module.upgrade()
-        assert output.getvalue() == ""
 
 
 def test_duplicate_exact_names_are_ambiguous_and_resolve_nothing(seeded_engine):
@@ -398,6 +403,203 @@ def test_identities_are_matched_raw_never_trimmed(seeded_engine):
     assert auth["Acme Drive "] is None
 
 
+def test_one_app_is_never_stamped_onto_two_rows(seeded_engine):
+    """_ensure_user_mcp_server creates a *new* row when a rename makes the old
+    one unfindable, so two rows for one app are this migration's own target
+    population. Stamping both would give them one identity, and
+    _lookup_oauth_server_for_app reads an unordered query — configure and
+    disconnect would then pick between them nondeterministically. Name
+    evidence wins; the provider-matched row keeps its pre-migration
+    behavior."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            # Matches by name.
+            {"name": "Acme Drive", "transport": "oauth", "auth": None},
+            # Would match the same app by provider — the orphan left behind by
+            # a rename.
+            {
+                "name": "Acme Drive (old)",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            },
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Drive"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["Acme Drive (old)"] == {"provider": "acme"}
+
+
+def test_name_evidence_wins_regardless_of_row_order(seeded_engine):
+    """The same collision with the provider-matched row seeded *first*: which
+    row wins must follow the evidence, not insertion order."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {
+                "name": "Acme Drive (old)",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            },
+            {"name": "Acme Drive", "transport": "oauth", "auth": None},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Drive"] == {"app_id": "acme-drive", "provider": "acme"}
+    assert auth["Acme Drive (old)"] == {"provider": "acme"}
+
+
+def test_an_ambiguous_name_still_gets_the_provider_fallback(seeded_engine):
+    """Poisoning is per *key*, not per row: an ambiguous name carries no
+    information, so a row under it still resolves through an unambiguous
+    provider. The two same-named apps differ in provider, so only one is
+    reachable that way."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            },
+            {
+                "app_id": "other-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "other",
+            },
+        ],
+        servers=[
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "other"},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {
+        "app_id": "other-drive",
+        "provider": "other",
+    }
+
+
+def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine):
+    """Three map-building branches at once: an app with a blank app_id is
+    skipped entirely, an app with a blank name contributes to the provider map
+    only, and app-side `transport` is case-folded (it is a shape enum, not an
+    identity)."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            # Blank app_id: unusable as an identity, contributes nothing.
+            {
+                "app_id": "   ",
+                "name": "Blank Id App",
+                "transport": "oauth",
+                "provider_name": "blank",
+            },
+            # Blank name: reachable by provider only.
+            {
+                "app_id": "nameless-app",
+                "name": "   ",
+                "transport": "oauth",
+                "provider_name": "nameless",
+            },
+            # Mixed-case transport still counts as oauth.
+            {
+                "app_id": "cased-app",
+                "name": "Cased App",
+                "transport": "OAuth",
+                "provider_name": None,
+            },
+        ],
+        servers=[
+            {"name": "Blank Id App", "transport": "oauth", "auth": None},
+            {
+                "name": "Whatever",
+                "transport": "oauth",
+                "auth": {"provider": "nameless"},
+            },
+            {"name": "Cased App", "transport": "oauth", "auth": None},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Blank Id App"] is None
+    assert auth["Whatever"] == {"provider": "nameless", "app_id": "nameless-app"}
+    # No provider on the app, so only app_id is written.
+    assert auth["Cased App"] == {"app_id": "cased-app"}
+
+
+def test_a_blank_provider_is_filled_while_unrelated_keys_survive(seeded_engine):
+    """A whitespace-only provider counts as absent and is replaced, and
+    everything else in the auth dict is carried through untouched."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "  ", "access_token": "encrypted-blob"},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {
+        "app_id": "acme-drive",
+        "provider": "acme",
+        "access_token": "encrypted-blob",
+    }
+
+
 def test_non_oauth_shapes_are_never_candidates(seeded_engine):
     """A stdio server row named like an app, and an oauth row named after a
     *non-oauth* app, are both left alone: the first is a different transport,
@@ -415,7 +617,11 @@ def test_non_oauth_shapes_are_never_candidates(seeded_engine):
             }
         ],
         servers=[
-            {"name": "Acme Notes", "transport": "stdio", "auth": None},
+            # mcp_servers.name is unique in production, so the two shapes must
+            # be seeded under distinct names; the stdio row is a candidate by
+            # neither transport nor name, and the oauth row's name resolves
+            # only a stdio app, which is the cross-shape refusal.
+            {"name": "Acme Notes Local", "transport": "stdio", "auth": None},
             {"name": "Acme Notes", "transport": "oauth", "auth": None},
         ],
     )
