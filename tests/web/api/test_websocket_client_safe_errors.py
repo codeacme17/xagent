@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,26 @@ def _client_payloads(connection_manager: MagicMock) -> list[dict]:
         )
         if call.args and isinstance(call.args[0], dict)
     ]
+
+
+def _sent_text_payloads(websocket: MagicMock) -> list[dict]:
+    """Payloads written straight to the socket, bypassing ``manager``.
+
+    ``handle_builder_chat`` uses this sink, so a helper that only reads the
+    manager mock cannot see it - which is why that handler's leak survived
+    until the AST sweep learned to recognize ``send_text``.
+    """
+    payloads = []
+    for call in websocket.send_text.await_args_list:
+        if not call.args:
+            continue
+        try:
+            decoded = json.loads(call.args[0])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(decoded, dict):
+            payloads.append(decoded)
+    return payloads
 
 
 @pytest.mark.asyncio
@@ -133,13 +154,24 @@ PRODUCERS: dict[str, int | None] = {
     "send_message_delivery": None,  # keyword-only
 }
 
-# The one deliberate exception: agent RuntimeError text is surfaced to the
-# sender by an existing, tested contract. Narrowing it is a product decision,
-# tracked in #1479 - not a hole to be quietly widened.
+# The one deliberate exception: agent RuntimeError text is passed through
+# untouched. Narrowing it is a product decision tracked in #1479.
 #
-# Anchored to (enclosing function, expression), not to the expression alone:
-# keying on source text blesses the string everywhere it is ever pasted,
-# including into a *validation* branch, which is not what #1479 describes.
+# Do NOT read this as "sender only". An earlier version of this comment cited
+# tests/web/api/test_websocket_owner_actor.py as an existing tested contract
+# for that; the citation was wrong. That file never pins this string, and its
+# one raw-RuntimeError assertion covers the sender-only fallback, not the
+# broadcast. Once a task resolves, this text goes out via broadcast_to_task to
+# every connection registered under the task_id - anonymous widget and share
+# visitors included, since they register into the same ConnectionManager.
+# DurableStorageOperationError is a RuntimeError subclass, so the tenant-scope
+# leak that motivates this module is still open on that path. #1479 owns it.
+#
+# Anchored to (enclosing function, expression) rather than to the expression
+# alone, which blessed the string in every function it appeared in. This stops
+# reuse in a *different* function only: `_local_assignments` unions every
+# assignment in the enclosing function regardless of branch, so moving the
+# string between branches of an allowlisted function is NOT caught. #1547.
 ALLOWED_RAW_MESSAGES = {
     ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
     ("handle_execute_task", "f'Runtime error: {str(e)}'"),
@@ -323,8 +355,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
                 f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
             )
 
-    # Pinned near the actual counts (23 / 23 at the time of writing) so that
-    # a producer disappearing from the sweep trips this before it trips a user.
+    # Actual counts at the time of writing: 23 producers, 28 error payloads.
+    # These floors sit below that, so a minority of sites can still vanish
+    # silently; tightening them to exact equality is tracked in #1547.
     assert checked_producers >= 21, (
         f"the producers moved; only {checked_producers} matched"
     )
@@ -456,3 +489,94 @@ def test_log_level_follows_the_marker_not_the_call_site(
     assert record.levelno == expected_level
     assert (record.exc_info is not None) is expects_traceback
     assert "task 7" in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_builder_chat_redacts_through_its_own_socket_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The leak found by self-review, pinned at runtime rather than by AST alone.
+
+    ``handle_builder_chat`` answers on ``websocket.send_text`` instead of going
+    through ``manager``, which is why it escaped both the original sweep and
+    every behavioural test in this file.
+    """
+    from xagent.web.services import builder_chat_runtime
+
+    monkeypatch.setattr(
+        builder_chat_runtime,
+        "load_builder_chat_runtime_inputs",
+        AsyncMock(side_effect=ValueError(f"builder fault at {SECRET}")),
+    )
+
+    websocket = MagicMock()
+    websocket.send_text = AsyncMock()
+    websocket.state = SimpleNamespace()
+
+    await websocket_api.handle_builder_chat(
+        websocket,
+        {"message": "build me an agent"},
+        SimpleNamespace(id=1, is_admin=False),
+    )
+
+    payloads = _sent_text_payloads(websocket)
+    errors = [p for p in payloads if p.get("type") == "error"]
+    assert errors, "the handler must answer the builder client"
+    assert SECRET not in repr(payloads)
+    assert errors[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_name", ["handle_pause_task", "handle_resume_task"], ids=["pause", "resume"]
+)
+async def test_permission_wording_survives_redaction_in_every_handler(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+) -> None:
+    """All three handlers share one raise site; only one of them was asserted.
+
+    ``test_websocket_error_payload.py`` pins this wording for
+    ``handle_chat_message``. A regression in either sibling's ``except`` - one
+    that redacted the refusal to the generic string, or leaked something else
+    through it - would have gone unnoticed.
+    """
+    db = _direct_db_session()
+    try:
+        owner = User(username=f"owner-{handler_name}", password_hash="hash")
+        intruder = User(username=f"intruder-{handler_name}", password_hash="hash")
+        db.add_all([owner, intruder])
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Someone else's task",
+            description="Not yours",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task_id, intruder_id = int(task.id), int(intruder.id)
+    finally:
+        db.close()
+
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    await getattr(websocket_api, handler_name)(
+        MagicMock(),
+        task_id,
+        {"user": SimpleNamespace(id=intruder_id, is_admin=False)},
+    )
+
+    payloads = _client_payloads(connection_manager)
+    assert payloads, "the handler must refuse the intruder out loud"
+    assert any(
+        payload.get("message")
+        == f"Access denied: Task {task_id} does not belong to you"
+        for payload in payloads
+    ), payloads

@@ -5033,17 +5033,17 @@ async def handle_chat_message(
     except (PermissionError, ValueError) as exc:
         log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
+        message = client_safe_error_message(exc)
         await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
-            message=client_safe_error_message(exc),
+            message=message,
             rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
-            websocket,
+            {"type": "error", "message": message}, websocket
         )
         return
     if enqueued is None:
