@@ -602,10 +602,15 @@ async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_p
     assert result["success"] is True
     assert result["collection_name"] == "agent_file_kb"
     assert result["files_ingested"] == 1
-    assert (
-        "Failed to ingest bad.txt due to unexpected error: parser exploded"
-        in result["message"]
-    )
+    # The failing file is named, so the model can tell the user which one to
+    # retry -- but not why, because this string is joined into the tool result
+    # and reaches the conversation transcript. The exceptions reachable here
+    # (``HashComputationError`` wrapping an OSError, ``DocumentValidationError``)
+    # render the absolute upload path, which sits under users/<user_id>/uploads
+    # and so carries the owning user's id. This assertion used to require the
+    # exception text, which pinned that disclosure in place.
+    assert "Failed to ingest bad.txt" in result["message"]
+    assert "parser exploded" not in result["message"]
     service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
     # One file landed, so the collection is real: cleaning it up would delete it.
     service.cleanup_failed_collection.assert_not_awaited()
@@ -1399,7 +1404,7 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     def fail_restore(_record):
         provider_exc = _ProviderThrottled(provider_message)
         raise DurableStorageOperationError(
-            f"Failed to restore durable object: {storage_key}"
+            "Failed to restore durable object", storage_key=storage_key
         ) from provider_exc
 
     source_file = tmp_path / "notes.txt"

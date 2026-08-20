@@ -98,16 +98,57 @@ class _ProviderThrottled(RuntimeError):
 def _wrapped_fault() -> DurableStorageOperationError:
     """Build a fault shaped exactly like ``ManagedFileRef``'s wraps.
 
-    The message carries the storage key and nothing else; everything an
-    operator needs to classify the failure lives in ``__cause__``. Assigning
-    ``__cause__`` directly is what ``raise ... from exc`` does, and it survives
-    a later bare ``raise`` of this object.
+    The key rides on ``storage_key``, not in the message, because ``str(exc)``
+    escapes to places the raise site does not control. Keeping this replica in
+    the production shape is the point: with the key in the message it would test
+    a shape nothing raises, and the log assertions would pass for the wrong
+    reason -- from the message text rather than from the rendered field.
+
+    Everything an operator needs to classify the failure lives in ``__cause__``.
+    Assigning it directly is what ``raise ... from exc`` does, and it survives a
+    later bare ``raise`` of this object.
     """
     fault = DurableStorageOperationError(
-        f"Failed to write durable object: {_STORAGE_KEY}"
+        "Failed to write durable object", storage_key=_STORAGE_KEY
     )
     fault.__cause__ = _ProviderThrottled(_PROVIDER_MESSAGE)
     return fault
+
+
+def test_the_wrap_keeps_the_storage_key_out_of_its_own_message() -> None:
+    """``str(exc)`` is the value that escapes; it must not carry the key.
+
+    A bare ``raise`` from a WebSocket fault arm carries this exception into a
+    task-wide broadcast and a persisted command row, and broad
+    ``except RuntimeError`` arms interpolate it into client-facing text. Those
+    egresses are pre-existing code that no arm in this PR can reach, so the
+    invariant has to hold at the exception rather than at each of them.
+    """
+    fault = _wrapped_fault()
+
+    assert _STORAGE_KEY not in str(fault)
+    assert "users/" not in str(fault)
+    assert fault.storage_key == _STORAGE_KEY
+
+    # Every real wrap site, not just this replica.
+    for path in (
+        Path(files_api.__file__).parent.parent / "services" / "managed_file_ref.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id
+                in {"DurableStorageOperationError", "DurableObjectIntegrityError"}
+            ):
+                continue
+            message = node.args[0] if node.args else None
+            assert not isinstance(message, ast.JoinedStr), (
+                f"{path.name}:{node.lineno} interpolates into the message; the "
+                "identifier belongs in storage_key= so str(exc) stays safe"
+            )
 
 
 def _rendered(record: logging.LogRecord) -> str:
@@ -145,18 +186,20 @@ def _warning_matching(
     return matches[0]
 
 
-def _assert_cause_chain_recorded(rendered: str, *, wrap_message: bool = True) -> None:
+def _assert_cause_chain_recorded(rendered: str, *, wrap_key: bool = True) -> None:
     """The provider fault -- class and message -- must be in the log text.
 
-    ``wrap_message=False`` for the delete path, whose exception was never
-    wrapped by ``ManagedFileRef`` and so carries no storage key of its own.
+    ``wrap_key=False`` where the wrap's own storage key should not appear: the
+    delete path hands over a raw provider exception that has none, and a caller
+    passing an explicit ``storage_key`` field deliberately overrides it.
     """
     assert _ProviderThrottled.__name__ in rendered
     assert _PROVIDER_MESSAGE in rendered
-    if wrap_message:
-        # The wrap's own message (and with it the storage key) is the anchor an
-        # operator greps for; it must not be dropped in favour of the cause.
-        assert _STORAGE_KEY in rendered
+    if wrap_key:
+        # The key is the anchor an operator greps for. It is no longer in the
+        # message -- ``str(exc)`` escapes to clients -- so this asserts the
+        # helper renders it from the exception instead of losing it.
+        assert f"storage_key={_STORAGE_KEY}" in rendered
 
 
 def test_durable_storage_unavailable_logs_cause_and_keeps_body_detail_free(
@@ -211,7 +254,7 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
     assert "durable cleanup before row delete" in rendered
     # The key is a named field, not part of the bounded operation label.
     assert f"storage_key={_STORAGE_KEY}" in rendered
-    _assert_cause_chain_recorded(rendered, wrap_message=False)
+    _assert_cause_chain_recorded(rendered, wrap_key=False)
 
 
 def test_one_wrap_yields_one_record_however_many_arms_report_it(
@@ -492,29 +535,60 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
 
 
 def test_no_client_supplied_message_type_can_become_an_operation_label() -> None:
-    """The WebSocket dispatch labels are a closed set, like the nine above.
+    """The label must be a literal from the map, never built from the input.
 
     ``operation`` is rendered into the message and, unlike the fields beside it,
-    is not escaped or bounded (#1520), so the received ``type`` must not reach
-    it. Mapping through a dict is what keeps that true; this pins the property
-    rather than the mechanism, so a future rewrite to interpolation fails.
+    is not escaped or bounded (#1520), so the received ``type`` reaching it would
+    reintroduce the injection this PR closed for fields.
+
+    Asserted against the **call site**, not by re-evaluating the lookup: an
+    earlier version of this test called ``_DISPATCH_OPERATIONS.get(hostile, ...)``
+    itself and claimed that pinned the property. It did not -- rewriting the call
+    site to ``f"websocket {message_data.get('type')}"`` would have left it green,
+    which is the exact leak class it claimed to guard.
     """
+    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
+    endpoint = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "websocket_chat_endpoint"
+    )
+
+    assignments = [
+        node
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "dispatching"
+            for target in node.targets
+        )
+    ]
+    assert assignments, "no assignment to `dispatching` -- the label plumbing moved"
+
+    for node in assignments:
+        value = node.value
+        if isinstance(value, ast.Constant):
+            assert isinstance(value.value, str)
+            continue
+        assert isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute), (
+            f"line {node.lineno}: `dispatching` is built by "
+            f"{ast.unparse(value)!r}; it must be a literal or a lookup in "
+            "_DISPATCH_OPERATIONS, never composed from the received type"
+        )
+        assert value.func.attr == "get"
+        assert (
+            isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "_DISPATCH_OPERATIONS"
+        ), f"line {node.lineno}: lookup is not against _DISPATCH_OPERATIONS"
+        fallback = value.args[1] if len(value.args) > 1 else None
+        assert isinstance(fallback, ast.Name) and fallback.id == (
+            "_UNKNOWN_DISPATCH_OPERATION"
+        ), f"line {node.lineno}: unknown types must fall back to a fixed label"
+
+    # And the values a client can select between are bounded literals.
     labels = set(websocket_api._DISPATCH_OPERATIONS.values())
     labels.add(websocket_api._UNKNOWN_DISPATCH_OPERATION)
-
-    for hostile in (
-        "chat\n2026-01-01 00:00:00 ERROR xagent.web - FABRICATED",
-        "../../etc/passwd",
-        "x" * 5000,
-        "",
-        "None",
-    ):
-        resolved = websocket_api._DISPATCH_OPERATIONS.get(
-            hostile, websocket_api._UNKNOWN_DISPATCH_OPERATION
-        )
-        assert resolved in labels
-        assert hostile not in resolved or hostile == ""
-
     for label in labels:
         assert label == label.strip()
         assert not any(char in label for char in "\n\r\t")
@@ -549,10 +623,69 @@ def test_every_dispatched_message_type_has_a_label() -> None:
     }
 
     assert dispatched, "found no dispatch branches -- the parse assumption broke"
-    assert dispatched == set(websocket_api._DISPATCH_OPERATIONS), (
+    labelled = set(websocket_api._DISPATCH_OPERATIONS)
+    assert dispatched == labelled | _SWALLOWED_DISPATCH_TYPES, (
         "dispatch cascade and label map disagree: "
-        f"{dispatched ^ set(websocket_api._DISPATCH_OPERATIONS)}"
+        f"{dispatched ^ (labelled | _SWALLOWED_DISPATCH_TYPES)}"
     )
+    assert not (labelled & _SWALLOWED_DISPATCH_TYPES), (
+        "a type cannot be both labelled and declared unreachable: "
+        f"{labelled & _SWALLOWED_DISPATCH_TYPES}"
+    )
+
+
+# Message types deliberately absent from the label map because their handler
+# swallows the fault before it can reach the endpoint arm. Declared, not
+# assumed: the test below reads the handlers to confirm it.
+_SWALLOWED_DISPATCH_TYPES = {"execute_task", "intervention"}
+_SWALLOWING_HANDLERS = {
+    "execute_task": "handle_execute_task",
+    "intervention": "handle_intervention",
+}
+
+
+@pytest.mark.parametrize(
+    ("dispatch_type", "handler"), sorted(_SWALLOWING_HANDLERS.items())
+)
+def test_a_type_is_unlabelled_only_because_its_handler_swallows(
+    dispatch_type: str, handler: str
+) -> None:
+    """The omission above must stay true of the code, not just of a comment.
+
+    Leaving these two out of the label map is only correct while their handlers
+    end in ``except RuntimeError`` without re-raising, because that is what stops
+    a durable fault ever reaching the arm that would use the label. If someone
+    adds a re-raise -- or a durable arm, which is the #1515 work -- the type
+    becomes reachable and needs a label, and this is what says so.
+    """
+    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
+    func = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == handler
+    )
+    runtime_arms = [
+        arm
+        for arm in (
+            handler_arm
+            for try_node in ast.walk(func)
+            if isinstance(try_node, ast.Try)
+            for handler_arm in try_node.handlers
+        )
+        if isinstance(arm.type, ast.Name) and arm.type.id == "RuntimeError"
+    ]
+
+    assert runtime_arms, f"{handler} no longer has an except RuntimeError arm"
+    for arm in runtime_arms:
+        reraises = any(
+            isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(arm)
+        )
+        assert not reraises, (
+            f"{handler}'s RuntimeError arm now re-raises, so {dispatch_type!r} "
+            "can reach the endpoint fault arm and needs a label in "
+            "_DISPATCH_OPERATIONS"
+        )
 
 
 @pytest.mark.parametrize(("label", "expected_fields"), _FAULT_SITES)
@@ -575,7 +708,11 @@ def test_fault_site_renders_its_label_and_fields(
     assert f"during {label}" in rendered
     for name in expected_fields:
         assert f"{name}=value-for-{name}" in rendered
-    _assert_cause_chain_recorded(rendered)
+    # A site that names its own storage_key overrides the wrap's, so the wrap's
+    # key is legitimately absent there -- that precedence is the point.
+    _assert_cause_chain_recorded(
+        rendered, wrap_key="storage_key" not in expected_fields
+    )
 
 
 def test_field_values_cannot_forge_a_log_record(

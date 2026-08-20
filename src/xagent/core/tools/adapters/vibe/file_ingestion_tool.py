@@ -238,10 +238,18 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 request_context = copy_context()
                 result = await loop.run_in_executor(None, request_context.run, func)
-            except Exception as exc:
-                errors.append(
-                    f"Failed to ingest {record.filename} due to unexpected error: {exc}"
-                )
+            except Exception:
+                # Deliberately does NOT interpolate the exception, for the same
+                # reason as the durable arm above: this string is joined into the
+                # tool result, so it reaches the model and the conversation
+                # transcript. ``HashComputationError`` wraps an OSError whose
+                # message embeds the absolute upload path, and
+                # ``DocumentValidationError`` renders "Source path does not
+                # exist: <path>" -- both under users/<user_id>/uploads/..., so
+                # both carry the owning user's id. The filename is the only part
+                # the model needs; the traceback below keeps everything else,
+                # server-side.
+                errors.append(f"Failed to ingest {record.filename}")
                 logger.exception(
                     "Unexpected error ingesting file %s",
                     record.filename,

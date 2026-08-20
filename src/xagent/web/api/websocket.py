@@ -7370,10 +7370,18 @@ async def handle_status_request(
 # ``operation`` is meant to be a bounded, aggregatable value -- it is also not
 # sanitised the way rendered fields are (#1520), so a client must not be able to
 # reach it.
+#
+# Only the message types whose handler lets a fault propagate are listed.
+# ``execute_task`` and ``handle_intervention`` end in ``except RuntimeError``
+# with no re-raise, so a durable fault from either is swallowed there and can
+# never reach the arms below; giving them a label would claim a reachability
+# that does not exist, and the label would read as covered while never being
+# emitted. Making them reachable means giving those two handlers a durable arm
+# of their own, which is absorber work and belongs to #1515 -- at which point
+# they get a label here. ``_SWALLOWED_DISPATCH_TYPES`` in the tests pins the
+# omission against the handlers, so this cannot silently become wrong.
 _DISPATCH_OPERATIONS = {
     "chat": "websocket chat turn",
-    "execute_task": "websocket execute_task",
-    "intervention": "websocket intervention",
     "status_request": "websocket status request",
     "pause_task": "websocket pause_task",
     "resume_task": "websocket resume_task",

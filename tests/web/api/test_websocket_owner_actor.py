@@ -3763,10 +3763,16 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
 
     Attachment preparation runs in the handler's *outer* scope, so this fault
     surfaces before the inner agent-execution arms and was answered with
-    ``str(exc)`` -- whose wrap text is
-    ``Failed to restore durable object: users/<id>/uploads/...``, embedding the
+    ``str(exc)``, which then read
+    ``Failed to restore durable object: users/<id>/uploads/...`` and embedded the
     owning user's id. Same defect as the model-facing leak in #1467, one
     transport over.
+
+    The key has since moved off the message onto ``storage_key``, so ``str(exc)``
+    no longer carries it and this arm is no longer the only thing standing
+    between the fault and the client. Both still matter: this pins the arm's
+    fixed message, and ``test_the_wrap_keeps_the_storage_key_out_of_its_own_message``
+    pins the exception. Neither alone would have caught both rounds of this.
 
     What this proves is the *rejection frame*: it asserts one was sent, so the
     negative assertions below cannot pass over an empty list. The broadcast
@@ -3794,7 +3800,7 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
 
     def failing_prepare(**_kwargs):
         wrap = DurableStorageOperationError(
-            f"Failed to restore durable object: {storage_key}"
+            "Failed to restore durable object", storage_key=storage_key
         )
         wrap.__cause__ = _ProviderThrottled("SlowDown: reduce your request rate")
         raise wrap
@@ -3862,13 +3868,22 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
     """The endpoint arm must name the message it was applying, not "chat turn".
 
     That arm guards the whole receive-loop dispatch, so it sees faults from
-    ``execute_task``, ``resume_task`` and the rest. It logged a fixed
-    ``"websocket chat turn"``, which mislabelled every one of them in the single
-    line meant to be authoritative about what failed.
+    every message type whose handler lets one through. It logged a fixed
+    ``"websocket chat turn"``, mislabelling all of them in the single line meant
+    to be authoritative about what failed.
 
-    Driven through the real endpoint rather than asserted on the label map: the
-    map agreeing with the cascade is checked separately, and neither of those
-    would notice the arm going back to a constant.
+    ``resume_task`` rather than ``execute_task``, and the difference matters:
+    ``handle_execute_task`` ends in ``except RuntimeError`` with no re-raise, so
+    a durable fault there never reaches this arm at all. An earlier version of
+    this test mocked that handler and asserted a label for a path production
+    cannot take -- green, and describing nothing.
+    ``handle_resume_task`` propagates, so mocking it to raise stands in for a
+    real fault, and
+    ``test_a_type_is_unlabelled_only_because_its_handler_swallows`` is what keeps
+    that distinction true rather than remembered.
+
+    Driven through the real endpoint, because neither the label map nor its
+    agreement with the cascade would notice this arm going back to a constant.
     """
     import json
     import logging
@@ -3885,7 +3900,7 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
 
     websocket = MagicMock()
     websocket.receive_text = AsyncMock(
-        side_effect=[json.dumps({"type": "execute_task"}), WebSocketDisconnect()]
+        side_effect=[json.dumps({"type": "resume_task"}), WebSocketDisconnect()]
     )
     ws_manager = MagicMock(
         connect=AsyncMock(),
@@ -3905,10 +3920,11 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
         patch.object(websocket_api, "handle_status_request", AsyncMock()),
         patch.object(
             websocket_api,
-            "handle_execute_task",
+            "handle_resume_task",
             AsyncMock(
                 side_effect=DurableStorageOperationError(
-                    f"Failed to restore durable object: users/{owner_id}/uploads/a/b.txt"
+                    "Failed to restore durable object",
+                    storage_key=f"users/{owner_id}/uploads/a/b.txt",
                 )
             ),
         ),
@@ -3923,5 +3939,7 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
         and "Durable storage unavailable" in entry.getMessage()
     ]
     assert len(fault_lines) == 1, fault_lines
-    assert "during websocket execute_task" in fault_lines[0]
+    assert "during websocket resume_task" in fault_lines[0]
     assert "chat turn" not in fault_lines[0]
+    # The key still reaches the log, from the attribute rather than the message.
+    assert f"storage_key=users/{owner_id}/uploads/a/b.txt" in fault_lines[0]
