@@ -128,22 +128,19 @@ def log_durable_storage_fault(
     # independently, instead of every new arm having to know which other arm
     # might already have run.
     #
-    # Both the read and the write are best-effort, because ``exc`` is not always
-    # one of this module's wraps: the delete path hands over the raw provider
-    # exception. A foreign object may use ``__slots__`` and reject the mark, and
-    # its ``__getattr__`` may raise something ``getattr``'s default does not
-    # absorb -- the default covers ``AttributeError`` only. Neither may become
-    # the outcome: this runs inside an ``except`` block, so an exception escaping
-    # here replaces a handled 503-with-a-log with an unhandled 500 that loses the
-    # fault, which is #1467's own failure mode. Logging twice is strictly better.
-    # (A ``BaseException`` from the same read still escapes; widening these
-    # guards module-wide is #1517.)
-    try:
-        if getattr(exc, "_durable_fault_logged", False):
+    # Only this module's own wraps are marked, and that is what makes the mark
+    # need no guarding. A wrap is what traverses several arms, so it is where
+    # dedup is needed; the raw provider exception the delete path hands over is
+    # reported by one site by definition. Restricting the mark also keeps this
+    # from setting a private attribute on an object the module does not own,
+    # where neither the read nor the write is safe in principle -- ``getattr``'s
+    # default absorbs ``AttributeError`` only -- and an exception escaping here,
+    # inside an ``except`` block, would replace a handled 503-with-a-log with an
+    # unhandled 500 that loses the fault, which is #1467's own failure mode.
+    if isinstance(exc, DurableStorageOperationError):
+        if exc._durable_fault_logged:
             return
-        exc._durable_fault_logged = True  # type: ignore[attr-defined]
-    except Exception:
-        pass
+        exc._durable_fault_logged = True
 
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
@@ -157,6 +154,12 @@ def log_durable_storage_fault(
 
 class DurableStorageOperationError(RuntimeError):
     """Raised when durable object storage is unavailable for an operation."""
+
+    # Set by ``log_durable_storage_fault`` so one fault yields one record even
+    # when several arms legitimately report it. Declared here rather than
+    # attached dynamically so it is typed, discoverable, and always present to
+    # read -- the reason that function needs no guard around the mark.
+    _durable_fault_logged: bool = False
 
 
 class DurableObjectIntegrityError(DurableStorageOperationError):

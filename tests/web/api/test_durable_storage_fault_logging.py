@@ -31,6 +31,7 @@ from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
     DurableStorageOperationError,
     ManagedFileRef,
+    log_durable_storage_fault,
 )
 
 from .conftest import _direct_db_session, _setup_admin
@@ -91,20 +92,6 @@ _UNAVAILABLE_DETAIL = "Durable storage is temporarily unavailable"
 
 class _ProviderThrottled(RuntimeError):
     """Stand-in for the boto/S3 error class the wrap discards."""
-
-
-class _HostileProviderError(RuntimeError):
-    """A provider exception whose non-dunder attribute reads raise.
-
-    Dunder lookups are left alone so ``traceback`` can still render the object;
-    the point is only that reading an attribute the helper invents is not safe
-    on a foreign exception.
-    """
-
-    def __getattr__(self, name: str) -> object:
-        if name.startswith("__"):
-            raise AttributeError(name)
-        raise RuntimeError(f"attribute access is not supported: {name}")
 
 
 def _wrapped_fault() -> DurableStorageOperationError:
@@ -226,31 +213,52 @@ def test_durable_storage_unavailable_accepts_an_unwrapped_provider_error(
     _assert_cause_chain_recorded(rendered, wrap_message=False)
 
 
-def test_a_provider_exception_that_rejects_attribute_reads_is_still_logged(
+def test_one_wrap_yields_one_record_however_many_arms_report_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The one-record-per-fault marker must not become the outcome.
+    """A fault crossing several handlers is recorded once.
 
-    Pairs with the test above: because the delete path hands over an unwrapped
-    provider exception, ``exc`` can be a foreign object, and the marker read
-    ``getattr(exc, ..., False)`` absorbs ``AttributeError`` only. Anything else a
-    ``__getattr__`` raises would propagate out of the helper -- from inside an
-    ``except`` block -- replacing the intended 503-with-a-log with an unhandled
-    500 that loses the fault. That is #1467's own failure mode, reintroduced by
-    the code meant to report it.
+    Two arms legitimately report the same fault -- the request-scoped one that
+    answers the client, and the endpoint-scoped one that catches whatever
+    escaped -- and neither can know whether the other ran. So the wrap carries
+    the fact that it has been logged. Without this, sustained-outage logs
+    duplicate every fault, and the duplicate looks like a second failure.
     """
-    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
-        with pytest.raises(HTTPException) as raised:
-            files_api._raise_durable_storage_unavailable(
-                _HostileProviderError(_PROVIDER_MESSAGE),
-                "durable cleanup before row delete",
-                storage_key=_STORAGE_KEY,
-            )
+    fault = _wrapped_fault()
 
-    assert raised.value.status_code == 503
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        log_durable_storage_fault(
+            files_api.logger, "websocket chat turn preparation", fault, task_id=42
+        )
+        log_durable_storage_fault(
+            files_api.logger, "websocket chat turn", fault, task_id=42
+        )
+
+    # The first arm to report wins, which is the innermost -- the one that knows
+    # what it was doing. The coarser endpoint label is the one dropped.
     rendered = _sole_warning(caplog, files_api.logger.name)
-    assert _HostileProviderError.__name__ in rendered
-    assert _PROVIDER_MESSAGE in rendered
+    assert "during websocket chat turn preparation" in rendered
+    _assert_cause_chain_recorded(rendered)
+
+
+def test_an_unwrapped_provider_error_is_not_marked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dedup is scoped to this module's wraps, and only they carry the mark.
+
+    Setting a private attribute on a foreign exception is not safe in principle
+    -- it may reject the write, and reading it back is not guaranteed either --
+    and it buys nothing: an unwrapped provider error reaches exactly one
+    reporting site, so there is nothing to deduplicate.
+    """
+    raw = _ProviderThrottled(_PROVIDER_MESSAGE)
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        log_durable_storage_fault(files_api.logger, "download", raw)
+        log_durable_storage_fault(files_api.logger, "preview", raw)
+
+    assert len(_warnings(caplog, files_api.logger.name)) == 2
+    assert not hasattr(raw, "_durable_fault_logged")
 
 
 @pytest.mark.asyncio
