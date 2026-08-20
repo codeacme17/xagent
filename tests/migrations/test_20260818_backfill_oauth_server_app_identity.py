@@ -9,9 +9,9 @@ What must hold:
 
 - an auth-less oauth row named exactly after an OAuth app is stamped with
   that app's ``app_id`` -- and only that: no ``provider`` is written;
-- a provider-only row (blank/absent ``app_id``) is stamped through its
-  provider when exactly one OAuth app uses that provider, and left alone
-  when the provider is ambiguous — providers are non-unique across apps;
+- a provider-only row is never stamped: the stored name is the only signal,
+  because no writer this codebase shipped produces a provider-without-app_id
+  row and the population that does exist carries no auth at all;
 - rows already carrying a nonblank ``app_id`` are untouched (idempotence);
 - rows resolving to nothing (orphans, non-oauth-app name matches) are left
   exactly as they were, preserving the name-fallback shim's behavior;
@@ -132,9 +132,14 @@ def test_an_auth_less_row_is_stamped_by_exact_display_name(seeded_engine):
     assert auth == {"app_id": "acme-drive"}
 
 
-def test_a_provider_only_row_is_stamped_when_the_provider_is_unambiguous(
-    seeded_engine,
-):
+def test_a_provider_only_row_is_never_stamped(seeded_engine):
+    """There is no provider fallback: the stored name is the only signal. No
+    writer this codebase shipped produces a provider-without-app_id row
+    (_oauth_auth_metadata writes app_id first and unconditionally; the generic
+    servers API cannot author transport="oauth" -- MCPServerConfig rejects it),
+    and the population that does exist carries no auth at all, so a
+    provider-keyed pass would defend nothing while being the only place two
+    rows could compete for one identity."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -148,56 +153,26 @@ def test_a_provider_only_row_is_stamped_when_the_provider_is_unambiguous(
             }
         ],
         servers=[
+            # Blank app_id plus a provider that would have resolved uniquely.
             {
                 "name": "Old Acme Name",
                 "transport": "oauth",
                 "auth": {"app_id": "   ", "provider": "acme"},
-            }
-        ],
-    )
-
-    _run_upgrade(engine)
-
-    auth = _auth_by_name(engine, metadata)["Old Acme Name"]
-    assert auth["app_id"] == "acme-drive"
-    # The row's own provider spelling is kept, not overwritten.
-    assert auth["provider"] == "acme"
-
-
-def test_an_ambiguous_provider_resolves_nothing(seeded_engine):
-    """The meta/Instagram case: two apps on one provider. Guessing would
-    attribute another connector's identity, so the row stays unstamped and
-    keeps the name-fallback shim's behavior."""
-    engine, metadata = seeded_engine
-    _seed(
-        engine,
-        metadata,
-        apps=[
-            {
-                "app_id": "acme-drive",
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "provider_name": "acme",
             },
+            # No app_id at all, provider only.
             {
-                "app_id": "acme-mail",
-                "name": "Acme Mail",
-                "transport": "oauth",
-                "provider_name": "acme",
-            },
-        ],
-        servers=[
-            {
-                "name": "Old Acme Name",
+                "name": "Older Acme Name",
                 "transport": "oauth",
                 "auth": {"provider": "acme"},
-            }
+            },
         ],
     )
 
     _run_upgrade(engine)
 
-    assert _auth_by_name(engine, metadata)["Old Acme Name"] == {"provider": "acme"}
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Old Acme Name"] == {"app_id": "   ", "provider": "acme"}
+    assert auth["Older Acme Name"] == {"provider": "acme"}
 
 
 def test_rows_already_stamped_and_orphans_are_untouched(seeded_engine):
@@ -266,9 +241,7 @@ def test_a_provider_conflict_refuses_the_name_match(seeded_engine):
     _run_upgrade(engine)
 
     # Untouched: the conflicting evidence is left for a human (or the
-    # provisioning writer's own refusal path) to resolve. NOTE the provider
-    # fallback did not fire either — the name match short-circuits before it,
-    # and resurrecting it here would guess between two contradictory signals.
+    # provisioning writer's own refusal path) to resolve.
     assert _auth_by_name(engine, metadata)["Acme Drive"] == {"provider": "other"}
 
 
@@ -393,11 +366,21 @@ def test_identities_are_matched_raw_never_trimmed(seeded_engine):
                 "name": "Acme Drive",
                 "transport": "oauth",
                 "provider_name": "acme",
-            }
+            },
+            # A second app so the variant-name row below has an identity
+            # available to it: were the lookup to trim, it would resolve this
+            # app rather than being refused by the claim guard, which would
+            # otherwise mask the bug.
+            {
+                "app_id": "acme-mail",
+                "name": "Acme Mail",
+                "transport": "oauth",
+                "provider_name": "mail",
+            },
         ],
         servers=[
             {"name": "Acme Drive", "transport": "oauth", "auth": None},
-            {"name": "Acme Drive ", "transport": "oauth", "auth": None},
+            {"name": "Acme Mail ", "transport": "oauth", "auth": None},
         ],
     )
 
@@ -405,17 +388,21 @@ def test_identities_are_matched_raw_never_trimmed(seeded_engine):
 
     auth = _auth_by_name(engine, metadata)
     assert auth["Acme Drive"] == {"app_id": " acme-drive "}
-    assert auth["Acme Drive "] is None
+    # Trailing space: no match, and "acme-mail" is claimed by nobody, so only a
+    # trimming lookup could have stamped this row.
+    assert auth["Acme Mail "] is None
 
 
-def test_one_app_is_never_stamped_onto_two_rows(seeded_engine):
-    """_ensure_user_mcp_server creates a *new* row when a rename makes the old
-    one unfindable, so two rows for one app are this migration's own target
-    population. Stamping both would give them one identity, and
-    _lookup_oauth_server_for_app reads an unordered query — configure and
-    disconnect would then pick between them nondeterministically. Name
-    evidence wins; the provider-matched row keeps its pre-migration
-    behavior."""
+def test_an_identity_another_row_already_carries_is_refused(seeded_engine):
+    """`claimed` seeds from the identities rows already carry, so an app whose
+    app_id is already on one row is never stamped onto a second -- two rows
+    sharing an identity would make _lookup_oauth_server_for_app, which reads an
+    unordered query, pick nondeterministically between them.
+
+    Reachable through the API, not only by out-of-band edits: rename the app
+    away (the writer, finding no row under the new name, creates and stamps a
+    fresh one), then rename it back, and a legacy unstamped row's name once
+    again resolves an app another row already carries."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -429,46 +416,13 @@ def test_one_app_is_never_stamped_onto_two_rows(seeded_engine):
             }
         ],
         servers=[
-            # Matches by name.
-            {"name": "Acme Drive", "transport": "oauth", "auth": None},
-            # Would match the same app by provider — the orphan left behind by
-            # a rename.
+            # Carries the identity already, and is not a candidate.
             {
-                "name": "Acme Drive (old)",
+                "name": "Acme Drive (renamed away)",
                 "transport": "oauth",
-                "auth": {"provider": "acme"},
+                "auth": {"app_id": "acme-drive"},
             },
-        ],
-    )
-
-    _run_upgrade(engine)
-
-    auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive"] == {"app_id": "acme-drive"}
-    assert auth["Acme Drive (old)"] == {"provider": "acme"}
-
-
-def test_name_evidence_wins_regardless_of_row_order(seeded_engine):
-    """The same collision with the provider-matched row seeded *first*: which
-    row wins must follow the evidence, not insertion order."""
-    engine, metadata = seeded_engine
-    _seed(
-        engine,
-        metadata,
-        apps=[
-            {
-                "app_id": "acme-drive",
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "provider_name": "acme",
-            }
-        ],
-        servers=[
-            {
-                "name": "Acme Drive (old)",
-                "transport": "oauth",
-                "auth": {"provider": "acme"},
-            },
+            # Would resolve to the same app by exact name.
             {"name": "Acme Drive", "transport": "oauth", "auth": None},
         ],
     )
@@ -476,55 +430,15 @@ def test_name_evidence_wins_regardless_of_row_order(seeded_engine):
     _run_upgrade(engine)
 
     auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive"] == {"app_id": "acme-drive"}
-    assert auth["Acme Drive (old)"] == {"provider": "acme"}
+    assert auth["Acme Drive (renamed away)"] == {"app_id": "acme-drive"}
+    assert auth["Acme Drive"] is None
 
 
-def test_an_ambiguous_name_still_gets_the_provider_fallback(seeded_engine):
-    """Poisoning is per *key*, not per row: an ambiguous name carries no
-    information, so a row under it still resolves through an unambiguous
-    provider. The two same-named apps differ in provider, so only one is
-    reachable that way."""
-    engine, metadata = seeded_engine
-    _seed(
-        engine,
-        metadata,
-        apps=[
-            {
-                "app_id": "acme-drive",
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "provider_name": "acme",
-            },
-            {
-                "app_id": "other-drive",
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "provider_name": "other",
-            },
-        ],
-        servers=[
-            {
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "auth": {"provider": "other"},
-            }
-        ],
-    )
-
-    _run_upgrade(engine)
-
-    assert _auth_by_name(engine, metadata)["Acme Drive"] == {
-        "app_id": "other-drive",
-        "provider": "other",
-    }
-
-
-def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine):
-    """Three map-building branches at once: an app with a blank app_id is
-    skipped entirely, an app with a blank name contributes to the provider map
-    only, and app-side `transport` is case-folded (it is a shape enum, not an
-    identity)."""
+def test_lookup_map_construction_skips_the_right_apps(seeded_engine):
+    """Two map-building branches: an app whose app_id is blank is unusable as
+    an identity and contributes nothing, and app-side ``transport`` is
+    case-folded (it is a shape enum, not an identity). A name-keyed map means a
+    blank-named app is simply unreachable."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -537,14 +451,7 @@ def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine)
                 "transport": "oauth",
                 "provider_name": "blank",
             },
-            # Blank name: reachable by provider only.
-            {
-                "app_id": "nameless-app",
-                "name": "   ",
-                "transport": "oauth",
-                "provider_name": "nameless",
-            },
-            # Mixed-case transport still counts as oauth.
+            # Mixed-case transport still counts as oauth on the app side.
             {
                 "app_id": "cased-app",
                 "name": "Cased App",
@@ -554,11 +461,6 @@ def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine)
         ],
         servers=[
             {"name": "Blank Id App", "transport": "oauth", "auth": None},
-            {
-                "name": "Whatever",
-                "transport": "oauth",
-                "auth": {"provider": "nameless"},
-            },
             {"name": "Cased App", "transport": "oauth", "auth": None},
         ],
     )
@@ -567,8 +469,6 @@ def test_lookup_map_construction_skips_and_folds_the_right_fields(seeded_engine)
 
     auth = _auth_by_name(engine, metadata)
     assert auth["Blank Id App"] is None
-    assert auth["Whatever"] == {"provider": "nameless", "app_id": "nameless-app"}
-    # No provider on the app, so only app_id is written.
     assert auth["Cased App"] == {"app_id": "cased-app"}
 
 
@@ -606,53 +506,10 @@ def test_unrelated_auth_keys_survive_the_stamp(seeded_engine):
     }
 
 
-def test_a_pre_stamped_row_blocks_a_second_row_claiming_its_app(seeded_engine):
-    """The collision the two-pass fix alone did not close: the partner row was
-    stamped *before* this run (by the writer, or by an earlier run), so it
-    never enters the candidate set. Its identity must still be claimed, or the
-    orphan gets the same app_id and _lookup_oauth_server_for_app picks between
-    them nondeterministically."""
-    engine, metadata = seeded_engine
-    _seed(
-        engine,
-        metadata,
-        apps=[
-            {
-                "app_id": "acme-drive",
-                "name": "Acme Drive v2",
-                "transport": "oauth",
-                "provider_name": "acme",
-            }
-        ],
-        servers=[
-            # Already carries the identity — the row the writer created on
-            # rename, and not a candidate.
-            {
-                "name": "Acme Drive v2",
-                "transport": "oauth",
-                "auth": {"app_id": "acme-drive", "provider": "acme"},
-            },
-            # The orphan left under the old name; only its provider resolves.
-            {
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "auth": {"provider": "acme"},
-            },
-        ],
-    )
-
-    _run_upgrade(engine)
-
-    auth = _auth_by_name(engine, metadata)
-    assert auth["Acme Drive v2"] == {"app_id": "acme-drive", "provider": "acme"}
-    assert auth["Acme Drive"] == {"provider": "acme"}
-
-
 def test_a_stamp_survives_a_rerun_unchanged(seeded_engine):
-    """Idempotence across runs, not just within one: run 1 stamps the name
-    match, and run 2 -- which is what a downgrade (a no-op) plus upgrade
-    produces -- must neither restamp it nor hand its identity to the orphan
-    that lost the first time."""
+    """Idempotence across runs, not just within one: run 2 -- what a downgrade
+    (a no-op) plus upgrade produces -- must neither restamp the row nor let the
+    identity it now carries be handed to anything else."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -665,34 +522,24 @@ def test_a_stamp_survives_a_rerun_unchanged(seeded_engine):
                 "provider_name": "acme",
             }
         ],
-        servers=[
-            {"name": "Acme Drive", "transport": "oauth", "auth": None},
-            {
-                "name": "Acme Drive (old)",
-                "transport": "oauth",
-                "auth": {"provider": "acme"},
-            },
-        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": None}],
     )
 
     _run_upgrade(engine)
     after_first = _auth_by_name(engine, metadata)
+    assert after_first["Acme Drive"] == {"app_id": "acme-drive"}
 
     module = _migration_module()
     module.downgrade()
     _run_upgrade(engine)
 
     assert _auth_by_name(engine, metadata) == after_first
-    assert after_first["Acme Drive"] == {"app_id": "acme-drive"}
-    assert after_first["Acme Drive (old)"] == {"provider": "acme"}
 
 
-def test_a_name_owned_by_a_non_oauth_app_refuses_the_provider_fallback(
-    seeded_engine,
-):
+def test_a_name_owned_by_a_non_oauth_app_is_refused(seeded_engine):
     """A name matching a *non-OAuth* app is evidence about this row, not an
-    absence of evidence. Treating the two alike would let the row fall through
-    to the provider fallback and be stamped with an unrelated app's id."""
+    absence of evidence: the row is refused rather than treated as unmatched,
+    so no later rule can claim it for an app of the wrong shape."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -725,6 +572,37 @@ def test_a_name_owned_by_a_non_oauth_app_refuses_the_provider_fallback(
     assert _auth_by_name(engine, metadata)["Acme Notes"] == {"provider": "acme"}
 
 
+def test_a_name_carried_by_both_shapes_refuses_the_oauth_app(seeded_engine):
+    """The one case where the cross-shape gate changes the outcome: a single
+    display name carried by an OAuth app *and* a non-OAuth app. Without the
+    gate the OAuth app would simply win the name; with it the ownership is
+    contested, so the row keeps its read-time name fallback."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            },
+            {
+                "app_id": "acme-drive-stdio",
+                "name": "Acme Drive",
+                "transport": "stdio",
+                "provider_name": None,
+            },
+        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": None}],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] is None
+
+
 def test_a_malformed_non_string_provider_refuses_the_row(seeded_engine):
     """A provider that is not a string at all cannot be compared by the
     conflict gate, and _is_oauth_server_for_app would reject the row against
@@ -754,35 +632,6 @@ def test_a_malformed_non_string_provider_refuses_the_row(seeded_engine):
     _run_upgrade(engine)
 
     assert _auth_by_name(engine, metadata)["Acme Drive"] == {"provider": ["acme"]}
-
-
-def test_two_provider_only_rows_resolve_deterministically(seeded_engine):
-    """A tie the evidence cannot break: two unstamped rows whose only signal
-    is the same provider. Exactly one may be stamped, and candidates are read
-    ordered by id so it is the same one on every run and every backend."""
-    engine, metadata = seeded_engine
-    _seed(
-        engine,
-        metadata,
-        apps=[
-            {
-                "app_id": "acme-drive",
-                "name": "Acme Drive",
-                "transport": "oauth",
-                "provider_name": "acme",
-            }
-        ],
-        servers=[
-            {"name": "orphan-a", "transport": "oauth", "auth": {"provider": "acme"}},
-            {"name": "orphan-b", "transport": "oauth", "auth": {"provider": "acme"}},
-        ],
-    )
-
-    _run_upgrade(engine)
-
-    auth = _auth_by_name(engine, metadata)
-    assert auth["orphan-a"] == {"app_id": "acme-drive", "provider": "acme"}
-    assert auth["orphan-b"] == {"provider": "acme"}
 
 
 def test_a_mixed_case_transport_row_is_not_a_candidate(seeded_engine):
@@ -918,7 +767,9 @@ def postgres_seeded_engine():
 @pytest.mark.postgresql
 def test_the_backfill_runs_on_postgresql(postgres_seeded_engine):
     """Stamp, refusal and collision behavior on the real backend: the JSON
-    write round-trips, and the pre-stamped partner still blocks the orphan."""
+    write round-trips; a name match is stamped; a row whose name resolves an
+    app another row already carries is refused; a provider-only row and an
+    orphan are both left alone."""
     engine, metadata = postgres_seeded_engine
     _seed(
         engine,
@@ -958,6 +809,7 @@ def test_the_backfill_runs_on_postgresql(postgres_seeded_engine):
     auth = _auth_by_name(engine, metadata)
     assert auth["Acme Mail"] == {"app_id": "acme-mail"}
     assert auth["Acme Drive v2"] == {"app_id": "acme-drive", "provider": "acme"}
-    # Its app_id is already carried by the row above.
+    # Its name resolves acme-drive, but the row above already carries that
+    # identity, so it is refused and keeps its pre-migration state.
     assert auth["Acme Drive"] == {"provider": "acme"}
     assert auth["orphan"] is None

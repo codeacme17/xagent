@@ -1,8 +1,7 @@
 """backfill auth.app_id onto unstamped OAuth-transport server rows
 
 Rows provisioned before ``_ensure_user_mcp_server`` wrote OAuth metadata
-carry no ``auth`` payload at all (and a small malformed population can
-carry a blank or provider-only ``auth``). Every read path that resolves a
+carry no ``auth`` payload at all. Every read path that resolves a
 server row back to its catalog app prefers the stable ``auth.app_id`` and
 falls back to the row's *exact current display name*
 (``get_app_for_mcp_server``) -- so an unstamped row's identity lives and
@@ -56,31 +55,35 @@ can be derived safely:
   whitespace/case variants are producible — they simply do not match here,
   and under-matching leaves the name-fallback shim in charge.
 - Each is matched against ``public_mcp_apps`` (builtin apps are seeded
-  into that table too) by exact display name -- the stored column, which is
-  the value ``_ensure_user_mcp_server`` named the row after *unless* a
-  builtin's stored name has drifted from the code registry
-  ``_app_to_dict`` serves it from, in which case this simply does not match
-  and the row is left alone. If the name resolves
-  nothing -- including when it is *ambiguous*, i.e. shared by two OAuth
-  apps -- and the row's ``auth.provider`` names exactly one OAuth app,
-  that app is used instead. Providers are non-unique across apps (the
-  meta/Instagram siblings), so an ambiguous provider is never resolved.
-  Names are resolved for *every* candidate before any provider fallback
-  runs, and an app already claimed by a name match is never handed to a
-  second row: ``_ensure_user_mcp_server`` creates a *new* row when a
-  rename makes the old one unfindable, so orphan pairs for one app are
-  this migration's own target population, and stamping both would give
-  two rows the same identity -- which ``_lookup_oauth_server_for_app``
-  resolves from an unordered query, making configure/disconnect pick
-  nondeterministically between them. Name evidence wins; the loser keeps
-  the behavior it had before this migration.
+  into that table too) by its exact stored display name -- the value
+  ``_ensure_user_mcp_server`` named the row after, *unless* a builtin's
+  stored name has drifted from the code registry ``_app_to_dict`` serves
+  it from, in which case this simply does not match and the row is left
+  alone. A name shared by two OAuth apps resolves nothing: picking either
+  would be a guess.
+- The stored name is the **only** signal used to resolve an app. There is
+  deliberately no provider fallback: no writer this codebase has ever
+  shipped produces a row carrying a provider but no ``app_id``
+  (``_oauth_auth_metadata`` writes ``app_id`` first and unconditionally,
+  and the generic servers API cannot author ``transport="oauth"`` at all --
+  ``MCPServerConfig`` rejects it), so that population has never existed,
+  while the population that *does* exist -- rows written with no ``auth``
+  at all before ``cb724dbb`` -- carries no provider to fall back to. A
+  provider-keyed pass would defend nothing real, and it was the only place
+  where two rows could compete for one identity.
+- An app already carried by another row is never handed to a second one.
+  ``_ensure_user_mcp_server`` creates a *new* row when a rename makes the
+  old one unfindable, so orphan pairs for one app are this migration's own
+  target population, and two rows sharing an identity would make
+  ``_lookup_oauth_server_for_app`` -- which reads an unordered query --
+  pick nondeterministically between them for configure/disconnect. The
+  refused row keeps the behavior it had before this migration.
 - Only apps whose own ``transport`` is ``oauth`` are eligible: a
   same-named non-OAuth app is a different connector shape, and stamping
   its id onto an oauth-transport row would manufacture exactly the
   cross-shape identity confusion this migration exists to remove. Such a
-  name is *refused*, not merely unmatched -- it is evidence about the row,
-  so letting it fall through to the provider fallback would stamp the row
-  with some unrelated app's id.
+  name is *refused*, not merely treated as unmatched -- it is evidence
+  about the row rather than an absence of evidence.
 - Rows that resolve to nothing are left untouched, keeping the exact-name
   fallback in ``get_app_for_mcp_server`` as their compatibility shim. That
   is a deliberate trade rather than a free win: ``get_app_for_mcp_server``
@@ -94,15 +97,17 @@ can be derived safely:
   the code registry (``_app_to_dict``) and only warn about drift. The two
   can therefore disagree about a drifted row; the blast radius is one
   unambiguous stamp on a row whose stored shape says ``oauth``.
-- Only rows whose stored name still matches can be stamped by name. In a
-  deployment where the drift already happened, only the provider fallback
-  can rescue the row -- and not when the provider is shared or absent. So
-  this hardens the population that is still resolvable today; it cannot
-  retroactively repair a row whose every identity signal is already gone.
+- Only rows whose stored name still matches can be stamped. In a
+  deployment where the drift already happened, nothing here can rescue the
+  row: this hardens the population still resolvable today, and cannot
+  retroactively repair one whose identity signal is already gone.
 - A row whose own ``auth.provider`` contradicts the name-resolved app's
   provider is refused — the same conflict the provisioning writer
-  (``_ensure_server_matches_oauth_app``) refuses with a ValueError.
-  Stamping the name's id would produce a row *no* app claims.
+  (``_ensure_server_matches_oauth_app``) refuses with a ValueError. This is
+  a guard on the name path, not a remnant of any fallback:
+  ``_is_oauth_server_for_app`` checks a stored provider *even when the
+  app_id matches*, so stamping here would leave a row that matches no app
+  at all, where today it still matches by name.
 - Only ``app_id`` is written, into a *copy* of the existing auth dict;
   nothing else is added or touched. A ``provider`` is deliberately not
   written: ``app_id`` alone resolves the app, while
@@ -152,7 +157,12 @@ depends_on: str | Sequence[str] | None = None
 
 
 class _CatalogApp(NamedTuple):
-    """The identity fields the backfill reads off a catalog app row."""
+    """A catalog app's ``app_id``, plus its provider.
+
+    ``app_id`` is the identity that gets stamped. ``provider`` is *not* an
+    identity signal -- nothing resolves an app by it -- and is carried only so
+    the name path can refuse a row whose own stored provider contradicts it.
+    """
 
     app_id: str
     provider: str | None
@@ -219,28 +229,25 @@ def upgrade() -> None:
         sa.column("provider_name", sa.String),
     )
 
-    # Exact display name -> app, and provider -> apps, for OAuth apps only.
-    # A key shared by two OAuth apps is poisoned to None: that *key* then
+    # Exact display name -> app, for OAuth apps only.
+    # A name shared by two OAuth apps is recorded as ambiguous: it then
     # resolves nothing rather than picking whichever app was seeded first.
-    # Poisoning is per key, not per row -- a row whose name is ambiguous
-    # still gets the provider fallback below, which is the point (the name
-    # carries no information there, while an unambiguous provider does).
     # Keys and stored values are the raw strings — identities are opaque, and
     # the identity paths compare them exactly. Only ``transport`` is folded,
     # because it is a shape enum rather than an identity -- and a little more
     # tolerantly than classify_app_auth, which lowercases without stripping.
     apps_by_name: dict[str, _CatalogApp] = {}
-    apps_by_provider: dict[str, _CatalogApp] = {}
     ambiguous_names: set[str] = set()
-    ambiguous_providers: set[str] = set()
     names_of_other_shapes: set[str] = set()
     for app_row in bind.execute(sa.select(public_mcp_apps)).mappings():
         if str(app_row["transport"] or "").strip().lower() != "oauth":
             # Recorded, not ignored: a row whose name belongs to a non-oauth
             # app must be told apart from a row whose name belongs to nothing.
             # Both miss apps_by_name, but the first is positive evidence of a
-            # *different-shape* app, and letting it fall through to the
-            # provider fallback would stamp it with an unrelated app's id.
+            # *different-shape* app. It only changes the outcome when one name
+            # is carried by both an oauth and a non-oauth app -- then this is
+            # what stops the oauth app from claiming the row on a name whose
+            # ownership is genuinely contested.
             other_name = _nonblank_str(app_row["name"])
             if other_name:
                 names_of_other_shapes.add(other_name)
@@ -248,24 +255,21 @@ def upgrade() -> None:
         app_id = _nonblank_str(app_row["app_id"])
         if not app_id:
             continue
-        provider = _nonblank_str(app_row["provider_name"])
-        entry = _CatalogApp(app_id, provider)
+        entry = _CatalogApp(app_id, _nonblank_str(app_row["provider_name"]))
         name = _nonblank_str(app_row["name"])
         if name:
             if name in apps_by_name:
                 ambiguous_names.add(name)
             apps_by_name[name] = entry
-        if provider:
-            if provider in apps_by_provider:
-                ambiguous_providers.add(provider)
-            apps_by_provider[provider] = entry
 
     # Materialized before the loop: the loop UPDATEs the same table, and
     # stepping a live pysqlite cursor across a mutating table has formally
     # unspecified row visibility. The table is small (one row per connector).
-    # Ordered by id so a tie the evidence cannot break -- two unstamped rows
-    # whose only signal is the same provider -- resolves to the same row on
-    # every run and every backend, instead of following an unordered scan.
+    # Ordered by id. No longer load-bearing for correctness -- with the
+    # provider pass gone, mcp_servers.name is unique and each name maps to one
+    # app, so two candidates can never contest one identity -- but it keeps the
+    # UPDATE order and the per-row audit log reproducible across runs and
+    # backends, which matters for a migration with no downgrade.
     candidates = (
         bind.execute(
             sa.select(mcp_servers)
@@ -325,27 +329,22 @@ def upgrade() -> None:
             continue
         pending.append(_Candidate(row, auth, _nonblank_str(raw_provider)))
 
-    # Two passes so one app is never stamped onto two rows, and so which row
-    # wins is decided by evidence rather than by row order. Name evidence is
-    # strictly stronger than a provider (it names one app; a provider can be
-    # shared), so every name match is resolved first and claims its app; the
-    # provider fallback then only fills apps nobody claimed by name.
+    # One pass: a row is resolved by its exact stored name and nothing else.
+    # There is deliberately no provider fallback -- no writer this codebase has
+    # ever shipped produces a row with a provider but no app_id
+    # (_oauth_auth_metadata writes app_id first and unconditionally; the
+    # generic servers API cannot author transport="oauth" at all), so such a
+    # population has never existed, and the population that *does* exist --
+    # rows written with no auth at all before cb724dbb -- carries no provider
+    # to fall back to. A provider-keyed pass would defend nothing real while
+    # being the only place two rows could compete for one identity.
     #
-    # This is not hypothetical: _ensure_user_mcp_server creates a *new* row
-    # when a rename makes the old one unfindable, so two rows for one app are
-    # exactly this migration's target population. Stamping both would make
-    # _lookup_oauth_server_for_app -- which reads an unordered query -- pick
-    # nondeterministically between them for configure/disconnect.
-    #
-    # `claimed` starts from the identities rows *already* carry, not empty:
-    # the colliding partner is usually the row the writer stamped on rename,
-    # which never enters `pending` at all. Seeding it is also what makes the
-    # idempotence claim true across a downgrade-then-upgrade rerun -- the
-    # no-op downgrade leaves run 1's stamps in place, and run 2 must not hand
-    # the same identity to the next-best row.
+    # `claimed` still starts from the identities rows already carry: the
+    # colliding partner is the row the writer stamped when a rename left the
+    # old one orphaned, and it never enters `pending`. Seeding it is also what
+    # makes idempotence hold across a downgrade-then-upgrade rerun.
     resolutions: dict[int, str] = {}
     claimed: set[str] = set(already_stamped)
-    deferred: list[_Candidate] = []
 
     def claim(candidate: _Candidate, app: _CatalogApp) -> None:
         """Record the stamp, or refuse it because the identity is taken."""
@@ -364,37 +363,26 @@ def upgrade() -> None:
     for candidate in pending:
         row_name = str(candidate.row["name"]) if candidate.row["name"] else ""
         if row_name in names_of_other_shapes:
-            # The name belongs to an app of another transport. That is
-            # evidence about *this* row, not an absence of evidence, so it
-            # refuses outright instead of falling through to the provider
-            # fallback -- which would stamp it with an unrelated app's id.
+            # The name belongs to an app of another transport -- evidence about
+            # this row, so it refuses rather than resolving to nothing.
             continue
-        app = None if row_name in ambiguous_names else apps_by_name.get(row_name)
+        if row_name in ambiguous_names:
+            # Two OAuth apps share this exact name; picking either would be a
+            # guess, so the row keeps its read-time name fallback.
+            continue
+        app = apps_by_name.get(row_name)
         if app is None:
-            if candidate.provider:
-                deferred.append(candidate)
             continue
         if candidate.provider and app.provider and candidate.provider != app.provider:
             # The row's own provider contradicts the name-resolved app -- the
             # same conflict _ensure_server_matches_oauth_app refuses with a
-            # ValueError. Stamping the name's app_id would create a row *no*
-            # app claims (it fails this app's provider gate and the provider's
-            # app_id gate), so refuse and leave the read-time name fallback
-            # exactly as it was. Unlike an *ambiguous* name, which carries no
-            # information and so still gets the provider fallback above, a
-            # contradiction is information: two signals disagree, and picking
-            # either one would be a guess.
+            # ValueError. This is a guard on the name path, not a leftover of
+            # any fallback: _is_oauth_server_for_app checks a stored provider
+            # *even when the app_id matches*, so stamping here would leave a
+            # row that matches no app at all, where today it still matches by
+            # name.
             continue
         claim(candidate, app)
-
-    for candidate in deferred:
-        provider = candidate.provider
-        assert provider is not None  # only providers reach the deferred list
-        if provider in ambiguous_providers:
-            continue
-        app = apps_by_provider.get(provider)
-        if app is not None:
-            claim(candidate, app)
 
     stamped = 0
     for candidate in pending:
