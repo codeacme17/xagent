@@ -5719,6 +5719,40 @@ async def _handle_chat_message_unserialized(
             )
         return not delivery_failure_pool_timeout
 
+    async def answer_turn_failure(message: str) -> bool:
+        """Reject the turn, addressed however this connection is reachable.
+
+        Every failure arm in the agent-execution block owes the client the same
+        three steps -- reject the delivery, then broadcast to the task if one is
+        authorized or answer this socket if not -- differing only in the message
+        and in what it logs first. Repeated per arm, the one line worth reviewing
+        -- what the client is told, and whether it carries exception text -- sat
+        inside twenty identical lines of dispatch. The #1467 leaks came from arms
+        at the wrong scope rather than from this duplication, but the duplication
+        is why reading these arms is harder than it needs to be.
+
+        Returns ``False`` when the delivery layer says the caller must stop
+        without dispatching, which is the caller's cue to return.
+        """
+        if not await finish_delivery_failure(message):
+            return False
+        timestamp = datetime.now(timezone.utc).timestamp()
+        if authorized_task_id is not None:
+            error_payload = await _read_task_error_payload_offloop(
+                authorized_task_id,
+                message,
+            )
+            await manager.broadcast_to_task(
+                {**error_payload, "timestamp": timestamp},
+                authorized_task_id,
+            )
+        else:
+            await manager.send_personal_message(
+                {"type": "error", "message": message, "timestamp": timestamp},
+                websocket,
+            )
+        return True
+
     async def finish_existing_delivery(
         claim: Union[UserMessageDeliveryClaim, _UserMessageDeliverySnapshot],
     ) -> None:
@@ -6388,30 +6422,8 @@ async def _handle_chat_message_unserialized(
             # Data validation and format error
             message = f"Data validation error: {str(e)}"
             logger.error(f"Data validation error in agent execution: {e}")
-            if not await finish_delivery_failure(message):
+            if not await answer_turn_failure(message):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    message,
-                )
-                await manager.broadcast_to_task(
-                    {
-                        **error_payload,
-                        "timestamp": timestamp,
-                    },
-                    authorized_task_id,
-                )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except DurableObjectIntegrityError:
             # Precedes the durable-fault arm below, which this subclasses. A
             # checksum mismatch is permanent corruption, already recorded at
@@ -6423,27 +6435,8 @@ async def _handle_chat_message_unserialized(
                 "A stored file for this message failed its integrity check "
                 "and must be re-uploaded."
             )
-            if not await finish_delivery_failure(message):
+            if not await answer_turn_failure(message):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    message,
-                )
-                await manager.broadcast_to_task(
-                    {**error_payload, "timestamp": timestamp},
-                    authorized_task_id,
-                )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except DurableStorageOperationError as exc:
             # Must precede the RuntimeError arm below, which this subclasses.
             # This is the selected-file attachment path: the fault arrives here
@@ -6466,55 +6459,14 @@ async def _handle_chat_message_unserialized(
             message = (
                 "A stored file for this message could not be read. Please try again."
             )
-            if not await finish_delivery_failure(message):
+            if not await answer_turn_failure(message):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    message,
-                )
-                await manager.broadcast_to_task(
-                    {**error_payload, "timestamp": timestamp},
-                    authorized_task_id,
-                )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except RuntimeError as e:
             # Runtime error
             message = f"Runtime error: {str(e)}"
             logger.error(f"Runtime error in agent execution: {e}", exc_info=True)
-            if not await finish_delivery_failure(message):
+            if not await answer_turn_failure(message):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    message,
-                )
-                await manager.broadcast_to_task(
-                    {
-                        **error_payload,
-                        "timestamp": timestamp,
-                    },
-                    authorized_task_id,
-                )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except Exception as e:
             # Other unknown errors, re-raise
             logger.error(f"Unexpected error in agent execution: {e}")
@@ -7413,6 +7365,22 @@ async def handle_status_request(
     await send_historical_data_as_stream(websocket, task_id, user)
 
 
+# Operation labels for the endpoint-level fault arms, keyed by message type.
+# A closed map rather than interpolation: ``type`` is client-supplied, and
+# ``operation`` is meant to be a bounded, aggregatable value -- it is also not
+# sanitised the way rendered fields are (#1520), so a client must not be able to
+# reach it.
+_DISPATCH_OPERATIONS = {
+    "chat": "websocket chat turn",
+    "execute_task": "websocket execute_task",
+    "intervention": "websocket intervention",
+    "status_request": "websocket status request",
+    "pause_task": "websocket pause_task",
+    "resume_task": "websocket resume_task",
+}
+_UNKNOWN_DISPATCH_OPERATION = "websocket unknown message type"
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -7431,6 +7399,13 @@ async def websocket_chat_endpoint(
 
     await manager.connect(websocket, task_id)
 
+    # Which message the loop is currently applying, for the fault arms below:
+    # they guard the whole dispatch, so a fixed label would report a resume or
+    # an execute_task fault as a chat turn in the one line meant to name it.
+    # Initialised here, not in the loop, because the initial status request runs
+    # before the first message is ever parsed.
+    dispatching = "websocket initial status request"
+
     try:
         # Send initial state
         await handle_status_request(websocket, task_id, user)
@@ -7447,6 +7422,10 @@ async def websocket_chat_endpoint(
             # Add user info to message data
             message_data["user_id"] = user.id
             message_data["user"] = user
+
+            dispatching = _DISPATCH_OPERATIONS.get(
+                str(message_data.get("type")), _UNKNOWN_DISPATCH_OPERATION
+            )
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
@@ -7481,7 +7460,7 @@ async def websocket_chat_endpoint(
         # the very path #1467 was filed about. Still swallowed, as before:
         # the socket is going away regardless and the client has already been
         # answered; only the diagnosis changes.
-        log_durable_storage_fault(logger, "websocket chat turn", exc, task_id=task_id)
+        log_durable_storage_fault(logger, dispatching, exc, task_id=task_id)
     except (ConnectionError, RuntimeError) as e:
         # Connection error
         logger.error(f"Connection error in WebSocket: {e}")

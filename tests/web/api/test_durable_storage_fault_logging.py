@@ -28,6 +28,7 @@ from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
 from xagent.web.services.managed_file_ref import (
+    _MAX_LOG_VALUE_LENGTH,
     DurableStorageOperationError,
     ManagedFileRef,
 )
@@ -349,7 +350,7 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
 # assertions; this sweep is what makes the set itself the contract.
 _FAULT_SITES = (
     ("signed durable redirect", ("file_id",)),
-    ("upload", ()),
+    ("upload", ("user_id", "task_id")),
     ("download", ("file_id",)),
     ("preview", ("file_id",)),
     ("pptx preview", ("file_id",)),
@@ -364,13 +365,7 @@ def _identifiers(expression: ast.expr) -> set[str]:
     """Every name and attribute the expression reads.
 
     ``file_ref.record.file_id`` yields ``file_ref``, ``record`` and ``file_id``,
-    so a field may be bound to a bare variable or reached through attributes --
-    what it may not be is bound to something of an unrelated name.
-
-    This does make the field name part of the call site's vocabulary: a new site
-    whose source is spelled differently (``file_id=row.id``) has to read it
-    through a local of the field's own name. That is the point -- the alternative
-    is a check that cannot tell ``file_id=file_id`` from ``file_id=storage_key``.
+    so a field may be bound to a bare variable or reached through attributes.
     """
     found: set[str] = set()
     for node in ast.walk(expression):
@@ -381,11 +376,34 @@ def _identifiers(expression: ast.expr) -> set[str]:
     return found
 
 
+def _binds_a_matching_name(field: str, expression: ast.expr) -> bool:
+    """Whether the expression reads an identifier plausibly holding ``field``.
+
+    A qualifier prefix is allowed -- ``task_id=parsed_task_id`` and
+    ``user_id=owner_user_id`` name the thing they carry -- while an unrelated
+    name is rejected, which is what catches ``file_id=storage_key``.
+
+    **This checks spelling, not referent, and that is a real limit.** The
+    "public preview task asset" site shipped with ``file_id=file_id`` where the
+    failing object was ``asset_record`` -- a different row from the route's
+    ``file_id``, so the one line meant to identify the failure named an object
+    that was fine. This check passed it, because the spelling was right. Only a
+    test that drives the endpoint distinguishes those, which is #1522; do not
+    read a green run here as "every site logs the right object".
+    """
+    return any(
+        identifier == field or identifier.endswith(field)
+        for identifier in _identifiers(expression)
+    )
+
+
 def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
     """The nine labels are a closed set of bounded, aggregatable values.
 
-    ``upload`` carries no identifier by design: it is a batch-registration path
-    with no single file_id. Every other site identifies its subject.
+    ``upload`` carries no ``file_id`` by design -- it is a batch-registration
+    path, and any file in the batch may be the one that failed -- but it does
+    carry tenant and task, which is what correlates a 503 burst. Every other
+    site identifies its subject.
     """
     tree = ast.parse(Path(files_api.__file__).read_text(encoding="utf-8"))
     calls = [
@@ -426,7 +444,7 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
         # something of the same name is what ties the label to the variable.
         for keyword in node.keywords:
             assert keyword.arg is not None, f"site {label!r} uses **kwargs"
-            assert keyword.arg in _identifiers(keyword.value), (
+            assert _binds_a_matching_name(keyword.arg, keyword.value), (
                 f"site {label!r} binds {keyword.arg}= to "
                 f"{ast.unparse(keyword.value)!r}, which never reads "
                 f"{keyword.arg} -- the field name and the value must agree"
@@ -481,16 +499,48 @@ def test_field_values_cannot_forge_a_log_record(
     )
 
 
+@pytest.mark.parametrize("length", [_MAX_LOG_VALUE_LENGTH - 1, _MAX_LOG_VALUE_LENGTH])
+def test_a_field_value_at_or_under_the_bound_is_kept_whole(
+    caplog: pytest.LogCaptureFixture, length: int
+) -> None:
+    """The bound is inclusive, so neither of these may be marked truncated."""
+    value = "v" * length
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException):
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), "upload", file_ids=value
+            )
+
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert f"file_ids={value} " in f"{rendered.splitlines()[0]} "
+    assert "truncated" not in rendered.splitlines()[0]
+
+
 def test_an_overlong_field_value_is_truncated(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One field must not be able to crowd out the rest of the line."""
+    """One field must not be able to crowd out the rest of the line.
+
+    Pins the boundary rather than only the marker: with the length unasserted
+    this passed for any bound at all, so a change from 256 to 4096 would have
+    kept a green run while one field again took over the line.
+    """
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
         with pytest.raises(HTTPException):
             files_api._raise_durable_storage_unavailable(
                 _wrapped_fault(), "upload", file_ids="x" * 5000
             )
 
-    rendered = _sole_warning(caplog, files_api.logger.name)
-    assert "...[truncated]" in rendered
-    assert len(rendered.splitlines()[0]) < 1000
+    message_line = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
+    # The retained part is the intact leading prefix, at exactly the bound --
+    # one character more is the off-by-one this pins.
+    assert f"file_ids={'x' * _MAX_LOG_VALUE_LENGTH}...[truncated]" in message_line
+    assert "x" * (_MAX_LOG_VALUE_LENGTH + 1) not in message_line
+    assert len(message_line) < 1000
+    # The magnitude is part of the contract too, not just the mechanics: the
+    # cap exists so one field cannot crowd out the rest of the line, and the
+    # assertions above are all written against the constant, so they would stay
+    # green if it were raised to a value that defeats that. A ceiling rather
+    # than an equality, so the number stays tunable within its purpose.
+    assert _MAX_LOG_VALUE_LENGTH <= 512

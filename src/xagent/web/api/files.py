@@ -612,7 +612,13 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        _raise_durable_storage_unavailable(exc, "upload")
+        # No single ``file_id``: this is a batch registration, and any of the
+        # files in it may be the one that failed. Tenant and task still
+        # correlate a 503 burst to who and what was affected, which is the
+        # question asked first during an outage.
+        _raise_durable_storage_unavailable(
+            exc, "upload", user_id=user_id, task_id=parsed_task_id
+        )
     finally:
         if not completed:
 
@@ -2087,8 +2093,15 @@ async def public_preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
+                # ``asset_record`` is a different row from the route's
+                # ``file_id``: the base record is the document, this is the
+                # preview asset registered under it, and it is the asset's
+                # restore that failed. Logging the route parameter here named an
+                # object that is fine.
                 _raise_durable_storage_unavailable(
-                    exc, "public preview task asset", file_id=file_id
+                    exc,
+                    "public preview task asset",
+                    file_id=asset_record.file_id,
                 )
             except DurableObjectMissingError:
                 target_path = asset_ref.local_path
