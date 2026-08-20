@@ -785,11 +785,15 @@ def test_two_provider_only_rows_resolve_deterministically(seeded_engine):
     assert auth["orphan-b"] == {"provider": "acme"}
 
 
-def test_a_mixed_case_transport_row_is_still_a_candidate(seeded_engine):
-    """Transport is a shape enum, not an identity, and every reader folds its
-    case (classify_app_auth, _normalize_app_key). A row stored "OAuth" is
-    builtin_oauth to all of them, so the candidate filter must see it too --
-    otherwise the one shape the backfill exists for is invisible to it."""
+def test_a_mixed_case_transport_row_is_not_a_candidate(seeded_engine):
+    """The five gates that make an oauth row work compare `transport ==
+    "oauth"` unfolded (tools/config.py's credential injection,
+    _is_oauth_server_for_app, _enrich_oauth_server_info,
+    _ensure_server_matches_oauth_app), so a row stored "OAuth" is dead to all
+    of them. Stamping it would be worthless to that row and could burn the
+    app's one identity: the `claimed` guard would then refuse the genuine row,
+    with no downgrade to undo it. The candidate filter therefore matches
+    exactly, like the writer and the readers."""
     engine, metadata = seeded_engine
     _seed(
         engine,
@@ -802,12 +806,19 @@ def test_a_mixed_case_transport_row_is_still_a_candidate(seeded_engine):
                 "provider_name": "acme",
             }
         ],
-        servers=[{"name": "Acme Drive", "transport": "OAuth", "auth": None}],
+        servers=[
+            {"name": "Acme Drive", "transport": "OAuth", "auth": None},
+            {"name": "Acme Drive (real)", "transport": "oauth", "auth": None},
+        ],
     )
 
     _run_upgrade(engine)
 
-    assert _auth_by_name(engine, metadata)["Acme Drive"] == {"app_id": "acme-drive"}
+    auth = _auth_by_name(engine, metadata)
+    # The dead row is untouched, and its presence did not deny the identity to
+    # a working row (this one loses only because its name does not match).
+    assert auth["Acme Drive"] is None
+    assert auth["Acme Drive (real)"] is None
 
 
 def test_downgrade_is_a_no_op(seeded_engine):

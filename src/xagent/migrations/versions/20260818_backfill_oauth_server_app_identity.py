@@ -12,9 +12,9 @@ current display name, and the runtime -- which knows the row only under
 its stored name -- resolves the selection to zero tools, silently (#1429,
 surfaced reviewing #1403).
 
-Which apps can drift that way is narrower than "any OAuth app", and
-worth stating precisely, because it is the whole reason this is a
-hardening pass rather than a repair of a known-broken population:
+Which apps can drift that way is worth stating precisely, because the
+at-risk population is real and was produced by the normal API, not by
+out-of-band edits:
 
 - Genuine **builtin** apps cannot be renamed at all: ``name``,
   ``transport`` and ``provider_name`` are in
@@ -23,13 +23,17 @@ hardening pass rather than a repair of a known-broken population:
   regardless of what the row stores.
 - **Admin-created** OAuth catalog apps *are* freely renameable, and
   ``classify_app_auth`` labels them ``builtin_oauth`` too (purely on
-  ``transport == "oauth"``). But admin app CRUD and the unconditional
-  ``app_id`` writer arrived in the same commit, so every row provisioned
-  for such an app already carries the stamp.
-- What is left unstamped-and-renameable is therefore reachable only
-  outside the API surface: direct database edits, or a code-level
-  registry rename across versions. This migration exists to make that
-  residue resolvable rather than to fix a live API-reachable break.
+  ``transport == "oauth"``). Admin app CRUD shipped in ``c8642b8c``
+  (2026-04-24); ``_ensure_user_mcp_server`` did not write ``auth`` at
+  all until ``cb724dbb`` (2026-06-26). For those ~63 days the ordinary
+  OAuth-connect flow, on an app an admin could rename the next day,
+  produced exactly the unstamped row this migration exists for. Any
+  deployment that connected such an app in that window still carries
+  those rows.
+- After ``cb724dbb`` every provisioned row carries the stamp, so nothing
+  new joins the population; what remains is that historical residue plus
+  whatever direct database edits or a code-level registry rename leave
+  behind.
 
 The stamp is derived while the name still matches, the only moment it
 can be derived safely:
@@ -265,7 +269,17 @@ def upgrade() -> None:
     candidates = (
         bind.execute(
             sa.select(mcp_servers)
-            .where(sa.func.lower(sa.func.trim(mcp_servers.c.transport)) == "oauth")
+            # Exact, matching the writer and every runtime reader: the five
+            # gates that make an oauth row *work* (tools/config.py's credential
+            # injection, _is_oauth_server_for_app, _enrich_oauth_server_info,
+            # _ensure_server_matches_oauth_app) all compare `transport ==
+            # "oauth"` unfolded. A row stored "OAuth" passes none of them, so
+            # it is a dead row: stamping it would be worthless to it and, worse,
+            # could burn the app's one identity -- the `claimed` guard would
+            # then refuse the genuine row, irreversibly (downgrade is a no-op).
+            # Folding here would make this migration the only place with a
+            # wider notion of "oauth" than everything consuming its output.
+            .where(mcp_servers.c.transport == "oauth")
             .order_by(mcp_servers.c.id)
         )
         .mappings()
