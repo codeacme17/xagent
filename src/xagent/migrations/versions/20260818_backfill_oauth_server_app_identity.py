@@ -140,7 +140,7 @@ to every pre-migration reader (they all prefer ``app_id`` and only fall
 back to names when it is absent).
 
 Revision ID: 20260818_backfill_oauth_server_app_identity
-Revises: 20260818_seed_jira_mcp_app
+Revises: 20260819_merge_jira_and_linear_heads
 Create Date: 2026-08-18
 """
 
@@ -157,7 +157,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260818_backfill_oauth_server_app_identity"
-down_revision: str | None = "20260818_seed_jira_mcp_app"
+down_revision: str | None = "20260819_merge_jira_and_linear_heads"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
