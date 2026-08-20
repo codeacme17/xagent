@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -250,7 +251,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     shapes leak today and are tracked in #1497 - do not read a passing run as
     "nothing can reach a client raw".
     """
-    source = Path(websocket_api.__file__).read_text()
+    # Explicit encoding: this module carries non-ASCII prose, and the
+    # platform default would decode it as cp1252/GBK on a Windows runner.
+    source = Path(websocket_api.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     parents = _parents(tree)
 
@@ -295,3 +298,90 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         "raw text can reach a chat client; route it through "
         "client_safe_error_message: " + "; ".join(sorted(set(offenders)))
     )
+
+
+WEBSOCKET_LOGGER = "xagent.web.api.websocket"
+
+# Every handler that turns an enqueue refusal into client-visible text. Each
+# entry is (handler, extra message_data) - the ack in handle_chat_message only
+# fires when the client supplied an id, so that one needs the extra key.
+ENQUEUE_FAILURE_HANDLERS = [
+    ("handle_chat_message", {"client_message_id": "cmid-1"}),
+    ("handle_pause_task", {}),
+    ("handle_resume_task", {}),
+]
+
+
+def test_missing_task_keeps_its_wording_for_the_sender(_test_db: None) -> None:
+    """A missing task is the sender's own answer, so redaction must spare it.
+
+    ``execute_task_background`` already raises this as client-visible; the
+    pause/resume enqueue path raised a bare ``ValueError``, which the redaction
+    turned into the generic string and left the sender with nothing to act on.
+    """
+    with pytest.raises(ValueError) as raised:
+        websocket_api._enqueue_websocket_task_command_sync(
+            task_id=424242,
+            actor_user_id=1,
+            actor_is_admin=False,
+            command_id="pause:missing-task",
+            kind=websocket_api.TaskCommandKind.PAUSE,
+            payload={},
+            allow_missing_task=False,
+        )
+
+    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert (
+        websocket_api.client_safe_error_message(raised.value) == "Task 424242 not found"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "extra_message_data"),
+    ENQUEUE_FAILURE_HANDLERS,
+    ids=[name for name, _ in ENQUEUE_FAILURE_HANDLERS],
+)
+async def test_redacted_enqueue_failure_still_reaches_the_log(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    handler_name: str,
+    extra_message_data: dict,
+) -> None:
+    """Redacting the client's copy must not delete the operator's copy.
+
+    These handlers previously leaked ``str(exc)`` to the client and logged
+    nothing; the leak was the only record. With the text redacted, an
+    incidental failure would otherwise vanish without a trace.
+    """
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "_enqueue_websocket_task_command",
+        AsyncMock(side_effect=ValueError(f"enqueue failed reading {SECRET}")),
+    )
+
+    handler = getattr(websocket_api, handler_name)
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        await handler(
+            MagicMock(),
+            7,
+            {"user": SimpleNamespace(id=1, is_admin=False), **extra_message_data},
+        )
+
+    payloads = _client_payloads(connection_manager)
+    assert payloads, "the handler must tell the client something"
+    assert SECRET not in repr(payloads)
+    assert any(
+        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        for payload in payloads
+    )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert records, f"{handler_name} redacted the failure without logging it"
+    assert any(SECRET in record.getMessage() for record in records)
+    assert any(record.exc_info is not None for record in records)

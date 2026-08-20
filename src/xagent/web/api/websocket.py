@@ -5013,6 +5013,9 @@ async def handle_chat_message(
             allow_missing_task=True,
         )
     except (PermissionError, ValueError) as exc:
+        logger.error(
+            "Chat command rejected for task %s: %s", task_id, exc, exc_info=True
+        )
         client_message_id = _client_message_id(message_data.get("client_message_id"))
         await send_message_delivery(
             websocket,
@@ -5085,7 +5088,7 @@ def _enqueue_websocket_task_command_sync(
         if task is None:
             if allow_missing_task:
                 return None
-            raise ValueError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(f"Task {task_id} not found")
         if not actor_is_admin and int(task.user_id) != actor_user_id:
             raise ClientVisiblePermissionError(
                 f"Access denied: Task {task_id} does not belong to you"
@@ -7444,7 +7447,7 @@ async def handle_intervention(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
-        logger.error(f"Data validation error in intervention: {e}")
+        logger.error("Data validation error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
@@ -7473,6 +7476,12 @@ async def handle_pause_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
+        logger.error(
+            "Pause command rejected for task %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(exc)},
             websocket,
@@ -7701,7 +7710,9 @@ async def _handle_pause_task_unserialized(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
         message_data["_durable_command_error"] = str(e)
-        logger.error(f"Data validation error pausing task {task_id}: {e}")
+        logger.error(
+            "Data validation error pausing task %s: %s", task_id, e, exc_info=True
+        )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
@@ -7731,6 +7742,12 @@ async def handle_resume_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
+        logger.error(
+            "Resume command rejected for task %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(exc)},
             websocket,
@@ -8091,7 +8108,9 @@ async def _handle_resume_task_unserialized(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
         message_data["_durable_command_error"] = str(e)
-        logger.error(f"Data validation error resuming task {task_id}: {e}")
+        logger.error(
+            "Data validation error resuming task %s: %s", task_id, e, exc_info=True
+        )
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
