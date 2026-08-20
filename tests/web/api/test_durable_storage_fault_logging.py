@@ -24,6 +24,7 @@ from fastapi.datastructures import UploadFile
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api import files as files_api
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
@@ -391,6 +392,11 @@ def _binds_a_matching_name(field: str, expression: ast.expr) -> bool:
     ``user_id=owner_user_id`` name the thing they carry -- while an unrelated
     name is rejected, which is what catches ``file_id=storage_key``.
 
+    The prefix must end at an underscore. A bare suffix test would admit
+    ``file_id=profile_id``, since ``"profile_id".endswith("file_id")`` -- an
+    unrelated identifier passing on a coincidental substring, which is the
+    opposite of the point.
+
     **This checks spelling, not referent, and that is a real limit.** The
     "public preview task asset" site shipped with ``file_id=file_id`` where the
     failing object was ``asset_record`` -- a different row from the route's
@@ -400,9 +406,35 @@ def _binds_a_matching_name(field: str, expression: ast.expr) -> bool:
     read a green run here as "every site logs the right object".
     """
     return any(
-        identifier == field or identifier.endswith(field)
+        identifier == field or identifier.endswith(f"_{field}")
         for identifier in _identifiers(expression)
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "source", "accepted"),
+    [
+        ("file_id", "file_id", True),
+        ("file_id", "file_ref.record.file_id", True),
+        ("task_id", "parsed_task_id", True),
+        ("user_id", "owner_user_id", True),
+        ("file_id", "storage_key", False),
+        # A coincidental suffix, not a qualified name: the underscore boundary
+        # is the whole difference, and without it this passes.
+        ("file_id", "profile_id", False),
+    ],
+)
+def test_the_binding_check_accepts_qualified_names_and_rejects_unrelated_ones(
+    field: str, source: str, accepted: bool
+) -> None:
+    """The rule the site sweep leans on, pinned on its own.
+
+    Asserted here rather than only through the sweep because the sweep can only
+    fail on the sites that exist: a rule too loose to reject anything would
+    still pass it. ``profile_id`` is the case that made this necessary.
+    """
+    expression = ast.parse(source, mode="eval").body
+    assert _binds_a_matching_name(field, expression) is accepted
 
 
 def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
@@ -457,6 +489,70 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
                 f"{ast.unparse(keyword.value)!r}, which never reads "
                 f"{keyword.arg} -- the field name and the value must agree"
             )
+
+
+def test_no_client_supplied_message_type_can_become_an_operation_label() -> None:
+    """The WebSocket dispatch labels are a closed set, like the nine above.
+
+    ``operation`` is rendered into the message and, unlike the fields beside it,
+    is not escaped or bounded (#1520), so the received ``type`` must not reach
+    it. Mapping through a dict is what keeps that true; this pins the property
+    rather than the mechanism, so a future rewrite to interpolation fails.
+    """
+    labels = set(websocket_api._DISPATCH_OPERATIONS.values())
+    labels.add(websocket_api._UNKNOWN_DISPATCH_OPERATION)
+
+    for hostile in (
+        "chat\n2026-01-01 00:00:00 ERROR xagent.web - FABRICATED",
+        "../../etc/passwd",
+        "x" * 5000,
+        "",
+        "None",
+    ):
+        resolved = websocket_api._DISPATCH_OPERATIONS.get(
+            hostile, websocket_api._UNKNOWN_DISPATCH_OPERATION
+        )
+        assert resolved in labels
+        assert hostile not in resolved or hostile == ""
+
+    for label in labels:
+        assert label == label.strip()
+        assert not any(char in label for char in "\n\r\t")
+        assert len(label) < 64
+
+
+def test_every_dispatched_message_type_has_a_label() -> None:
+    """The map and the dispatch cascade must not drift apart.
+
+    They are two switches on the same value, kept in step by hand: a seventh
+    handler added to the cascade without a label would log its faults as
+    "unknown message type", which is silent and exactly the mislabelling the
+    map was added to fix.
+    """
+    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
+    endpoint = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "websocket_chat_endpoint"
+    )
+    dispatched = {
+        comparator.value
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Call)
+        and isinstance(node.left.func, ast.Attribute)
+        and node.left.func.attr == "get"
+        and [getattr(arg, "value", None) for arg in node.left.args] == ["type"]
+        for comparator in node.comparators
+        if isinstance(comparator, ast.Constant)
+    }
+
+    assert dispatched, "found no dispatch branches -- the parse assumption broke"
+    assert dispatched == set(websocket_api._DISPATCH_OPERATIONS), (
+        "dispatch cascade and label map disagree: "
+        f"{dispatched ^ set(websocket_api._DISPATCH_OPERATIONS)}"
+    )
 
 
 @pytest.mark.parametrize(("label", "expected_fields"), _FAULT_SITES)

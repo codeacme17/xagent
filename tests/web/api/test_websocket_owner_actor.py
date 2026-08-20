@@ -3852,3 +3852,76 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
     assert "during websocket chat turn preparation" in fault_lines[0]
     assert storage_key in fault_lines[0]
     assert "_ProviderThrottled" in fault_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
+    db_session,
+    caplog,
+) -> None:
+    """The endpoint arm must name the message it was applying, not "chat turn".
+
+    That arm guards the whole receive-loop dispatch, so it sees faults from
+    ``execute_task``, ``resume_task`` and the rest. It logged a fixed
+    ``"websocket chat turn"``, which mislabelled every one of them in the single
+    line meant to be authoritative about what failed.
+
+    Driven through the real endpoint rather than asserted on the label map: the
+    map agreeing with the cascade is checked separately, and neither of those
+    would notice the arm going back to a constant.
+    """
+    import json
+    import logging
+
+    from fastapi import WebSocketDisconnect
+
+    from xagent.web.services.managed_file_ref import DurableStorageOperationError
+
+    owner = _user(db_session, "dispatch-label-owner")
+    task = _task(db_session, owner.id)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    websocket = MagicMock()
+    websocket.receive_text = AsyncMock(
+        side_effect=[json.dumps({"type": "execute_task"}), WebSocketDisconnect()]
+    )
+    ws_manager = MagicMock(
+        connect=AsyncMock(),
+        disconnect=MagicMock(),
+        send_personal_message=AsyncMock(),
+        broadcast_to_task=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch.object(websocket_api, "manager", ws_manager),
+        patch.object(
+            websocket_api,
+            "get_authenticated_user",
+            AsyncMock(return_value=SimpleNamespace(id=owner_id, is_admin=False)),
+        ),
+        patch.object(websocket_api, "handle_status_request", AsyncMock()),
+        patch.object(
+            websocket_api,
+            "handle_execute_task",
+            AsyncMock(
+                side_effect=DurableStorageOperationError(
+                    f"Failed to restore durable object: users/{owner_id}/uploads/a/b.txt"
+                )
+            ),
+        ),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        await websocket_api.websocket_chat_endpoint(websocket, task_id, None)
+
+    fault_lines = [
+        entry.getMessage()
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ]
+    assert len(fault_lines) == 1, fault_lines
+    assert "during websocket execute_task" in fault_lines[0]
+    assert "chat turn" not in fault_lines[0]
