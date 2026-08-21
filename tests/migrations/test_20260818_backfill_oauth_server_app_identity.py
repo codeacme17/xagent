@@ -89,11 +89,22 @@ def seeded_engine():
 
 
 def _run_upgrade(engine) -> None:
+    _run(engine, "upgrade")
+
+
+def _run_downgrade(engine) -> None:
+    _run(engine, "downgrade")
+
+
+def _run(engine, direction: str) -> None:
+    """Both directions go through the same Operations context Alembic gives a
+    version module, so a downgrade that started using `op` would be exercised
+    the same way an upgrade is rather than only appearing to work."""
     module = _migration_module()
     with engine.begin() as conn:
         migration_context = MigrationContext.configure(conn)
         with Operations.context(migration_context):
-            module.upgrade()
+            getattr(module, direction)()
 
 
 def _auth_by_name(engine, metadata) -> dict[str, object]:
@@ -529,8 +540,7 @@ def test_a_stamp_survives_a_rerun_unchanged(seeded_engine):
     after_first = _auth_by_name(engine, metadata)
     assert after_first["Acme Drive"] == {"app_id": "acme-drive"}
 
-    module = _migration_module()
-    module.downgrade()
+    _run_downgrade(engine)
     _run_upgrade(engine)
 
     assert _auth_by_name(engine, metadata) == after_first
@@ -670,6 +680,150 @@ def test_a_mixed_case_transport_row_is_not_a_candidate(seeded_engine):
     assert auth["Acme Drive (real)"] is None
 
 
+def test_an_identity_on_a_non_oauth_transport_row_is_still_claimed(seeded_engine):
+    """The claim set is read *without* a transport filter, deliberately wider
+    than the candidate query. get_app_for_mcp_server resolves from auth.app_id
+    with no transport check at all, and the OAuth-disconnect cleanup path walks
+    a user's whole server list through it -- so a row stored "OAuth" (or any
+    other transport) still makes its app_id taken, even though that row could
+    never serve the connector itself. Filtering the claim set by transport left
+    such an id invisible and let a second row be stamped with it."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            # Not a candidate (transport is not exactly "oauth"), but it does
+            # carry the identity, and the transport-blind reader sees it.
+            {
+                "name": "Acme Drive (mixed case)",
+                "transport": "OAuth",
+                "auth": {"app_id": "acme-drive"},
+            },
+            # Would resolve to the same app by exact name.
+            {"name": "Acme Drive", "transport": "oauth", "auth": None},
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    auth = _auth_by_name(engine, metadata)
+    assert auth["Acme Drive (mixed case)"] == {"app_id": "acme-drive"}
+    assert auth["Acme Drive"] is None
+
+
+def test_a_provider_differing_only_in_case_is_not_a_conflict(seeded_engine):
+    """The conflict gate compares providers the way the runtime does
+    (_normalize_app_key: casefold, strip, whitespace-to-hyphen). Comparing
+    them exactly would permanently refuse a stamp over a difference
+    _is_oauth_server_for_app already treats as none -- and this migration runs
+    once."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "  Acme "},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {
+        "provider": "  Acme ",
+        "app_id": "acme-drive",
+    }
+
+
+def test_a_missing_table_is_a_logged_no_op(seeded_engine, caplog):
+    """Alembic commits the version bump either way, so a skip here is
+    permanent: it must at least say so."""
+    import logging
+
+    engine, _metadata = seeded_engine
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE public_mcp_apps"))
+
+    with caplog.at_level(logging.WARNING):
+        _run_upgrade(engine)
+
+    assert any("search_path" in r.getMessage() for r in caplog.records)
+
+
+def test_an_auth_list_payload_is_left_alone(seeded_engine):
+    """The non-dict branch covers a JSON list too, not just a scalar."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "acme",
+            }
+        ],
+        servers=[{"name": "Acme Drive", "transport": "oauth", "auth": ["junk"]}],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == ["junk"]
+
+
+def test_a_blank_app_side_provider_is_not_a_conflict(seeded_engine):
+    """An app with no provider cannot contradict anything, so a row that has
+    one is still stamped."""
+    engine, metadata = seeded_engine
+    _seed(
+        engine,
+        metadata,
+        apps=[
+            {
+                "app_id": "acme-drive",
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "provider_name": "   ",
+            }
+        ],
+        servers=[
+            {
+                "name": "Acme Drive",
+                "transport": "oauth",
+                "auth": {"provider": "acme"},
+            }
+        ],
+    )
+
+    _run_upgrade(engine)
+
+    assert _auth_by_name(engine, metadata)["Acme Drive"] == {
+        "provider": "acme",
+        "app_id": "acme-drive",
+    }
+
+
 def test_downgrade_is_a_no_op(seeded_engine):
     """Documented as irreversible: the downgrade must not attempt to strip
     stamps it cannot tell apart from the writer's own."""
@@ -690,7 +844,7 @@ def test_downgrade_is_a_no_op(seeded_engine):
     _run_upgrade(engine)
     before = _auth_by_name(engine, metadata)
 
-    _migration_module().downgrade()
+    _run_downgrade(engine)
 
     assert _auth_by_name(engine, metadata) == before
 
@@ -729,6 +883,16 @@ def test_non_oauth_shapes_are_never_candidates(seeded_engine):
     assert all(row.auth is None for row in rows)
 
 
+# Its own schema, not the shared public one. The CI Postgres job runs every
+# step against a single database, and later steps depend on the real,
+# fully-migrated shape of mcp_servers/public_mcp_apps -- dropping and stubbing
+# those in `public` would corrupt them. The migration reads through
+# `inspector.get_table_names()` and unqualified table literals, both of which
+# follow search_path, so pointing search_path at a private schema isolates the
+# whole run without the migration needing to know.
+_PG_SCHEMA = "backfill_app_identity_test"
+
+
 def _postgres_url() -> str | None:
     # Both spellings, matching the sibling migration suites: CI sets the first,
     # while a local run may already export the second.
@@ -739,28 +903,30 @@ def _postgres_url() -> str | None:
 
 @pytest.fixture
 def postgres_seeded_engine():
-    """The same two tables on a real PostgreSQL server.
+    """The two tables on a real PostgreSQL server, in a throwaway schema.
 
     The chain-level CI job upgrades an *empty* database, so without this the
     backfill's data path would never run on PostgreSQL at all -- and JSON
-    round-tripping and the ordered read are exactly the parts that could
-    differ from SQLite.
+    round-tripping, the ordered read and the re-read guard are exactly the
+    parts that could differ from SQLite.
     """
     url = _postgres_url()
     if not url:
         pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
-    engine = create_engine(url)
-    metadata = _pre_migration_metadata()
+    engine = create_engine(
+        url,
+        connect_args={"options": f"-csearch_path={_PG_SCHEMA}"},
+    )
     with engine.begin() as conn:
-        for table in ("mcp_servers", "public_mcp_apps"):
-            conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {_PG_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {_PG_SCHEMA}"))
+    metadata = _pre_migration_metadata()
     metadata.create_all(bind=engine)
     try:
         yield engine, metadata
     finally:
         with engine.begin() as conn:
-            for table in ("mcp_servers", "public_mcp_apps"):
-                conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {_PG_SCHEMA} CASCADE"))
         engine.dispose()
 
 
