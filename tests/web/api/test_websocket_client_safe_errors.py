@@ -104,7 +104,6 @@ async def test_execute_task_redacts_an_incidental_validation_error(
         TaskTurnOrchestrator,
         "schedule_existing_task_execution",
         AsyncMock(side_effect=raise_at_schedule),
-        raising=False,
     )
 
     await websocket_api.handle_execute_task(
@@ -214,6 +213,10 @@ def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
 # ``send_text`` takes a serialized payload, so the dict sits one call deeper.
 ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
 
+# Both render in the client's conversation, so both are the same disclosure
+# surface. ``agent_error`` was missing until review found a producer using it.
+ERROR_PAYLOAD_TYPES = {"error", "agent_error"}
+
 
 def _unwrap_serializer(expr: ast.expr) -> ast.expr:
     """``json.dumps(payload)`` -> ``payload``; anything else unchanged."""
@@ -236,7 +239,7 @@ def _error_payload_message(node: ast.Call) -> ast.expr | None:
             if isinstance(key, ast.Constant)
         }
         kind = keys.get("type")
-        if isinstance(kind, ast.Constant) and kind.value == "error":
+        if isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES:
             return keys.get("message")
     return None
 
@@ -297,12 +300,18 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
     Scope, stated honestly: this walks direct calls to the producers in
-    ``PRODUCERS`` and ``{"type": "error", ...}`` dict *literals* passed to
-    ``send_personal_message``/``broadcast_to_task``. It does NOT follow
-    dict-spread payloads, payloads built by a helper and passed as a call, or
-    wrapper functions that forward a raw argument into a producer. Those
-    shapes leak today and are tracked in #1497 - do not read a passing run as
-    "nothing can reach a client raw".
+    ``PRODUCERS`` and dict *literals* whose ``type`` is one of
+    ``ERROR_PAYLOAD_TYPES``, passed to one of ``ERROR_PAYLOAD_SINKS``.
+
+    It does NOT follow dict-spread payloads, payloads built by a helper and
+    passed as a call, wrapper functions that forward a raw argument into a
+    producer (all #1497), or payloads whose ``type`` is a variable rather than
+    a string literal (#1547). ``agent_error`` was added only after review
+    found ``_broadcast_terminal_command_error`` escaping on that dimension
+    alone - the type set is a maintained list, not a derived invariant.
+
+    Those shapes leak today. Do not read a passing run as "nothing can reach a
+    client raw"; the xfail tests below pin the ones we know about.
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
@@ -355,7 +364,7 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
                 f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
             )
 
-    # Actual counts at the time of writing: 23 producers, 28 error payloads.
+    # Actual counts at the time of writing: 23 producers, 30 error payloads.
     # These floors sit below that, so a minority of sites can still vanish
     # silently; tightening them to exact equality is tracked in #1547.
     assert checked_producers >= 21, (
@@ -494,6 +503,7 @@ def test_log_level_follows_the_marker_not_the_call_site(
 @pytest.mark.asyncio
 async def test_builder_chat_redacts_through_its_own_socket_sink(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The leak found by self-review, pinned at runtime rather than by AST alone.
 
@@ -513,10 +523,17 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
     websocket.send_text = AsyncMock()
     websocket.state = SimpleNamespace()
 
-    await websocket_api.handle_builder_chat(
-        websocket,
-        {"message": "build me an agent"},
-        SimpleNamespace(id=1, is_admin=False),
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        await websocket_api.handle_builder_chat(
+            websocket,
+            {"message": "build me an agent"},
+            SimpleNamespace(id=1, is_admin=False),
+        )
+
+    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert any(SECRET in r.getMessage() for r in records), (
+        "the operator half of the contract: redacting the client's copy must "
+        "not delete the server's"
     )
 
     payloads = _sent_text_payloads(websocket)
@@ -580,3 +597,185 @@ async def test_permission_wording_survives_redaction_in_every_handler(
         == f"Access denied: Task {task_id} does not belong to you"
         for payload in payloads
     ), payloads
+
+
+# Each entry is a bypass shape this module admits it does not cover: a source
+# snippet the guard reports clean even though raw exception text reaches a
+# client. Each mirrors a real site rather than a minimal repro, so the xfail
+# cannot flip on a shape nothing actually uses - dict-spread copies
+# ``execute_task_background`` (text under ``error``, type inherited from the
+# spread), helper-built copies ``send_historical_data_as_stream``, and
+# wrapper-forwarded copies ``notify_deferred_delivery``. They are pinned as strict xfails so the day the guard learns a shape,
+# its test flips to a failure and says so, instead of the hole quietly
+# outliving the issue that tracks it.
+BYPASS_SHAPES = [
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        terminal_payload = _terminal_task_error_payload(task_id, str(e))
+        message = str(e)
+        await manager.broadcast_to_task(
+            {
+                **terminal_payload,
+                "task_id": task_id,
+                "error": message,
+                "timestamp": 0,
+            },
+            task_id,
+        )
+""",
+        id="dict-spread",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.broadcast_to_task(
+            create_stream_event("error", task_id, {"message": str(e)}), task_id
+        )
+""",
+        id="helper-built",
+    ),
+    pytest.param(
+        """
+async def forward(websocket, raw):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=raw,
+        rejection_outcome="not_accepted",
+    )
+
+
+async def leak(websocket):
+    try:
+        pass
+    except Exception as e:
+        await forward(websocket, str(e))
+""",
+        id="wrapper-forwarded",
+    ),
+]
+
+# Deliberately NOT listed above: ``message_data["_durable_command_error"] =
+# str(e)``. Earlier rounds of this PR described that as reaching clients via
+# _broadcast_terminal_command_error, which is wrong - TaskCommandRejected is
+# re-raised without broadcasting (websocket.py, execute_durable_task_command),
+# and the two branches that do broadcast now go through the chokepoint.
+#
+# The text lands in the TaskExecutionCommand.error column. That column IS
+# read back to a client - a2a.py returns it verbatim as a 500 internal_error
+# body - so the reason this particular channel is not a client leak is
+# narrower than "nothing reads the column": a2a only ever enqueues CANCEL, so
+# the pause/resume text written here cannot reach that read path. Widening a2a
+# to another command kind would turn this into a real leak, which is why the
+# dependency is written down rather than left implicit.
+
+
+def _guard_offenders(source: str) -> list[str]:
+    """Run the sweep's recognition logic over an arbitrary module source."""
+    tree = ast.parse(source)
+    parents = _parents(tree)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_name(node)
+        if name in PRODUCERS:
+            expr = _message_expression(node, PRODUCERS[name])
+        else:
+            expr = _error_payload_message(node)
+        if expr is None:
+            continue
+        scopes = _enclosing_functions(node, parents)
+        if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
+            continue
+        candidates = (
+            _local_assignments(scopes, expr.id)
+            if isinstance(expr, ast.Name)
+            else [expr]
+        )
+        if not candidates:
+            offenders.append(f"{name}:{node.lineno} unresolvable")
+            continue
+        enclosing = next(
+            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
+            "<module>",
+        )
+        for candidate in candidates:
+            if _is_client_safe(candidate):
+                continue
+            if (enclosing, ast.unparse(candidate)) in ALLOWED_RAW_MESSAGES:
+                continue
+            offenders.append(f"{name}:{node.lineno} {ast.unparse(candidate)}")
+    return offenders
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known guard blind spots, all tracked in #1497. When one is closed "
+    "this flips to a failure - fix the issue, then delete its param.",
+)
+@pytest.mark.parametrize("source", BYPASS_SHAPES)
+def test_known_bypass_shapes_are_still_invisible_to_the_guard(source: str) -> None:
+    """A passing sweep does not mean no raw text can reach a client.
+
+    Every snippet here puts ``str(e)`` in front of a client and the guard says
+    nothing. Asserting that out loud is the difference between a documented
+    gap and a forgotten one.
+    """
+    assert _guard_offenders(source), (
+        "the guard now sees this shape - remove it from BYPASS_SHAPES and "
+        "close the tracking issue"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_task_answers_the_sender_instead_of_dropping_them(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Silence is a worse answer than redaction.
+
+    This raise site was a bare ``Exception`` while its sibling a few lines
+    above already carried the marker. Being untyped, it escaped every typed
+    handler, reached the connection-level ``finally: manager.disconnect`` and
+    left the client with nothing at all - not the text, not even the generic
+    string.
+    """
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    missing_task_id = 987654
+    with caplog.at_level(logging.DEBUG, logger=WEBSOCKET_LOGGER):
+        await websocket_api.handle_execute_task(
+            MagicMock(),
+            missing_task_id,
+            {"user": SimpleNamespace(id=1, is_admin=False)},
+        )
+
+    payloads = _client_payloads(connection_manager)
+    assert any(
+        payload.get("message") == f"Task {missing_task_id} not found or access denied"
+        for payload in payloads
+    ), payloads
+
+    # Marking this raise made it reachable by a typed handler, which is the
+    # point - but that handler must not hand an anonymous visitor a way to
+    # make the server dump a stack for every task id they guess.
+    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert records, "the refusal still has to be recorded"
+    assert all(r.exc_info is None for r in records), (
+        "a curated refusal is routine; only an incidental fault earns a stack"
+    )
+    assert all(r.levelno <= logging.WARNING for r in records)

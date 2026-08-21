@@ -327,9 +327,16 @@ def _client_message_id(value: Any) -> str | None:
 # error bubble and the message_rejected ack, so an *incidental* validation
 # failure only ever surfaces as this fixed string; the detail stays in the log.
 #
-# Agent RuntimeError text is deliberately left alone: surfacing it to the sender
-# is an existing, tested contract (tests/web/api/test_websocket_owner_actor.py),
-# and narrowing it is a product decision rather than a redaction bug.
+# Agent RuntimeError text is deliberately left alone, and narrowing it is a
+# product decision tracked in #1479 rather than a redaction bug.
+#
+# It is NOT sender-only. An earlier version of this comment said so and cited
+# tests/web/api/test_websocket_owner_actor.py; that file never pins the string,
+# and its one raw-RuntimeError assertion covers the sender-only pool-timeout
+# fallback. Once a task resolves, the text goes out through broadcast_to_task
+# to every connection under the task_id, anonymous widget and share visitors
+# included. DurableStorageOperationError subclasses RuntimeError, so the
+# tenant-scope leak described above is still open on that path.
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
 
@@ -351,15 +358,33 @@ class ClientVisiblePermissionError(ClientVisibleError, PermissionError):
     """An authorization refusal whose text is safe to show the sender."""
 
 
-def client_safe_error_message(error: Exception) -> str:
+class ClientVisibleTaskCommandDeferred(ClientVisibleError, TaskCommandDeferred):
+    """A deferral whose wording this module wrote for the sender.
+
+    Terminal deferral broadcasts go through the chokepoint like everything
+    else, so without the marker "waiting for the active task lease owner"
+    would reach the client as the generic string and become
+    indistinguishable from an outright failure.
+    """
+
+
+def client_safe_error_message(error: BaseException) -> str:
     """The only way an exception may become text a chat client can see.
 
-    Every ``message_rejected`` and ``error`` payload that this module builds
-    from an exception *at a direct call site* goes through here.
-    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces that for
-    the shapes it recognizes; payloads assembled by a helper, spread into a
-    dict, or forwarded through a wrapper are not yet covered and still carry
-    raw text - see #1497.
+    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces this for
+    the shapes it recognizes: direct calls to the delivery producers, and
+    ``error``/``agent_error`` dict *literals* handed to ``send_personal_message``,
+    ``broadcast_to_task`` or ``send_text``.
+
+    It does not reach payloads assembled by a helper, spread into a dict, or
+    forwarded through a wrapper (#1497). It also only ever inspects the
+    ``message`` key of a literal ``type`` it already knows: the background
+    failure broadcast at ``execute_task_background`` is invisible on both
+    counts at once, carrying its text under ``error`` with type ``task_error``
+    (#1497). A ``type`` built from a variable is likewise unseen (#1547).
+
+    Read a passing sweep as "the recognized shapes are clean", never as
+    "nothing reaches a client raw".
     """
     return (
         str(error)
@@ -6452,9 +6477,7 @@ async def _handle_chat_message_unserialized(
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
             message = client_safe_error_message(e)
-            logger.error(
-                "Data validation error in agent execution: %s", e, exc_info=True
-            )
+            log_client_facing_failure(e, "Data validation error in agent execution: %s")
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6509,14 +6532,18 @@ async def _handle_chat_message_unserialized(
                 )
         except Exception as e:
             # Other unknown errors, re-raise
-            # Re-raised: the outermost handler owns the traceback.
-            logger.error("Unexpected error in agent execution: %s", e)
+            # The branch that withholds the detail logs it, rather than
+            # relying on a caller: the durable dispatcher does record a stack
+            # (task_command_transport.py:1100, logger.exception) but
+            # websocket_chat_endpoint and both public_chat_access.py endpoints
+            # log without exc_info, so the record depends on who called.
+            logger.error("Unexpected error in agent execution: %s", e, exc_info=True)
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
-        logger.error("Message format error: %s", e, exc_info=True)
+        log_client_facing_failure(e, "Message format error: %s")
         message = client_safe_error_message(e)
         await finish_delivery_failure(message)
         await manager.send_personal_message(
@@ -6524,12 +6551,12 @@ async def _handle_chat_message_unserialized(
         )
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
-        logger.error(f"Connection error handling chat message: {e}")
+        logger.error("Connection error handling chat message: %s", e)
         raise
     except Exception as e:
         # Other errors, re-raise
-        # Re-raised: the outermost handler owns the traceback.
-        logger.error("Unexpected error handling chat message: %s", e)
+        # Redacted below, so the traceback is the only record left.
+        logger.error("Unexpected error handling chat message: %s", e, exc_info=True)
         await finish_delivery_failure(client_safe_error_message(e))
         raise
 
@@ -6663,7 +6690,9 @@ async def handle_execute_task(
             )
         )
         if request is None:
-            raise Exception(f"Task {task_id} not found or access denied")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found or access denied"
+            )
         authorized_task_id = request.task_id
 
         await manager.broadcast_to_task(
@@ -6699,7 +6728,7 @@ async def handle_execute_task(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation and format error
         message = client_safe_error_message(e)
-        logger.error("Data validation error in task execution: %s", e, exc_info=True)
+        log_client_facing_failure(e, "Data validation error in task execution: %s")
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -7454,7 +7483,10 @@ async def handle_intervention(
         await manager.broadcast_to_task(
             {
                 "type": "intervention_processed",
-                "message": f"Manual intervention processed: {intervention_data['action']}",
+                # The action is client-supplied and reaches every connection on
+                # the task, so it travels as a structured field only.
+                "message": "Manual intervention processed",
+                "action": intervention_data["action"],
                 "intervention_id": intervention_data["step_id"],
                 "timestamp": datetime.now(
                     timezone.utc
@@ -7465,7 +7497,7 @@ async def handle_intervention(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
-        logger.error("Data validation error in intervention: %s", e, exc_info=True)
+        log_client_facing_failure(e, "Data validation error in intervention: %s")
         await manager.send_personal_message(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
@@ -7733,6 +7765,8 @@ async def _handle_pause_task_unserialized(
         )
     except RuntimeError as e:
         # Runtime error
+        # No traceback: this branch passes the text through to the client
+        # unredacted (#1479), so nothing is being withheld from the log.
         logger.error("Runtime error pausing task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
@@ -8128,6 +8162,8 @@ async def _handle_resume_task_unserialized(
         )
     except RuntimeError as e:
         # Runtime error
+        # No traceback: this branch passes the text through to the client
+        # unredacted (#1479), so nothing is being withheld from the log.
         logger.error("Runtime error resuming task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
@@ -8214,7 +8250,7 @@ async def _execute_durable_task_command(
     } and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
     ):
-        raise TaskCommandDeferred(
+        raise ClientVisibleTaskCommandDeferred(
             f"{command.kind.value.title()} command {command.command_id} is waiting "
             "for the active task lease owner"
         )
@@ -8224,7 +8260,7 @@ async def _execute_durable_task_command(
             websocket, command.task_id, message_data
         )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
-            raise TaskCommandDeferred(
+            raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
             )
         if message_data.get("_registered_turn_handoff") == command.command_id:
@@ -8240,7 +8276,7 @@ async def _execute_durable_task_command(
             )
         )
         if delivery_status == DELIVERY_PENDING:
-            raise TaskCommandDeferred(
+            raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
         if delivery_status == DELIVERY_FAILED:
@@ -8314,7 +8350,11 @@ async def _broadcast_terminal_command_error(
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
-            "message": (f"Task command {command.kind.value} failed: {error}"),
+            # Kept a plain chokepoint call rather than an f-string: the guard
+            # cannot see inside an interpolation, and the command kind travels
+            # as a structured field instead.
+            "message": client_safe_error_message(error),
+            "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
             "timestamp": datetime.now(timezone.utc).timestamp(),
