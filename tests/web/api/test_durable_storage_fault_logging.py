@@ -396,6 +396,47 @@ def test_v1_turn_attachment_durable_fault_logs_the_provider_cause(
     _assert_cause_chain_recorded(rendered)
 
 
+def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The integrity subclass through the real cascade, not just the parent.
+
+    The test above injects only ``DurableStorageOperationError``, so it would
+    pass with the two arms swapped -- the parent would catch the subclass and
+    this site would report permanent corruption as a retryable outage. That is
+    the safety property the ordering exists for, and injecting the subclass is
+    what actually exercises it.
+    """
+    from xagent.web.services.managed_file_ref import (
+        FILE_INTEGRITY_REUPLOAD_MESSAGE,
+        DurableObjectIntegrityError,
+    )
+
+    def fail_resolve(**_kwargs: Any) -> None:
+        raise DurableObjectIntegrityError(FILE_INTEGRITY_REUPLOAD_MESSAGE)
+
+    monkeypatch.setattr(v1_tasks, "resolve_turn_file_infos", fail_resolve)
+
+    with caplog.at_level(logging.WARNING, logger=v1_tasks.logger.name):
+        with pytest.raises(V1ApiError) as raised:
+            v1_tasks._resolve_turn_files_or_400(
+                file_ids=["8ac1f2"],
+                owner_user_id=7,
+                db=cast(Any, None),
+                task_id=42,
+            )
+
+    assert raised.value.http_status == 503
+    # The envelope is deliberately unchanged; what must not happen is a second,
+    # contradicting record calling permanent corruption a transient outage.
+    assert not [
+        line
+        for line in _warnings(caplog, v1_tasks.logger.name)
+        if "Durable storage unavailable" in line
+    ], "an integrity fault emitted an outage warning -- the arms are misordered"
+
+
 # Every ``_raise_durable_storage_unavailable`` call site in files.py, with the
 # fields it is expected to carry. N2 in review -- the signed-redirect site
 # shipping with no identifier -- was invisible because only two sites had
@@ -411,6 +452,55 @@ _FAULT_SITES = (
     ("public preview task asset", ("file_id",)),
     ("durable cleanup before row delete", ("file_id", "storage_key")),
 )
+
+
+# --- shared AST primitives -------------------------------------------------
+#
+# Several contracts in this file can only be checked against source: which
+# call sites exist, what they bind, which arms come first, and whether a
+# handler re-raises. Each of those started as its own hand-rolled walk, and
+# four near-identical parse-and-search blocks were three too many. These are
+# the pieces they share; the checks themselves stay separate because they
+# assert different things.
+
+
+def _module_ast(module: Any) -> ast.Module:
+    """Parse an imported module's own source."""
+    return ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+
+
+def _function_named(tree: ast.Module, name: str) -> ast.AST:
+    """The (async) function definition called ``name``, anywhere in ``tree``."""
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == name
+    )
+
+
+def _handler_types(handler: ast.ExceptHandler) -> list[str]:
+    """The exception class names an ``except`` arm names, tuple or not."""
+    if isinstance(handler.type, ast.Name):
+        return [handler.type.id]
+    if isinstance(handler.type, ast.Tuple):
+        return [e.id for e in handler.type.elts if isinstance(e, ast.Name)]
+    return []
+
+
+def _durable_arm_pairs(tree: ast.Module) -> list[ast.Try]:
+    """Every ``try`` that handles both the integrity subclass and its parent."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            "DurableObjectIntegrityError" in _handler_types(h) for h in node.handlers
+        )
+        and any(
+            "DurableStorageOperationError" in _handler_types(h) for h in node.handlers
+        )
+    ]
 
 
 def _identifiers(expression: ast.expr) -> set[str]:
@@ -488,7 +578,7 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
     carry tenant and task, which is what correlates a 503 burst. Every other
     site identifies its subject.
     """
-    tree = ast.parse(Path(files_api.__file__).read_text(encoding="utf-8"))
+    tree = _module_ast(files_api)
     calls = [
         node
         for node in ast.walk(tree)
@@ -547,13 +637,7 @@ def test_no_client_supplied_message_type_can_become_an_operation_label() -> None
     site to ``f"websocket {message_data.get('type')}"`` would have left it green,
     which is the exact leak class it claimed to guard.
     """
-    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
-    endpoint = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "websocket_chat_endpoint"
-    )
+    endpoint = _function_named(_module_ast(websocket_api), "websocket_chat_endpoint")
 
     assignments = [
         node
@@ -603,13 +687,7 @@ def test_every_dispatched_message_type_has_a_label() -> None:
     "unknown message type", which is silent and exactly the mislabelling the
     map was added to fix.
     """
-    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
-    endpoint = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "websocket_chat_endpoint"
-    )
+    endpoint = _function_named(_module_ast(websocket_api), "websocket_chat_endpoint")
     dispatched = {
         comparator.value
         for node in ast.walk(endpoint)
@@ -624,13 +702,14 @@ def test_every_dispatched_message_type_has_a_label() -> None:
 
     assert dispatched, "found no dispatch branches -- the parse assumption broke"
     labelled = set(websocket_api._DISPATCH_OPERATIONS)
-    assert dispatched == labelled | _SWALLOWED_DISPATCH_TYPES, (
+    unlabelled = _SWALLOWED_DISPATCH_TYPES | _INNER_REPORTED_DISPATCH_TYPES
+    assert dispatched == labelled | unlabelled, (
         "dispatch cascade and label map disagree: "
-        f"{dispatched ^ (labelled | _SWALLOWED_DISPATCH_TYPES)}"
+        f"{dispatched ^ (labelled | unlabelled)}"
     )
-    assert not (labelled & _SWALLOWED_DISPATCH_TYPES), (
+    assert not (labelled & unlabelled), (
         "a type cannot be both labelled and declared unreachable: "
-        f"{labelled & _SWALLOWED_DISPATCH_TYPES}"
+        f"{labelled & unlabelled}"
     )
 
 
@@ -638,10 +717,46 @@ def test_every_dispatched_message_type_has_a_label() -> None:
 # swallows the fault before it can reach the endpoint arm. Declared, not
 # assumed: the test below reads the handlers to confirm it.
 _SWALLOWED_DISPATCH_TYPES = {"execute_task", "intervention"}
+
+# Absent for a different reason: the handler propagates, but its own fault arm
+# reports first and the shared logger marks the instance, so the endpoint-level
+# call is a no-op. ``test_a_reported_chat_fault_needs_no_endpoint_label`` pins
+# that behaviour rather than trusting this comment.
+_INNER_REPORTED_DISPATCH_TYPES = {"chat"}
 _SWALLOWING_HANDLERS = {
     "execute_task": "handle_execute_task",
     "intervention": "handle_intervention",
 }
+
+
+def test_a_reported_chat_fault_needs_no_endpoint_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Why ``chat`` is not in the label map, asserted rather than asserted-in-prose.
+
+    Its own fault arm reports before re-raising, and the shared logger marks the
+    instance, so the endpoint-level call that would render a ``chat`` label is a
+    no-op. Giving it one would name a line that is never emitted -- which is what
+    it had, and what a reviewer found by tracing the marker.
+
+    If the marker or the arm ever changes so a second record *is* produced, this
+    fails and the label goes back.
+    """
+    fault = _wrapped_fault()
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        # The arm inside the chat handler.
+        log_durable_storage_fault(
+            files_api.logger, "websocket chat turn preparation", fault, task_id=42
+        )
+        # The endpoint-level arm, reached by the bare ``raise`` that follows it.
+        log_durable_storage_fault(
+            files_api.logger, "websocket chat turn", fault, task_id=42
+        )
+
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert "during websocket chat turn preparation" in rendered
+    assert "chat" in _INNER_REPORTED_DISPATCH_TYPES
 
 
 @pytest.mark.parametrize(
@@ -658,13 +773,7 @@ def test_a_type_is_unlabelled_only_because_its_handler_swallows(
     adds a re-raise -- or a durable arm, which is the #1515 work -- the type
     becomes reachable and needs a label, and this is what says so.
     """
-    tree = ast.parse(Path(websocket_api.__file__).read_text(encoding="utf-8"))
-    func = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
-        and node.name == handler
-    )
+    func = _function_named(_module_ast(websocket_api), handler)
     runtime_arms = [
         arm
         for arm in (
@@ -685,6 +794,66 @@ def test_a_type_is_unlabelled_only_because_its_handler_swallows(
             f"{handler}'s RuntimeError arm now re-raises, so {dispatch_type!r} "
             "can reach the endpoint fault arm and needs a label in "
             "_DISPATCH_OPERATIONS"
+        )
+
+
+# Every module carrying an integrity/parent arm pair. The ordering below is a
+# safety property, not a style rule: ``DurableObjectIntegrityError`` subclasses
+# ``DurableStorageOperationError``, so a parent arm placed first makes the child
+# arm dead and reports permanent corruption as a retryable outage -- loud enough
+# to trip the alerts that watch for one, and burying the real diagnosis.
+_MODULES_WITH_DURABLE_ARM_PAIRS = (
+    ("files.py", lambda: files_api),
+    ("websocket.py", lambda: websocket_api),
+    ("v1/tasks.py", lambda: v1_tasks),
+    ("file_ingestion_tool.py", lambda: _file_ingestion_tool()),
+)
+
+
+def _file_ingestion_tool() -> Any:
+    from xagent.core.tools.adapters.vibe import file_ingestion_tool
+
+    return file_ingestion_tool
+
+
+@pytest.mark.parametrize(("label", "loader"), _MODULES_WITH_DURABLE_ARM_PAIRS)
+def test_the_integrity_arm_precedes_its_parent_at_every_site(
+    label: str, loader: Any
+) -> None:
+    """Checked at all twelve pairs, because only one has real end-to-end cover.
+
+    The integrity-vs-outage distinction is asserted through a real call path in
+    exactly one place (``file_ingestion_tool``, via ``test_kb_creation_tools``).
+    Everywhere else -- seven pairs in ``files.py``, three in ``websocket.py``,
+    one in ``v1/tasks.py`` -- the tests either drive the shared helper directly
+    with a pre-built exception or inject only the parent class, so a swapped
+    ordering would change behaviour silently at ten of the twelve.
+
+    This does not replace those tests: it proves ordering, not that each arm
+    produces the right answer. What it does is make the one regression that
+    silently breaks the property at every site impossible to land. Real
+    end-to-end coverage for the ``files.py`` sites is #1522.
+    """
+    tree = _module_ast(loader())
+    pairs = _durable_arm_pairs(tree)
+    assert pairs, f"{label}: expected at least one integrity/parent pair"
+
+    for node in pairs:
+        integrity_at = min(
+            handler.lineno
+            for handler in node.handlers
+            if "DurableObjectIntegrityError" in _handler_types(handler)
+        )
+        parent_at = min(
+            handler.lineno
+            for handler in node.handlers
+            if "DurableStorageOperationError" in _handler_types(handler)
+        )
+        assert integrity_at < parent_at, (
+            f"{label}: the try at line {node.lineno} catches "
+            f"DurableStorageOperationError (line {parent_at}) before its "
+            f"subclass DurableObjectIntegrityError (line {integrity_at}), which "
+            "makes the integrity arm dead and reports corruption as an outage"
         )
 
 

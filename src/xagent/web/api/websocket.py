@@ -7380,8 +7380,11 @@ async def handle_status_request(
 # of their own, which is absorber work and belongs to #1515 -- at which point
 # they get a label here. ``_SWALLOWED_DISPATCH_TYPES`` in the tests pins the
 # omission against the handlers, so this cannot silently become wrong.
+# ``chat`` is absent for a third reason, distinct from the two above: its own
+# fault arm always reports before re-raising, and ``log_durable_storage_fault``
+# marks the instance, so the call here would be a no-op rather than a second
+# record. A label for it would name a line that is never emitted.
 _DISPATCH_OPERATIONS = {
-    "chat": "websocket chat turn",
     "status_request": "websocket status request",
     "pause_task": "websocket pause_task",
     "resume_task": "websocket resume_task",

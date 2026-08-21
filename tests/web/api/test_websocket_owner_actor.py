@@ -3943,3 +3943,76 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
     assert "chat turn" not in fault_lines[0]
     # The key still reaches the log, from the attribute rather than the message.
     assert f"storage_key=users/{owner_id}/uploads/a/b.txt" in fault_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage(
+    db_session,
+    caplog,
+) -> None:
+    """The integrity subclass through the real cascade, not just the parent.
+
+    ``test_durable_attachment_failure_keeps_the_storage_key_off_the_socket``
+    injects only ``DurableStorageOperationError``, so it would pass with these
+    two arms swapped -- the parent would catch the subclass and tell the client
+    to retry something retrying cannot fix, while emitting a transient-outage
+    warning over the permanent-corruption ERROR already logged upstream.
+
+    Ordering is checked across all twelve pairs by
+    ``test_the_integrity_arm_precedes_its_parent_at_every_site``; this is what
+    proves this pair's arms also produce the right answers.
+    """
+    import logging
+
+    from xagent.web.services.managed_file_ref import (
+        FILE_INTEGRITY_REUPLOAD_MESSAGE,
+        DurableObjectIntegrityError,
+    )
+
+    owner = _user(db_session, "integrity-answer-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+
+    def failing_prepare(**_kwargs):
+        raise DurableObjectIntegrityError(FILE_INTEGRITY_REUPLOAD_MESSAGE)
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    logger_name = "xagent.web.api.websocket"
+
+    with (
+        patch(
+            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            side_effect=failing_prepare,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        caplog.at_level(logging.WARNING, logger=logger_name),
+    ):
+        with pytest.raises(DurableObjectIntegrityError):
+            await _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "with a corrupted attachment",
+                    "client_message_id": "integrity-probe",
+                    "user": SimpleNamespace(id=owner_id, is_admin=False),
+                    "files": ["8ac1f2"],
+                },
+            )
+
+    frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
+    assert any("message_rejected" in frame for frame in frames), frames
+    # Told to re-upload, not to retry: retrying cannot repair corruption.
+    assert any("integrity check" in frame for frame in frames), frames
+    assert not any("temporarily unavailable" in frame for frame in frames), frames
+
+    assert not [
+        entry
+        for entry in caplog.records
+        if entry.name == logger_name
+        and "Durable storage unavailable" in entry.getMessage()
+    ], "an integrity fault emitted an outage warning -- the arms are misordered"
