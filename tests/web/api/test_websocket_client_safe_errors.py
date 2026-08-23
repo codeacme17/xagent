@@ -8,7 +8,8 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from typing import NamedTuple
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -173,6 +174,12 @@ PRODUCERS: dict[str, int | None] = {
 # string between branches of an allowlisted function is NOT caught. #1547.
 ALLOWED_RAW_MESSAGES = {
     ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
+    # The same #1479 flow seen through the closure scope chain: the outer
+    # function's runtime-error string reaches these closures' ``message``
+    # parameter at their call sites. Surfaced when the parameter short-circuit
+    # stopped hiding rebound names; not a new leak.
+    ("finish_delivery", "f'Runtime error: {str(e)}'"),
+    ("finish_delivery_failure", "f'Runtime error: {str(e)}'"),
     ("handle_execute_task", "f'Runtime error: {str(e)}'"),
     ("handle_intervention", "f'Runtime error: {str(e)}'"),
     ("_handle_pause_task_unserialized", "f'Runtime error: {str(e)}'"),
@@ -216,6 +223,12 @@ ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
 ERROR_PAYLOAD_TYPES = {"error", "agent_error"}
+
+# The only functions allowed to mint client-visible text from an exception.
+SAFE_MESSAGE_BUILDERS = {
+    "client_safe_error_message",
+    "client_safe_task_command_failure",
+}
 
 
 def _unwrap_serializer(expr: ast.expr) -> ast.expr:
@@ -284,7 +297,14 @@ def _is_client_safe(expr: ast.expr) -> bool:
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-        return expr.func.id == "client_safe_error_message"
+        if expr.func.id == "client_safe_error_message":
+            return True
+        if expr.func.id == "client_safe_task_command_failure":
+            # The prefix argument must be attribute access on server state
+            # (``command.kind``), never a literal or a bare name a caller
+            # could point at untrusted text.
+            return bool(expr.args) and isinstance(expr.args[0], ast.Attribute)
+        return False
     # `_TURN_REJECTION_MESSAGES.get(reason, "<literal>")` - a curated table.
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
         return expr.func.attr == "get" and all(
@@ -294,6 +314,76 @@ def _is_client_safe(expr: ast.expr) -> bool:
     if isinstance(expr, ast.BoolOp):
         return all(_is_client_safe(value) for value in expr.values)
     return False
+
+
+class _ScanResult(NamedTuple):
+    offenders: list[str]
+    producers: int
+    error_payloads: int
+    used_allowlist: set[tuple[str, str]]
+
+
+def _scan(tree: ast.Module) -> _ScanResult:
+    """The one copy of the sweep's recognition logic.
+
+    Both the production sweep and the snippet-based regression tests run
+    this same function, so a change to the analysis cannot pass the snippet
+    tests while silently not applying to the real module (or vice versa).
+    """
+    parents = _parents(tree)
+    producers = 0
+    error_payloads = 0
+    offenders: list[str] = []
+    used_allowlist: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_name(node)
+        is_producer = name in PRODUCERS
+        if is_producer:
+            expr = _message_expression(node, PRODUCERS[name])
+        else:
+            # The error bubble renders in the same conversation as the
+            # rejection ack, so it is the same disclosure surface.
+            expr = _error_payload_message(node)
+            name = f"{name}(error payload)"
+        if expr is None:
+            continue
+        if is_producer:
+            producers += 1
+        else:
+            error_payloads += 1
+        scopes = _enclosing_functions(node, parents)
+        candidates = (
+            _local_assignments(scopes, expr.id)
+            if isinstance(expr, ast.Name)
+            else [expr]
+        )
+        if not candidates:
+            # Only a name nothing rebinds is a genuinely forwarded parameter,
+            # vetted at the wrapper's own call sites. A parameter rebound by a
+            # plain assignment lands in the candidates instead; rebinding via
+            # AnnAssign/AugAssign/walrus/tuple targets is still invisible to
+            # ``_local_assignments`` and tracked in #1547.
+            if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
+                continue
+            offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
+            continue
+        enclosing = next(
+            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
+            "<module>",
+        )
+        for candidate in candidates:
+            if _is_client_safe(candidate):
+                continue
+            key = (enclosing, ast.unparse(candidate))
+            if key in ALLOWED_RAW_MESSAGES:
+                used_allowlist.add(key)
+                continue
+            offenders.append(
+                f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
+            )
+    return _ScanResult(offenders, producers, error_payloads, used_allowlist)
 
 
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
@@ -316,66 +406,32 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
     source = Path(websocket_api.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    parents = _parents(tree)
+    result = _scan(ast.parse(source))
 
-    checked_producers = 0
-    checked_error_payloads = 0
-    offenders: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _called_name(node)
-        is_producer = name in PRODUCERS
-        if is_producer:
-            expr = _message_expression(node, PRODUCERS[name])
-        else:
-            # The error bubble renders in the same conversation as the
-            # rejection ack, so it is the same disclosure surface.
-            expr = _error_payload_message(node)
-            name = f"{name}(error payload)"
-        if expr is None:
-            continue
-        if is_producer:
-            checked_producers += 1
-        else:
-            checked_error_payloads += 1
-        scopes = _enclosing_functions(node, parents)
-        if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
-            continue
-        candidates = (
-            _local_assignments(scopes, expr.id)
-            if isinstance(expr, ast.Name)
-            else [expr]
+    for builder in SAFE_MESSAGE_BUILDERS:
+        assert callable(getattr(websocket_api, builder, None)), (
+            f"SAFE_MESSAGE_BUILDERS blesses {builder!r}, which does not exist"
         )
-        if not candidates:
-            offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
-            continue
-        enclosing = next(
-            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
-            "<module>",
-        )
-        for candidate in candidates:
-            if _is_client_safe(candidate):
-                continue
-            if (enclosing, ast.unparse(candidate)) in ALLOWED_RAW_MESSAGES:
-                continue
-            offenders.append(
-                f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
-            )
 
     # Actual counts at the time of writing: 23 producers, 30 error payloads.
     # These floors sit below that, so a minority of sites can still vanish
     # silently; tightening them to exact equality is tracked in #1547.
-    assert checked_producers >= 21, (
-        f"the producers moved; only {checked_producers} matched"
+    assert result.producers >= 21, (
+        f"the producers moved; only {result.producers} matched"
     )
-    assert checked_error_payloads >= 21, (
-        f"the error payloads moved; only {checked_error_payloads} matched"
+    assert result.error_payloads >= 21, (
+        f"the error payloads moved; only {result.error_payloads} matched"
     )
-    assert not offenders, (
+    # Every allowlist entry must be earned by a live call site: a stale entry
+    # is a standing exemption nothing uses, and an unused closure entry is
+    # exactly what a reverted parameter-rebinding fix would leave behind.
+    assert result.used_allowlist == ALLOWED_RAW_MESSAGES, (
+        "stale allowlist entries: "
+        f"{sorted(ALLOWED_RAW_MESSAGES - result.used_allowlist)}"
+    )
+    assert not result.offenders, (
         "raw text can reach a chat client; route it through "
-        "client_safe_error_message: " + "; ".join(sorted(set(offenders)))
+        "client_safe_error_message: " + "; ".join(sorted(set(result.offenders)))
     )
 
 
@@ -680,42 +736,8 @@ async def leak(websocket):
 
 
 def _guard_offenders(source: str) -> list[str]:
-    """Run the sweep's recognition logic over an arbitrary module source."""
-    tree = ast.parse(source)
-    parents = _parents(tree)
-    offenders: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _called_name(node)
-        if name in PRODUCERS:
-            expr = _message_expression(node, PRODUCERS[name])
-        else:
-            expr = _error_payload_message(node)
-        if expr is None:
-            continue
-        scopes = _enclosing_functions(node, parents)
-        if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
-            continue
-        candidates = (
-            _local_assignments(scopes, expr.id)
-            if isinstance(expr, ast.Name)
-            else [expr]
-        )
-        if not candidates:
-            offenders.append(f"{name}:{node.lineno} unresolvable")
-            continue
-        enclosing = next(
-            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
-            "<module>",
-        )
-        for candidate in candidates:
-            if _is_client_safe(candidate):
-                continue
-            if (enclosing, ast.unparse(candidate)) in ALLOWED_RAW_MESSAGES:
-                continue
-            offenders.append(f"{name}:{node.lineno} {ast.unparse(candidate)}")
-    return offenders
+    """Run the one sweep implementation over an arbitrary module source."""
+    return _scan(ast.parse(source)).offenders
 
 
 @pytest.mark.xfail(
@@ -779,3 +801,335 @@ async def test_unresolvable_task_answers_the_sender_instead_of_dropping_them(
         "a curated refusal is routine; only an incidental fault earns a stack"
     )
     assert all(r.levelno <= logging.WARNING for r in records)
+
+
+# --- Round 5: the parameter short-circuit must not hide rebound names -------
+
+REBOUND_PARAMETER_SHAPES = [
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message = str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="same-scope-rebind",
+    ),
+    pytest.param(
+        """
+async def outer(websocket, message):
+    async def inner(e):
+        message = str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="nested-shadow",
+    ),
+]
+
+
+@pytest.mark.parametrize("source", REBOUND_PARAMETER_SHAPES)
+def test_guard_catches_a_rebound_parameter(source: str) -> None:
+    """A name is only "vetted at the caller" while nothing in scope rebinds it.
+
+    The short-circuit used to fire on the bare parameter match, before local
+    assignments were even collected, so ``message = str(e)`` shadowing a
+    ``message`` argument sailed through.
+    """
+    assert _guard_offenders(source), "the rebound parameter must be flagged"
+
+
+def test_guard_still_trusts_a_genuinely_forwarded_parameter() -> None:
+    """The wrapper shape stays clean; only its callers are judged."""
+    source = """
+async def forward(websocket, message):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=message,
+        rejection_outcome="not_accepted",
+    )
+"""
+    assert not _guard_offenders(source)
+
+
+# The concurrent-delete race (TaskCommandTaskMissing between lookup and
+# enqueue) is pinned in tests/web/services/test_task_command_transport.py:
+# recovery-allowed returns None, and the strict path converts to
+# ClientVisibleValidationError with "Task N not found" preserved.
+
+
+# --- Round 5: runtime payload contracts for the changed egresses ------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> None:
+    """The kind prefix is ours; the exception text is not.
+
+    The frontend renders ``message`` verbatim for ``agent_error``, so the
+    redaction must not also delete the command context the client used to
+    get, and the secret must not ride along in any field.
+    """
+    connection_manager = MagicMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    command = SimpleNamespace(
+        kind=websocket_api.TaskCommandKind.PAUSE, task_id=7, command_id="cmd-7"
+    )
+    with patch.object(websocket_api, "manager", connection_manager):
+        await websocket_api._broadcast_terminal_command_error(
+            command, RuntimeError(f"lease lost at {SECRET}")
+        )
+    (payload, task_id) = connection_manager.broadcast_to_task.await_args.args
+    assert task_id == 7
+    assert SECRET not in repr(payload)
+    assert payload["message"] == (
+        f"Task command pause failed: {websocket_api.CLIENT_SAFE_VALIDATION_ERROR}"
+    )
+    assert payload["command_kind"] == "pause"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_name",
+    ["_handle_pause_task_unserialized", "_handle_resume_task_unserialized"],
+    ids=["pause", "resume"],
+)
+async def test_inner_command_validation_redacts_the_client_payload(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+) -> None:
+    """The unserialized handlers' validation branch is a client egress too."""
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "run_db_io_cancellation_safe",
+        AsyncMock(side_effect=ValueError(f"snapshot fault at {SECRET}")),
+    )
+
+    await getattr(websocket_api, handler_name)(
+        MagicMock(),
+        7,
+        {"user": SimpleNamespace(id=1, is_admin=False)},
+    )
+
+    payloads = _client_payloads(connection_manager)
+    assert payloads, "the handler must answer the client"
+    assert SECRET not in repr(payloads)
+    assert any(
+        payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        for payload in payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_intervention_validation_redacts_the_client_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The intervention validation branch is asserted, not just swept."""
+    connection_manager = MagicMock()
+    connection_manager.broadcast_to_task = AsyncMock(
+        side_effect=ValueError(f"intervention fault at {SECRET}")
+    )
+    connection_manager.send_personal_message = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    await websocket_api.handle_intervention(
+        MagicMock(), 7, {"step_id": "s1", "action": "approve"}
+    )
+
+    sent = [c.args[0] for c in connection_manager.send_personal_message.await_args_list]
+    assert sent, "the handler must answer the sender"
+    assert SECRET not in repr(sent)
+    assert sent[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_unexpected_execute_error_keeps_its_traceback(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """handle_execute_task re-raises into callers that log no stack."""
+
+    class _Unexpected(Exception):
+        pass
+
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    db = _direct_db_session()
+    try:
+        user = User(username="unexpected-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        task = Task(
+            user_id=int(user.id),
+            title="Unexpected",
+            description="generic branch",
+            status=TaskStatus.PENDING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task_id, user_id = int(task.id), int(user.id)
+    finally:
+        db.close()
+    monkeypatch.setattr(
+        TaskTurnOrchestrator,
+        "schedule_existing_task_execution",
+        AsyncMock(side_effect=_Unexpected("boom")),
+    )
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        with pytest.raises(_Unexpected):
+            await websocket_api.handle_execute_task(
+                MagicMock(),
+                task_id,
+                {"user": SimpleNamespace(id=user_id, is_admin=False)},
+            )
+
+    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert any(r.exc_info is not None for r in records), (
+        "the traceback must be recorded where the detail is known"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_intervention_error_keeps_its_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """handle_intervention re-raises into public endpoints that swallow."""
+
+    class _Unexpected(Exception):
+        pass
+
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock(side_effect=_Unexpected("boom"))
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        with pytest.raises(_Unexpected):
+            await websocket_api.handle_intervention(
+                MagicMock(), 7, {"step_id": "s1", "action": "approve"}
+            )
+
+    records = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert any(r.exc_info is not None for r in records), (
+        "the traceback must be recorded where the detail is known"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
+    _test_db: None,
+) -> None:
+    """The inner chat validation branch answers on two sinks; assert both.
+
+    The rejection ack goes to the sender and the task broadcast goes to every
+    subscriber through a dict-spread payload the AST guard cannot follow, so
+    this is runtime-only coverage: reverting the branch to ``str(e)`` must
+    fail here even though the sweep stays green.
+    """
+    db = _direct_db_session()
+    try:
+        owner = User(username="chat-validation-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Live control",
+            description="validation branch",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task.runner_id = "rt5-runner"
+        task.run_id = "rt5-run"
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=ValueError(f"validation fault at {SECRET}")
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
+        return {"type": "agent_error", "message": message, "task_id": task_id}
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            MagicMock(side_effect=_fake_error_payload),
+        ),
+    ):
+        await websocket_api._handle_chat_message_unserialized(
+            MagicMock(),
+            task_id,
+            {
+                "message": "trip the validation branch",
+                "client_message_id": "chat-validation-secret",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [],
+            },
+        )
+
+    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
+    broadcast = [c.args[0] for c in ws_manager.broadcast_to_task.await_args_list]
+    everything = personal + broadcast
+    assert everything, "the failure must be answered somewhere"
+    assert SECRET not in repr(everything), everything
+
+    rejected = [p for p in personal if p.get("type") == "message_rejected"]
+    assert rejected and rejected[0]["message"] == (
+        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )
+    task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
+    assert task_errors and task_errors[0]["message"] == (
+        websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )

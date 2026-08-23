@@ -393,6 +393,18 @@ def client_safe_error_message(error: BaseException) -> str:
     )
 
 
+def client_safe_task_command_failure(
+    kind: TaskCommandKind, error: BaseException
+) -> str:
+    """Terminal command failure: server-owned kind prefix + redacted detail.
+
+    The frontend renders ``message`` verbatim for ``agent_error``, so dropping
+    the prefix entirely removed user-visible context. The kind comes from our
+    own enum, never from the exception, which is what makes the prefix safe.
+    """
+    return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
+
+
 def log_client_facing_failure(error: Exception, template: str, *args: object) -> None:
     """Record a failure whose text the client will not see in full.
 
@@ -5175,13 +5187,17 @@ def _enqueue_websocket_task_command_sync(
                 kind=kind,
                 payload=payload,
             )
-        except TaskCommandTaskMissing:
+        except TaskCommandTaskMissing as exc:
             # The row was deleted after the check above, so route this through
             # the same sentinel as a task that was already gone. Otherwise the
             # caller rejects the delivery instead of creating a replacement.
             if allow_missing_task:
                 return None
-            raise
+            # Same answer as the direct lookup above, in the same wording.
+            # The sentinel is a bare ValueError, so re-raising it as-is let
+            # the pause/resume catch redact "not found" on this race alone.
+            # Converted at this boundary only; transport semantics unchanged.
+            raise ClientVisibleValidationError(str(exc)) from exc
         return result
 
 
@@ -6778,8 +6794,9 @@ async def handle_execute_task(
                 websocket,
             )
     except Exception as e:
-        # Other unknown errors, re-raise
-        logger.error("Unexpected error in task execution: %s", e)
+        # Re-raised, but the callers do not own the stack: the chat endpoint
+        # logs without exc_info and the public endpoints swallow entirely.
+        logger.error("Unexpected error in task execution: %s", e, exc_info=True)
         raise
 
 
@@ -7508,8 +7525,9 @@ async def handle_intervention(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
     except Exception as e:
-        # Other errors, re-raise
-        logger.error("Unexpected error in intervention: %s", e)
+        # Re-raised, but the callers do not own the stack: the chat endpoint
+        # logs without exc_info and the public endpoints swallow entirely.
+        logger.error("Unexpected error in intervention: %s", e, exc_info=True)
         raise
 
 
@@ -8350,10 +8368,10 @@ async def _broadcast_terminal_command_error(
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
-            # Kept a plain chokepoint call rather than an f-string: the guard
-            # cannot see inside an interpolation, and the command kind travels
-            # as a structured field instead.
-            "message": client_safe_error_message(error),
+            # A blessed constructor rather than an f-string at the call
+            # site: the guard cannot see inside an interpolation. The kind
+            # also travels as a structured field for consumers that want it.
+            "message": client_safe_task_command_failure(command.kind, error),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
