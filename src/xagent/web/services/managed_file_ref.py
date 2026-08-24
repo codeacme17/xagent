@@ -47,6 +47,125 @@ class DurableObjectMissingError(FileNotFoundError):
     """Raised when a registered file has no local copy or durable object."""
 
 
+# Rendered fields sit in a plain-text log line, so a value carrying a newline
+# would start what reads as a new, fully-formatted record (CWE-117). Some of
+# these values are client-supplied -- ``/v1/*`` passes the ``files`` list from
+# the request body, which is an unvalidated ``list[str]`` -- so a caller cannot
+# be relied on to have checked. Sanitising here covers every field at every
+# site, including ones added later.
+_LOG_VALUE_TRANSLATION = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
+
+# Long enough for a UUID list of realistic size, short enough that one field
+# cannot crowd out the rest of the line.
+_MAX_LOG_VALUE_LENGTH = 256
+
+
+def _sanitize_log_value(value: object) -> str:
+    """Flatten a field value to one bounded, single-line token.
+
+    Contract: callers filter ``None`` out before rendering -- a ``None`` field
+    is dropped from the line entirely, never rendered as ``None`` or ``""``
+    (whether it should render instead is #1642's open question). A new caller
+    must keep that filter; this function does not decide the policy.
+    """
+    text = str(value).translate(_LOG_VALUE_TRANSLATION)
+    if len(text) > _MAX_LOG_VALUE_LENGTH:
+        return f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
+    return text
+
+
+def log_durable_storage_fault(
+    target_logger: logging.Logger,
+    operation: str,
+    exc: Exception,
+    **fields: object,
+) -> None:
+    """Record a durable-storage fault with its full cause chain.
+
+    The single implementation for every site that reports a durable-storage
+    fault *as such*, so none of them can log it without its cause.
+
+    That is narrower than "every consumer of ``DurableStorageOperationError``",
+    and the difference matters: the class is a ``RuntimeError``, so broad
+    ``except Exception`` / ``except RuntimeError`` arms elsewhere absorb it
+    without ever naming it -- agent-service setup in web/api/chat.py,
+    knowledge-base refresh in web/api/kb.py, and workspace file resolution in
+    core/workspace.py. Those arms cannot route through this function, because
+    they handle every exception type; each carries ``exc_info`` so the chain
+    survives there, but none of them produces the fields this function renders.
+
+    So the accurate claim is about *naming*, not about coverage: a site that
+    reports this fault as a durable-storage fault does it here, and a site that
+    merely absorbs it keeps its own traceback. Anything added later in the first
+    category belongs here. Do not restate this as "every consumer" -- that was
+    the wording it replaced, and it was false.
+
+    The wraps in this module keep the storage key on the exception rather than
+    in its message (see ``DurableStorageOperationError``); the provider error
+    class, the
+    HTTP status, and throttle vs. timeout vs. rejected credentials live in
+    ``__cause__`` and nowhere else, and none of the envelopes these faults
+    become -- FastAPI's ``HTTPException``, the ``/v1/*`` error body, a tool
+    result -- carries a traceback. ``exc_info`` is the only thing that gets the
+    chain into a log (#1467).
+
+    ``target_logger`` is the caller's logger rather than this module's, so a
+    line stays attributed to the endpoint or tool that produced it.
+
+    Field values are escaped and bounded, because some are client-supplied.
+    That covers the fields *this* function renders -- it does **not** make the
+    record as a whole unforgeable: the formatter renders ``exc_info`` verbatim,
+    so a newline in a provider exception message still produces a physical
+    continuation line. Closing that needs the formatter itself and is tracked in
+    #1516; do not read the sanitising below as a stronger guarantee than it is.
+
+    ``operation`` must be a bounded label -- a small fixed set of values, so it
+    stays aggregatable. Per-request identifiers belong in ``fields``, which is
+    rendered as ``key=value`` pairs *in the message*: the deployed formatter is
+    ``"%(asctime)s %(levelname)-8s %(name)s - %(message)s"``
+    (see web/logging_config.py), which never renders ``extra``, so anything
+    passed that way would be invisible in exactly the logs an incident is
+    diagnosed from.
+    """
+    # One record per fault instance, whatever the nesting. A durable fault can
+    # pass through more than one handler that legitimately wants to report it --
+    # a request-scoped arm that answers the client, and an endpoint-scoped arm
+    # that catches whatever escaped -- and both calling this would log the same
+    # cause twice. Marking the exception is what makes each arm safe to write
+    # independently, instead of every new arm having to know which other arm
+    # might already have run.
+    #
+    # Only this module's own wraps are marked, and that is what makes the mark
+    # need no guarding. A wrap is what traverses several arms, so it is where
+    # dedup is needed; the raw provider exception the delete path hands over is
+    # reported by one site by definition. Restricting the mark also keeps this
+    # from setting a private attribute on an object the module does not own,
+    # where neither the read nor the write is safe in principle -- ``getattr``'s
+    # default absorbs ``AttributeError`` only -- and an exception escaping here,
+    # inside an ``except`` block, would replace a handled 503-with-a-log with an
+    # unhandled 500 that loses the fault, which is #1467's own failure mode.
+    if isinstance(exc, DurableStorageOperationError):
+        if exc._durable_fault_logged:
+            return
+        exc._durable_fault_logged = True
+        # The wraps carry the key on the exception rather than in its message,
+        # so ``str(exc)`` is safe wherever it escapes. Rendering it here is what
+        # keeps that from costing the log anything: the key reaches this line
+        # from every site, including ones that never passed it as a field.
+        # An explicit field wins, so a caller can still name a different key.
+        if exc.storage_key and "storage_key" not in fields:
+            fields = {**fields, "storage_key": exc.storage_key}
+
+    rendered = "".join(
+        f" {name}={_sanitize_log_value(value)}"
+        for name, value in fields.items()
+        if value is not None
+    )
+    target_logger.warning(
+        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
+    )
+
+
 class DurableStorageOperationError(RuntimeError):
     """Raised when durable object storage is unavailable for an operation.
 
@@ -64,17 +183,22 @@ class DurableStorageOperationError(RuntimeError):
     carries other identifiers (it has no storage key) in its own message
     (#1642).
 
-    What this costs, stated so it is not overread: the one log line that
-    renders ``str(exc)`` today (the upload warning in ``web/api/files.py``)
-    is updated to render the attribute alongside it. Other absorbers of
-    ``str(exc)`` -- the KB ingestion tool's error text, the WebSocket
-    ``except RuntimeError`` arm -- lose the key from their output until they
-    read the attribute, which is #1515's scope.
+    ``log_durable_storage_fault`` renders the attribute as a field, so every
+    line that reports the fault *as such* still carries the key. The broad
+    absorbers that render ``str(e)`` -- chat.py, kb.py, core/workspace.py --
+    lose it from their lines until they read the attribute, which is #1515's
+    scope.
 
     ``storage_key`` is required (still nullable) so an omission is a type
     error at the call site rather than a silently ``None`` attribute --
     pass ``storage_key=None`` only where there genuinely is no key yet.
     """
+
+    # Set by ``log_durable_storage_fault`` so one fault yields one record even
+    # when several arms legitimately report it. Declared here rather than
+    # attached dynamically so it is typed, discoverable, and always present to
+    # read -- the reason that function needs no guard around the mark.
+    _durable_fault_logged: bool = False
 
     def __init__(self, message: str, *, storage_key: str | None) -> None:
         super().__init__(message)
@@ -651,12 +775,18 @@ class ManagedFileRef:
             # backend-mediated access.
             raise
         except Exception as exc:
+            # ``exc_info`` for the same reason as everywhere else on this
+            # path: this fault is swallowed -- the caller only sees ``False``
+            # and silently falls back to backend-mediated delivery -- so this
+            # line is the only record of it, and ``error=%s`` alone drops the
+            # exception class and the cause chain (#1467).
             logger.warning(
                 "Falling back to backend-mediated durable access because content "
                 "hash is unavailable: file_id=%s storage_key=%s error=%s",
                 getattr(self.record, "file_id", None),
                 self.storage_key,
                 exc,
+                exc_info=exc,
             )
             return False
 

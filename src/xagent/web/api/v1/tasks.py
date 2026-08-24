@@ -76,7 +76,11 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
-from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -228,8 +232,32 @@ def _resolve_turn_files_or_400(
             db=db,
             task_id=task_id,
         )
+    except DurableObjectIntegrityError:
+        # Precedes the parent arm: permanent corruption, already logged at
+        # ERROR with both checksums where it is raised. The envelope below is
+        # left as-is deliberately -- reclassifying it for the SDK is a
+        # compatibility change, not a logging one -- but it must not also emit
+        # a transient-outage warning.
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="File storage is temporarily unavailable.",
+        ) from None
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
+        # The V1ApiError envelope reaches the client without a traceback, so
+        # this log line is the only record of the provider fault (#1467).
+        # ``task_id`` is None on the create path -- one of this function's two
+        # callers, not an edge case -- so the owner and the requested ids carry
+        # the identification there.
+        log_durable_storage_fault(
+            logger,
+            "turn attachment resolution",
+            exc,
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            file_ids=",".join(file_ids),
+        )
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR,
             503,
