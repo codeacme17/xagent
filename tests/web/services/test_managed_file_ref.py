@@ -617,10 +617,13 @@ def test_no_wrap_site_interpolates_into_the_message():
     The message must be a string literal or a bare name (a module constant
     like ``FILE_INTEGRITY_REUPLOAD_MESSAGE``) -- a whitelist, because the
     first version of this test blacklisted f-strings only, and ``"..." + key``,
-    ``"%s" % key``, and ``"{}".format(key)`` all walked past it. What the
-    whitelist still cannot see: a name bound to dynamically built text one
-    statement earlier. That indirection would need assignment tracing to
-    catch; this test does not claim to.
+    ``"%s" % key``, and ``"{}".format(key)`` all walked past it. The second
+    version read only the positional slot, so ``message=...`` slipped past as
+    a keyword; it is looked up in both places now, and a ``**`` unpacking --
+    which no static check can see through -- fails outright rather than being
+    skipped. What the whitelist still cannot see: a name bound to dynamically
+    built text one statement earlier. That indirection would need assignment
+    tracing to catch; this test does not claim to.
     """
     import ast
 
@@ -636,7 +639,17 @@ def test_no_wrap_site_interpolates_into_the_message():
             in {"DurableStorageOperationError", "DurableObjectIntegrityError"}
         ):
             continue
-        message = node.args[0] if node.args else None
+        assert not any(kw.arg is None for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs via ** unpacking, "
+            "which this check cannot see through; spell the arguments out so "
+            "the message stays statically checkable"
+        )
+        if node.args:
+            message = node.args[0]
+        else:
+            message = next(
+                (kw.value for kw in node.keywords if kw.arg == "message"), None
+            )
         if message is None:
             continue
         checked += 1
