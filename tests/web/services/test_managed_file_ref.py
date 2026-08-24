@@ -613,12 +613,21 @@ def test_no_wrap_site_interpolates_into_the_message():
     A new wrap site that puts the key back into the message would reopen the
     leak at every ``str(exc)`` egress at once, and no runtime test can drive a
     site that does not exist yet. Parsing the module is what closes that gap.
+
+    The message must be a string literal or a bare name (a module constant
+    like ``FILE_INTEGRITY_REUPLOAD_MESSAGE``) -- a whitelist, because the
+    first version of this test blacklisted f-strings only, and ``"..." + key``,
+    ``"%s" % key``, and ``"{}".format(key)`` all walked past it. What the
+    whitelist still cannot see: a name bound to dynamically built text one
+    statement earlier. That indirection would need assignment tracing to
+    catch; this test does not claim to.
     """
     import ast
 
     from xagent.web.services import managed_file_ref
 
     tree = ast.parse(Path(managed_file_ref.__file__).read_text(encoding="utf-8"))
+    checked = 0
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
@@ -628,7 +637,16 @@ def test_no_wrap_site_interpolates_into_the_message():
         ):
             continue
         message = node.args[0] if node.args else None
-        assert not isinstance(message, ast.JoinedStr), (
-            f"managed_file_ref.py:{node.lineno} interpolates into the message; "
-            "the identifier belongs in storage_key= so str(exc) stays safe"
+        if message is None:
+            continue
+        checked += 1
+        is_literal = isinstance(message, ast.Constant) and isinstance(
+            message.value, str
         )
+        assert is_literal or isinstance(message, ast.Name), (
+            f"managed_file_ref.py:{node.lineno} builds the message dynamically "
+            f"({ast.unparse(message)!r}); it must be a string literal or a "
+            "module constant -- the identifier belongs in storage_key= so "
+            "str(exc) stays safe"
+        )
+    assert checked, "found no constructions -- the parse assumption broke"
