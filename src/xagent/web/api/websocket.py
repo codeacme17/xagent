@@ -4609,6 +4609,78 @@ async def _with_current_task_control_state(
 
 
 # Connection manager
+class _CommandOriginRegistry:
+    """(task_id, command_id) -> the exact socket that submitted the command.
+
+    Recorded at the ingress handler, where the connection is the verified
+    origin, and consulted by the durable executor in place of any guess:
+    origin is never inferred from task membership, actor id, guest id, or
+    connection order. Same-worker only, by design - when the command executes
+    after a worker restart or on a different worker, ``resolve`` finds nothing
+    and the executor degrades to a discarding socket, so personal detail is
+    dropped rather than sent to an unverified connection.
+
+    ``command_id`` is client-supplied and only unique per task (the DB carries
+    a ``(task_id, command_id)`` uniqueness constraint), so the key is the pair,
+    never the id alone - otherwise a command_id shared across two tasks would
+    let one void or overwrite the other's entry.
+
+    First registration wins. A second connection on the same task cannot
+    overwrite an existing origin by resubmitting the same command_id: the
+    enqueue dedupe returns the in-flight row for such a resubmission, so
+    without this rule a co-tenant on a public/share task could redirect
+    another sender's error detail to itself. Re-registering the *same* socket
+    is idempotent.
+
+    Lifecycle: an entry dies with its socket (``discard_socket`` from
+    ``ConnectionManager.disconnect``) or with its command's terminal outcome
+    (``discard_command`` from the durable dispatch wrapper), whichever comes
+    first (``detach_task_connections`` also clears them). A deferred command
+    that will retry keeps its entry. An entry whose command is claimed by
+    another worker is never resolved here (wrong worker); it is reclaimed when
+    this worker's socket disconnects, so the only unbounded case would be a
+    socket that never disconnects while submitting commands that always run
+    elsewhere - not a shape this deployment produces, and tracked rather than
+    given a TTL here.
+    """
+
+    def __init__(self) -> None:
+        self._origins: dict[tuple[int, str], Any] = {}
+
+    def register(self, command_id: str, websocket: Any, task_id: int) -> None:
+        if not command_id:
+            return
+        key = (int(task_id), command_id)
+        existing = self._origins.get(key)
+        if existing is not None and existing is not websocket:
+            # First registration wins; a resubmission from another socket
+            # must not capture this command's origin.
+            return
+        self._origins[key] = websocket
+
+    def resolve(self, command_id: str, task_id: int) -> Any | None:
+        websocket = self._origins.get((int(task_id), command_id))
+        if websocket is None:
+            return None
+        if not manager.is_connection_registered(websocket, int(task_id)):
+            return None
+        return websocket
+
+    def discard_command(self, command_id: str, task_id: int) -> None:
+        self._origins.pop((int(task_id), command_id), None)
+
+    def has(self, command_id: str, task_id: int) -> bool:
+        """Whether an origin is currently recorded for this command."""
+        return (int(task_id), command_id) in self._origins
+
+    def discard_socket(self, websocket: Any) -> None:
+        for key in [k for k, ws in self._origins.items() if ws is websocket]:
+            del self._origins[key]
+
+
+_command_origins = _CommandOriginRegistry()
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
@@ -4644,6 +4716,7 @@ class ConnectionManager:
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
+        _command_origins.discard_socket(websocket)
 
     def detach_task_connections(self, task_id: int) -> List[WebSocket]:
         """Remove and return every connection currently owned by a task."""
@@ -4651,6 +4724,7 @@ class ConnectionManager:
         for connection in connections:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
+            _command_origins.discard_socket(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -5124,6 +5198,9 @@ async def handle_chat_message(
         accepted=True,
     )
     if enqueued.command_id:
+        # This connection is the verified origin of the command; personal
+        # detail from durable execution goes here or nowhere.
+        _command_origins.register(enqueued.client_command_id, websocket, task_id)
         await dispatch_task_command_promptly(
             execute_durable_task_command,
             command_db_id=enqueued.command_id,
@@ -6544,6 +6621,18 @@ async def _handle_chat_message_unserialized(
                     },
                     authorized_task_id,
                 )
+                # Only the durable path needs this: there the rejection ack
+                # is suppressed, so the detail bubble is the sender's only
+                # copy. On the live path finish_delivery_failure already sent
+                # the ack with the same wording, so a bubble would duplicate
+                # it. The origin socket came from the registry and is a
+                # discarding stub when unverifiable, so this is
+                # origin-or-nowhere by construction.
+                if suppress_delivery_ack:
+                    await manager.send_personal_message(
+                        {"type": "error", "message": message, "timestamp": timestamp},
+                        websocket,
+                    )
             else:
                 await manager.send_personal_message(
                     {
@@ -6792,6 +6881,12 @@ async def handle_execute_task(
                     "timestamp": timestamp,
                 },
                 authorized_task_id,
+            )
+            # This handler is invoked with its real ingress socket (it is not
+            # dispatched durably), so the initiating sender keeps the detail.
+            await manager.send_personal_message(
+                {"type": "error", "message": message, "timestamp": timestamp},
+                websocket,
             )
         else:
             await manager.send_personal_message(
@@ -7580,6 +7675,9 @@ async def handle_pause_task(
         },
         websocket,
     )
+    # This connection is the verified origin; personal detail from durable
+    # execution goes here or nowhere.
+    _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,
@@ -7845,6 +7943,9 @@ async def handle_resume_task(
         },
         websocket,
     )
+    # This connection is the verified origin; personal detail from durable
+    # execution goes here or nowhere.
+    _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,
@@ -8233,20 +8334,16 @@ async def _execute_durable_task_command(
 ) -> dict[str, Any] | None:
     """Apply one DB-claimed command using the existing transport adapters.
 
-    The handler is independent of the originating connection. If the socket is
-    still connected, personal validation errors go there; after a crash or on a
-    different worker they are discarded while task-level state/error events are
-    still broadcast normally.
+    Personal replies go only to the registered origin socket, verified to
+    still be connected to this task. Origin is never inferred from task
+    membership, actor id, or connection order: after a crash, a handoff to a
+    different worker, or a disconnect, personal detail is discarded while
+    task-level state/error events are still broadcast normally.
     """
 
-    connections = manager.connections_for_task(command.task_id)
-    # Broadcast-only subscribers (e.g. the v1 SSE sink) never issued this
-    # command and must not be mistaken for the originating socket, so they
-    # are skipped when picking the target for a personal reply.
-    websocket: Any = next(
-        (c for c in connections if not getattr(c, "is_broadcast_only", False)),
-        _DiscardingCommandWebSocket(),
-    )
+    websocket: Any = _command_origins.resolve(command.command_id, command.task_id)
+    if websocket is None:
+        websocket = _DiscardingCommandWebSocket()
     message_data = dict(command.payload)
     message_data.update(
         {
@@ -8396,19 +8493,25 @@ async def execute_durable_task_command(
     """Apply one command and expose only terminal transport failures to clients."""
 
     try:
-        return await _execute_durable_task_command(command)
+        result = await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+            _command_origins.discard_command(command.command_id, command.task_id)
             await _broadcast_terminal_command_error(command, exc)
+        # A deferral that will retry keeps its origin entry.
         raise
     except TaskCommandRejected:
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
+        _command_origins.discard_command(command.command_id, command.task_id)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            _command_origins.discard_command(command.command_id, command.task_id)
             await _broadcast_terminal_command_error(command, exc)
         raise
+    _command_origins.discard_command(command.command_id, command.task_id)
+    return result
 
 
 def _load_command_message_delivery_status(

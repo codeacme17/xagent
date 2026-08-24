@@ -8,7 +8,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import Iterator, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1291,3 +1291,553 @@ async def test_execute_runtime_error_broadcast_is_redacted(
     assert any(
         b.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE for b in broadcast
     )
+
+
+# --- Round 6: the durable command origin registry ---------------------------
+#
+# Personal detail from durable execution goes to the exact socket that
+# submitted the command, verified to still be connected to that task - or
+# nowhere. Origin is never inferred from task membership, actor id, or
+# connection order.
+
+
+@pytest.fixture()
+def _clean_origins() -> Iterator[None]:
+    saved = dict(websocket_api._command_origins._origins)
+    websocket_api._command_origins._origins.clear()
+    yield
+    websocket_api._command_origins._origins.clear()
+    websocket_api._command_origins._origins.update(saved)
+
+
+def _pause_command(
+    task_id: int = 7, command_id: str = "pause:origin"
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=1,
+        task_id=task_id,
+        actor_user_id=1,
+        command_id=command_id,
+        kind=websocket_api.TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+        target_run_id=None,
+        attempt_count=1,
+        failure_count=0,
+        defer_count=0,
+    )
+
+
+def _origin_test_manager(registered: set) -> MagicMock:
+    """A manager mock whose registration check is membership in ``registered``."""
+    m = MagicMock()
+    m.send_personal_message = AsyncMock()
+    m.broadcast_to_task = AsyncMock()
+    m.is_connection_registered = MagicMock(
+        side_effect=lambda ws, task_id: ws in registered
+    )
+    return m
+
+
+async def _run_pause_to_runtime_error(
+    monkeypatch: pytest.MonkeyPatch, manager_mock: MagicMock, command
+) -> None:
+    monkeypatch.setattr(websocket_api, "manager", manager_mock)
+    monkeypatch.setattr(
+        websocket_api,
+        "_load_command_actor",
+        lambda actor_user_id: SimpleNamespace(id=actor_user_id or 1, is_admin=False),
+    )
+    monkeypatch.setattr(
+        websocket_api, "task_has_live_foreign_runner", lambda task_id: False
+    )
+    import xagent.web.services.task_setup_snapshot as snapshot_module
+
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_task_setup_snapshot_sync",
+        MagicMock(side_effect=RuntimeError(f"storage fault at {SECRET}")),
+    )
+    with pytest.raises(RuntimeError):
+        await websocket_api._execute_durable_task_command(command)
+
+
+def _personal_targets(manager_mock: MagicMock) -> list[tuple[dict, object]]:
+    return [
+        (c.args[0], c.args[1])
+        for c in manager_mock.send_personal_message.await_args_list
+        if c.args and isinstance(c.args[0], dict)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_durable_raw_detail_reaches_only_the_verified_origin(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_origins: None,
+) -> None:
+    """Reviewer-specified ordering: [public, authenticated-origin, broadcast-only].
+
+    Before the registry, the executor picked the first ordinary socket, so
+    the public visitor received the raw RuntimeError text. Now the raw
+    detail goes to the registered origin regardless of order, and the
+    public socket gets nothing personal.
+    """
+    public, owner_origin, sse = (
+        MagicMock(name="public"),
+        MagicMock(name="origin"),
+        MagicMock(name="sse"),
+    )
+    sse.is_broadcast_only = True
+    manager_mock = _origin_test_manager(registered={public, owner_origin, sse})
+    command = _pause_command()
+    websocket_api._command_origins.register(
+        command.command_id, owner_origin, command.task_id
+    )
+
+    await _run_pause_to_runtime_error(monkeypatch, manager_mock, command)
+
+    raw_sends = [
+        (payload, ws)
+        for payload, ws in _personal_targets(manager_mock)
+        if SECRET in repr(payload)
+    ]
+    assert raw_sends, "the verified origin must still receive the detail"
+    assert all(ws is owner_origin for _, ws in raw_sends), raw_sends
+    assert not any(ws is public for _, ws in _personal_targets(manager_mock)), (
+        "the public socket must receive nothing personal"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "degrade_case",
+    ["no-registration", "origin-disconnected", "wrong-task"],
+)
+async def test_durable_raw_detail_degrades_when_origin_is_unverifiable(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_origins: None,
+    degrade_case: str,
+) -> None:
+    """Worker restart/handoff, disconnect, and task mismatch all degrade safely.
+
+    No registration entry (a different worker executed the command), an
+    origin that has since disconnected, or an entry recorded for another
+    task: in every case the raw text reaches no socket at all.
+    """
+    public, owner_origin = MagicMock(name="public"), MagicMock(name="origin")
+    registered = {public, owner_origin}
+    command = _pause_command()
+    if degrade_case == "origin-disconnected":
+        websocket_api._command_origins.register(
+            command.command_id, owner_origin, command.task_id
+        )
+        registered = {public}
+    elif degrade_case == "wrong-task":
+        websocket_api._command_origins.register(
+            command.command_id, owner_origin, command.task_id + 1
+        )
+    manager_mock = _origin_test_manager(registered=registered)
+
+    await _run_pause_to_runtime_error(monkeypatch, manager_mock, command)
+
+    # The handler still emits its personal reply, but the executor gave it a
+    # discarding stub, so the raw text reaches no real socket. Anything else
+    # as the target - the public socket in particular - is a rerouted leak.
+    raw_targets = [
+        ws for payload, ws in _personal_targets(manager_mock) if SECRET in repr(payload)
+    ]
+    assert all(
+        isinstance(ws, websocket_api._DiscardingCommandWebSocket) for ws in raw_targets
+    ), f"raw detail rerouted to a real socket: {raw_targets}"
+
+
+@pytest.mark.asyncio
+async def test_origin_entry_dies_with_its_command_or_socket(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_origins: None,
+) -> None:
+    """Lifecycle: terminal outcomes and disconnects both clear the entry."""
+    origins = websocket_api._command_origins
+
+    # Terminal rejection clears it.
+    command = _pause_command(command_id="pause:cleanup")
+    socket = MagicMock(name="origin")
+    origins.register(command.command_id, socket, command.task_id)
+    monkeypatch.setattr(
+        websocket_api,
+        "_execute_durable_task_command",
+        AsyncMock(side_effect=websocket_api.TaskCommandRejected("done")),
+    )
+    with pytest.raises(websocket_api.TaskCommandRejected):
+        await websocket_api.execute_durable_task_command(command)
+    assert origins.resolve(command.command_id, command.task_id) is None
+    assert not origins.has(command.command_id, command.task_id)
+
+    # A deferral that will retry keeps it; exhaustion clears it.
+    origins.register(command.command_id, socket, command.task_id)
+    monkeypatch.setattr(
+        websocket_api,
+        "_execute_durable_task_command",
+        AsyncMock(side_effect=websocket_api.ClientVisibleTaskCommandDeferred("wait")),
+    )
+    monkeypatch.setattr(websocket_api, "manager", _origin_test_manager({socket}))
+    with pytest.raises(websocket_api.TaskCommandDeferred):
+        await websocket_api.execute_durable_task_command(command)
+    assert origins.has(command.command_id, command.task_id), (
+        "retrying deferral keeps the origin"
+    )
+    exhausted = _pause_command(command_id="pause:cleanup")
+    exhausted.defer_count = websocket_api.MAX_COMMAND_DEFERS
+    with pytest.raises(websocket_api.TaskCommandDeferred):
+        await websocket_api.execute_durable_task_command(exhausted)
+    assert not origins.has(command.command_id, command.task_id)
+
+    # Disconnect clears every entry for that socket.
+    origins.register("a:1", socket, 7)
+    origins.register("b:2", socket, 8)
+    real_manager = websocket_api.ConnectionManager()
+    real_manager.disconnect(socket)
+    assert not origins.has("a:1", 7) and not origins.has("b:2", 8), (
+        "disconnect must clear the socket's entries"
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_chat_detail_reaches_the_verified_origin_only(
+    _test_db: None,
+) -> None:
+    """G18: on the durable path the ack is suppressed, so the detail bubble
+    to the verified origin is the sender's only copy - and the broadcast that
+    everyone else sees stays generic."""
+    db = _direct_db_session()
+    try:
+        owner = User(username="durable-detail-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Durable detail",
+            description="runtime branch, durable path",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task.runner_id = "rt7-runner"
+        task.run_id = "rt7-run"
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    raised = RuntimeError(f"durable object scope={SECRET}")
+    mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
+    origin_socket = MagicMock(name="verified-origin")
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            MagicMock(side_effect=fake_payload),
+        ),
+    ):
+        await websocket_api._handle_chat_message_unserialized(
+            origin_socket,
+            task_id,
+            {
+                "message": "durable runtime failure",
+                "client_message_id": "durable-detail",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [],
+                "_durable_ack_sent": True,
+            },
+        )
+
+    broadcast = [c.args[0] for c in ws_manager.broadcast_to_task.await_args_list]
+    assert broadcast and SECRET not in repr(broadcast), broadcast
+    personal = [
+        (c.args[0], c.args[1]) for c in ws_manager.send_personal_message.await_args_list
+    ]
+    # The suppressed ack means no message_rejected; the detail bubble is the
+    # sender's only copy and goes to the socket the executor resolved.
+    assert not any(p.get("type") == "message_rejected" for p, _ in personal)
+    detail = [(p, ws) for p, ws in personal if SECRET in repr(p)]
+    assert detail, "the verified origin must receive the detail bubble"
+    assert all(ws is origin_socket for _, ws in detail), detail
+
+
+@pytest.mark.asyncio
+async def test_execute_detail_reaches_the_ingress_socket(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G18: legacy execute keeps its real ingress socket, so the sender gets
+    the detail personally while the broadcast stays generic."""
+    db = _direct_db_session()
+    try:
+        owner = User(username="exec-detail-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Exec detail",
+            description="runtime branch",
+            status=TaskStatus.PENDING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "_read_task_error_payload_isolated",
+        MagicMock(
+            side_effect=lambda task_id, message, **kwargs: {
+                "type": "agent_error",
+                "message": message,
+                "task_id": task_id,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        TaskTurnOrchestrator,
+        "schedule_existing_task_execution",
+        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+    )
+
+    ingress = MagicMock(name="ingress")
+    await websocket_api.handle_execute_task(
+        ingress,
+        task_id,
+        {"user": SimpleNamespace(id=owner_id, is_admin=False)},
+    )
+
+    broadcast = [
+        c.args[0] for c in connection_manager.broadcast_to_task.await_args_list
+    ]
+    assert broadcast and SECRET not in repr(broadcast), broadcast
+    detail = [
+        (c.args[0], c.args[1])
+        for c in connection_manager.send_personal_message.await_args_list
+        if SECRET in repr(c.args[0])
+    ]
+    assert detail, "the ingress socket must receive the detail personally"
+    assert all(ws is ingress for _, ws in detail), detail
+
+
+@pytest.mark.asyncio
+async def test_preview_unknown_message_answers_on_the_wire_without_echo() -> None:
+    """G16: endpoint-level coverage of the unknown-message response.
+
+    Feeds an unknown type through the real receive loop and decodes the
+    actual send_text JSON, so a deleted branch, wrong wiring, or a
+    reintroduced echo of the client's message type all fail here.
+    """
+    from fastapi import WebSocketDisconnect
+
+    mock_websocket = AsyncMock()
+    mock_websocket.state = MagicMock()
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    hostile_type = f"nope-{SECRET}"
+    mock_websocket.receive_text.side_effect = [
+        json.dumps({"type": hostile_type}),
+        WebSocketDisconnect(),
+    ]
+
+    with patch(
+        "xagent.web.api.websocket.get_authenticated_user", return_value=mock_user
+    ):
+        await websocket_api.websocket_build_preview_endpoint(mock_websocket)
+
+    sent = [json.loads(c.args[0]) for c in mock_websocket.send_text.call_args_list]
+    errors = [p for p in sent if p.get("type") == "error"]
+    assert errors == [{"type": "error", "message": "Unknown message type"}] or (
+        len(errors) == 1 and errors[0]["message"] == "Unknown message type"
+    ), errors
+    assert hostile_type not in repr(sent), "the client's type must not echo back"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "extra"),
+    [
+        ("handle_chat_message", {"client_message_id": "reg-1"}),
+        ("handle_pause_task", {}),
+        ("handle_resume_task", {}),
+    ],
+    ids=["chat", "pause", "resume"],
+)
+async def test_ingress_handlers_register_the_command_origin(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_origins: None,
+    handler_name: str,
+    extra: dict,
+) -> None:
+    """Deleting a registration line degrades every sender silently; pin it."""
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    enqueued = SimpleNamespace(
+        command_id=41,
+        client_command_id="cmd:origin-reg",
+        payload_matches=True,
+        status="claimed",
+    )
+    monkeypatch.setattr(
+        websocket_api,
+        "_enqueue_websocket_task_command",
+        AsyncMock(return_value=enqueued),
+    )
+    monkeypatch.setattr(websocket_api, "dispatch_task_command_promptly", AsyncMock())
+
+    ingress = MagicMock(name="ingress")
+    await getattr(websocket_api, handler_name)(
+        ingress,
+        7,
+        {"user": SimpleNamespace(id=1, is_admin=False), **extra},
+    )
+
+    assert websocket_api._command_origins.has("cmd:origin-reg", 7), (
+        f"{handler_name} must register its origin"
+    )
+    assert websocket_api._command_origins.resolve("cmd:origin-reg", 7) is ingress
+
+
+def test_a_resubmitted_command_id_cannot_capture_another_senders_origin(
+    _clean_origins: None,
+) -> None:
+    """First registration wins (preflight PoC: co-tenant origin hijack).
+
+    On a public/share task every visitor carries the owner principal, so the
+    enqueue dedupe returns the in-flight row for a resubmission of the same
+    command_id and the second connection would otherwise reach `register` and
+    overwrite the origin - redirecting the first sender's error detail to the
+    attacker. The registry must keep the original.
+    """
+    origins = websocket_api._command_origins
+    victim, attacker = MagicMock(name="victim"), MagicMock(name="attacker")
+
+    origins.register("shared-cmd", victim, 7)
+    origins.register("shared-cmd", attacker, 7)  # resubmission on the same task
+
+    with patch.object(
+        websocket_api.manager, "is_connection_registered", return_value=True
+    ):
+        assert origins.resolve("shared-cmd", 7) is victim, (
+            "the attacker must not capture the victim's origin"
+        )
+
+    # Re-registering the same socket stays idempotent.
+    origins.register("shared-cmd", victim, 7)
+    with patch.object(
+        websocket_api.manager, "is_connection_registered", return_value=True
+    ):
+        assert origins.resolve("shared-cmd", 7) is victim
+
+
+def test_same_command_id_on_two_tasks_is_isolated(_clean_origins: None) -> None:
+    """command_id is unique only per task, so the key is (task_id, command_id).
+
+    A shared id must not let one task's registration void or answer the
+    other's - the DB carries a (task_id, command_id) uniqueness constraint,
+    not command_id alone.
+    """
+    origins = websocket_api._command_origins
+    sock_a, sock_b = MagicMock(name="task-a"), MagicMock(name="task-b")
+    origins.register("1", sock_a, 100)
+    origins.register("1", sock_b, 200)
+
+    with patch.object(
+        websocket_api.manager, "is_connection_registered", return_value=True
+    ):
+        assert origins.resolve("1", 100) is sock_a
+        assert origins.resolve("1", 200) is sock_b
+
+    # Discarding one task's entry leaves the other intact.
+    origins.discard_command("1", 100)
+    assert not origins.has("1", 100)
+    assert origins.has("1", 200)
+
+
+@pytest.mark.asyncio
+async def test_live_chat_runtime_error_does_not_double_send_the_detail(
+    _test_db: None,
+) -> None:
+    """On the live path the rejection ack already carries the detail, so the
+    origin bubble must not fire a second copy (preflight side-effect)."""
+    db = _direct_db_session()
+    try:
+        owner = User(username="no-double-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="No double",
+            description="live runtime branch",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task.runner_id = "rt8-runner"
+        task.run_id = "rt8-run"
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    raised = RuntimeError(f"live fault {SECRET}")
+    mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch("xagent.web.api.websocket.mark_user_message_delivery_sync", MagicMock()),
+        patch(
+            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            MagicMock(side_effect=fake_payload),
+        ),
+    ):
+        await websocket_api._handle_chat_message_unserialized(
+            MagicMock(name="live-sender"),
+            task_id,
+            {
+                "message": "live runtime failure",
+                "client_message_id": "no-double",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [],
+                # no _durable_ack_sent: this is the live path
+            },
+        )
+
+    personal = [
+        c.args[0]
+        for c in ws_manager.send_personal_message.await_args_list
+        if isinstance(c.args[0], dict)
+    ]
+    with_detail = [p for p in personal if SECRET in repr(p)]
+    assert len(with_detail) == 1, (
+        f"live path must carry the detail exactly once, got {with_detail}"
+    )
+    assert with_detail[0].get("type") == "message_rejected"
