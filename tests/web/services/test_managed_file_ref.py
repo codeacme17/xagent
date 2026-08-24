@@ -581,3 +581,54 @@ def test_adopt_existing_object_refreshes_same_size_checksum_mismatch_from_local_
     assert storage.stat_calls == [record.storage_key]
     assert storage.put_calls == [(local_path, record.storage_key)]
     assert record.checksum == sha256(b"new-data").hexdigest()
+
+
+def test_the_wrap_keeps_the_storage_key_out_of_its_own_message(tmp_path):
+    """``str(exc)`` is the value that escapes; it must not carry the key.
+
+    The key's scope segments encode the owning user's id, and ``str(exc)`` on
+    these classes reaches places the raise site does not control: a bare
+    ``raise`` from a WebSocket fault arm carries it into a task-wide broadcast
+    and a persisted command row, and broad ``except RuntimeError`` arms
+    interpolate it into client-facing text (#1497). The invariant therefore
+    has to hold at the exception, not at each egress.
+    """
+    source = tmp_path / "uploads" / "leak-probe.txt"
+    source.parent.mkdir()
+    source.write_text("leak probe", encoding="utf-8")
+    record = _record(source, file_size=source.stat().st_size)
+
+    with pytest.raises(DurableStorageOperationError) as raised:
+        ManagedFileRef(record, storage=FailingStorage()).sync_to_durable()
+
+    fault = raised.value
+    assert fault.storage_key, "the wrap must carry the key on the attribute"
+    assert fault.storage_key not in str(fault)
+    assert "users/" not in str(fault)
+
+
+def test_no_wrap_site_interpolates_into_the_message():
+    """Every construction of these classes, not just the one driven above.
+
+    A new wrap site that puts the key back into the message would reopen the
+    leak at every ``str(exc)`` egress at once, and no runtime test can drive a
+    site that does not exist yet. Parsing the module is what closes that gap.
+    """
+    import ast
+
+    from xagent.web.services import managed_file_ref
+
+    tree = ast.parse(Path(managed_file_ref.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id
+            in {"DurableStorageOperationError", "DurableObjectIntegrityError"}
+        ):
+            continue
+        message = node.args[0] if node.args else None
+        assert not isinstance(message, ast.JoinedStr), (
+            f"managed_file_ref.py:{node.lineno} interpolates into the message; "
+            "the identifier belongs in storage_key= so str(exc) stays safe"
+        )

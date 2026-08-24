@@ -48,7 +48,25 @@ class DurableObjectMissingError(FileNotFoundError):
 
 
 class DurableStorageOperationError(RuntimeError):
-    """Raised when durable object storage is unavailable for an operation."""
+    """Raised when durable object storage is unavailable for an operation.
+
+    **The storage key belongs in ``storage_key``, never in the message.** Its
+    scope segments encode the owning user's id, and ``str(exc)`` on this class
+    reaches places this module does not control: a bare ``raise`` from a
+    WebSocket fault arm carries it into a task-wide broadcast and into a
+    persisted command row, and broad ``except RuntimeError`` arms interpolate
+    it straight into client-facing text (#1497). Redacting those egresses one
+    at a time is how the leak kept returning under new names; with the key off
+    the message, ``str(exc)`` is safe by construction and a new egress cannot
+    reintroduce it.
+
+    Operators lose nothing: a consumer that wants the key in a log line reads
+    it from ``storage_key``.
+    """
+
+    def __init__(self, message: str, *, storage_key: str | None = None) -> None:
+        super().__init__(message)
+        self.storage_key = storage_key
 
 
 class DurableObjectIntegrityError(DurableStorageOperationError):
@@ -377,7 +395,8 @@ class ManagedFileRef:
         except Exception as exc:
             temp_path.unlink(missing_ok=True)
             raise DurableStorageOperationError(
-                f"Failed to restore durable object: {self.storage_key}"
+                "Failed to restore durable object",
+                storage_key=self.storage_key,
             ) from exc
 
     def materialize(self, *, allow_existing_local: bool = True) -> Path:
@@ -405,13 +424,15 @@ class ManagedFileRef:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
-                    f"Failed to materialize durable object: {self.storage_key}"
+                    "Failed to materialize durable object",
+                    storage_key=self.storage_key,
                 ) from exc
 
         if last_integrity_error is not None:
             raise last_integrity_error
         raise DurableStorageOperationError(
-            f"Failed to materialize durable object: {self.storage_key}"
+            "Failed to materialize durable object",
+            storage_key=self.storage_key,
         )
 
     def open_read(self) -> BinaryIO:
@@ -439,7 +460,8 @@ class ManagedFileRef:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
-                f"Failed to sign durable object URL: {self.storage_key}"
+                "Failed to sign durable object URL",
+                storage_key=self.storage_key,
             ) from exc
 
     def sync_to_durable(
@@ -490,7 +512,8 @@ class ManagedFileRef:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
-                f"Failed to write durable object: {resolved_key}"
+                "Failed to write durable object",
+                storage_key=resolved_key,
             ) from exc
         self.apply_stored_object(stored_object)
         setattr(self.record, "file_size", path.stat().st_size)
@@ -509,7 +532,8 @@ class ManagedFileRef:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
-                f"Failed to inspect durable object metadata: {expected_key}"
+                "Failed to inspect durable object metadata",
+                storage_key=expected_key,
             ) from exc
 
         checksum = stored_object.checksum
@@ -553,7 +577,8 @@ class ManagedFileRef:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
-                    f"Failed to inspect durable object metadata: {expected_key}"
+                    "Failed to inspect durable object metadata",
+                    storage_key=expected_key,
                 ) from exc
 
         self.apply_stored_object(
