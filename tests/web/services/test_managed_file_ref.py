@@ -621,23 +621,40 @@ def test_no_wrap_site_interpolates_into_the_message():
     version read only the positional slot, so ``message=...`` slipped past as
     a keyword; it is looked up in both places now, and a ``**`` unpacking --
     which no static check can see through -- fails outright rather than being
-    skipped. What the whitelist still cannot see: a name bound to dynamically
-    built text one statement earlier. That indirection would need assignment
-    tracing to catch; this test does not claim to.
+    skipped. Calls are matched by bare name and by attribute
+    (``module.DurableStorageOperationError(...)``), with the guarded name set
+    derived from the class hierarchy so a future subclass is covered without
+    editing this test. What the whitelist still cannot see: a name bound to
+    dynamically built text one statement earlier, or a construction hidden
+    behind an alias -- which is what the exact count below turns into a
+    failure instead of a silent skip.
     """
     import ast
 
     from xagent.web.services import managed_file_ref
 
+    def _hierarchy_names(cls: type) -> set[str]:
+        names = {cls.__name__}
+        for sub in cls.__subclasses__():
+            names |= _hierarchy_names(sub)
+        return names
+
+    guarded = _hierarchy_names(DurableStorageOperationError)
+
     tree = ast.parse(Path(managed_file_ref.__file__).read_text(encoding="utf-8"))
     checked = 0
     for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id
-            in {"DurableStorageOperationError", "DurableObjectIntegrityError"}
-        ):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        callee_name = (
+            callee.id
+            if isinstance(callee, ast.Name)
+            else callee.attr
+            if isinstance(callee, ast.Attribute)
+            else None
+        )
+        if callee_name not in guarded:
             continue
         assert not any(kw.arg is None for kw in node.keywords), (
             f"managed_file_ref.py:{node.lineno} constructs via ** unpacking, "
@@ -662,4 +679,15 @@ def test_no_wrap_site_interpolates_into_the_message():
             "module constant -- the identifier belongs in storage_key= so "
             "str(exc) stays safe"
         )
-    assert checked, "found no constructions -- the parse assumption broke"
+    # The count is part of the contract, same as the pair-count tables in the
+    # fault-logging suite: consolidating constructions into a helper would
+    # leave only the helper's own body visible to this walk while every real
+    # call site goes dark, and an aliased construction is invisible to the
+    # name match -- both would silently shrink coverage. A changed count means
+    # a construction was added, removed, or hidden: update it deliberately and
+    # give the new site its coverage story.
+    assert checked == 8, (
+        f"expected 8 constructions (7 wraps + the integrity raise), found "
+        f"{checked} -- a construction was added, removed, aliased, or moved "
+        "behind a helper; update this count deliberately"
+    )

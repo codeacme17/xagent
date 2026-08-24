@@ -60,11 +60,19 @@ class DurableStorageOperationError(RuntimeError):
     the message, ``str(exc)`` is safe by construction and a new egress cannot
     reintroduce it.
 
-    Operators lose nothing: a consumer that wants the key in a log line reads
-    it from ``storage_key``.
+    What this costs, stated so it is not overread: the one log line that
+    renders ``str(exc)`` today (the upload warning in ``web/api/files.py``)
+    is updated to render the attribute alongside it. Other absorbers of
+    ``str(exc)`` -- the KB ingestion tool's error text, the WebSocket
+    ``except RuntimeError`` arm -- lose the key from their output until they
+    read the attribute, which is #1515's scope.
+
+    ``storage_key`` is required (still nullable) so an omission is a type
+    error at the call site rather than a silently ``None`` attribute --
+    pass ``storage_key=None`` only where there genuinely is no key yet.
     """
 
-    def __init__(self, message: str, *, storage_key: str | None = None) -> None:
+    def __init__(self, message: str, *, storage_key: str | None) -> None:
         super().__init__(message)
         self.storage_key = storage_key
 
@@ -664,7 +672,9 @@ class ManagedFileRef:
             expected_checksum,
             actual_checksum,
         )
-        raise DurableObjectIntegrityError(FILE_INTEGRITY_REUPLOAD_MESSAGE)
+        raise DurableObjectIntegrityError(
+            FILE_INTEGRITY_REUPLOAD_MESSAGE, storage_key=self.storage_key
+        )
 
 
 def managed_file_from_record(file_record: UploadedFile) -> ManagedFileRef:
