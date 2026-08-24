@@ -327,17 +327,22 @@ def _client_message_id(value: Any) -> str | None:
 # error bubble and the message_rejected ack, so an *incidental* validation
 # failure only ever surfaces as this fixed string; the detail stays in the log.
 #
-# Agent RuntimeError text is deliberately left alone, and narrowing it is a
-# product decision tracked in #1479 rather than a redaction bug.
+# Agent RuntimeError text is passed through to the INITIATING SENDER only -
+# the rejection ack and the personal error bubble - which is the existing
+# contract, and narrowing that wording is the product decision left in #1479.
 #
-# It is NOT sender-only. An earlier version of this comment said so and cited
-# tests/web/api/test_websocket_owner_actor.py; that file never pins the string,
-# and its one raw-RuntimeError assertion covers the sender-only pool-timeout
-# fallback. Once a task resolves, the text goes out through broadcast_to_task
-# to every connection under the task_id, anonymous widget and share visitors
-# included. DurableStorageOperationError subclasses RuntimeError, so the
-# tenant-scope leak described above is still open on that path.
+# The broadcast half of that passthrough is closed (maintainer scope ruling
+# on #1514): once a task resolves, the task-wide broadcast reaches every
+# connection under the task_id, anonymous widget and share visitors included,
+# and DurableStorageOperationError subclasses RuntimeError with tenant-scope
+# text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
+# the exception text. Still #1479: whether the sender copy should also be
+# narrowed when the initiator is an anonymous public connection.
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
+
+# Broadcast audiences did not send anything, so the validation wording above
+# would be misdirected; task-level failure broadcasts use this instead.
+CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
 
 
 class ClientVisibleError(Exception):
@@ -6519,7 +6524,9 @@ async def _handle_chat_message_unserialized(
                     websocket,
                 )
         except RuntimeError as e:
-            # Runtime error
+            # Runtime error. The sender's rejection ack keeps the wording
+            # (#1479 contract); the task-wide broadcast reaches anonymous
+            # subscribers and gets the fixed string instead.
             message = f"Runtime error: {str(e)}"
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
             if not await finish_delivery_failure(message):
@@ -6528,7 +6535,7 @@ async def _handle_chat_message_unserialized(
             if authorized_task_id is not None:
                 error_payload = await _read_task_error_payload_offloop(
                     authorized_task_id,
-                    message,
+                    CLIENT_SAFE_TASK_FAILURE,
                 )
                 await manager.broadcast_to_task(
                     {
@@ -6768,14 +6775,16 @@ async def handle_execute_task(
                 websocket,
             )
     except RuntimeError as e:
-        # Runtime error
+        # Runtime error. The initiating sender keeps the wording (#1479
+        # contract); the task-wide broadcast reaches anonymous subscribers
+        # and gets the fixed string instead.
         message = f"Runtime error: {str(e)}"
         logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
-                message,
+                CLIENT_SAFE_TASK_FAILURE,
             )
             await manager.broadcast_to_task(
                 {

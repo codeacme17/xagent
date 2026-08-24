@@ -154,18 +154,18 @@ PRODUCERS: dict[str, int | None] = {
     "send_message_delivery": None,  # keyword-only
 }
 
-# The one deliberate exception: agent RuntimeError text is passed through
-# untouched. Narrowing it is a product decision tracked in #1479.
+# The one deliberate exception: agent RuntimeError text is passed through to
+# the INITIATING SENDER - the rejection ack and the personal error bubble.
+# Narrowing that wording is the product decision tracked in #1479.
 #
-# Do NOT read this as "sender only". An earlier version of this comment cited
-# tests/web/api/test_websocket_owner_actor.py as an existing tested contract
-# for that; the citation was wrong. That file never pins this string, and its
-# one raw-RuntimeError assertion covers the sender-only fallback, not the
-# broadcast. Once a task resolves, this text goes out via broadcast_to_task to
-# every connection registered under the task_id - anonymous widget and share
-# visitors included, since they register into the same ConnectionManager.
-# DurableStorageOperationError is a RuntimeError subclass, so the tenant-scope
-# leak that motivates this module is still open on that path. #1479 owns it.
+# The broadcast half of the passthrough is closed (maintainer scope ruling on
+# #1514): the task-wide broadcast reaches every connection under the task_id,
+# anonymous widget and share visitors included, and DurableStorageOperation-
+# Error subclasses RuntimeError with tenant-scope text in its message, so
+# broadcasts carry CLIENT_SAFE_TASK_FAILURE instead - pinned by the two
+# audience-boundary tests at the end of this file. Still #1479: whether the
+# sender copy should also be narrowed when the initiator is an anonymous
+# public connection.
 #
 # Anchored to (enclosing function, expression) rather than to the expression
 # alone, which blessed the string in every function it appeared in. This stops
@@ -1132,4 +1132,162 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
     assert task_errors and task_errors[0]["message"] == (
         websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
+def _chat_runtime_error_harness(secret_error: Exception):
+    """Shared live-control setup that raises ``secret_error`` at injection."""
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=secret_error)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
+        return {"type": "agent_error", "message": message, "task_id": task_id}
+
+    return mgr, ws_manager, bg_mgr, _fake_error_payload
+
+
+@pytest.mark.asyncio
+async def test_runtime_error_broadcast_is_redacted_but_the_sender_keeps_the_detail(
+    _test_db: None,
+) -> None:
+    """The audience boundary of the #1479 passthrough (maintainer ruling).
+
+    The initiating sender keeps ``Runtime error: ...`` in the rejection ack -
+    that is the existing contract and #1479 owns narrowing it. The task-wide
+    broadcast reaches every subscriber, anonymous widget/share connections
+    included, so it must carry the fixed string and never the exception text.
+    """
+    db = _direct_db_session()
+    try:
+        owner = User(username="runtime-boundary-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Audience boundary",
+            description="runtime branch",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task.runner_id = "rt6-runner"
+        task.run_id = "rt6-run"
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    raised = RuntimeError(f"durable object scope={SECRET}")
+    mgr, ws_manager, bg_mgr, fake_payload = _chat_runtime_error_harness(raised)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket._read_task_error_payload_isolated",
+            MagicMock(side_effect=fake_payload),
+        ),
+    ):
+        await websocket_api._handle_chat_message_unserialized(
+            MagicMock(),
+            task_id,
+            {
+                "message": "trip the runtime branch",
+                "client_message_id": "runtime-boundary",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [],
+            },
+        )
+
+    broadcast = [c.args[0] for c in ws_manager.broadcast_to_task.await_args_list]
+    assert broadcast, "the task-wide notification must still go out"
+    assert SECRET not in repr(broadcast), broadcast
+    task_errors = [b for b in broadcast if b.get("type") == "agent_error"]
+    assert task_errors and task_errors[0]["message"] == (
+        websocket_api.CLIENT_SAFE_TASK_FAILURE
+    )
+
+    personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
+    rejected = [p for p in personal if p.get("type") == "message_rejected"]
+    assert rejected, "the sender still gets the rejection ack"
+    assert rejected[0]["message"] == f"Runtime error: {raised}", (
+        "the sender's copy is the existing #1479 contract and must survive"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_runtime_error_broadcast_is_redacted(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same audience boundary through handle_execute_task's runtime branch."""
+    db = _direct_db_session()
+    try:
+        owner = User(username="exec-runtime-owner", password_hash="hash")
+        db.add(owner)
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Exec audience boundary",
+            description="runtime branch",
+            status=TaskStatus.PENDING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        task_id, owner_id = int(task.id), int(owner.id)
+    finally:
+        db.close()
+
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "_read_task_error_payload_isolated",
+        MagicMock(
+            side_effect=lambda task_id, message, **kwargs: {
+                "type": "agent_error",
+                "message": message,
+                "task_id": task_id,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        TaskTurnOrchestrator,
+        "schedule_existing_task_execution",
+        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+    )
+
+    await websocket_api.handle_execute_task(
+        MagicMock(),
+        task_id,
+        {"user": SimpleNamespace(id=owner_id, is_admin=False)},
+    )
+
+    broadcast = [
+        c.args[0] for c in connection_manager.broadcast_to_task.await_args_list
+    ]
+    assert broadcast, "the task-wide notification must still go out"
+    assert SECRET not in repr(broadcast), broadcast
+    assert any(
+        b.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE for b in broadcast
     )
