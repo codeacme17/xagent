@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import OrderedDict
 import logging
 import re
 import shutil
@@ -4632,20 +4633,28 @@ class _CommandOriginRegistry:
     another sender's error detail to itself. Re-registering the *same* socket
     is idempotent.
 
+    Only the ingress that *created* the durable row registers (callers gate on
+    ``EnqueuedTaskCommand.created``); a payload-matching duplicate never binds,
+    which is what keeps a co-tenant, a post-disconnect resubmission, or a
+    duplicate handled on another worker from acquiring the origin.
+
     Lifecycle: an entry dies with its socket (``discard_socket`` from
-    ``ConnectionManager.disconnect``) or with its command's terminal outcome
-    (``discard_command`` from the durable dispatch wrapper), whichever comes
-    first (``detach_task_connections`` also clears them). A deferred command
-    that will retry keeps its entry. An entry whose command is claimed by
-    another worker is never resolved here (wrong worker); it is reclaimed when
-    this worker's socket disconnects, so the only unbounded case would be a
-    socket that never disconnects while submitting commands that always run
-    elsewhere - not a shape this deployment produces, and tracked rather than
-    given a TTL here.
+    ``ConnectionManager.disconnect`` and ``detach_task_connections``) or with
+    its command's terminal outcome (``discard_command`` from the durable
+    dispatch wrapper), whichever comes first. A deferred command that will
+    retry keeps its entry. An entry whose command is claimed by another worker
+    is never resolved here (wrong worker) and its local cleanup never runs, so
+    to bound that case the store is an LRU capped at ``_MAX_ORIGINS``: an
+    eviction just makes ``resolve`` miss and the executor degrade to the safe
+    discard, so a socket that never disconnects while its commands always run
+    elsewhere can cost at most the wording on the oldest few, never unbounded
+    memory.
     """
 
+    _MAX_ORIGINS = 4096
+
     def __init__(self) -> None:
-        self._origins: dict[tuple[int, str], Any] = {}
+        self._origins: OrderedDict[tuple[int, str], Any] = OrderedDict()
 
     def register(self, command_id: str, websocket: Any, task_id: int) -> None:
         if not command_id:
@@ -4657,6 +4666,11 @@ class _CommandOriginRegistry:
             # must not capture this command's origin.
             return
         self._origins[key] = websocket
+        self._origins.move_to_end(key)
+        while len(self._origins) > self._MAX_ORIGINS:
+            # Oldest first: eviction degrades that command to the safe discard,
+            # it never reroutes detail.
+            self._origins.popitem(last=False)
 
     def resolve(self, command_id: str, task_id: int) -> Any | None:
         websocket = self._origins.get((int(task_id), command_id))
@@ -5198,9 +5212,14 @@ async def handle_chat_message(
         accepted=True,
     )
     if enqueued.command_id:
-        # This connection is the verified origin of the command; personal
-        # detail from durable execution goes here or nowhere.
-        _command_origins.register(enqueued.client_command_id, websocket, task_id)
+        if enqueued.created:
+            # Only the ingress that created the durable row owns the origin.
+            # A payload-matching duplicate (created=False) - a co-tenant
+            # resubmission, one arriving after the creator disconnected, or one
+            # handled on another worker - must never bind, or it could receive
+            # the creator's raw error detail. Registered before dispatch so
+            # local execution cannot outrun the binding.
+            _command_origins.register(enqueued.client_command_id, websocket, task_id)
         await dispatch_task_command_promptly(
             execute_durable_task_command,
             command_db_id=enqueued.command_id,
@@ -7675,9 +7694,11 @@ async def handle_pause_task(
         },
         websocket,
     )
-    # This connection is the verified origin; personal detail from durable
-    # execution goes here or nowhere.
-    _command_origins.register(enqueued.client_command_id, websocket, task_id)
+    if enqueued.created:
+        # Only the creating ingress owns the origin; a payload-matching
+        # duplicate must never bind (see handle_chat_message). Registered
+        # before dispatch so local execution cannot outrun the binding.
+        _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,
@@ -7943,9 +7964,11 @@ async def handle_resume_task(
         },
         websocket,
     )
-    # This connection is the verified origin; personal detail from durable
-    # execution goes here or nowhere.
-    _command_origins.register(enqueued.client_command_id, websocket, task_id)
+    if enqueued.created:
+        # Only the creating ingress owns the origin; a payload-matching
+        # duplicate must never bind (see handle_chat_message). Registered
+        # before dispatch so local execution cannot outrun the binding.
+        _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,

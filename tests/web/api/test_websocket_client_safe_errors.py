@@ -1692,16 +1692,18 @@ async def test_ingress_handlers_register_the_command_origin(
     handler_name: str,
     extra: dict,
 ) -> None:
-    """Deleting a registration line degrades every sender silently; pin it."""
+    """The creating ingress binds; deleting the line degrades senders silently."""
     connection_manager = MagicMock()
     connection_manager.send_personal_message = AsyncMock()
     connection_manager.broadcast_to_task = AsyncMock()
+    connection_manager.is_connection_registered = MagicMock(return_value=True)
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
     enqueued = SimpleNamespace(
         command_id=41,
         client_command_id="cmd:origin-reg",
         payload_matches=True,
         status="claimed",
+        created=True,
     )
     monkeypatch.setattr(
         websocket_api,
@@ -1721,6 +1723,65 @@ async def test_ingress_handlers_register_the_command_origin(
         f"{handler_name} must register its origin"
     )
     assert websocket_api._command_origins.resolve("cmd:origin-reg", 7) is ingress
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "extra"),
+    [
+        ("handle_chat_message", {"client_message_id": "dup-1"}),
+        ("handle_pause_task", {}),
+        ("handle_resume_task", {}),
+    ],
+    ids=["chat", "pause", "resume"],
+)
+async def test_a_duplicate_enqueue_never_binds_the_origin(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    _clean_origins: None,
+    handler_name: str,
+    extra: dict,
+) -> None:
+    """A payload-matching duplicate (created=False) must not acquire origin.
+
+    This is the P1 blocker: a duplicate - a co-tenant resubmission, one after
+    the creator disconnected, or one handled on another worker - reaches these
+    handlers with a valid command_id but created=False. It still dispatches
+    (idempotent), but it must never register, or the durable executor could
+    resolve it and send the creator's raw detail to the wrong socket.
+    """
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    connection_manager.is_connection_registered = MagicMock(return_value=True)
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    dispatch = AsyncMock()
+    monkeypatch.setattr(websocket_api, "dispatch_task_command_promptly", dispatch)
+    monkeypatch.setattr(
+        websocket_api,
+        "_enqueue_websocket_task_command",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                command_id=41,
+                client_command_id="dup:cmd",
+                payload_matches=True,
+                status="claimed",
+                created=False,
+            )
+        ),
+    )
+
+    duplicate = MagicMock(name="duplicate-ingress")
+    await getattr(websocket_api, handler_name)(
+        duplicate,
+        7,
+        {"user": SimpleNamespace(id=1, is_admin=False), **extra},
+    )
+
+    assert not websocket_api._command_origins.has("dup:cmd", 7), (
+        "a duplicate must never bind the origin"
+    )
+    assert dispatch.await_count == 1, "the duplicate still dispatches idempotently"
 
 
 def test_a_resubmitted_command_id_cannot_capture_another_senders_origin(
@@ -1841,3 +1902,56 @@ async def test_live_chat_runtime_error_does_not_double_send_the_detail(
         f"live path must carry the detail exactly once, got {with_detail}"
     )
     assert with_detail[0].get("type") == "message_rejected"
+
+
+def test_a_later_duplicate_cannot_rebind_after_the_creator_disconnects(
+    _clean_origins: None,
+) -> None:
+    """P1 disconnect/rebind: once the creator's entry is gone, no bind at all.
+
+    First-registration-wins protects a live entry, but the sharper case is the
+    creator disconnecting (its entry cleared) and a later duplicate arriving.
+    Because only the creating ingress registers, the duplicate never calls
+    register, so resolve stays empty rather than pointing at the late arrival.
+    """
+    origins = websocket_api._command_origins
+    creator = MagicMock(name="creator")
+    origins.register("cmd", creator, 7)
+
+    # creator disconnects
+    real_manager = websocket_api.ConnectionManager()
+    real_manager.disconnect(creator)
+    assert not origins.has("cmd", 7)
+
+    # a later duplicate is created=False at the handler, so it never registers;
+    # the registry stays empty and the executor will safe-discard.
+    assert not origins.has("cmd", 7)
+    with patch.object(
+        websocket_api.manager, "is_connection_registered", return_value=True
+    ):
+        assert origins.resolve("cmd", 7) is None
+
+
+def test_registry_is_bounded_by_lru_eviction(_clean_origins: None) -> None:
+    """P2: entries whose commands run on another worker cannot grow unbounded.
+
+    A long-lived socket whose commands are always claimed elsewhere would never
+    get local cleanup. The store is an LRU capped at _MAX_ORIGINS; the oldest
+    entry is evicted on overflow, which only makes resolve miss (safe discard),
+    never reroutes detail.
+    """
+    origins = websocket_api._command_origins
+    cap = websocket_api._CommandOriginRegistry._MAX_ORIGINS
+    socket = MagicMock(name="long-lived")
+
+    for i in range(cap + 50):
+        origins.register(f"cmd-{i}", socket, 7)
+
+    assert len(origins._origins) == cap, "the store must not grow past the cap"
+    # oldest evicted, newest retained
+    assert not origins.has("cmd-0", 7)
+    assert origins.has(f"cmd-{cap + 49}", 7)
+    with patch.object(
+        websocket_api.manager, "is_connection_registered", return_value=True
+    ):
+        assert origins.resolve("cmd-0", 7) is None  # evicted -> safe discard
