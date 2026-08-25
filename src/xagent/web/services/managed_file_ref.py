@@ -57,8 +57,12 @@ class DurableStorageOperationError(RuntimeError):
     persisted command row, and broad ``except RuntimeError`` arms interpolate
     it straight into client-facing text (#1497). Redacting those egresses one
     at a time is how the leak kept returning under new names; with the key off
-    the message, ``str(exc)`` is safe by construction and a new egress cannot
-    reintroduce it.
+    the message at every construction in this module -- enforced by the purity
+    test in ``tests/web/services/test_managed_file_ref.py`` -- no ``str(exc)``
+    egress can reintroduce it from here. The guarantee is module-scoped: that
+    scan does not cover other modules, and ``uploaded_file_store.py`` still
+    carries other identifiers (it has no storage key) in its own message
+    (#1642).
 
     What this costs, stated so it is not overread: the one log line that
     renders ``str(exc)`` today (the upload warning in ``web/api/files.py``)

@@ -614,6 +614,11 @@ def test_no_wrap_site_interpolates_into_the_message():
     leak at every ``str(exc)`` egress at once, and no runtime test can drive a
     site that does not exist yet. Parsing the module is what closes that gap.
 
+    It also asserts ``storage_key=`` is present at every site: the invariant
+    is the key off the message *and* on the attribute, and mypy enforcing the
+    required keyword elsewhere is not a reason to leave the second half
+    unpinned here.
+
     The message must be a string literal or a bare name (a module constant
     like ``FILE_INTEGRITY_REUPLOAD_MESSAGE``) -- a whitelist, because the
     first version of this test blacklisted f-strings only, and ``"..." + key``,
@@ -661,6 +666,16 @@ def test_no_wrap_site_interpolates_into_the_message():
             "which this check cannot see through; spell the arguments out so "
             "the message stays statically checkable"
         )
+        # The invariant has two halves: the key is off the message AND on the
+        # attribute. mypy enforces the required keyword, but pin it here too so
+        # a site that regressed to a message-only construction fails on this
+        # assertion rather than on a type-check that runs elsewhere. storage_key
+        # is keyword-only, so it can only appear as a keyword.
+        assert any(kw.arg == "storage_key" for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs "
+            f"{callee_name} without storage_key=; the key must ride the "
+            "attribute, not just be absent from the message"
+        )
         if node.args:
             message = node.args[0]
         else:
@@ -679,13 +694,12 @@ def test_no_wrap_site_interpolates_into_the_message():
             "module constant -- the identifier belongs in storage_key= so "
             "str(exc) stays safe"
         )
-    # The count is part of the contract, same as the pair-count tables in the
-    # fault-logging suite: consolidating constructions into a helper would
-    # leave only the helper's own body visible to this walk while every real
-    # call site goes dark, and an aliased construction is invisible to the
-    # name match -- both would silently shrink coverage. A changed count means
-    # a construction was added, removed, or hidden: update it deliberately and
-    # give the new site its coverage story.
+    # The count is part of the contract: consolidating constructions into a
+    # helper would leave only the helper's own body visible to this walk while
+    # every real call site goes dark, and an aliased construction is invisible
+    # to the name match -- both would silently shrink coverage. A changed count
+    # means a construction was added, removed, or hidden: update it
+    # deliberately and give the new site its coverage story.
     assert checked == 8, (
         f"expected 8 constructions (7 wraps + the integrity raise), found "
         f"{checked} -- a construction was added, removed, aliased, or moved "

@@ -592,7 +592,7 @@ async def store_uploaded_files(
         # (see DurableStorageOperationError), so render it explicitly -- this
         # line is what operators grep during an outage and must not lose it.
         logger.warning(
-            "Durable storage unavailable during upload: %s storage_key=%s",
+            "Durable storage unavailable during upload: %s; storage_key=%s",
             exc,
             exc.storage_key,
         )
