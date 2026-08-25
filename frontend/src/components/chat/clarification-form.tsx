@@ -14,6 +14,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
+import type { TranslationKey } from "@/i18n/translations"
 
 interface ClarificationFormProps {
   message?: string
@@ -88,6 +89,20 @@ const readSendReason = (error: unknown): string => {
   return typeof message === "string" ? message.trim() : ""
 }
 
+/**
+ * The hint that belongs with a disposition, as a key rather than a translated
+ * string: the toast needs it once at failure time, while the persistent alert
+ * has to re-resolve it on every render so a locale switch is not stuck behind
+ * whatever language was active when the send failed.
+ */
+const sendHintKey = (
+  disposition: MessageDeliveryDisposition | null,
+): TranslationKey | null => disposition === "outcome_unknown"
+  ? "chatPage.clarification.sendOutcomeUnknown"
+  : disposition === "not_sent" || disposition === "rejected"
+    ? "chatPage.clarification.sendNotSent"
+    : null
+
 // Interaction types that are "live widgets" reflecting external state (e.g.
 // useMcpApps()'s connection state), not a question with an answer to submit
 // - see the comment on isConnectAppsOnly below for why that distinction
@@ -146,7 +161,11 @@ export function ClarificationForm({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
   const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
-  const [sendFailure, setSendFailure] = useState<{ message: string; hint: string | null } | null>(null)
+  // Raw evidence only. Translating at render (not at failure time) is what
+  // lets a locale switch reach an alert that is already on screen.
+  const [sendFailure, setSendFailure] = useState<
+    { detail: string; disposition: MessageDeliveryDisposition | null } | null
+  >(null)
 
   useEffect(() => {
     if (active) {
@@ -353,19 +372,18 @@ export function ClarificationForm({
       // string is a last resort.
       const detail = readSendReason(error)
       const disposition = readSendDisposition(error)
-      const failure = {
-        message: detail || t("chatPage.clarification.sendError"),
-        // The draft is preserved and Submit stays enabled in every case, so
-        // the copy may only warn, never promise: a resubmit after an unknown
-        // outcome mints a fresh delivery and could answer the question twice.
-        hint: disposition === "outcome_unknown"
-          ? t("chatPage.clarification.sendOutcomeUnknown")
-          : disposition === "not_sent" || disposition === "rejected"
-            ? t("chatPage.clarification.sendNotSent")
-            : null,
-      }
-      setSendFailure(failure)
-      toast.error(failure.message, failure.hint ? { description: failure.hint } : undefined)
+      setSendFailure({ detail, disposition })
+      // The toast is a snapshot - it keeps whatever language was active when
+      // it fired. The alert below is not, and re-resolves on every render.
+      // The draft is preserved and Submit stays enabled in every case, so the
+      // copy may only warn, never promise: a resubmit after an unknown
+      // outcome mints a fresh delivery and could answer the question twice.
+      const hintKey = sendHintKey(disposition)
+      const hint = hintKey ? t(hintKey) : null
+      toast.error(
+        detail || t("chatPage.clarification.sendError"),
+        hint ? { description: hint } : undefined,
+      )
     } finally {
       setIsSubmitting(false)
     }
@@ -593,6 +611,10 @@ export function ClarificationForm({
     }
   }
 
+  // Recomputed on every render, which is the point: a locale change re-renders
+  // this component without remounting it.
+  const sendFailureHintKey = sendFailure ? sendHintKey(sendFailure.disposition) : null
+
   return (
     <Collapsible
       open={isOpen}
@@ -651,9 +673,9 @@ export function ClarificationForm({
 
             {sendFailure && (
               <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-                <div>{sendFailure.message}</div>
-                {sendFailure.hint && (
-                  <div className="mt-1 text-xs text-destructive/80">{sendFailure.hint}</div>
+                <div>{sendFailure.detail || t("chatPage.clarification.sendError")}</div>
+                {sendFailureHintKey && (
+                  <div className="mt-1 text-xs text-destructive/80">{t(sendFailureHintKey)}</div>
                 )}
               </div>
             )}

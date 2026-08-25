@@ -32,10 +32,20 @@ vi.mock("@/contexts/app-context-chat", () => ({
   },
 }))
 
+// `translate` is a mutable box so a test can swap the active locale's `t` and
+// rerender, the way I18nProvider does - it changes its context value without
+// remounting consumers. `identity` is kept beside it as the single definition
+// the file-wide reset below restores.
+const i18nMock = vi.hoisted(() => {
+  const identity = (key: string, vars?: Record<string, string | number>) =>
+    vars ? `${key}:${JSON.stringify(vars)}` : key
+  return { identity, translate: identity }
+})
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
-      vars ? `${key}:${JSON.stringify(vars)}` : key,
+      i18nMock.translate(key, vars),
   }),
 }))
 
@@ -55,6 +65,12 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 import { ClarificationForm } from "./clarification-form"
+
+// Every describe in this file gets the identity translate back, so a locale
+// swapped by one test cannot leak into a suite added below it.
+beforeEach(() => {
+  i18nMock.translate = i18nMock.identity
+})
 
 describe("ClarificationForm Session file capability", () => {
   beforeEach(() => {
@@ -437,9 +453,13 @@ describe("ClarificationForm delivery failures", () => {
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent(
       "A previous guidance message is still being applied.",
     )
+    // The hint lives in the alert too, not only in the toast - without this
+    // the inline hint could be deleted with every test still green.
+    expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
   })
 
   it("keeps the form submittable after a failure that never reached the agent", async () => {
@@ -481,6 +501,9 @@ describe("ClarificationForm delivery failures", () => {
     expect(screen.getByRole("button", {
       name: "chatPage.clarification.submit",
     })).toBeEnabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendOutcomeUnknown",
+    )
   })
 
   it("keeps connection plumbing diagnostics away from the visitor", async () => {
@@ -545,6 +568,58 @@ describe("ClarificationForm delivery failures", () => {
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
+  })
+
+  it("re-renders the visible failure in the new locale", async () => {
+    // I18nProvider swaps its context value on a locale change without
+    // remounting consumers, so an alert holding pre-translated strings would
+    // keep showing the previous language until it is cleared.
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} onSend={onSend} />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
+
+    i18nMock.translate = (key: string) => `zh:${key}`
+    rerender(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "zh:chatPage.clarification.sendNotSent",
+    )
+    // The backend's own reason is not ours to translate - it passes through.
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Durable storage is temporarily unavailable",
+    )
+  })
+
+  it("re-renders the generic fallback message in the new locale", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("   "))
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} onSend={onSend} />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendError",
+    )
+
+    i18nMock.translate = (key: string) => `zh:${key}`
+    rerender(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "zh:chatPage.clarification.sendError",
+    )
   })
 
   it("uses hint keys that resolve in both locale trees", () => {
