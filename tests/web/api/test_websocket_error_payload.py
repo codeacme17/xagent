@@ -114,7 +114,8 @@ def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
         assert len(messages) == 1
         assert messages[0].content == websocket_api.CLIENT_SAFE_TASK_FAILURE
         assert secret not in messages[0].content
-        persisted_task = db.query(Task).filter(Task.id == task_id).one()
+        persisted_task = db.get(Task, task_id)
+        assert persisted_task is not None
         assert persisted_task.error_message == error_text
     finally:
         db.close()
@@ -535,7 +536,8 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
 
     db = _direct_db_session()
     try:
-        persisted_task = db.query(Task).filter(Task.id == task_id).one()
+        persisted_task = db.get(Task, task_id)
+        assert persisted_task is not None
         assert persisted_task.status == TaskStatus.FAILED
         assert persisted_task.runner_id is None
         assert persisted_task.lease_expires_at is None

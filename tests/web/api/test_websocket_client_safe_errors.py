@@ -224,6 +224,7 @@ ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
 ERROR_PAYLOAD_TYPES = {"error", "agent_error", "task_error"}
+NON_ERROR_STREAM_EVENT_BUILDERS = {"_agent_outbound_event_type"}
 
 # The only functions allowed to mint client-visible text from an exception.
 SAFE_MESSAGE_BUILDERS = {
@@ -243,7 +244,25 @@ def _unwrap_serializer(expr: ast.expr) -> ast.expr:
     return expr
 
 
-def _error_payload_messages(node: ast.Call) -> list[ast.expr]:
+def _call_argument(
+    node: ast.Call,
+    position: int,
+    keyword: str,
+) -> ast.expr | None:
+    """Resolve one argument passed either positionally or by exact keyword."""
+    if len(node.args) > position:
+        return node.args[position]
+    return next(
+        (candidate.value for candidate in node.keywords if candidate.arg == keyword),
+        None,
+    )
+
+
+def _error_payload_messages(
+    node: ast.Call,
+    parents: dict[ast.AST, ast.AST],
+    module_non_error_stream_event_builders: set[str],
+) -> list[ast.expr]:
     """Client-visible text fields of a recognized error payload."""
     if _called_name(node) not in ERROR_PAYLOAD_SINKS:
         return []
@@ -253,16 +272,44 @@ def _error_payload_messages(node: ast.Call) -> list[ast.expr]:
         helper_builds_error = False
         if isinstance(argument, ast.Call):
             helper = _called_name(argument)
-            if helper == "create_terminal_task_error_event" and len(argument.args) > 1:
-                messages.append(argument.args[1])
+            if helper == "create_terminal_task_error_event":
+                message = _call_argument(argument, 1, "message")
+                # A recognized error helper must never disappear from the
+                # sweep merely because its call shape cannot be resolved.
+                messages.append(message if message is not None else argument)
                 continue
-            if (
-                helper == "create_stream_event"
-                and len(argument.args) > 2
-                and isinstance(argument.args[0], ast.Constant)
-                and argument.args[0].value in ERROR_PAYLOAD_TYPES
-            ):
-                argument = argument.args[2]
+            if helper == "create_stream_event":
+                event_type = _call_argument(argument, 0, "event_type")
+                if isinstance(event_type, ast.Constant):
+                    if event_type.value not in ERROR_PAYLOAD_TYPES:
+                        # A literal non-error stream event is outside this sink.
+                        continue
+                elif (
+                    isinstance(event_type, ast.Call)
+                    and isinstance(event_type.func, ast.Name)
+                    and event_type.func.id in module_non_error_stream_event_builders
+                    and not _is_parameter(
+                        _enclosing_functions(event_type, parents),
+                        event_type.func.id,
+                    )
+                    and not _local_assignments(
+                        _enclosing_functions(event_type, parents),
+                        event_type.func.id,
+                    )
+                ):
+                    # Known non-error stream events are not error payloads.
+                    continue
+                else:
+                    messages.append(argument)
+                    continue
+                data = _call_argument(argument, 2, "data")
+                if data is None:
+                    messages.append(argument)
+                    continue
+                if not isinstance(data, ast.Dict):
+                    messages.append(data)
+                    continue
+                argument = data
                 helper_builds_error = True
         if not isinstance(argument, ast.Dict):
             continue
@@ -275,7 +322,11 @@ def _error_payload_messages(node: ast.Call) -> list[ast.expr]:
         is_error_payload = (
             (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
             or helper_builds_error
-            or (None in argument.keys and "error" in keys)
+            or (
+                None in argument.keys
+                and "type" not in keys
+                and any(field in keys for field in ("message", "error"))
+            )
         )
         if is_error_payload:
             messages.extend(
@@ -325,8 +376,6 @@ def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
 def _is_client_safe(expr: ast.expr) -> bool:
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return True
-    if isinstance(expr, ast.Name) and expr.id in SAFE_MESSAGE_CONSTANTS:
-        return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
         if expr.func.id == "client_safe_error_message":
             return True
@@ -362,6 +411,21 @@ def _scan(tree: ast.Module) -> _ScanResult:
     tests while silently not applying to the real module (or vice versa).
     """
     parents = _parents(tree)
+    imported_safe_constants = {
+        alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        and statement.level == 2
+        and statement.module == "services.client_error_messages"
+        for alias in statement.names
+        if alias.asname is None and alias.name in SAFE_MESSAGE_CONSTANTS
+    }
+    module_non_error_stream_event_builders = {
+        statement.name
+        for statement in tree.body
+        if isinstance(statement, FUNCTION_NODES)
+        and statement.name in NON_ERROR_STREAM_EVENT_BUILDERS
+    }
     producers = 0
     error_payloads = 0
     offenders: list[str] = []
@@ -377,7 +441,11 @@ def _scan(tree: ast.Module) -> _ScanResult:
         else:
             # The error bubble renders in the same conversation as the
             # rejection ack, so it is the same disclosure surface.
-            expressions = _error_payload_messages(node)
+            expressions = _error_payload_messages(
+                node,
+                parents,
+                module_non_error_stream_event_builders,
+            )
             name = f"{name}(error payload)"
         if not expressions:
             continue
@@ -387,13 +455,19 @@ def _scan(tree: ast.Module) -> _ScanResult:
             error_payloads += len(expressions)
         scopes = _enclosing_functions(node, parents)
         for expr in expressions:
-            if _is_client_safe(expr):
-                continue
             candidates = (
                 _local_assignments(scopes, expr.id)
                 if isinstance(expr, ast.Name)
                 else [expr]
             )
+            is_unshadowed_safe_constant = (
+                isinstance(expr, ast.Name)
+                and expr.id in imported_safe_constants
+                and not candidates
+                and not _is_parameter(scopes, expr.id)
+            )
+            if is_unshadowed_safe_constant or _is_client_safe(expr):
+                continue
             if not candidates:
                 # Only a name nothing rebinds is a genuinely forwarded parameter,
                 # vetted at the wrapper's own call sites. Known client-facing
@@ -716,11 +790,165 @@ async def leak(websocket, task_id):
     try:
         pass
     except Exception as e:
+        terminal_payload = _terminal_task_error_payload(task_id, str(e))
+        await manager.broadcast_to_task(
+            {
+                **terminal_payload,
+                "message": str(e),
+            },
+            task_id,
+        )
+""",
+        id="dict-spread-message",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        CLIENT_SAFE_TASK_FAILURE = str(e)
+        await manager.broadcast_to_task(
+            {
+                "type": "task_error",
+                "message": CLIENT_SAFE_TASK_FAILURE,
+            },
+            task_id,
+        )
+""",
+        id="shadowed-safe-message-constant",
+    ),
+    pytest.param(
+        """
+from untrusted import raw_message as CLIENT_SAFE_TASK_FAILURE
+
+
+async def leak(websocket, task_id):
+    await manager.broadcast_to_task(
+        {
+            "type": "task_error",
+            "message": CLIENT_SAFE_TASK_FAILURE,
+        },
+        task_id,
+    )
+""",
+        id="safe-message-constant-wrong-import",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
         await manager.broadcast_to_task(
             create_stream_event("error", task_id, {"message": str(e)}), task_id
         )
 """,
         id="helper-built",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.broadcast_to_task(
+            create_terminal_task_error_event(
+                task_id=task_id,
+                message=str(e),
+            ),
+            task_id,
+        )
+""",
+        id="terminal-helper-keywords",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.send_personal_message(
+            create_stream_event(
+                event_type="error",
+                task_id=task_id,
+                data={"message": str(e)},
+            ),
+            websocket,
+        )
+""",
+        id="stream-helper-keywords",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id, event_type):
+    try:
+        pass
+    except Exception as e:
+        await manager.send_personal_message(
+            create_stream_event(
+                event_type=event_type,
+                task_id=task_id,
+                data={"message": str(e)},
+            ),
+            websocket,
+        )
+""",
+        id="stream-helper-dynamic-event-type",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.send_personal_message(
+            create_stream_event(
+                task_id=task_id,
+                data={"message": str(e)},
+            ),
+            websocket,
+        )
+""",
+        id="stream-helper-missing-event-type",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, task_id):
+    try:
+        pass
+    except Exception as e:
+        await manager.send_personal_message(
+            create_stream_event(
+                event_type=untrusted._agent_outbound_event_type(task_id),
+                task_id=task_id,
+                data={"message": str(e)},
+            ),
+            websocket,
+        )
+""",
+        id="stream-helper-non-error-builder-impostor",
+    ),
+    pytest.param(
+        """
+def _agent_outbound_event_type(payload):
+    return "agent_progress"
+
+
+async def leak(websocket, task_id, _agent_outbound_event_type):
+    try:
+        pass
+    except Exception as e:
+        await manager.send_personal_message(
+            create_stream_event(
+                event_type=_agent_outbound_event_type(task_id),
+                task_id=task_id,
+                data={"message": str(e)},
+            ),
+            websocket,
+        )
+""",
+        id="stream-helper-shadowed-non-error-builder",
     ),
     pytest.param(
         """

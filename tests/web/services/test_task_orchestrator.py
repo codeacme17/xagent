@@ -1087,7 +1087,8 @@ def test_error_settlement_persists_client_safe_history(db_session) -> None:
     secret = "orchestrator-provider-secret"
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
-    lease = acquire_task_lease_isolated(int(task.id))
+    task_id = int(task.id)
+    lease = acquire_task_lease_isolated(task_id)
     assert lease is not None
 
     assert (
@@ -1099,12 +1100,13 @@ def test_error_settlement_persists_client_safe_history(db_session) -> None:
     )
 
     db_session.expire_all()
-    persisted = db_session.query(Task).filter(Task.id == task.id).one()
+    persisted = db_session.get(Task, task_id)
+    assert persisted is not None
     assert persisted.error_message == f"setup/run failed: {secret}"
     messages = (
         db_session.query(TaskChatMessage)
         .filter(
-            TaskChatMessage.task_id == int(task.id),
+            TaskChatMessage.task_id == task_id,
             TaskChatMessage.role == "assistant",
         )
         .all()
