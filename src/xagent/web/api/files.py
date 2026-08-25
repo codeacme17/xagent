@@ -69,8 +69,8 @@ from ..services.db_runtime import (
 )
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.managed_file_ref import (
-    _NAMESPACE_AUTHORITY_ERRORS,
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    NAMESPACE_AUTHORITY_ERRORS,
     DurableObjectIntegrityError,
     DurableObjectMissingError,
     DurableStorageOperationError,
@@ -113,6 +113,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 file_router = APIRouter(prefix="/api/files", tags=["files"])
+
+# Faults the delete-cleanup arm must let propagate instead of folding into the
+# retryable 503 (#1473): the namespace-authority family, plus ValueError from
+# ``normalize_storage_key`` for a structurally-invalid persisted key. A named
+# tuple constant rather than ``(*..., ValueError)`` inline: mypy only accepts
+# a name or a tuple display of types in an ``except`` clause.
+_PERMANENT_CLEANUP_FAULTS: tuple[type[BaseException], ...] = (
+    *NAMESPACE_AUTHORITY_ERRORS,
+    ValueError,
+)
 
 
 def _raise_durable_storage_unavailable(
@@ -2172,11 +2182,18 @@ async def delete_file(
                 get_user_file_storage(_file_user_id_value(file_record)).delete(
                     storage_key
                 )
-            except _NAMESPACE_AUTHORITY_ERRORS:
-                # A containment violation is a permanent authority fault, not
-                # an outage: folding it into the retryable 503 below is what
-                # #1473 tracked. It propagates to the dedicated handler in
-                # web/app.py, consistent with every other site in this file.
+            except _PERMANENT_CLEANUP_FAULTS:
+                # Permanent faults, not outages: folding either into the
+                # retryable 503 below is what #1473 tracked. A containment
+                # violation propagates to its dedicated handler in web/app.py,
+                # consistent with every other site in this file. A ValueError
+                # from ``normalize_storage_key`` (null byte, empty key, ``.``/
+                # ``..`` segment -- raised even in tolerant mode) means the
+                # persisted key itself is malformed, which no retry can clear;
+                # it has no dedicated handler, so it surfaces as the generic
+                # 500. The arm deliberately admits any ValueError from the
+                # call -- there is no narrower type to name, and none of them
+                # is an outage.
                 raise
             except Exception as exc:
                 _raise_durable_storage_unavailable(

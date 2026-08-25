@@ -431,7 +431,27 @@ _FAULT_SITES = (
 
 def _module_ast(module: Any) -> ast.Module:
     """Parse an imported module's own source."""
-    return ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    source_path = Path(module.__file__)
+    return ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+
+def _operation_label_of(call: ast.Call, where: str) -> str:
+    """The call's operation label, which must be a string literal.
+
+    Positional or ``operation=`` keyword -- a site refactored to keyword form
+    must fail with "not a literal", never silently drop out of a drift
+    comparison or die on an IndexError.
+    """
+    node = (
+        call.args[1]
+        if len(call.args) > 1
+        else next((kw.value for kw in call.keywords if kw.arg == "operation"), None)
+    )
+    assert isinstance(node, ast.Constant) and isinstance(node.value, str), (
+        f"{where}:{call.lineno}: the operation label must be a string "
+        f"literal (positional or operation=); got {ast.unparse(call)[:90]!r}"
+    )
+    return node.value
 
 
 def _handler_types(handler: ast.ExceptHandler) -> list[str]:
@@ -549,28 +569,28 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
     )
 
     declared = {label for label, _ in _FAULT_SITES}
-    passed = {
-        node.args[1].value
-        for node in calls
-        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
-    }
+
     # Every label is a plain literal, so it stays a bounded, aggregatable value
     # -- an f-string here is how the storage key first became part of a label.
+    passed = {_operation_label_of(node, "files.py") for node in calls}
     assert passed == declared, f"labels drifted: {passed ^ declared}"
 
     for node in calls:
-        label = node.args[1].value
+        label = _operation_label_of(node, "files.py")
         expected = dict(_FAULT_SITES)[label]
-        assert tuple(kw.arg for kw in node.keywords) == expected, (
+        field_keywords = [kw for kw in node.keywords if kw.arg != "operation"]
+        # Set comparison: the field names are the contract, their order is not.
+        assert {kw.arg for kw in field_keywords} == set(expected), (
             f"site {label!r} passes "
-            f"{[kw.arg for kw in node.keywords]}, expected {list(expected)}"
+            f"{sorted(str(kw.arg) for kw in field_keywords)}, "
+            f"expected {sorted(expected)}"
         )
         # Names alone are not the contract. ``file_id=storage_key`` declares the
         # right field and renders the wrong value, which is invisible both here
         # and to the sweep below -- that one supplies its own placeholder values
         # and never reads the call site. Requiring the bound expression to read
         # something of the same name is what ties the label to the variable.
-        for keyword in node.keywords:
+        for keyword in field_keywords:
             assert keyword.arg is not None, f"site {label!r} uses **kwargs"
             assert _binds_a_matching_name(keyword.arg, keyword.value), (
                 f"site {label!r} binds {keyword.arg}= to "
@@ -587,10 +607,86 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
 # where the subclass is unreachable -- which is why the count must be declared,
 # not derived.)
 _MODULES_WITH_DURABLE_ARM_PAIRS = (
-    ("files.py", 7, lambda: files_api),
-    ("v1/tasks.py", 1, lambda: v1_tasks),
-    ("file_ingestion_tool.py", 1, lambda: _file_ingestion_tool()),
+    ("web/api/files.py", 7, lambda: files_api),
+    ("web/api/v1/tasks.py", 1, lambda: v1_tasks),
+    (
+        "core/tools/adapters/vibe/file_ingestion_tool.py",
+        1,
+        lambda: _file_ingestion_tool(),
+    ),
 )
+
+
+# The two sites that call the shared helper directly, without files.py's
+# ``_raise_durable_storage_unavailable`` wrapper, and therefore sit outside
+# the files.py sweep above. Same contract: a bounded literal label and a
+# declared field set.
+_DIRECT_HELPER_SITES = (
+    ("web/api/v1/tasks.py", lambda: v1_tasks, "turn attachment resolution"),
+    (
+        "core/tools/adapters/vibe/file_ingestion_tool.py",
+        lambda: _file_ingestion_tool(),
+        "knowledge-base file restore",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "loader", "expected_operation"), _DIRECT_HELPER_SITES
+)
+def test_direct_helper_sites_keep_a_bounded_literal_label(
+    label: str, loader: Any, expected_operation: str
+) -> None:
+    """The two non-files.py reporting sites are held to the same label rules.
+
+    The files.py sweep cannot see them -- they call the shared helper
+    directly -- so without this, a rewrite of either label to an f-string
+    (the leak-and-cardinality class the sweep exists to prevent) would land
+    unchecked.
+    """
+    tree = _module_ast(loader())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "log_durable_storage_fault"
+    ]
+    assert len(calls) == 1, (
+        f"{label}: expected exactly one direct helper call, found {len(calls)} "
+        "-- add the new site here with its label"
+    )
+    operation = _operation_label_of(calls[0], label)
+    assert operation == expected_operation, (
+        f"{label}: the operation label must stay the bounded literal "
+        f"{expected_operation!r}; got {operation!r}"
+    )
+    for keyword in calls[0].keywords:
+        assert keyword.arg is not None, f"{label} passes **kwargs to the helper"
+
+
+def test_every_module_with_an_arm_pair_is_in_the_table() -> None:
+    """The table above is discovered, not merely declared.
+
+    A closed list can only check the modules someone remembered to add: a new
+    module introducing a misordered pair elsewhere would be invisible to the
+    per-module sweep. This walks every module under ``src/xagent`` and requires
+    the set of modules carrying an integrity/parent pair to equal the table, so
+    a new pair anywhere fails here with directions instead of going unchecked.
+    """
+    package_root = Path(files_api.__file__).parents[2]
+    found = set()
+    for path in package_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if _durable_arm_pairs(tree):
+            found.add(path.relative_to(package_root).as_posix())
+
+    declared = {label for label, _, _ in _MODULES_WITH_DURABLE_ARM_PAIRS}
+    assert found == declared, (
+        f"modules with integrity/parent arm pairs changed: {found ^ declared} "
+        "-- add the module to _MODULES_WITH_DURABLE_ARM_PAIRS with its pair "
+        "count so its ordering is swept, or remove the stale row"
+    )
 
 
 def _file_ingestion_tool() -> Any:
@@ -654,7 +750,13 @@ def test_fault_site_renders_its_label_and_fields(
     label: str,
     expected_fields: tuple[str, ...],
 ) -> None:
-    """Each site's label and field set must survive into the log line."""
+    """The helper renders each declared label and field set into the line.
+
+    Helper rendering only, with synthetic values: this never executes a real
+    ``files.py`` call site. What ties each site to its declared label, fields,
+    and bindings is the AST sweep above; what this pins is that the declared
+    shape, once passed, survives into the rendered record.
+    """
     fields = {name: f"value-for-{name}" for name in expected_fields}
 
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):

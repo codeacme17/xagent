@@ -112,6 +112,10 @@ def log_durable_storage_fault(
     ``target_logger`` is the caller's logger rather than this module's, so a
     line stays attributed to the endpoint or tool that produced it.
 
+    Translation stays per call site while #1521 (ASGI boundary handler vs.
+    per-site arms) is undecided; this helper is the shared half either answer
+    keeps.
+
     Field values are escaped and bounded, because some are client-supplied.
     That covers the fields *this* function renders -- it does **not** make the
     record as a whole unforgeable: the formatter renders ``exc_info`` verbatim,
@@ -127,27 +131,15 @@ def log_durable_storage_fault(
     passed that way would be invisible in exactly the logs an incident is
     diagnosed from.
     """
-    # One record per fault instance, whatever the nesting. A durable fault can
-    # pass through more than one handler that legitimately wants to report it --
-    # a request-scoped arm that answers the client, and an endpoint-scoped arm
-    # that catches whatever escaped -- and both calling this would log the same
-    # cause twice. Marking the exception is what makes each arm safe to write
-    # independently, instead of every new arm having to know which other arm
-    # might already have run.
-    #
-    # Only this module's own wraps are marked, and that is what makes the mark
-    # need no guarding. A wrap is what traverses several arms, so it is where
-    # dedup is needed; the raw provider exception the delete path hands over is
-    # reported by one site by definition. Restricting the mark also keeps this
-    # from setting a private attribute on an object the module does not own,
-    # where neither the read nor the write is safe in principle -- ``getattr``'s
-    # default absorbs ``AttributeError`` only -- and an exception escaping here,
-    # inside an ``except`` block, would replace a handled 503-with-a-log with an
-    # unhandled 500 that loses the fault, which is #1467's own failure mode.
+    # One record per fault instance: a wrap can traverse more than one arm
+    # that legitimately reports it -- a request-scoped arm that answers the
+    # client, then an endpoint-scoped arm that catches whatever escaped --
+    # and the mark is what makes each arm safe to write independently. Only
+    # this module's own wraps are marked (the attribute is declared on the
+    # class), so no guard is needed around the read or the write.
     if isinstance(exc, DurableStorageOperationError):
         if exc._durable_fault_logged:
             return
-        exc._durable_fault_logged = True
         # The wraps carry the key on the exception rather than in its message,
         # so ``str(exc)`` is safe wherever it escapes. Rendering it here is what
         # keeps that from costing the log anything: the key reaches this line
@@ -164,6 +156,11 @@ def log_durable_storage_fault(
     target_logger.warning(
         "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
     )
+    # Marked only after the record is emitted: if emission raised, the fault
+    # would stay unmarked for a later arm to report, instead of being
+    # permanently recorded as logged by an attempt that never wrote.
+    if isinstance(exc, DurableStorageOperationError):
+        exc._durable_fault_logged = True
 
 
 class DurableStorageOperationError(RuntimeError):
@@ -227,7 +224,7 @@ class DurableObjectIntegrityError(DurableStorageOperationError):
 # once, at the application boundary (see the handlers registered in
 # ``web/app.py``), instead of being reported as an outage an operator would
 # retry.
-_NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
+NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
     StorageKeyScopeError,
     ExecutionScopeAuthorityError,
     ExecutionScopeResolverContractError,
@@ -525,7 +522,7 @@ class ManagedFileRef:
         except DurableObjectIntegrityError:
             temp_path.unlink(missing_ok=True)
             raise
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             temp_path.unlink(missing_ok=True)
             raise
         except Exception as exc:
@@ -556,7 +553,7 @@ class ManagedFileRef:
                 last_integrity_error = exc
                 if materialized_path is not None:
                     materialized_path.unlink(missing_ok=True)
-            except _NAMESPACE_AUTHORITY_ERRORS:
+            except NAMESPACE_AUTHORITY_ERRORS:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
@@ -592,7 +589,7 @@ class ManagedFileRef:
                 content_type=content_type,
                 content_disposition=content_disposition,
             )
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -644,7 +641,7 @@ class ManagedFileRef:
                 resolved_key,
                 mime_type or getattr(self.record, "mime_type", None),
             )
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -664,7 +661,7 @@ class ManagedFileRef:
             stored_object = self._bound_storage().stat(expected_key)
         except FileNotFoundError:
             return "missing"
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -686,7 +683,7 @@ class ManagedFileRef:
             if not checksum:
                 try:
                     checksum = self._bound_storage().content_hash(expected_key)
-                except _NAMESPACE_AUTHORITY_ERRORS:
+                except NAMESPACE_AUTHORITY_ERRORS:
                     # The rule holds at every site in this module, not only
                     # where a downstream call happens to raise the same class
                     # again: relying on that would make this a silent swallow
@@ -709,7 +706,7 @@ class ManagedFileRef:
         if not checksum:
             try:
                 checksum = self._bound_storage().content_hash(expected_key)
-            except _NAMESPACE_AUTHORITY_ERRORS:
+            except NAMESPACE_AUTHORITY_ERRORS:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
@@ -769,7 +766,7 @@ class ManagedFileRef:
 
         try:
             actual_checksum = self._bound_storage().content_hash(self.storage_key)
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             # A permanent authority fault must not be reported as "checksum
             # unavailable", which reads as a transient reason to fall back to
             # backend-mediated access.

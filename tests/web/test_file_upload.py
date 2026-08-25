@@ -1585,6 +1585,63 @@ class TestFileManagement:
         finally:
             db.close()
 
+    def test_delete_file_malformed_key_is_not_reported_as_an_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers, caplog
+    ):
+        """The other half of #1473: a structurally-invalid persisted key.
+
+        ``ScopedFileStorage.delete`` normalizes the key even in tolerant mode,
+        and ``normalize_storage_key`` raises ``ValueError`` for a ``..`` path
+        segment (also a null byte or an empty key). That is data-level
+        corruption in the row itself -- no retry can clear it -- so the
+        cleanup arm must let it propagate rather than fold it into the
+        retryable 503 with a transient-outage warning, which is exactly the
+        failure #1473 describes: the row becomes undeletable through the API
+        while the client is told to retry forever.
+        """
+        admin_user, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("malformed-key.txt", b"malformed key", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        # Corrupt the persisted key the way a bad migration or adopt would:
+        # structurally invalid, not merely out of scope.
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+            )
+            record.storage_key = f"users/{admin_user.id}/uploads/../{file_id}"
+            db.commit()
+        finally:
+            db.close()
+
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            with pytest.raises(ValueError, match="Invalid storage key"):
+                client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        # No outage warning: the fault is permanent, not a durable outage.
+        assert not [
+            entry
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and "Durable storage unavailable" in entry.getMessage()
+        ], "a malformed persisted key was reported as a durable-storage outage"
+        # The row survives, same as any failed cleanup.
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            assert (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                is not None
+            )
+        finally:
+            db.close()
+
     def test_delete_file_scope_violation_is_not_reported_as_an_outage(
         self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
     ):
