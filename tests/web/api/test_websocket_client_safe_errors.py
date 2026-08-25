@@ -167,23 +167,39 @@ PRODUCERS: dict[str, int | None] = {
 # sender copy should also be narrowed when the initiator is an anonymous
 # public connection.
 #
-# Anchored to (enclosing function, expression) rather than to the expression
-# alone, which blessed the string in every function it appeared in. This stops
-# reuse in a *different* function only: `_local_assignments` unions every
-# assignment in the enclosing function regardless of branch, so moving the
-# string between branches of an allowlisted function is NOT caught. #1547.
+# Anchored to the function and the exception handler that owns the expression.
+# The raw wording is the deliberate #1479 RuntimeError contract; the same text
+# in a validation or generic-exception branch is not curated and must fail.
+
+
+class _RawMessageAllowance(NamedTuple):
+    function: str
+    handler: str
+    expression: str
+
+
 ALLOWED_RAW_MESSAGES = {
-    ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
-    # The same #1479 flow seen through the closure scope chain: the outer
-    # function's runtime-error string reaches these closures' ``message``
-    # parameter at their call sites. Surfaced when the parameter short-circuit
-    # stopped hiding rebound names; not a new leak.
-    ("finish_delivery", "f'Runtime error: {str(e)}'"),
-    ("finish_delivery_failure", "f'Runtime error: {str(e)}'"),
-    ("handle_execute_task", "f'Runtime error: {str(e)}'"),
-    ("handle_intervention", "f'Runtime error: {str(e)}'"),
-    ("_handle_pause_task_unserialized", "f'Runtime error: {str(e)}'"),
-    ("_handle_resume_task_unserialized", "f'Runtime error: {str(e)}'"),
+    _RawMessageAllowance(
+        "_handle_chat_message_unserialized",
+        "RuntimeError",
+        "f'Runtime error: {str(e)}'",
+    ),
+    _RawMessageAllowance(
+        "handle_execute_task", "RuntimeError", "f'Runtime error: {str(e)}'"
+    ),
+    _RawMessageAllowance(
+        "handle_intervention", "RuntimeError", "f'Runtime error: {str(e)}'"
+    ),
+    _RawMessageAllowance(
+        "_handle_pause_task_unserialized",
+        "RuntimeError",
+        "f'Runtime error: {str(e)}'",
+    ),
+    _RawMessageAllowance(
+        "_handle_resume_task_unserialized",
+        "RuntimeError",
+        "f'Runtime error: {str(e)}'",
+    ),
 }
 
 
@@ -231,19 +247,25 @@ SAFE_MESSAGE_BUILDERS = {
 }
 
 
-def _unwrap_serializer(expr: ast.expr) -> ast.expr:
+def _unwrap_serializer(expr: ast.expr, parents: dict[ast.AST, ast.AST]) -> ast.expr:
     """``json.dumps(payload)`` -> ``payload``; anything else unchanged."""
-    if isinstance(expr, ast.Call) and _called_name(expr) == "dumps" and expr.args:
+    if (
+        isinstance(expr, ast.Call)
+        and _called_name(expr, parents) == "dumps"
+        and expr.args
+    ):
         return expr.args[0]
     return expr
 
 
-def _error_payload_message(node: ast.Call) -> ast.expr | None:
+def _error_payload_message(
+    node: ast.Call, parents: dict[ast.AST, ast.AST]
+) -> ast.expr | None:
     """The message of an ``{"type": "error", ...}`` payload, if this is one."""
-    if _called_name(node) not in ERROR_PAYLOAD_SINKS:
+    if _called_name(node, parents) not in ERROR_PAYLOAD_SINKS:
         return None
     for raw in (*node.args, *(kw.value for kw in node.keywords)):
-        argument = _unwrap_serializer(raw)
+        argument = _unwrap_serializer(raw, parents)
         if not isinstance(argument, ast.Dict):
             continue
         keys = {
@@ -257,11 +279,35 @@ def _error_payload_message(node: ast.Call) -> ast.expr | None:
     return None
 
 
-def _called_name(node: ast.Call) -> str | None:
+ATTRIBUTE_CALL_RECEIVERS = {
+    "broadcast_to_task": {"manager"},
+    "dumps": {"json"},
+    "send_personal_message": {"manager"},
+    "send_text": {"connection", "self.ws", "websocket"},
+}
+
+
+def _attribute_path(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        owner = _attribute_path(node.value)
+        if owner is not None:
+            return f"{owner}.{node.attr}"
+    return None
+
+
+def _called_name(
+    node: ast.Call, parents: dict[ast.AST, ast.AST] | None = None
+) -> str | None:
     if isinstance(node.func, ast.Name):
-        return node.func.id
+        if parents is None:
+            return node.func.id
+        return _single_name_alias(node.func.id, node, parents)
     if isinstance(node.func, ast.Attribute):
-        return node.func.attr
+        receivers = ATTRIBUTE_CALL_RECEIVERS.get(node.func.attr)
+        if receivers is not None and _attribute_path(node.func.value) in receivers:
+            return node.func.attr
     return None
 
 
@@ -281,16 +327,229 @@ def _is_parameter(scopes: list[ast.AST], name: str) -> bool:
     return False
 
 
+def _resolved_assignments(
+    scopes: list[ast.AST],
+    name: str,
+    reference: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> list[ast.expr]:
+    """Prefer the active control branch, then the nearest lexical binding."""
+    for scope in scopes:
+        current = parents.get(reference)
+        while current is not None and current is not scope:
+            if isinstance(current, (ast.ExceptHandler, ast.If)):
+                all_assignments = _local_assignments([current], name)
+                if all_assignments:
+                    assignments = [
+                        value
+                        for value in all_assignments
+                        if _precedes(value, reference)
+                    ]
+                    if not assignments:
+                        return [_incoming_parameter()]
+                    return _include_unassigned_parameter_path(
+                        assignments, scopes, name, reference, current, parents
+                    )
+            current = parents.get(current)
+        all_assignments = _local_assignments([scope], name)
+        if all_assignments:
+            assignments = [
+                value for value in all_assignments if _precedes(value, reference)
+            ]
+            if not assignments:
+                return [_incoming_parameter()]
+            return _include_unassigned_parameter_path(
+                assignments, scopes, name, reference, scope, parents
+            )
+        if _is_parameter([scope], name):
+            return []
+    return []
+
+
+def _include_unassigned_parameter_path(
+    assignments: list[ast.expr],
+    scopes: list[ast.AST],
+    name: str,
+    reference: ast.AST,
+    binding_scope: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> list[ast.expr]:
+    """Keep the incoming parameter when every binding is branch-conditional."""
+    if not _is_parameter(scopes, name) or not all(
+        _is_conditional_before_reference(value, reference, binding_scope, parents)
+        for value in assignments
+    ):
+        return assignments
+    return [*assignments, _incoming_parameter()]
+
+
+def _incoming_parameter() -> ast.Call:
+    return ast.Call(
+        func=ast.Name(id="_incoming_parameter", ctx=ast.Load()),
+        args=[],
+        keywords=[],
+    )
+
+
+def _precedes(value: ast.expr, reference: ast.AST) -> bool:
+    """Only bindings evaluated before the client-facing sink can reach it."""
+    value_position = (getattr(value, "lineno", -1), getattr(value, "col_offset", -1))
+    reference_position = (
+        getattr(reference, "lineno", -1),
+        getattr(reference, "col_offset", -1),
+    )
+    return value_position < reference_position
+
+
+def _is_conditional_before_reference(
+    value: ast.expr,
+    reference: ast.AST,
+    scope: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    """Whether an assignment can be skipped on the path to ``reference``."""
+    current: ast.AST | None = value
+    while current is not None and current is not scope:
+        parent = parents.get(current)
+        if isinstance(parent, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            value_branch = _control_branch(current, parent)
+            reference_branch = _descendant_control_branch(reference, parent, parents)
+            if value_branch in {"body", "orelse"} and value_branch != reference_branch:
+                return True
+        elif isinstance(parent, ast.match_case):
+            if not _is_descendant(reference, parent, parents):
+                return True
+        elif isinstance(parent, ast.BoolOp):
+            if current is not parent.values[0] and not _is_descendant(
+                reference, current, parents
+            ):
+                return True
+        current = parent
+    return False
+
+
+def _control_branch(
+    node: ast.AST, conditional: ast.If | ast.For | ast.AsyncFor | ast.While
+) -> str:
+    if node in conditional.body:
+        return "body"
+    if node in conditional.orelse:
+        return "orelse"
+    return "test"
+
+
+def _descendant_control_branch(
+    node: ast.AST,
+    conditional: ast.If | ast.For | ast.AsyncFor | ast.While,
+    parents: dict[ast.AST, ast.AST],
+) -> str | None:
+    current = node
+    while current is not conditional:
+        parent = parents.get(current)
+        if parent is conditional:
+            return _control_branch(current, conditional)
+        if parent is None:
+            return None
+        current = parent
+    return None
+
+
+def _is_descendant(
+    node: ast.AST, ancestor: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    current: ast.AST | None = node
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = parents.get(current)
+    return False
+
+
+def _scope_nodes(scope: ast.AST) -> Iterator[ast.AST]:
+    """Walk one lexical scope without borrowing bindings from its closures."""
+    for child in ast.iter_child_nodes(scope):
+        if isinstance(child, FUNCTION_NODES):
+            continue
+        yield child
+        yield from _scope_nodes(child)
+
+
+def _target_values(target: ast.expr, value: ast.expr, name: str) -> list[ast.expr]:
+    if isinstance(target, ast.Name):
+        return [value] if target.id == name else []
+    if isinstance(target, (ast.List, ast.Tuple)):
+        if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(
+            value.elts
+        ):
+            values: list[ast.expr] = []
+            for child_target, child_value in zip(target.elts, value.elts):
+                values.extend(_target_values(child_target, child_value, name))
+            return values
+        if any(_target_contains_name(child, name) for child in target.elts):
+            return [value]
+    if isinstance(target, ast.Starred) and _target_contains_name(target.value, name):
+        return [value]
+    return []
+
+
+def _target_contains_name(target: ast.expr, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, ast.Starred):
+        return _target_contains_name(target.value, name)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return any(_target_contains_name(child, name) for child in target.elts)
+    return False
+
+
 def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
-    """Values assigned to `name` inside the given scopes only."""
+    """Values bound to ``name`` in the given lexical scopes."""
     values: list[ast.expr] = []
     for scope in scopes:
-        for node in ast.walk(scope):
+        for node in _scope_nodes(scope):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == name:
-                        values.append(node.value)
+                    values.extend(_target_values(target, node.value, name))
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                values.extend(_target_values(node.target, node.value, name))
+            elif isinstance(node, ast.AugAssign):
+                if _target_contains_name(node.target, name):
+                    values.append(
+                        ast.copy_location(
+                            ast.Call(
+                                func=ast.Name(
+                                    id="_augmented_assignment", ctx=ast.Load()
+                                ),
+                                args=[node.value],
+                                keywords=[],
+                            ),
+                            node,
+                        )
+                    )
+            elif isinstance(node, ast.NamedExpr):
+                values.extend(_target_values(node.target, node.value, name))
     return values
+
+
+def _single_name_alias(
+    name: str, node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> str:
+    """Resolve an unambiguous local ``alias = callable`` binding."""
+    for scope in _enclosing_functions(node, parents):
+        assignments = _local_assignments([scope], name)
+        if not assignments:
+            continue
+        if len(assignments) == 1 and isinstance(assignments[0], ast.Name):
+            return assignments[0].id
+        return name
+    current: ast.AST | None = node
+    while current is not None and not isinstance(current, ast.Module):
+        current = parents.get(current)
+    if isinstance(current, ast.Module):
+        assignments = _local_assignments([current], name)
+        if len(assignments) == 1 and isinstance(assignments[0], ast.Name):
+            return assignments[0].id
+    return name
 
 
 def _is_client_safe(expr: ast.expr) -> bool:
@@ -307,9 +566,15 @@ def _is_client_safe(expr: ast.expr) -> bool:
         return False
     # `_TURN_REJECTION_MESSAGES.get(reason, "<literal>")` - a curated table.
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
-        return expr.func.attr == "get" and all(
-            isinstance(arg, ast.Constant) or isinstance(arg, ast.Attribute)
-            for arg in expr.args[1:]
+        return (
+            expr.func.attr == "get"
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "_TURN_REJECTION_MESSAGES"
+            and len(expr.args) >= 2
+            and all(
+                isinstance(arg, ast.Constant) or isinstance(arg, ast.Attribute)
+                for arg in expr.args[1:]
+            )
         )
     if isinstance(expr, ast.BoolOp):
         return all(_is_client_safe(value) for value in expr.values)
@@ -320,7 +585,34 @@ class _ScanResult(NamedTuple):
     offenders: list[str]
     producers: int
     error_payloads: int
-    used_allowlist: set[tuple[str, str]]
+    used_allowlist: set[_RawMessageAllowance]
+
+
+def _allowlist_key(
+    candidate: ast.expr,
+    sink: ast.Call,
+    parents: dict[ast.AST, ast.AST],
+) -> _RawMessageAllowance:
+    functions = _enclosing_functions(candidate, parents)
+    qualname = ".".join(
+        reversed(
+            [scope.name for scope in functions if isinstance(scope, FUNCTION_NODES)]
+        )
+    )
+    handler_name = "<no-except>"
+    current = parents.get(sink)
+    while current is not None:
+        if isinstance(current, ast.ExceptHandler):
+            handler_name = (
+                ast.unparse(current.type)
+                if current.type is not None
+                else "BaseException"
+            )
+            break
+        current = parents.get(current)
+    return _RawMessageAllowance(
+        qualname or "<module>", handler_name, ast.unparse(candidate)
+    )
 
 
 def _scan(tree: ast.Module) -> _ScanResult:
@@ -334,18 +626,18 @@ def _scan(tree: ast.Module) -> _ScanResult:
     producers = 0
     error_payloads = 0
     offenders: list[str] = []
-    used_allowlist: set[tuple[str, str]] = set()
+    used_allowlist: set[_RawMessageAllowance] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        name = _called_name(node)
+        name = _called_name(node, parents)
         is_producer = name in PRODUCERS
         if is_producer:
             expr = _message_expression(node, PRODUCERS[name])
         else:
             # The error bubble renders in the same conversation as the
             # rejection ack, so it is the same disclosure surface.
-            expr = _error_payload_message(node)
+            expr = _error_payload_message(node, parents)
             name = f"{name}(error payload)"
         if expr is None:
             continue
@@ -355,28 +647,22 @@ def _scan(tree: ast.Module) -> _ScanResult:
             error_payloads += 1
         scopes = _enclosing_functions(node, parents)
         candidates = (
-            _local_assignments(scopes, expr.id)
+            _resolved_assignments(scopes, expr.id, node, parents)
             if isinstance(expr, ast.Name)
             else [expr]
         )
         if not candidates:
             # Only a name nothing rebinds is a genuinely forwarded parameter,
-            # vetted at the wrapper's own call sites. A parameter rebound by a
-            # plain assignment lands in the candidates instead; rebinding via
-            # AnnAssign/AugAssign/walrus/tuple targets is still invisible to
-            # ``_local_assignments`` and tracked in #1547.
+            # vetted at the wrapper's own call sites. Every supported rebinding
+            # form lands in candidates instead of taking this short-circuit.
             if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
                 continue
             offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
             continue
-        enclosing = next(
-            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
-            "<module>",
-        )
         for candidate in candidates:
             if _is_client_safe(candidate):
                 continue
-            key = (enclosing, ast.unparse(candidate))
+            key = _allowlist_key(candidate, node, parents)
             if key in ALLOWED_RAW_MESSAGES:
                 used_allowlist.add(key)
                 continue
@@ -413,14 +699,15 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
             f"SAFE_MESSAGE_BUILDERS blesses {builder!r}, which does not exist"
         )
 
-    # Actual counts at the time of writing: 23 producers, 30 error payloads.
-    # These floors sit below that, so a minority of sites can still vanish
-    # silently; tightening them to exact equality is tracked in #1547.
-    assert result.producers >= 21, (
-        f"the producers moved; only {result.producers} matched"
+    # These are deliberate exact baselines. If a producer is added or removed,
+    # inspect the changed site and bump the corresponding count in this test.
+    assert result.producers == 23, (
+        f"expected exactly 23 producers, matched {result.producers}; "
+        "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads >= 21, (
-        f"the error payloads moved; only {result.error_payloads} matched"
+    assert result.error_payloads == 32, (
+        f"expected exactly 32 error payloads, matched {result.error_payloads}; "
+        "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
     # is a standing exemption nothing uses, and an unused closure entry is
@@ -554,6 +841,64 @@ def test_log_level_follows_the_marker_not_the_call_site(
     assert record.levelno == expected_level
     assert (record.exc_info is not None) is expects_traceback
     assert "task 7" in record.getMessage()
+
+
+def test_log_helper_rejects_a_template_that_would_drop_the_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed template falls back without replacing the handler outcome."""
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"), "Pause command rejected"
+        )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 1
+    assert "malformed client-facing log template" in records[0].getMessage().lower()
+    assert "Pause command rejected" in records[0].getMessage()
+    assert "operator detail" in records[0].getMessage()
+
+
+def test_client_visible_error_is_a_subclass_only_marker() -> None:
+    """The marker base cannot escape handlers that catch its typed subclasses."""
+    with pytest.raises(TypeError, match="must be subclassed"):
+        websocket_api.ClientVisibleError("bare marker")
+
+    assert str(websocket_api.ClientVisibleValidationError("curated")) == "curated"
+
+
+@pytest.mark.parametrize("message", ["", "   ", "\t\n"])
+def test_empty_client_visible_message_falls_back_to_the_generic_text(
+    message: str,
+) -> None:
+    error = websocket_api.ClientVisibleValidationError(message)
+
+    assert (
+        websocket_api.client_safe_error_message(error)
+        == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
+def test_client_visible_message_preserves_non_ascii_text() -> None:
+    message = "请求无效：缺少步骤标识"
+
+    assert (
+        websocket_api.client_safe_error_message(
+            websocket_api.ClientVisibleValidationError(message)
+        )
+        == message
+    )
+
+
+def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
+    cause = RuntimeError(SECRET)
+    error = websocket_api.ClientVisibleValidationError("")
+    error.__cause__ = cause
+
+    rendered = websocket_api.client_safe_error_message(error)
+
+    assert rendered == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert SECRET not in rendered
 
 
 @pytest.mark.asyncio
@@ -840,6 +1185,78 @@ async def outer(websocket, message):
 """,
         id="nested-shadow",
     ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message: str = str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="annotated-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message += str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="augmented-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        (message := str(e))
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="walrus-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message, ignored = str(e), None
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="tuple-rebind",
+    ),
 ]
 
 
@@ -867,6 +1284,257 @@ async def forward(websocket, message):
         rejection_outcome="not_accepted",
     )
 """
+    assert not _guard_offenders(source)
+
+
+def test_allowlist_is_scoped_to_the_runtime_error_handler() -> None:
+    source = """
+async def handle_intervention(websocket):
+    try:
+        pass
+    except ValueError as e:
+        await manager.send_personal_message(
+            {"type": "error", "message": f"Runtime error: {str(e)}"},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "a validation branch cannot reuse the carve-out"
+
+
+def test_allowlist_cannot_flow_from_runtime_into_a_validation_handler() -> None:
+    source = """
+async def handle_intervention(websocket):
+    try:
+        pass
+    except RuntimeError as e:
+        message = f"Runtime error: {str(e)}"
+
+    try:
+        pass
+    except ValueError:
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the carve-out cannot cross except handlers"
+
+
+def test_conditional_allowlisted_assignment_keeps_the_incoming_parameter() -> None:
+    source = """
+async def handle_intervention(websocket, message, flag):
+    try:
+        pass
+    except RuntimeError as e:
+        if flag:
+            message = f"Runtime error: {str(e)}"
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the false branch still forwards raw input"
+
+
+def test_allowlisted_assignment_after_sink_cannot_rewrite_history() -> None:
+    source = """
+async def handle_intervention(websocket, message):
+    try:
+        pass
+    except RuntimeError as e:
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+        message = f"Runtime error: {str(e)}"
+"""
+
+    assert _guard_offenders(source), "a later binding cannot sanitize an earlier send"
+
+
+@pytest.mark.parametrize(
+    "control_flow",
+    [
+        'for item in items:\n            message = f"Runtime error: {str(e)}"',
+        'async for item in items:\n            message = f"Runtime error: {str(e)}"',
+        'while items:\n            message = f"Runtime error: {str(e)}"\n            break',
+        'match items:\n            case [item]:\n                message = f"Runtime error: {str(e)}"',
+    ],
+    ids=["for", "async-for", "while", "match"],
+)
+def test_conditional_control_flow_keeps_the_incoming_parameter(
+    control_flow: str,
+) -> None:
+    source = f"""
+async def handle_intervention(websocket, message, items):
+    try:
+        pass
+    except RuntimeError as e:
+        {control_flow}
+        await manager.send_personal_message(
+            {{"type": "error", "message": message}},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the control flow can skip the safe binding"
+
+
+def test_short_circuit_walrus_keeps_the_incoming_parameter() -> None:
+    source = """
+async def handle_intervention(websocket, message, flag):
+    try:
+        pass
+    except RuntimeError as e:
+        flag and (message := f"Runtime error: {str(e)}")
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the short-circuited walrus may never bind"
+
+
+def test_guard_catches_augassign_that_keeps_a_forwarded_parameter() -> None:
+    source = """
+async def leak(websocket, message):
+    message += "!"
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=message,
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_catches_a_nested_unpack_rebinding() -> None:
+    source = """
+async def leak(websocket, message, source):
+    ((message, other), final) = source
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=message,
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        'message_data.get("error", "fallback")',
+        'message_data.get("error")',
+        'error.__dict__.get("detail", "fallback")',
+    ],
+)
+def test_guard_rejects_get_calls_from_untrusted_receivers(expression: str) -> None:
+    source = f"""
+async def leak(websocket, message_data, error):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message={expression},
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_accepts_the_curated_rejection_table_lookup() -> None:
+    source = """
+async def reject(websocket, reason):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=_TURN_REJECTION_MESSAGES.get(reason, "Task is busy"),
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert not _guard_offenders(source)
+
+
+def test_guard_resolves_a_single_name_producer_alias() -> None:
+    source = """
+async def leak(websocket):
+    producer = send_message_delivery
+    try:
+        pass
+    except Exception as error:
+        await producer(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=f"leaked: {str(error)}",
+            rejection_outcome="not_accepted",
+        )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_resolves_a_module_level_producer_alias() -> None:
+    source = """
+producer = send_message_delivery
+
+async def leak(websocket, error):
+    await producer(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=str(error),
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_allowlist_does_not_apply_to_a_same_named_nested_handler() -> None:
+    source = """
+async def outer(websocket):
+    async def handle_intervention():
+        try:
+            pass
+        except RuntimeError as e:
+            await manager.send_personal_message(
+                {"type": "error", "message": f"Runtime error: {str(e)}"},
+                websocket,
+            )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_ignores_a_same_named_method_on_an_unrelated_receiver() -> None:
+    source = """
+async def audit_failure(audit, error):
+    await audit.send_text(
+        json.dumps({"type": "error", "message": str(error)})
+    )
+"""
+
     assert not _guard_offenders(source)
 
 

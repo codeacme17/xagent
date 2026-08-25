@@ -355,6 +355,11 @@ class ClientVisibleError(Exception):
     redacted, so forgetting the marker fails closed.
     """
 
+    def __init__(self, *args: object) -> None:
+        if type(self) is ClientVisibleError:
+            raise TypeError("ClientVisibleError must be subclassed")
+        super().__init__(*args)
+
 
 class ClientVisibleValidationError(ClientVisibleError, ValueError):
     """A validation failure whose text is safe to show the sender."""
@@ -392,11 +397,11 @@ def client_safe_error_message(error: BaseException) -> str:
     Read a passing sweep as "the recognized shapes are clean", never as
     "nothing reaches a client raw".
     """
-    return (
-        str(error)
-        if isinstance(error, ClientVisibleError)
-        else CLIENT_SAFE_VALIDATION_ERROR
-    )
+    if isinstance(error, ClientVisibleError):
+        message = str(error)
+        if message.strip():
+            return message
+    return CLIENT_SAFE_VALIDATION_ERROR
 
 
 def client_safe_task_command_failure(
@@ -423,6 +428,15 @@ def log_client_facing_failure(error: Exception, template: str, *args: object) ->
     ``template`` ends in the ``%s`` that receives ``error``; ``args`` fill the
     placeholders before it.
     """
+    if not template.endswith("%s") or template.count("%s") != len(args) + 1:
+        logger.error(
+            "Malformed client-facing log template %r with args=%r; original error: %s",
+            template,
+            args,
+            error,
+            exc_info=not isinstance(error, ClientVisibleError),
+        )
+        return
     if isinstance(error, ClientVisibleError):
         logger.warning(template, *args, error)
     else:
