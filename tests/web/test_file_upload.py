@@ -1643,6 +1643,51 @@ class TestFileManagement:
         finally:
             db.close()
 
+    def test_delete_file_backend_value_error_is_still_a_retryable_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
+    ):
+        """A ValueError from the backend is an outage, not a malformed key.
+
+        ``ScopedFileStorage.delete`` normalizes and then calls ``fs.exists`` /
+        ``fs.rm``, and those raise ``ValueError`` for their own reasons. The
+        malformed-key half of #1473 must not swallow that case: catching
+        ``ValueError`` around the whole call made every backend one permanent,
+        bypassing both the durable-outage log and the retryable 503. The key
+        is validated before the call now, so only the normalization boundary
+        is permanent.
+        """
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        _, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("backend-value-error.txt", b"payload", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        def backend_value_error(self, key):
+            raise ValueError("backend rejected the request")
+
+        monkeypatch.setattr(FsspecFileStorage, "delete", backend_value_error)
+
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        # Retryable, not the permanent 500 a malformed key produces.
+        assert response.status_code == 503, response.text
+        # And it is reported as a durable-storage fault, with its cause.
+        fault_lines = [
+            entry.getMessage()
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
+        ]
+        assert len(fault_lines) == 1, caplog.records
+        assert "durable cleanup before row delete" in fault_lines[0]
+
     def test_delete_file_scope_violation_is_not_reported_as_an_outage(
         self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
     ):

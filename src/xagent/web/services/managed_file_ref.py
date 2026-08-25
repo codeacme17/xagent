@@ -48,13 +48,16 @@ class DurableObjectMissingError(FileNotFoundError):
     """Raised when a registered file has no local copy or durable object."""
 
 
-# Rendered fields sit in a plain-text log line, so a value carrying a newline
-# would start what reads as a new, fully-formatted record (CWE-117). Some of
-# these values are client-supplied -- ``/v1/*`` passes the ``files`` list from
-# the request body, which is an unvalidated ``list[str]`` -- so a caller cannot
-# be relied on to have checked. Sanitising here covers every field at every
-# site, including ones added later.
+# Field values are rendered into a plain-text ``key=value`` line, so a value
+# must stay one token: whitespace in it would let a client-supplied string put
+# what reads as further fields on the same record (CWE-117). Quoting is not
+# enough -- it only protects consumers that honour quotes, and the deployed
+# logs are read by whitespace tokenizers -- so whitespace is escaped instead.
+# Some of these values are client-supplied (``/v1/*`` renders the request's
+# ``files`` list, an unvalidated ``list[str]``), so a caller cannot be relied
+# on to have checked.
 _LOG_VALUE_TRANSLATION = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
+_LOG_VALUE_WHITESPACE = re.compile(r"\s")
 
 # Long enough for a UUID list of realistic size, short enough that one field
 # cannot crowd out the rest of the line.
@@ -62,52 +65,35 @@ _MAX_LOG_VALUE_LENGTH = 256
 
 # The stable prefix every durable-fault line starts with, and the anchor the
 # operational note tells alerts to key on. Public because tests assert on its
-# *absence* to prove an integrity fault was not reported as an outage -- with
-# the string inlined there, rewording this message would leave those
-# assertions passing vacuously against text that no longer exists.
+# *absence* to prove an integrity fault was not reported as an outage, and an
+# inlined copy there would pass vacuously once this text changed.
 DURABLE_FAULT_LOG_PREFIX = "Durable storage unavailable during"
 
-# Whitespace -- not a newline -- is what lets a client-supplied value forge a
-# *second field on the same line*: ``file_ids=abc user_id=999`` reads as two
-# fields to anything that splits on whitespace, no line break required. A value
-# carrying any is therefore quoted. Conditional, because every field rendered
-# today (ids, keys, counts) has no whitespace and stays bare and greppable.
-_LOG_VALUE_NEEDS_QUOTING = re.compile(r"\s")
+
+def _escape_whitespace(match: re.Match[str]) -> str:
+    """Render one whitespace character as an unambiguous escape."""
+    code = ord(match.group())
+    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
 
 
 def _sanitize_log_value(value: object) -> str:
-    """Flatten a field value to one bounded, single-line, single-*field* token.
+    """Flatten a field value to one bounded, single-token string.
 
-    Contract: callers filter ``None`` out before rendering -- a ``None`` field
-    is dropped from the line entirely, never rendered as ``None`` or ``""``
-    (whether it should render instead is #1642's open question). A new caller
-    must keep that filter; this function does not decide the policy.
+    Callers filter ``None`` out before rendering; a ``None`` field is dropped
+    from the line entirely (whether it should render instead is #1642).
 
-    The escaping is unconditional and the quoting is not, so one value has one
-    encoding either way: a reader unescapes always, and strips the quotes when
-    they are there. (Escaping only inside the quoted branch would give
-    ``a\\nb`` two different renderings depending on whether the value happened
-    to carry a space elsewhere -- same input, two encodings, decodable by
-    nothing.)
-
-    Quoting closes same-line field forgery only. It does not make the value
-    unbreakable to a naive reader: a raw ``\\v``/``\\f``/U+2028 still splits a
-    line visually because it is not in the escape table above (#1519), and the
-    record as a whole stays forgeable through ``exc_info`` text (#1516).
-
-    ``_MAX_LOG_VALUE_LENGTH`` bounds the value *before* escaping; escaping can
-    at most double it and quoting adds two, so the rendered token is bounded
-    too, just not by that number exactly.
+    The escape character goes first so the result stays decodable: ``\\\\``
+    is a literal backslash, ``\\n`` a newline, ``\\x20`` a space. What this
+    does not do is make the whole *record* unforgeable -- ``exc_info`` text is
+    rendered verbatim by the formatter (#1516), and ESC is not whitespace so it
+    still passes through (#1519).
     """
-    text = str(value).translate(_LOG_VALUE_TRANSLATION)
+    text = str(value).replace("\\", "\\\\")
+    text = text.translate(_LOG_VALUE_TRANSLATION)
+    text = _LOG_VALUE_WHITESPACE.sub(_escape_whitespace, text)
     if len(text) > _MAX_LOG_VALUE_LENGTH:
-        text = f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
-    # The closer and the escape character itself, so a quoted value cannot end
-    # its own region and resume as bare text.
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-    if _LOG_VALUE_NEEDS_QUOTING.search(text):
-        return f'"{escaped}"'
-    return escaped
+        return f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
+    return text
 
 
 def log_durable_storage_fault(
@@ -119,67 +105,38 @@ def log_durable_storage_fault(
     """Record a durable-storage fault with its full cause chain.
 
     The single implementation for every site that reports a durable-storage
-    fault *as such*, so none of them can log it without its cause.
+    fault *as such*. That is narrower than every consumer of the class: it is
+    a ``RuntimeError``, so broad ``except Exception``/``except RuntimeError``
+    arms (chat.py, kb.py, core/workspace.py) absorb it without naming it, and
+    each keeps its own ``exc_info`` instead of the fields rendered here.
 
-    That is narrower than "every consumer of ``DurableStorageOperationError``",
-    and the difference matters: the class is a ``RuntimeError``, so broad
-    ``except Exception`` / ``except RuntimeError`` arms elsewhere absorb it
-    without ever naming it -- agent-service setup in web/api/chat.py,
-    knowledge-base refresh in web/api/kb.py, and workspace file resolution in
-    core/workspace.py. Those arms cannot route through this function, because
-    they handle every exception type; each carries ``exc_info`` so the chain
-    survives there, but none of them produces the fields this function renders.
+    The provider class, HTTP status, and throttle-vs-timeout-vs-credentials
+    distinction live only in ``__cause__``, and none of the envelopes these
+    faults become -- ``HTTPException``, the ``/v1/*`` body, a tool result --
+    carries a traceback, so ``exc_info`` is what gets them into a log (#1467).
 
-    So the accurate claim is about *naming*, not about coverage: a site that
-    reports this fault as a durable-storage fault does it here, and a site that
-    merely absorbs it keeps its own traceback. Anything added later in the first
-    category belongs here. Do not restate this as "every consumer" -- that was
-    the wording it replaced, and it was false.
+    ``target_logger`` is the caller's, so a line stays attributed to the
+    endpoint or tool that produced it. ``operation`` must be a bounded label,
+    a small fixed set of values, so it stays aggregatable; per-request
+    identifiers belong in ``fields``.
 
-    The wraps in this module keep the storage key on the exception rather than
-    in its message (see ``DurableStorageOperationError``); the provider error
-    class, the
-    HTTP status, and throttle vs. timeout vs. rejected credentials live in
-    ``__cause__`` and nowhere else, and none of the envelopes these faults
-    become -- FastAPI's ``HTTPException``, the ``/v1/*`` error body, a tool
-    result -- carries a traceback. ``exc_info`` is the only thing that gets the
-    chain into a log (#1467).
-
-    ``target_logger`` is the caller's logger rather than this module's, so a
-    line stays attributed to the endpoint or tool that produced it.
-
-    Translation stays per call site while #1521 (ASGI boundary handler vs.
-    per-site arms) is undecided; this helper is the shared half either answer
-    keeps.
-
-    Field values are escaped and bounded, because some are client-supplied.
-    That covers the fields *this* function renders -- it does **not** make the
-    record as a whole unforgeable: the formatter renders ``exc_info`` verbatim,
-    so a newline in a provider exception message still produces a physical
-    continuation line. Closing that needs the formatter itself and is tracked in
-    #1516; do not read the sanitising below as a stronger guarantee than it is.
-
-    ``operation`` must be a bounded label -- a small fixed set of values, so it
-    stays aggregatable. Per-request identifiers belong in ``fields``, which is
-    rendered as ``key=value`` pairs *in the message*: the deployed formatter is
-    ``"%(asctime)s %(levelname)-8s %(name)s - %(message)s"``
-    (see web/logging_config.py), which never renders ``extra``, so anything
-    passed that way would be invisible in exactly the logs an incident is
-    diagnosed from.
+    Fields are rendered as ``key=value`` *in the message*, not via ``extra=``:
+    the deployed formatter (``web/logging_config.py``) renders only
+    ``%(message)s``, so anything passed as ``extra`` is invisible in exactly
+    the logs an incident is read from. Values are escaped and bounded because
+    some are client-supplied; that bounds the fields, not the whole record,
+    whose ``exc_info`` text the formatter still renders verbatim (#1516).
     """
-    # One record per fault instance: a wrap can traverse more than one arm
-    # that legitimately reports it -- a request-scoped arm that answers the
-    # client, then an endpoint-scoped arm that catches whatever escaped --
-    # and the mark is what makes each arm safe to write independently. Only
-    # this module's own wraps are marked (the attribute is declared on the
-    # class), so no guard is needed around the read or the write.
+    # One record per fault instance: a wrap can cross several arms that each
+    # legitimately report it, and the mark is what makes them safe to write
+    # independently. Only this module's wraps are marked, and the attribute is
+    # declared on the class, so neither the read nor the write needs a guard.
     if isinstance(exc, DurableStorageOperationError):
         if exc._durable_fault_logged:
             return
-        # The wraps carry the key on the exception rather than in its message,
-        # so ``str(exc)`` is safe wherever it escapes. Rendering it here is what
-        # keeps that from costing the log anything: the key reaches this line
-        # from every site, including ones that never passed it as a field.
+        # The key rides on the exception, not in its message (#1643), so it
+        # reaches this line from every site -- including ones that never pass
+        # it as a field -- while ``str(exc)`` stays safe wherever it escapes.
         # An explicit field wins, so a caller can still name a different key.
         if exc.storage_key and "storage_key" not in fields:
             fields = {**fields, "storage_key": exc.storage_key}

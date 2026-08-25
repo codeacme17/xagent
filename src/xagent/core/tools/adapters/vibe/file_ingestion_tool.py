@@ -211,10 +211,11 @@ async def _create_knowledge_base_from_file_impl(
                 )
                 # Deliberately does NOT interpolate ``exc``. This string is
                 # joined into the tool result, so it reaches the model and the
-                # conversation transcript -- and ``str(exc)`` is the wrap's
-                # message, which carries the storage key, whose scope segments
-                # encode the owning user's id. The provider detail belongs in
-                # the log line above, which is server-side only.
+                # conversation transcript, and the provider detail belongs in
+                # the log line above, which is server-side only. (Since #1643
+                # the storage key is on ``storage_key`` rather than in the
+                # message, so it is the provider text -- not the key -- that
+                # interpolating would expose here.)
                 errors.append(
                     f"Failed to restore {record.filename} from durable storage"
                 )

@@ -899,9 +899,6 @@ def test_field_values_cannot_forge_a_log_record(
     assert not any(line.startswith("2026-01-01") for line in rendered.splitlines()), (
         "the injected text must not stand as its own record"
     )
-    # It carries whitespace, so it is also quoted -- see the same-line forgery
-    # test below for why that half matters independently.
-    assert 'file_ids="' in message_line
 
 
 def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
@@ -909,13 +906,19 @@ def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
 ) -> None:
     """Whitespace, not a newline, is the cheaper forgery -- close that too.
 
-    Escaping line breaks stops a value from fabricating a whole *record*, and
-    nothing stopped it fabricating a *field*: rendered bare, a client-supplied
-    ``abc user_id=999`` put two more ``key=value`` pairs on the line, indistin-
-    guishable from the ones the helper renders itself. An operator reading the
-    line -- or anything parsing it -- would attribute the fault to another
-    tenant and another file. No line break needed, so neither the escape table
-    (#1519) nor the ``exc_info`` channel (#1516) covers it.
+    Escaping line breaks stops a value fabricating a whole *record*, and
+    nothing stopped it fabricating a *field*: rendered with its spaces intact,
+    a client-supplied ``abc user_id=999`` put two more ``key=value`` pairs on
+    the line, and an operator -- or anything parsing it -- would attribute the
+    fault to another tenant and another file.
+
+    Asserted through the tokenizer a consumer actually uses, not against the
+    escaping this file happens to do. The first attempt at this quoted the
+    value instead, and asserted by stripping the quoted substring before
+    looking -- which proved the quoting existed, not that anything downstream
+    was safe. It was not: a whitespace tokenizer splits ``file_ids="abc`` from
+    ``user_id=999`` and reads the forgery as real, because nothing obliges a
+    log reader to honour quotes.
     """
     forged = "abc user_id=999 file_id=someone-elses"
 
@@ -926,13 +929,16 @@ def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
             )
 
     message_line = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
-    # The whole value is one quoted token, so the forged pairs are inside it.
-    assert f'file_ids="{forged}"' in message_line
-    # And no bare forged field stands on its own next to the real ones.
-    assert " user_id=999" not in message_line.replace(f'"{forged}"', "")
-    assert " file_id=someone-elses" not in message_line.replace(f'"{forged}"', "")
-    # The real fields stay bare and greppable -- quoting is conditional.
-    assert f"storage_key={_STORAGE_KEY}" in message_line
+
+    # The consumer: split on whitespace, then on the first ``=``. This is what
+    # awk, a kv filter, and a grep pipeline all do.
+    fields = dict(token.split("=", 1) for token in message_line.split() if "=" in token)
+    assert set(fields) == {"file_ids", "storage_key"}, fields
+    assert "user_id" not in fields and "file_id" not in fields
+    # The value survives whole in the one field it belongs to, escaped.
+    assert fields["file_ids"].replace("\\x20", " ") == forged
+    # Fields the helper renders itself stay untouched and greppable.
+    assert fields["storage_key"] == _STORAGE_KEY
 
 
 def test_the_exported_prefix_is_the_one_the_helper_emits(
@@ -951,47 +957,6 @@ def test_the_exported_prefix_is_the_one_the_helper_emits(
 
     rendered = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
     assert rendered.startswith(f"{DURABLE_FAULT_LOG_PREFIX} download"), rendered
-
-
-def test_one_value_has_one_encoding_whether_or_not_it_is_quoted() -> None:
-    """Escaping is unconditional; only the quoting is conditional.
-
-    The first version escaped inside the quoted branch only, so ``a\\nb``
-    rendered as ``a\\nb`` bare but as ``a\\\\nb`` once any space elsewhere in
-    the value triggered quoting -- the same input with two encodings, which a
-    consumer cannot decode. Quoting may frame the value; it may not change it.
-    """
-    from xagent.web.services.managed_file_ref import _sanitize_log_value
-
-    bare = _sanitize_log_value("a\nb")
-    quoted = _sanitize_log_value("a\nb c")
-
-    assert not bare.startswith('"')
-    assert quoted.startswith('"') and quoted.endswith('"')
-    # The quoted rendering is the bare one, framed and with the space -- not a
-    # differently-escaped string.
-    assert quoted[1:-1] == f"{bare} c"
-
-
-def test_a_quoted_value_cannot_end_its_own_quoting(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The escape of the closer is what makes the quoting load-bearing.
-
-    Without escaping ``"`` (and the escape character itself), a value can close
-    the quoted region early and resume as bare text -- forging fields again,
-    one level down.
-    """
-    forged = 'abc" user_id=999'
-
-    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
-        with pytest.raises(HTTPException):
-            files_api._raise_durable_storage_unavailable(
-                _wrapped_fault(), "upload", file_ids=forged
-            )
-
-    message_line = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
-    assert 'file_ids="abc\\" user_id=999"' in message_line
 
 
 @pytest.mark.parametrize("length", [_MAX_LOG_VALUE_LENGTH - 1, _MAX_LOG_VALUE_LENGTH])

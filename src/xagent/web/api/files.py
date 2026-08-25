@@ -37,7 +37,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.execution_scope import resolve_execution_scope
-from ...core.file_storage import get_user_file_storage
+from ...core.file_storage import get_user_file_storage, normalize_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
@@ -114,17 +114,12 @@ logger = logging.getLogger(__name__)
 
 file_router = APIRouter(prefix="/api/files", tags=["files"])
 
+
 # Faults the delete-cleanup arm must let propagate instead of folding into the
 # retryable 503 (#1473): the namespace-authority family, plus ValueError from
 # ``normalize_storage_key`` for a structurally-invalid persisted key. A named
 # tuple constant rather than ``(*..., ValueError)`` inline: mypy only accepts
 # a name or a tuple display of types in an ``except`` clause.
-_PERMANENT_CLEANUP_FAULTS: tuple[type[BaseException], ...] = (
-    *NAMESPACE_AUTHORITY_ERRORS,
-    ValueError,
-)
-
-
 def _raise_durable_storage_unavailable(
     exc: Exception, operation: str, **fields: object
 ) -> NoReturn:
@@ -136,10 +131,11 @@ def _raise_durable_storage_unavailable(
     lost, which is the bug #1467 was filed for). The 503 body is deliberately
     detail-free, which is what makes the log the only record.
 
-    ``exc``'s text carries the storage key, whose scope segments can encode
-    end-user identity, so it is only ever logged -- never returned to the
-    client. Pass request identifiers as ``fields``, and keep ``operation`` a
-    bounded label so it stays aggregatable.
+    The 503 body carries no detail from ``exc``. The storage key rides on the
+    exception's ``storage_key`` attribute rather than its message (#1643), so
+    the log line renders it as a field while ``str(exc)`` stays safe wherever
+    it escapes. Pass request identifiers as ``fields``, and keep ``operation``
+    a bounded label so it stays aggregatable.
 
     ``exc`` is ``Exception``, not ``BaseException``, so mypy rejects a caller
     that hands over an ``asyncio.CancelledError`` or ``KeyboardInterrupt``:
@@ -2193,22 +2189,22 @@ async def delete_file(
         storage_key = str(file_record.storage_key or "")
         storage_status = str(file_record.storage_status or "")
         if storage_key and storage_status == "available":
+            # Validate the persisted key *before* the try. A malformed one
+            # (null byte, empty, ``.``/``..`` segment -- rejected even in
+            # tolerant mode) is permanent, and no retry clears it, which is
+            # the half of #1473 about ``ValueError``. Doing it here rather
+            # than catching ``ValueError`` around the call is what keeps a
+            # *backend* ``ValueError`` -- ``fs.exists``/``fs.rm`` raise it
+            # too -- on the retryable path below where it belongs.
+            normalize_storage_key(storage_key, strict=False)
             try:
                 get_user_file_storage(_file_user_id_value(file_record)).delete(
                     storage_key
                 )
-            except _PERMANENT_CLEANUP_FAULTS:
-                # Permanent faults, not outages: folding either into the
-                # retryable 503 below is what #1473 tracked. A containment
-                # violation propagates to its dedicated handler in web/app.py,
-                # consistent with every other site in this file. A ValueError
-                # from ``normalize_storage_key`` (null byte, empty key, ``.``/
-                # ``..`` segment -- raised even in tolerant mode) means the
-                # persisted key itself is malformed, which no retry can clear;
-                # it has no dedicated handler, so it surfaces as the generic
-                # 500. The arm deliberately admits any ValueError from the
-                # call -- there is no narrower type to name, and none of them
-                # is an outage.
+            except NAMESPACE_AUTHORITY_ERRORS:
+                # A containment violation is permanent too, and has its own
+                # handler in web/app.py -- consistent with every other site in
+                # this file.
                 raise
             except Exception as exc:
                 _raise_durable_storage_unavailable(

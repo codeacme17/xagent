@@ -1384,8 +1384,10 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     * the provider fault only exists in ``__cause__``, and no envelope this
       path produces carries a traceback, so the log line is its only record;
     * the error string is joined into the tool result, so it reaches the model
-      and the conversation transcript -- and the wrap's message embeds the
-      storage key, whose scope segments encode the owning user's id.
+      and the conversation transcript, and provider text does not belong
+      there. (The storage key itself moved onto ``storage_key`` in #1643, so
+      what interpolation would expose today is the provider detail, not the
+      key -- the redaction obligation is the same either way.)
 
     Interpolating the exception into that string satisfied the first obligation
     while violating the second.
