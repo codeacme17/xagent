@@ -527,6 +527,26 @@ describe("ClarificationForm delivery failures", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
   })
 
+  it("reads the reason off a failure that is not an Error instance", async () => {
+    // `onSend` belongs to arbitrary builder callbacks (#1485), so a rejection
+    // carrying the contract's fields need not be an `Error` subclass - the
+    // disposition is probed structurally and the reason has to match.
+    const onSend = vi.fn().mockRejectedValue({
+      message: "A previous guidance message is still being applied.",
+      disposition: "rejected",
+      userFacing: true,
+    })
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "A previous guidance message is still being applied.",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+  })
+
   it("uses hint keys that resolve in both locale trees", () => {
     // The component tests stub t() as identity, so they pin the key strings
     // only against themselves. This binds them to the real trees: a typo'd

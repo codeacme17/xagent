@@ -71,6 +71,10 @@ const readSendDisposition = (error: unknown): MessageDeliveryDisposition | null 
  * shown as-is. Connection plumbing messages stay behind the localized string:
  * they are English diagnostics, and a widget visitor is not the audience for
  * them.
+ *
+ * The message is probed structurally for the same reason the disposition is:
+ * an `onSend` callback's rejection need not be an `Error` instance. Nothing
+ * new becomes displayable either way — `userFacing` still has to be set.
  */
 const readSendReason = (error: unknown): string => {
   if (
@@ -80,7 +84,8 @@ const readSendReason = (error: unknown): string => {
   ) {
     return ""
   }
-  return error instanceof Error ? error.message.trim() : ""
+  const message = (error as { message?: unknown }).message
+  return typeof message === "string" ? message.trim() : ""
 }
 
 // Interaction types that are "live widgets" reflecting external state (e.g.
