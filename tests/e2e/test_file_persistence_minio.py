@@ -17,6 +17,7 @@ from tests.e2e.minio_harness import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
@@ -260,13 +261,16 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
         assert execution_started["type"] == "execution_started"
         error_message = _receive_until_execution_error(websocket)
 
-    error_text = str(
-        error_message.get("error") or error_message.get("message") or ""
-    ).lower()
-    assert "durable object" in error_text
+    assert error_message["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert error_message["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "simulated MinIO output write outage" not in repr(error_message)
 
     db = session_factory()
     try:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert "durable object" in str(task.error_message).lower()
         assert (
             db.query(UploadedFile)
             .filter(
