@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { McpApp } from "@/contexts/mcp-apps-context"
+import { resolveTranslation } from "@/i18n/translations"
 
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -386,5 +387,181 @@ describe("ClarificationForm connect_apps interaction", () => {
     expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
     // An ordinary field's own persisted label is untouched by this.
     expect(screen.getByText("Note:")).toBeInTheDocument()
+  })
+})
+
+describe("ClarificationForm delivery failures", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  const deliveryError = (
+    message: string,
+    disposition: string,
+    userFacing = false,
+  ) => Object.assign(new Error(message), { disposition, userFacing })
+
+  const submitAnswer = async (onSend: ReturnType<typeof vi.fn>) => {
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+        onSend={onSend}
+      />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+  }
+
+  it("surfaces the backend rejection reason instead of the generic toast", async () => {
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "A previous guidance message is still being applied. Please wait for it to finish.",
+      "rejected",
+      true,
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "A previous guidance message is still being applied. Please wait for it to finish.",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A previous guidance message is still being applied.",
+    )
+  })
+
+  it("keeps the form submittable after a failure that never reached the agent", async () => {
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(
+      "Durable storage is temporarily unavailable",
+      { description: "chatPage.clarification.sendNotSent" },
+    ))
+    const submit = screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })
+    expect(submit).toBeEnabled()
+    expect(screen.getByRole("textbox")).toHaveValue("Beijing")
+  })
+
+  it("warns before a resubmit when the delivery outcome is unknown", async () => {
+    // No resubmit guard exists in this component (a retry mints a fresh
+    // client message id today), so the copy must warn - not promise safety.
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "The task is busy applying an earlier answer.",
+      "outcome_unknown",
+      true,
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "The task is busy applying an earlier answer.",
+        { description: "chatPage.clarification.sendOutcomeUnknown" },
+      )
+    })
+    // Advisory only: the button stays enabled, exactly as it does today.
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeEnabled()
+  })
+
+  it("keeps connection plumbing diagnostics away from the visitor", async () => {
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "Message not sent: the connection changed before delivery.",
+      "not_sent",
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    expect(await screen.findByRole("alert")).not.toHaveTextContent(
+      "the connection changed before delivery",
+    )
+  })
+
+  it("falls back to the generic string when the failure carries no reason", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("   "))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        undefined,
+      )
+    })
+  })
+
+  it("clears the failure once the visitor edits an answer", async () => {
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+
+    await submitAnswer(onSend)
+
+    await screen.findByRole("alert")
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Shanghai" } })
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
+  })
+
+  it("uses hint keys that resolve in both locale trees", () => {
+    // The component tests stub t() as identity, so they pin the key strings
+    // only against themselves. This binds them to the real trees: a typo'd
+    // key would fall back to itself instead of a translated sentence.
+    for (const key of [
+      "chatPage.clarification.sendNotSent",
+      "chatPage.clarification.sendOutcomeUnknown",
+    ] as const) {
+      expect(resolveTranslation("en", key)).not.toBe(key)
+      expect(resolveTranslation("zh", key)).not.toBe(key)
+    }
+  })
+
+  it("clears a previous round's failure when the form is asked again", async () => {
+    // The live turn render path keeps one component instance across
+    // clarification rounds, so a stale round-1 alert would sit on top of
+    // round 2's question.
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "Durable storage is temporarily unavailable",
+      "not_sent",
+      true,
+    ))
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} active />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    await screen.findByRole("alert")
+
+    rerender(<ClarificationForm interactions={interactions} active={false} />)
+    rerender(<ClarificationForm interactions={interactions} active />)
+
+    expect(screen.queryByRole("alert")).toBeNull()
   })
 })
