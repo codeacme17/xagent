@@ -29,6 +29,7 @@ from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
 from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
+    DURABLE_FAULT_LOG_PREFIX,
     DurableStorageOperationError,
     ManagedFileRef,
     log_durable_storage_fault,
@@ -399,7 +400,7 @@ def test_v1_turn_attachment_integrity_fault_is_not_reported_as_an_outage(
     assert not [
         line
         for line in _warnings(caplog, v1_tasks.logger.name)
-        if "Durable storage unavailable" in line
+        if DURABLE_FAULT_LOG_PREFIX in line
     ], "an integrity fault emitted an outage warning -- the arms are misordered"
 
 
@@ -435,6 +436,18 @@ def _module_ast(module: Any) -> ast.Module:
     return ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
 
 
+def _callee_name(call: ast.Call) -> str | None:
+    """The function name a call targets, bare or qualified."""
+    return _exception_name(call.func)
+
+
+def _operation_label_node(call: ast.Call) -> ast.expr | None:
+    """The expression a call passes as ``operation``, positional or keyword."""
+    if len(call.args) > 1:
+        return call.args[1]
+    return next((kw.value for kw in call.keywords if kw.arg == "operation"), None)
+
+
 def _operation_label_of(call: ast.Call, where: str) -> str:
     """The call's operation label, which must be a string literal.
 
@@ -442,11 +455,7 @@ def _operation_label_of(call: ast.Call, where: str) -> str:
     must fail with "not a literal", never silently drop out of a drift
     comparison or die on an IndexError.
     """
-    node = (
-        call.args[1]
-        if len(call.args) > 1
-        else next((kw.value for kw in call.keywords if kw.arg == "operation"), None)
-    )
+    node = _operation_label_node(call)
     assert isinstance(node, ast.Constant) and isinstance(node.value, str), (
         f"{where}:{call.lineno}: the operation label must be a string "
         f"literal (positional or operation=); got {ast.unparse(call)[:90]!r}"
@@ -454,13 +463,53 @@ def _operation_label_of(call: ast.Call, where: str) -> str:
     return node.value
 
 
+def _package_modules(package_root: Path) -> list[Path]:
+    """Every module the repo-wide sweeps below walk, in a stable order."""
+    return sorted(package_root.rglob("*.py"))
+
+
+def _parse_module_file(path: Path) -> ast.Module:
+    """Parse a source file, naming it if it cannot be read or parsed.
+
+    The sweeps walk the whole package, so an unrelated unparsable or
+    non-UTF-8 file would otherwise fail them with a traceback that names
+    neither the file nor why this test touched it.
+    """
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise AssertionError(
+            f"{path} could not be parsed while sweeping the package for "
+            f"durable-fault sites ({exc.__class__.__name__}: {exc}). This is "
+            "not a durable-storage failure -- fix or exclude that file."
+        ) from exc
+
+
+def _exception_name(node: ast.expr) -> str | None:
+    """The class name an ``except`` operand refers to, bare or qualified.
+
+    ``ast.Attribute`` counts: a module refactored to ``except mfr.Durable...``
+    would otherwise drop out of every sweep below with nothing failing.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
 def _handler_types(handler: ast.ExceptHandler) -> list[str]:
     """The exception class names an ``except`` arm names, tuple or not."""
-    if isinstance(handler.type, ast.Name):
-        return [handler.type.id]
+    if handler.type is None:
+        return []
     if isinstance(handler.type, ast.Tuple):
-        return [e.id for e in handler.type.elts if isinstance(e, ast.Name)]
-    return []
+        return [
+            name
+            for name in (_exception_name(element) for element in handler.type.elts)
+            if name is not None
+        ]
+    name = _exception_name(handler.type)
+    return [name] if name is not None else []
 
 
 def _durable_arm_pairs(tree: ast.Module) -> list[ast.Try]:
@@ -617,52 +666,96 @@ _MODULES_WITH_DURABLE_ARM_PAIRS = (
 )
 
 
-# The two sites that call the shared helper directly, without files.py's
-# ``_raise_durable_storage_unavailable`` wrapper, and therefore sit outside
-# the files.py sweep above. Same contract: a bounded literal label and a
-# declared field set.
-_DIRECT_HELPER_SITES = (
-    ("web/api/v1/tasks.py", lambda: v1_tasks, "turn attachment resolution"),
-    (
-        "core/tools/adapters/vibe/file_ingestion_tool.py",
-        lambda: _file_ingestion_tool(),
-        "knowledge-base file restore",
-    ),
+# Every direct ``log_durable_storage_fault`` call in the tree, by module and
+# bounded label. "Direct" means not through files.py's
+# ``_raise_durable_storage_unavailable`` wrapper, whose own forwarding call
+# passes its caller's label along as a parameter -- the one site whose label
+# is legitimately not a literal, pinned by the files.py sweep instead.
+_DIRECT_HELPER_SITES = frozenset(
+    {
+        ("web/api/files.py", "upload compensation"),
+        ("web/api/v1/tasks.py", "turn attachment resolution"),
+        (
+            "core/tools/adapters/vibe/file_ingestion_tool.py",
+            "knowledge-base file restore",
+        ),
+    }
 )
 
+# Labels that are legitimately not string literals, by module and the name
+# they are passed as, each with what keeps the value bounded. A label must be
+# a literal *or* appear here -- "not a literal" alone is not a licence, or a
+# future site passing an unbounded variable would be waved through as if it
+# were one of these.
+_BOUNDED_NON_LITERAL_LABELS = {
+    # The wrapper forwarding its caller's label; the literals live at its
+    # callers, where the files.py sweep above checks them.
+    ("web/api/files.py", "operation"),
+}
 
-@pytest.mark.parametrize(
-    ("label", "loader", "expected_operation"), _DIRECT_HELPER_SITES
-)
-def test_direct_helper_sites_keep_a_bounded_literal_label(
-    label: str, loader: Any, expected_operation: str
-) -> None:
-    """The two non-files.py reporting sites are held to the same label rules.
 
-    The files.py sweep cannot see them -- they call the shared helper
-    directly -- so without this, a rewrite of either label to an f-string
-    (the leak-and-cardinality class the sweep exists to prevent) would land
-    unchecked.
+def test_every_direct_helper_site_is_declared_with_a_bounded_label() -> None:
+    """Discovered, not declared: a new direct reporting site cannot go unswept.
+
+    The files.py sweep only sees calls through the ``NoReturn`` wrapper, so a
+    site calling the shared helper directly is outside it. Previously this was
+    a hardcoded pair of modules, which could only check the sites someone
+    remembered to list -- a third would have gone unscanned. Now the tree is
+    walked, and every direct call must carry a string-literal label declared
+    above, so an f-string label (the leak-and-cardinality class this exists to
+    prevent) fails wherever it appears.
     """
-    tree = _module_ast(loader())
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "log_durable_storage_fault"
-    ]
-    assert len(calls) == 1, (
-        f"{label}: expected exactly one direct helper call, found {len(calls)} "
-        "-- add the new site here with its label"
+    package_root = Path(files_api.__file__).parents[2]
+    found: set[tuple[str, str]] = set()
+    forwarding: list[str] = []
+    for path in _package_modules(package_root):
+        module_label = path.relative_to(package_root).as_posix()
+        tree = _parse_module_file(path)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and _callee_name(node) == "log_durable_storage_fault"
+            ):
+                continue
+            label_node = _operation_label_node(node)
+            if isinstance(label_node, ast.Constant) and isinstance(
+                label_node.value, str
+            ):
+                # Only the reporting sites: the wrapper below forwards its
+                # caller's ``**fields`` by design, and its callers' field names
+                # are what the files.py sweep checks.
+                assert all(kw.arg is not None for kw in node.keywords), (
+                    f"{module_label}:{node.lineno} passes **kwargs to the "
+                    "helper, so its field names are not checkable here"
+                )
+                found.add((module_label, label_node.value))
+            elif (
+                isinstance(label_node, ast.Name)
+                and (module_label, label_node.id) in _BOUNDED_NON_LITERAL_LABELS
+            ):
+                # Declared above with the mechanism that bounds it.
+                forwarding.append(f"{module_label}:{label_node.id}")
+            else:
+                raise AssertionError(
+                    f"{module_label}:{node.lineno} passes a label that is "
+                    "neither a string literal nor a declared bounded variable: "
+                    f"{ast.unparse(node)[:90]!r}. A bounded literal keeps the "
+                    "label aggregatable; add it to _DIRECT_HELPER_SITES, or -- "
+                    "if it is a variable something else bounds -- to "
+                    "_BOUNDED_NON_LITERAL_LABELS with that reason."
+                )
+
+    assert found == set(_DIRECT_HELPER_SITES), (
+        f"direct helper sites changed: {found ^ set(_DIRECT_HELPER_SITES)} -- "
+        "declare the new site with its bounded label, or fix a label that "
+        "stopped being a string literal"
     )
-    operation = _operation_label_of(calls[0], label)
-    assert operation == expected_operation, (
-        f"{label}: the operation label must stay the bounded literal "
-        f"{expected_operation!r}; got {operation!r}"
+    assert set(forwarding) == {
+        f"{module}:{name}" for module, name in _BOUNDED_NON_LITERAL_LABELS
+    }, (
+        "the declared bounded-variable labels and the ones actually passed "
+        f"disagree: {sorted(forwarding)} vs {sorted(_BOUNDED_NON_LITERAL_LABELS)}"
     )
-    for keyword in calls[0].keywords:
-        assert keyword.arg is not None, f"{label} passes **kwargs to the helper"
 
 
 def test_every_module_with_an_arm_pair_is_in_the_table() -> None:
@@ -676,9 +769,8 @@ def test_every_module_with_an_arm_pair_is_in_the_table() -> None:
     """
     package_root = Path(files_api.__file__).parents[2]
     found = set()
-    for path in package_root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if _durable_arm_pairs(tree):
+    for path in _package_modules(package_root):
+        if _durable_arm_pairs(_parse_module_file(path)):
             found.add(path.relative_to(package_root).as_posix())
 
     declared = {label for label, _, _ in _MODULES_WITH_DURABLE_ARM_PAIRS}
@@ -701,19 +793,26 @@ def _file_ingestion_tool() -> Any:
 def test_the_integrity_arm_precedes_its_parent_at_every_site(
     label: str, expected: int, loader: Any
 ) -> None:
-    """Checked at all nine pairs, because only two have real end-to-end cover.
+    """Checked at all nine pairs, because three of them have no other guard.
 
-    The integrity subclass goes through a real call path at two of the nine:
-    ``file_ingestion_tool`` (via ``test_kb_creation_tools``) and ``v1/tasks.py``
-    (the resolver test above). At the other seven -- all in ``files.py`` -- the
-    tests either drive the shared helper directly with a pre-built exception or
-    inject only the parent class, so a swapped ordering would change behaviour
-    silently at seven of the nine.
+    Measured, not estimated -- an earlier version of this docstring claimed
+    seven of the nine were unguarded, which was more than twice the truth.
+    Neutralising each integrity arm in turn and running the suite shows six
+    pairs are caught behaviourally: ``_durable_redirect_response``,
+    ``download_file``, ``preview_file`` and the first ``public_preview_file``
+    pair (by the five ``*_checksum_mismatch_asks_user_to_reupload`` tests),
+    plus ``v1/tasks.py`` and ``file_ingestion_tool`` (by the real-path
+    injections in this file and ``test_kb_creation_tools``).
 
-    This does not replace those tests: it proves ordering, not that each arm
-    produces the right answer. What it does is make the one regression that
-    silently breaks the property at every site impossible to land. Real
-    end-to-end coverage for the ``files.py`` seven is #1522.
+    The three where a swapped or deleted arm changes behaviour with no
+    behavioural test failing are ``preview_pptx_as_pdf``,
+    ``public_download_file``, and the second ``public_preview_file`` pair --
+    the task-asset one. Those are what this check is load-bearing for; giving
+    them real end-to-end coverage is #1522.
+
+    This does not replace the behavioural tests: it proves ordering, not that
+    each arm answers correctly. What it adds is that the one regression which
+    breaks the property at every site at once cannot land anywhere.
     """
     tree = _module_ast(loader())
     pairs = _durable_arm_pairs(tree)
@@ -800,6 +899,99 @@ def test_field_values_cannot_forge_a_log_record(
     assert not any(line.startswith("2026-01-01") for line in rendered.splitlines()), (
         "the injected text must not stand as its own record"
     )
+    # It carries whitespace, so it is also quoted -- see the same-line forgery
+    # test below for why that half matters independently.
+    assert 'file_ids="' in message_line
+
+
+def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Whitespace, not a newline, is the cheaper forgery -- close that too.
+
+    Escaping line breaks stops a value from fabricating a whole *record*, and
+    nothing stopped it fabricating a *field*: rendered bare, a client-supplied
+    ``abc user_id=999`` put two more ``key=value`` pairs on the line, indistin-
+    guishable from the ones the helper renders itself. An operator reading the
+    line -- or anything parsing it -- would attribute the fault to another
+    tenant and another file. No line break needed, so neither the escape table
+    (#1519) nor the ``exc_info`` channel (#1516) covers it.
+    """
+    forged = "abc user_id=999 file_id=someone-elses"
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException):
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), "upload", file_ids=forged
+            )
+
+    message_line = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
+    # The whole value is one quoted token, so the forged pairs are inside it.
+    assert f'file_ids="{forged}"' in message_line
+    # And no bare forged field stands on its own next to the real ones.
+    assert " user_id=999" not in message_line.replace(f'"{forged}"', "")
+    assert " file_id=someone-elses" not in message_line.replace(f'"{forged}"', "")
+    # The real fields stay bare and greppable -- quoting is conditional.
+    assert f"storage_key={_STORAGE_KEY}" in message_line
+
+
+def test_the_exported_prefix_is_the_one_the_helper_emits(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The constant the other suites match on must track the real message.
+
+    Four negative assertions elsewhere prove an integrity fault emitted *no*
+    outage line by looking for this text. They previously inlined it, so a
+    reworded message would have left them passing against text that no longer
+    exists. Importing the constant only moves that risk unless the constant
+    itself is pinned to what the helper emits -- which is what this does.
+    """
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        log_durable_storage_fault(files_api.logger, "download", _wrapped_fault())
+
+    rendered = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
+    assert rendered.startswith(f"{DURABLE_FAULT_LOG_PREFIX} download"), rendered
+
+
+def test_one_value_has_one_encoding_whether_or_not_it_is_quoted() -> None:
+    """Escaping is unconditional; only the quoting is conditional.
+
+    The first version escaped inside the quoted branch only, so ``a\\nb``
+    rendered as ``a\\nb`` bare but as ``a\\\\nb`` once any space elsewhere in
+    the value triggered quoting -- the same input with two encodings, which a
+    consumer cannot decode. Quoting may frame the value; it may not change it.
+    """
+    from xagent.web.services.managed_file_ref import _sanitize_log_value
+
+    bare = _sanitize_log_value("a\nb")
+    quoted = _sanitize_log_value("a\nb c")
+
+    assert not bare.startswith('"')
+    assert quoted.startswith('"') and quoted.endswith('"')
+    # The quoted rendering is the bare one, framed and with the space -- not a
+    # differently-escaped string.
+    assert quoted[1:-1] == f"{bare} c"
+
+
+def test_a_quoted_value_cannot_end_its_own_quoting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The escape of the closer is what makes the quoting load-bearing.
+
+    Without escaping ``"`` (and the escape character itself), a value can close
+    the quoted region early and resume as bare text -- forging fields again,
+    one level down.
+    """
+    forged = 'abc" user_id=999'
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException):
+            files_api._raise_durable_storage_unavailable(
+                _wrapped_fault(), "upload", file_ids=forged
+            )
+
+    message_line = _sole_warning(caplog, files_api.logger.name).splitlines()[0]
+    assert 'file_ids="abc\\" user_id=999"' in message_line
 
 
 @pytest.mark.parametrize("length", [_MAX_LOG_VALUE_LENGTH - 1, _MAX_LOG_VALUE_LENGTH])

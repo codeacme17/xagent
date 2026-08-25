@@ -1491,6 +1491,7 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
 
     from xagent.core.tools.core.RAG_tools import kb as kb_module
     from xagent.web.services.managed_file_ref import (
+        DURABLE_FAULT_LOG_PREFIX,
         FILE_INTEGRITY_REUPLOAD_MESSAGE,
         DurableObjectIntegrityError,
     )
@@ -1545,7 +1546,6 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
     outage_lines = [
         entry
         for entry in caplog.records
-        if entry.name == logger_name
-        and "Durable storage unavailable" in entry.getMessage()
+        if entry.name == logger_name and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
     ]
     assert outage_lines == [], "permanent corruption must not read as an outage"

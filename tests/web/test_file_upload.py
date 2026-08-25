@@ -20,6 +20,7 @@ from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.managed_file_ref import DURABLE_FAULT_LOG_PREFIX
 
 
 @pytest.fixture(scope="function")
@@ -1630,7 +1631,7 @@ class TestFileManagement:
             entry
             for entry in caplog.records
             if entry.name == "xagent.web.api.files"
-            and "Durable storage unavailable" in entry.getMessage()
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
         ], "a malformed persisted key was reported as a durable-storage outage"
         # The row survives, same as any failed cleanup.
         db = next(test_app.dependency_overrides[get_db]())
@@ -1690,7 +1691,7 @@ class TestFileManagement:
             entry
             for entry in caplog.records
             if entry.name == "xagent.web.api.files"
-            and "Durable storage unavailable" in entry.getMessage()
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
         ], "a scope violation was reported as a durable-storage outage"
         # The row survives, same as any failed cleanup.
         db = next(test_app.dependency_overrides[get_db]())

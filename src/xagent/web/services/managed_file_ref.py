@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import logging
 import mimetypes
+import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -59,19 +60,54 @@ _LOG_VALUE_TRANSLATION = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
 # cannot crowd out the rest of the line.
 _MAX_LOG_VALUE_LENGTH = 256
 
+# The stable prefix every durable-fault line starts with, and the anchor the
+# operational note tells alerts to key on. Public because tests assert on its
+# *absence* to prove an integrity fault was not reported as an outage -- with
+# the string inlined there, rewording this message would leave those
+# assertions passing vacuously against text that no longer exists.
+DURABLE_FAULT_LOG_PREFIX = "Durable storage unavailable during"
+
+# Whitespace -- not a newline -- is what lets a client-supplied value forge a
+# *second field on the same line*: ``file_ids=abc user_id=999`` reads as two
+# fields to anything that splits on whitespace, no line break required. A value
+# carrying any is therefore quoted. Conditional, because every field rendered
+# today (ids, keys, counts) has no whitespace and stays bare and greppable.
+_LOG_VALUE_NEEDS_QUOTING = re.compile(r"\s")
+
 
 def _sanitize_log_value(value: object) -> str:
-    """Flatten a field value to one bounded, single-line token.
+    """Flatten a field value to one bounded, single-line, single-*field* token.
 
     Contract: callers filter ``None`` out before rendering -- a ``None`` field
     is dropped from the line entirely, never rendered as ``None`` or ``""``
     (whether it should render instead is #1642's open question). A new caller
     must keep that filter; this function does not decide the policy.
+
+    The escaping is unconditional and the quoting is not, so one value has one
+    encoding either way: a reader unescapes always, and strips the quotes when
+    they are there. (Escaping only inside the quoted branch would give
+    ``a\\nb`` two different renderings depending on whether the value happened
+    to carry a space elsewhere -- same input, two encodings, decodable by
+    nothing.)
+
+    Quoting closes same-line field forgery only. It does not make the value
+    unbreakable to a naive reader: a raw ``\\v``/``\\f``/U+2028 still splits a
+    line visually because it is not in the escape table above (#1519), and the
+    record as a whole stays forgeable through ``exc_info`` text (#1516).
+
+    ``_MAX_LOG_VALUE_LENGTH`` bounds the value *before* escaping; escaping can
+    at most double it and quoting adds two, so the rendered token is bounded
+    too, just not by that number exactly.
     """
     text = str(value).translate(_LOG_VALUE_TRANSLATION)
     if len(text) > _MAX_LOG_VALUE_LENGTH:
-        return f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
-    return text
+        text = f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
+    # The closer and the escape character itself, so a quoted value cannot end
+    # its own region and resume as bare text.
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    if _LOG_VALUE_NEEDS_QUOTING.search(text):
+        return f'"{escaped}"'
+    return escaped
 
 
 def log_durable_storage_fault(
@@ -153,6 +189,11 @@ def log_durable_storage_fault(
         for name, value in fields.items()
         if value is not None
     )
+    # The prefix stays a literal in the template, not an argument: this repo
+    # reads ``record.msg`` as the event's identity, and ``"%s %s%s"`` identifies
+    # nothing. ``DURABLE_FAULT_LOG_PREFIX`` is the same text for callers and
+    # tests to match on, pinned against this line by
+    # ``test_the_exported_prefix_is_the_one_the_helper_emits``.
     target_logger.warning(
         "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
     )

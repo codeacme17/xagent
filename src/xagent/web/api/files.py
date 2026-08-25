@@ -659,6 +659,21 @@ async def store_uploaded_files(
                 await drain_async_task_cancellation_safe(cleanup_task)
             except asyncio.CancelledError:
                 raise
+            except DurableStorageOperationError as exc:
+                # The double fault: the upload already failed against durable
+                # storage, and compensating against the same backend failed
+                # too -- the shape of the incident this reporting exists for.
+                # The generic arm below would log it, but without the fields
+                # that let a burst be aggregated, so it is named here instead.
+                # It stays swallowed: best-effort cleanup inside the
+                # ``finally`` of a request that is already failing.
+                log_durable_storage_fault(
+                    logger,
+                    "upload compensation",
+                    exc,
+                    user_id=user_id,
+                    task_id=parsed_task_id,
+                )
             except Exception:
                 logger.exception("Failed to compensate cancelled/failed upload")
 
