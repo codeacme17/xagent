@@ -38,6 +38,7 @@ from tests.web.pool_contention_shared import (
     wait_for_ticks,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
@@ -1080,6 +1081,37 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
     assert persisted.error_message is None
     assert persisted.runner_id is None
     assert persisted.lease_expires_at is None
+
+
+def test_error_settlement_persists_client_safe_history(db_session) -> None:
+    secret = "orchestrator-provider-secret"
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    lease = acquire_task_lease_isolated(int(task.id))
+    assert lease is not None
+
+    assert (
+        settle_task_lease_isolated(
+            lease,
+            error_message=f"setup/run failed: {secret}",
+        )
+        is True
+    )
+
+    db_session.expire_all()
+    persisted = db_session.query(Task).filter(Task.id == task.id).one()
+    assert persisted.error_message == f"setup/run failed: {secret}"
+    messages = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == int(task.id),
+            TaskChatMessage.role == "assistant",
+        )
+        .all()
+    )
+    assert len(messages) == 1
+    assert messages[0].content == "Task execution failed."
+    assert secret not in messages[0].content
 
 
 @pytest.mark.asyncio
@@ -2745,6 +2777,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     transaction pushes the exact run to ``FAILED`` while releasing it.
     """
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2777,6 +2810,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             new=AsyncMock(),
         ) as mock_exec,
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2807,8 +2841,81 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     assert task.runner_id is None
     assert task.error_message is not None
     assert "simulated snapshot load failure" in str(task.error_message)
+    task_errors = [
+        call.args[0]
+        for call in broadcast.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(task_errors) == 1
+    assert task_errors[0]["message"] == "Task execution failed."
+    assert task_errors[0]["error"] == "Task execution failed."
+    assert "simulated snapshot load failure" not in repr(task_errors[0])
     assert get_ephemeral_runtime_values(payload.turn_id) is None
     assert pop_ephemeral_runtime_values(payload.turn_id) is None
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
+    db_session,
+) -> None:
+    """A typed, curated setup failure remains actionable to the client."""
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    public_message = "Required MCP servers are unavailable."
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            side_effect=RequiredMCPUnavailableError([]),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    assert persisted is not None
+    assert persisted.error_message == public_message
+    assistant = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task.id,
+            TaskChatMessage.role == "assistant",
+        )
+        .one()
+    )
+    assert assistant.content == public_message
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == public_message
+    assert event["error"] == public_message
 
 
 @pytest.mark.asyncio

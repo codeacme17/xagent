@@ -151,6 +151,7 @@ FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 PRODUCERS: dict[str, int | None] = {
     "finish_delivery_failure": 0,
     "finish_delivery": 1,
+    "notify_deferred_delivery": 1,
     "send_message_delivery": None,  # keyword-only
 }
 
@@ -222,12 +223,16 @@ ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"
 
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
-ERROR_PAYLOAD_TYPES = {"error", "agent_error"}
+ERROR_PAYLOAD_TYPES = {"error", "agent_error", "task_error"}
 
 # The only functions allowed to mint client-visible text from an exception.
 SAFE_MESSAGE_BUILDERS = {
     "client_safe_error_message",
     "client_safe_task_command_failure",
+}
+SAFE_MESSAGE_CONSTANTS = {
+    "CLIENT_SAFE_TASK_FAILURE",
+    "CLIENT_SAFE_VALIDATION_ERROR",
 }
 
 
@@ -238,12 +243,27 @@ def _unwrap_serializer(expr: ast.expr) -> ast.expr:
     return expr
 
 
-def _error_payload_message(node: ast.Call) -> ast.expr | None:
-    """The message of an ``{"type": "error", ...}`` payload, if this is one."""
+def _error_payload_messages(node: ast.Call) -> list[ast.expr]:
+    """Client-visible text fields of a recognized error payload."""
     if _called_name(node) not in ERROR_PAYLOAD_SINKS:
-        return None
+        return []
+    messages: list[ast.expr] = []
     for raw in (*node.args, *(kw.value for kw in node.keywords)):
         argument = _unwrap_serializer(raw)
+        helper_builds_error = False
+        if isinstance(argument, ast.Call):
+            helper = _called_name(argument)
+            if helper == "create_terminal_task_error_event" and len(argument.args) > 1:
+                messages.append(argument.args[1])
+                continue
+            if (
+                helper == "create_stream_event"
+                and len(argument.args) > 2
+                and isinstance(argument.args[0], ast.Constant)
+                and argument.args[0].value in ERROR_PAYLOAD_TYPES
+            ):
+                argument = argument.args[2]
+                helper_builds_error = True
         if not isinstance(argument, ast.Dict):
             continue
         keys = {
@@ -252,9 +272,18 @@ def _error_payload_message(node: ast.Call) -> ast.expr | None:
             if isinstance(key, ast.Constant)
         }
         kind = keys.get("type")
-        if isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES:
-            return keys.get("message")
-    return None
+        is_error_payload = (
+            (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
+            or helper_builds_error
+            or (None in argument.keys and "error" in keys)
+        )
+        if is_error_payload:
+            messages.extend(
+                value
+                for field in ("message", "error")
+                if (value := keys.get(field)) is not None
+            )
+    return messages
 
 
 def _called_name(node: ast.Call) -> str | None:
@@ -295,6 +324,8 @@ def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
 
 def _is_client_safe(expr: ast.expr) -> bool:
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return True
+    if isinstance(expr, ast.Name) and expr.id in SAFE_MESSAGE_CONSTANTS:
         return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
         if expr.func.id == "client_safe_error_message":
@@ -341,67 +372,65 @@ def _scan(tree: ast.Module) -> _ScanResult:
         name = _called_name(node)
         is_producer = name in PRODUCERS
         if is_producer:
-            expr = _message_expression(node, PRODUCERS[name])
+            message = _message_expression(node, PRODUCERS[name])
+            expressions = [message] if message is not None else []
         else:
             # The error bubble renders in the same conversation as the
             # rejection ack, so it is the same disclosure surface.
-            expr = _error_payload_message(node)
+            expressions = _error_payload_messages(node)
             name = f"{name}(error payload)"
-        if expr is None:
+        if not expressions:
             continue
         if is_producer:
             producers += 1
         else:
-            error_payloads += 1
+            error_payloads += len(expressions)
         scopes = _enclosing_functions(node, parents)
-        candidates = (
-            _local_assignments(scopes, expr.id)
-            if isinstance(expr, ast.Name)
-            else [expr]
-        )
-        if not candidates:
-            # Only a name nothing rebinds is a genuinely forwarded parameter,
-            # vetted at the wrapper's own call sites. A parameter rebound by a
-            # plain assignment lands in the candidates instead; rebinding via
-            # AnnAssign/AugAssign/walrus/tuple targets is still invisible to
-            # ``_local_assignments`` and tracked in #1547.
-            if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
+        for expr in expressions:
+            if _is_client_safe(expr):
                 continue
-            offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
-            continue
-        enclosing = next(
-            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
-            "<module>",
-        )
-        for candidate in candidates:
-            if _is_client_safe(candidate):
-                continue
-            key = (enclosing, ast.unparse(candidate))
-            if key in ALLOWED_RAW_MESSAGES:
-                used_allowlist.add(key)
-                continue
-            offenders.append(
-                f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
+            candidates = (
+                _local_assignments(scopes, expr.id)
+                if isinstance(expr, ast.Name)
+                else [expr]
             )
+            if not candidates:
+                # Only a name nothing rebinds is a genuinely forwarded parameter,
+                # vetted at the wrapper's own call sites. Known client-facing
+                # wrappers are also scanned as producers at their call sites.
+                if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
+                    continue
+                offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
+                continue
+            enclosing = next(
+                (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
+                "<module>",
+            )
+            for candidate in candidates:
+                if _is_client_safe(candidate):
+                    continue
+                key = (enclosing, ast.unparse(candidate))
+                if key in ALLOWED_RAW_MESSAGES:
+                    used_allowlist.add(key)
+                    continue
+                offenders.append(
+                    f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
+                )
     return _ScanResult(offenders, producers, error_payloads, used_allowlist)
 
 
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
-    Scope, stated honestly: this walks direct calls to the producers in
-    ``PRODUCERS`` and dict *literals* whose ``type`` is one of
-    ``ERROR_PAYLOAD_TYPES``, passed to one of ``ERROR_PAYLOAD_SINKS``.
+    Scope, stated honestly: this walks the direct producers and error payload
+    sinks used by this module. It understands the task-error and stream-event
+    helpers, explicit overrides on dict-spread payloads, and the listed
+    deferred-delivery wrapper.
 
-    It does NOT follow dict-spread payloads, payloads built by a helper and
-    passed as a call, wrapper functions that forward a raw argument into a
-    producer (all #1497), or payloads whose ``type`` is a variable rather than
-    a string literal (#1547). ``agent_error`` was added only after review
-    found ``_broadcast_terminal_command_error`` escaping on that dimension
-    alone - the type set is a maintained list, not a derived invariant.
-
-    Those shapes leak today. Do not read a passing run as "nothing can reach a
-    client raw"; the xfail tests below pin the ones we know about.
+    It is not general interprocedural data-flow analysis. Payloads whose
+    ``type`` is built from a variable remain outside its scope (#1547), and
+    the payload-type set is maintained rather than derived. Do not read a
+    passing run as proof that arbitrary Python data flow cannot reach a client.
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
@@ -655,15 +684,11 @@ async def test_permission_wording_survives_redaction_in_every_handler(
     ), payloads
 
 
-# Each entry is a bypass shape this module admits it does not cover: a source
-# snippet the guard reports clean even though raw exception text reaches a
-# client. Each mirrors a real site rather than a minimal repro, so the xfail
-# cannot flip on a shape nothing actually uses - dict-spread copies
+# Each entry mirrors an egress shape fixed for #1696: dict-spread copies
 # ``execute_task_background`` (text under ``error``, type inherited from the
 # spread), helper-built copies ``send_historical_data_as_stream``, and
-# wrapper-forwarded copies ``notify_deferred_delivery``. They are pinned as strict xfails so the day the guard learns a shape,
-# its test flips to a failure and says so, instead of the hole quietly
-# outliving the issue that tracks it.
+# wrapper-forwarded copies ``notify_deferred_delivery``. These regression
+# fixtures ensure the static guard continues to reject all three.
 BYPASS_SHAPES = [
     pytest.param(
         """
@@ -699,9 +724,9 @@ async def leak(websocket, task_id):
     ),
     pytest.param(
         """
-async def forward(websocket, raw):
+async def notify_deferred_delivery(accepted, raw):
     await send_message_delivery(
-        websocket,
+        object(),
         client_message_id="c",
         turn_id="t",
         accepted=False,
@@ -714,7 +739,7 @@ async def leak(websocket):
     try:
         pass
     except Exception as e:
-        await forward(websocket, str(e))
+        await notify_deferred_delivery(False, str(e))
 """,
         id="wrapper-forwarded",
     ),
@@ -740,22 +765,11 @@ def _guard_offenders(source: str) -> list[str]:
     return _scan(ast.parse(source)).offenders
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known guard blind spots, all tracked in #1497. When one is closed "
-    "this flips to a failure - fix the issue, then delete its param.",
-)
 @pytest.mark.parametrize("source", BYPASS_SHAPES)
-def test_known_bypass_shapes_are_still_invisible_to_the_guard(source: str) -> None:
-    """A passing sweep does not mean no raw text can reach a client.
-
-    Every snippet here puts ``str(e)`` in front of a client and the guard says
-    nothing. Asserting that out loud is the difference between a documented
-    gap and a forgotten one.
-    """
+def test_known_bypass_shapes_are_rejected_by_the_guard(source: str) -> None:
+    """The guard rejects every producer shape fixed for #1696."""
     assert _guard_offenders(source), (
-        "the guard now sees this shape - remove it from BYPASS_SHAPES and "
-        "close the tracking issue"
+        "the guard missed a client-facing raw exception shape fixed for #1696"
     )
 
 

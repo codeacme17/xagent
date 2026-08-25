@@ -58,7 +58,7 @@ def test_terminal_task_error_payload_marks_unowned_task_failed(_test_db):
             event.remove(engine, "before_cursor_execute", record_task_update)
 
         assert payload["type"] == "agent_error"
-        assert payload["message"] == "Runtime error"
+        assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
         assert payload["task"]["id"] == task_id
         assert payload["task"]["status"] == "failed"
         assert len(task_updates) == 1
@@ -76,8 +76,8 @@ def test_terminal_task_error_payload_marks_unowned_task_failed(_test_db):
 
 def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
     """Failures before agent execution (no trace events, e.g. sandbox
-    capacity rejection) must persist the error as an assistant message so
-    a history reload shows the real error instead of a generic bubble."""
+    capacity rejection) persist a client-safe assistant message while the
+    task keeps the diagnostic detail for operators."""
     from xagent.web.models.chat_message import TaskChatMessage
 
     db = _direct_db_session()
@@ -98,7 +98,8 @@ def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
         db.commit()
         task_id = task.id
 
-        error_text = "Sandbox capacity limit reached (2 containers, cap 2)"
+        secret = "sandbox-host-secret"
+        error_text = f"Sandbox capacity limit reached on {secret}"
         _terminal_task_error_payload(task_id, error_text, event_type="task_error")
 
         db.expire_all()
@@ -111,9 +112,77 @@ def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
             .all()
         )
         assert len(messages) == 1
-        assert error_text in messages[0].content
+        assert messages[0].content == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        assert secret not in messages[0].content
+        persisted_task = db.query(Task).filter(Task.id == task_id).one()
+        assert persisted_task.error_message == error_text
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_history_replay_redacts_exception_text(
+    _test_db,
+    monkeypatch,
+) -> None:
+    secret = "replayed-provider-secret"
+    db = _direct_db_session()
+    try:
+        user = User(username="replay-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        task = Task(
+            user_id=user.id,
+            title="Replay failure",
+            description="Replay failure",
+            status=TaskStatus.RUNNING,
+            runner_id=None,
+            lease_expires_at=None,
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        user_id = int(user.id)
+    finally:
+        db.close()
+
+    _terminal_task_error_payload(
+        task_id,
+        f"provider failed: {secret}",
+        event_type="task_error",
+    )
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, _websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr(websocket_api, "cache_get", lambda *_args: None)
+    monkeypatch.setattr(websocket_api, "cache_set", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        websocket_api.manager,
+        "send_personal_message",
+        send_personal_message,
+    )
+
+    await websocket_api.send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    assert secret not in repr(sent_events)
+    replayed_assistant = [
+        event
+        for event in sent_events
+        if event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("source") == "chat_history"
+    ]
+    assert len(replayed_assistant) == 1
+    assert (
+        replayed_assistant[0]["data"]["message"]
+        == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    )
 
 
 def test_terminal_task_error_payload_rejects_replacement_runner_same_run(_test_db):
@@ -410,6 +479,7 @@ async def test_handle_execute_task_unauthenticated_does_not_fail_task(
 
 @pytest.mark.asyncio
 async def test_execute_task_background_error_marks_task_failed(_test_db, monkeypatch):
+    secret = "provider-token-secret"
     db = _direct_db_session()
     try:
         user = User(username="owner", password_hash="hash")
@@ -438,7 +508,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
 
     class FailingAgentManager:
         async def get_agent_for_task(self, *args, **kwargs):
-            raise RuntimeError("setup failed")
+            raise RuntimeError(f"setup failed: {secret}")
 
     monkeypatch.setattr(
         websocket_api.manager,
@@ -459,7 +529,9 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
     assert broadcast_task_id == task_id
     assert payload["type"] == "task_error"
     assert payload["task"]["status"] == "failed"
-    assert payload["error"] == "setup failed"
+    assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert payload["error"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert secret not in repr(payload)
 
     db = _direct_db_session()
     try:
@@ -467,7 +539,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
         assert persisted_task.status == TaskStatus.FAILED
         assert persisted_task.runner_id is None
         assert persisted_task.lease_expires_at is None
-        assert persisted_task.error_message == "setup failed"
+        assert persisted_task.error_message == f"setup failed: {secret}"
     finally:
         db.close()
 
