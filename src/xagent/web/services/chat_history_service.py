@@ -22,6 +22,7 @@ from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
+    safe_str,
 )
 from .file_reference_output_service import reconcile_assistant_file_references
 from .ops_signals import (
@@ -757,9 +758,9 @@ def load_task_transcript(
         if remaining_references <= 0:
             break
         stored_message = stored_messages[index]
-        if str(stored_message.role) == "assistant" and not (
+        if safe_str(stored_message.role) == "assistant" and not (
             assistant_history_has_safe_ancillary_payload(
-                str(stored_message.message_type)
+                safe_str(stored_message.message_type)
             )
         ):
             continue
@@ -769,12 +770,12 @@ def load_task_transcript(
 
     messages: List[Dict[str, Any]] = []
     for message, references in zip(stored_messages, retained_references):
-        role = str(message.role)
-        content = str(message.content)
+        role = safe_str(message.role)
+        content = safe_str(message.content)
         if role == "assistant":
             content = client_safe_assistant_history_content(
                 content=content,
-                message_type=str(message.message_type),
+                message_type=safe_str(message.message_type),
             )
         item: Dict[str, Any] = {
             "role": role,

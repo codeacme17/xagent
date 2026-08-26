@@ -86,6 +86,7 @@ from ..services.assistant_history_safety import (
     assistant_history_has_safe_ancillary_payload,
     assistant_history_values_for_persistence,
     client_safe_assistant_history_content,
+    safe_str,
 )
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
@@ -2498,12 +2499,12 @@ def _finalize_task_execution_result_isolated(
                     expected_run_id=expected_run_id,
                 )
                 if final_status == TaskStatus.FAILED:
-                    diagnostic_error = str(result.get("error") or "").strip()
+                    diagnostic_error = safe_str(result.get("error")).strip()
                     setattr(
                         task_updated,
                         "error_message",
                         diagnostic_error
-                        or str(ai_response).strip()
+                        or safe_str(ai_response).strip()
                         or CLIENT_SAFE_TASK_FAILURE,
                     )
                 sync_workforce_run_status(
@@ -2524,7 +2525,7 @@ def _finalize_task_execution_result_isolated(
                     )
                 history_content, history_message_type = (
                     assistant_history_values_for_persistence(
-                        content=str(ai_response),
+                        content=safe_str(ai_response),
                         message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
                         is_failure=task_updated.status == TaskStatus.FAILED,
                     )

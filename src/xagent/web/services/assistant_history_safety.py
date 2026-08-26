@@ -17,6 +17,12 @@ KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES = frozenset(
 )
 
 
+def safe_str(value: object | None) -> str:
+    """Convert a nullable value to text without producing literal ``None``."""
+
+    return "" if value is None else str(value)
+
+
 def assistant_history_values_for_persistence(
     *,
     content: str,

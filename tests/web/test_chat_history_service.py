@@ -1,4 +1,5 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -12,6 +13,8 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import chat_history_service
+from xagent.web.services.assistant_history_safety import safe_str
 from xagent.web.services.chat_history_service import (
     _MAX_HISTORICAL_IMAGE_CONTEXT_REFS,
     DELIVERY_COMPLETED,
@@ -52,6 +55,14 @@ def _create_task(db_session):
     db_session.commit()
     db_session.refresh(task)
     return task
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, ""), ("", ""), (False, "False"), (0, "0"), ("answer", "answer")],
+)
+def test_safe_str_only_special_cases_none(value: object | None, expected: str) -> None:
+    assert safe_str(value) == expected
 
 
 def test_load_task_transcript_returns_prior_turns_only():
@@ -99,6 +110,36 @@ def test_load_task_transcript_returns_prior_turns_only():
         ]
     finally:
         db_session.close()
+
+
+def test_load_task_transcript_coerces_nullable_fields_to_empty_strings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = SimpleNamespace(
+        role="assistant",
+        content=None,
+        message_type=None,
+        attachments=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+        message
+    ]
+
+    def project_content(*, content: str, message_type: str) -> str:
+        assert content == ""
+        assert message_type == ""
+        return "safe fallback"
+
+    monkeypatch.setattr(
+        chat_history_service,
+        "client_safe_assistant_history_content",
+        project_content,
+    )
+
+    assert load_task_transcript(db, 1) == [
+        {"role": "assistant", "content": "safe fallback"}
+    ]
 
 
 @pytest.mark.parametrize(

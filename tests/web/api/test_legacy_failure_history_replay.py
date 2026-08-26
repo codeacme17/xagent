@@ -463,6 +463,75 @@ async def test_new_plain_assistant_response_replays_unchanged(
     assert CLIENT_SAFE_TASK_FAILURE not in repr(events)
 
 
+def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(
+    _test_db,
+) -> None:
+    task_id, user_id = _running_task(
+        username="failed-websocket-null-diagnostics",
+        title="Failed WebSocket null diagnostics",
+    )
+
+    finalized = websocket_api._finalize_task_execution_result_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result={
+            "success": False,
+            "status": "error",
+            "output": None,
+            "error": None,
+        },
+        expected_run_id=None,
+        task_lease=None,
+        resolved_scope_segments=(),
+        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+    )
+
+    assert not finalized.late_result
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert task.error_message == CLIENT_SAFE_TASK_FAILURE
+    finally:
+        db.close()
+
+
+def test_successful_websocket_result_with_null_output_skips_empty_history(
+    _test_db,
+) -> None:
+    task_id, user_id = _running_task(
+        username="successful-websocket-null-output",
+        title="Successful WebSocket null output",
+    )
+
+    finalized = websocket_api._finalize_task_execution_result_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result={"success": True, "output": None},
+        expected_run_id=None,
+        task_lease=None,
+        resolved_scope_segments=(),
+        prepared_outputs=websocket_api._PreparedTaskFileOutputs((), (), ()),
+    )
+
+    assert not finalized.late_result
+    db = _direct_db_session()
+    try:
+        rows = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .all()
+        )
+        assert rows == []
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_failed_websocket_result_replays_only_safe_history(
     _test_db,
