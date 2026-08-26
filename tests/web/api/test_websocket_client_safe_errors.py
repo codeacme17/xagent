@@ -557,6 +557,19 @@ def test_log_level_follows_the_marker_not_the_call_site(
     assert "task 7" in record.getMessage()
 
 
+def test_malformed_curated_failure_remains_a_warning_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket_api.log_client_facing_failure(
+        websocket_api.ClientVisibleValidationError("Authentication required"),
+        "Pause command rejected",
+    )
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert (record.levelno, record.exc_info) == (logging.WARNING, None)
+    assert "malformed client-facing log template" in record.getMessage().lower()
+
+
 @pytest.mark.parametrize(
     ("template", "args"),
     [
@@ -564,12 +577,14 @@ def test_log_level_follows_the_marker_not_the_call_site(
         ("Task %s failed: %s", ()),
         ("Task %d failed: %s", ()),
         ("Task %(task_id)s failed: %s", ()),
+        ("%%s", ()),
     ],
     ids=[
         "missing-placeholder",
         "count-mismatch",
         "integer-placeholder",
         "mapping-placeholder",
+        "terminal-escaped-percent-s",
     ],
 )
 def test_log_helper_rejects_every_malformed_percent_template(
@@ -577,13 +592,17 @@ def test_log_helper_rejects_every_malformed_percent_template(
     template: str,
     args: tuple[object, ...],
 ) -> None:
-    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
-        websocket_api.log_client_facing_failure(
-            ValueError("operator detail"), template, *args
-        )
+    try:
+        raise ValueError("operator detail")
+    except ValueError as error:
+        with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+            websocket_api.log_client_facing_failure(error, template, *args)
 
     records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
     assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[0] is ValueError
     assert "malformed client-facing log template" in records[0].getMessage().lower()
     assert "operator detail" in records[0].getMessage()
 
@@ -605,6 +624,26 @@ def test_log_helper_accepts_int_enum_for_native_integer_placeholder(
     assert len(records) == 1
     assert records[0].getMessage() == "Task 7 failed: operator detail"
     assert "malformed client-facing log template" not in records[0].getMessage().lower()
+
+
+@pytest.mark.parametrize(
+    ("template", "args", "expected_message"),
+    [
+        ("V=%r: %s", (SimpleNamespace(x="é"),), "V=namespace(x='é'): e"),
+        ("V=%a: %s", (SimpleNamespace(x="é"),), "V=namespace(x='\\xe9'): e"),
+        ("100%%: %s", (), "100%: e"),
+    ],
+)
+def test_log_helper_preserves_native_percent_formatting(
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    args: tuple[object, ...],
+    expected_message: str,
+) -> None:
+    websocket_api.log_client_facing_failure(ValueError("e"), template, *args)
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert record.getMessage() == expected_message
 
 
 def test_log_helper_does_not_raise_for_unprintable_values(
