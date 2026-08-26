@@ -56,6 +56,7 @@ type CombinedItem = {
   isStreamingFinalAnswer?: boolean
   traceEvents?: any[]
   interactions?: any[]
+  interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
   timelineOrder?: number
@@ -297,6 +298,7 @@ export function TaskConversationPanel({
             (event: unknown) => !shouldHideWorkforceInternalTrace(event),
           ),
           interactions: message.interactions,
+          interactionRequestId: message.interactionRequestId,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -781,6 +783,7 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
+                        interactionRequestId={item.interactionRequestId}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -807,6 +810,7 @@ export function TaskConversationPanel({
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}

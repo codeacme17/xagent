@@ -660,3 +660,27 @@ describe("ClarificationForm delivery failures", () => {
     expect(screen.queryByRole("alert")).toBeNull()
   })
 })
+
+describe("ClarificationForm interaction identity", () => {
+  it("submits the request id bound to this rendered form", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(
+      "City: Sydney",
+      [],
+      { request_id: "inputreq_0011223344556677889900aabbccddee" },
+    ))
+  })
+})

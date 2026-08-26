@@ -111,6 +111,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     onOpenExecutionPlan,
     contextBadges,
     taskRuntimeExtensionMetadata,
+    interactionRequestId,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -125,6 +126,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       bindings: string[]
       publicMetadata: Record<string, Record<string, unknown>>
     }
+    interactionRequestId?: string
   }) => (
     <div
       data-testid="chat-message"
@@ -136,6 +138,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-show-process-view={showProcessView ? "true" : "false"}
       data-context-badges={JSON.stringify(contextBadges || [])}
       data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
+      data-request-id={interactionRequestId || ""}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -528,6 +531,46 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("Which dataset should I use?")).toBeInTheDocument()
     expect(screen.getByTestId("chat-message")).toHaveAttribute("data-active", "true")
+  })
+
+  it("keeps each rendered clarification bound to its own request id", () => {
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "inputreq_q1",
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which hotel?",
+        timestamp: "2000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        interactionRequestId: "inputreq_q2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which hotel?",
+      waitingRequestId: "inputreq_q2",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    expect(rendered[0]).toHaveAttribute("data-request-id", "inputreq_q1")
+    expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
   })
 
   it("shows history loading before waiting-for-user content while history is loading", () => {

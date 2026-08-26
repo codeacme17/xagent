@@ -20,6 +20,7 @@ interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
   messageId?: string
+  requestId?: string
   active?: boolean
   filesDisabled?: boolean
   onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
@@ -115,6 +116,7 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 export function ClarificationForm({
   interactions,
   messageId,
+  requestId,
   active = true,
   filesDisabled: filesDisabledOverride,
   onSend,
@@ -261,7 +263,7 @@ export function ClarificationForm({
 
   const handleSubmit = async () => {
     // Construct the message
-    const metadata: any = {}
+    const metadata: any = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
       const value = formState[interaction.field]
 

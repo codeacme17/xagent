@@ -14,6 +14,7 @@ type TestWebSocketMessage = {
   run_id?: string | null
   state_version?: number
   control_state?: string
+  request_id?: string
 }
 
 const webSocketOptions = vi.hoisted(() => ({
@@ -162,6 +163,7 @@ function StateProbe() {
               typeof message.content === "string" ? message.content : "react-node",
             isOptimistic: message.isOptimistic,
             isResult: message.isResult,
+            interactionRequestId: message.interactionRequestId,
           }))
         )}
       </div>
@@ -177,6 +179,7 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
       <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
@@ -3048,11 +3051,10 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.({
         type: "task_waiting_for_user",
         timestamp: "2026-05-27T05:00:06Z",
-        data: {
-          question: "Which file should I use?",
-          interactions: [],
-        },
-      })
+        question: "Which file should I use?",
+        interactions: [],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+      } as TestWebSocketMessage)
     })
 
     await waitFor(() => {
@@ -3062,6 +3064,12 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("processing").textContent).toBe("false")
       expect(screen.getByTestId("messages").textContent).toContain(
         "Which file should I use?"
+      )
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
       )
     })
   })
@@ -3109,7 +3117,8 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn",
       undefined,
       undefined,
-      "session-turn-1"
+      "session-turn-1",
+      undefined,
     )
     expect(screen.getByTestId("messages").textContent).not.toContain(
       "First Session turn"
@@ -3127,6 +3136,36 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn"
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("forwards the rendered interaction request id to the Session socket", async () => {
+    const transport = makeSessionTransport()
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onConnect?.())
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(42)))
+    await waitFor(() => expect(screen.getByTestId("task-id").textContent).toBe("42"))
+
+    await act(async () => {
+      await getSessionControls().sendMessage("City: Sydney", {
+        clientMessageId: "answer-q1",
+        metadata: {
+          request_id: "inputreq_0011223344556677889900aabbccddee",
+        },
+      })
+    })
+
+    expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+      "City: Sydney",
+      undefined,
+      undefined,
+      "answer-q1",
+      "inputreq_0011223344556677889900aabbccddee",
+    )
   })
 
   it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {
@@ -3173,6 +3212,7 @@ describe("AppProvider websocket message routing", () => {
       [file],
       undefined,
       "session-file-turn",
+      undefined,
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
     expect(transport.uploadFiles).not.toHaveBeenCalled()
@@ -3513,7 +3553,8 @@ describe("AppProvider websocket message routing", () => {
       "Start replacement conversation",
       undefined,
       undefined,
-      "session-turn-after-reset"
+      "session-turn-after-reset",
+      undefined,
     )
 
     act(() => {
@@ -4184,6 +4225,59 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-id").textContent).toBe("102")
       expect(screen.getByTestId("task-title").textContent).toBe("Refreshed same task")
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    })
+  })
+
+  it("replaces a cached waiting identity with the request replayed after reconnect", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("waiting-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(103))
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 103,
+        question: "Which city?",
+        interactions: [],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+    })
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("waiting-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(103))
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 103,
+        question: "Which hotel?",
+        interactions: [],
+        request_id: "inputreq_ffeeddccbbaa00998877665544332211",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_ffeeddccbbaa00998877665544332211"
+      )
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "inputreq_ffeeddccbbaa00998877665544332211"
+      )
     })
   })
 
