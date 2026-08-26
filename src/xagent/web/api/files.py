@@ -115,11 +115,6 @@ logger = logging.getLogger(__name__)
 file_router = APIRouter(prefix="/api/files", tags=["files"])
 
 
-# Faults the delete-cleanup arm must let propagate instead of folding into the
-# retryable 503 (#1473): the namespace-authority family, plus ValueError from
-# ``normalize_storage_key`` for a structurally-invalid persisted key. A named
-# tuple constant rather than ``(*..., ValueError)`` inline: mypy only accepts
-# a name or a tuple display of types in an ``except`` clause.
 def _raise_durable_storage_unavailable(
     exc: Exception, operation: str, **fields: object
 ) -> NoReturn:
