@@ -2711,7 +2711,6 @@ async def execute_task_background(
             # Send task completion event (includes agent response info)
             await manager.broadcast_to_task(
                 {
-                    "type": "task_completed",
                     "task": {
                         "id": broadcast_meta["id"],
                         "title": broadcast_meta["title"],
@@ -2728,6 +2727,7 @@ async def execute_task_background(
                     "error_code": result.get("error_code"),
                     "error_details": result.get("error_details"),
                     **control_event_state,
+                    "type": "task_completed",
                     "chat_response": chat_response
                     if isinstance(chat_response, dict)
                     else None,
@@ -3649,7 +3649,6 @@ async def execute_resume_background(
 
         await manager.broadcast_to_task(
             {
-                "type": "task_completed",
                 "task": {
                     "id": task_id,
                     "title": task_title,
@@ -3665,6 +3664,7 @@ async def execute_resume_background(
                 "error_code": result.get("error_code"),
                 "error_details": result.get("error_details"),
                 **control_event_state,
+                "type": "task_completed",
                 "metadata": result.get("metadata", {}),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
@@ -3911,7 +3911,6 @@ async def execute_resume_background(
                                 )
                                 await manager.broadcast_to_task(
                                     {
-                                        "type": event_type,
                                         "task_id": task_id,
                                         "message": message,
                                         "timestamp": datetime.now(
@@ -3922,6 +3921,7 @@ async def execute_resume_background(
                                             if restored_snapshot is not None
                                             else {}
                                         ),
+                                        "type": event_type,
                                     },
                                     task_id,
                                 )

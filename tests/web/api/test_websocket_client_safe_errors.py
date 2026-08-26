@@ -146,6 +146,7 @@ async def test_execute_task_keeps_a_message_written_for_the_sender(
 
 
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+READABLE_SCOPE_NODES = (*FUNCTION_NODES, ast.Lambda)
 
 # arg name -> positional index of the client-visible message
 PRODUCERS: dict[str, int | None] = {
@@ -203,7 +204,7 @@ def _enclosing_functions(
     chain: list[ast.AST] = []
     current = parents.get(node)
     while current is not None:
-        if isinstance(current, FUNCTION_NODES):
+        if isinstance(current, READABLE_SCOPE_NODES):
             chain.append(current)
         current = parents.get(current)
     return chain
@@ -224,7 +225,17 @@ ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"
 # Both render in the client's conversation, so both are the same disclosure
 # surface. ``agent_error`` was missing until review found a producer using it.
 ERROR_PAYLOAD_TYPES = {"error", "agent_error", "task_error"}
-NON_ERROR_STREAM_EVENT_BUILDERS = {"_agent_outbound_event_type"}
+SENSITIVE_PAYLOAD_FIELDS = {"type", "message", "error"}
+NON_ERROR_STREAM_EVENT_BUILDERS = {
+    "_agent_outbound_event_type": None,
+    "_waiting_or_paused_event_fields": 0,
+}
+DICT_ERROR_PAYLOAD_BUILDERS = {
+    "_read_task_error_payload_offloop": "error",
+    "_task_error_payload": "error",
+    "_terminal_task_error_payload": "agent_error",
+    "create_terminal_task_error_event": "task_error",
+}
 
 # The only functions allowed to mint client-visible text from an exception.
 SAFE_MESSAGE_BUILDERS = {
@@ -258,44 +269,123 @@ def _call_argument(
     )
 
 
+def _dict_variants(
+    expr: ast.expr,
+    scopes: list[ast.AST],
+    module_helpers: set[str],
+    resolving: frozenset[str] = frozenset(),
+) -> list[tuple[dict[str, ast.expr], set[str]]]:
+    """Resolve possible effective fields from dict and local-name spreads."""
+    if isinstance(expr, ast.Await):
+        return _dict_variants(expr.value, scopes, module_helpers, resolving)
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and (helper := expr.func.id) in DICT_ERROR_PAYLOAD_BUILDERS
+        and helper in module_helpers
+        and not _has_local_binding(scopes, helper)
+    ):
+        message_position = 2 if helper == "_task_error_payload" else 1
+        message = _call_argument(expr, message_position, "message")
+        if message is None:
+            return [({}, {"type", "message", "error"})]
+        event_type = next(
+            (keyword.value for keyword in expr.keywords if keyword.arg == "event_type"),
+            ast.Constant(DICT_ERROR_PAYLOAD_BUILDERS[helper]),
+        )
+        fields = {"type": event_type, "message": message}
+        if helper == "create_terminal_task_error_event":
+            fields["error"] = message
+        unresolved = set() if isinstance(event_type, ast.Constant) else {"type"}
+        return [(fields, unresolved)]
+    if isinstance(expr, ast.Name):
+        if expr.id in resolving:
+            return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
+        assignments = _local_assignments(scopes, expr.id)
+        if not assignments:
+            return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
+        return [
+            variant
+            for assignment in assignments
+            for variant in _dict_variants(
+                assignment,
+                scopes,
+                module_helpers,
+                resolving | {expr.id},
+            )
+        ]
+    if not isinstance(expr, ast.Dict):
+        return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
+
+    variants: list[tuple[dict[str, ast.expr], set[str]]] = [({}, set())]
+    for key, value in zip(expr.keys, expr.values):
+        if key is None:
+            spread_variants = _dict_variants(value, scopes, module_helpers, resolving)
+            merged_variants = []
+            for fields, unresolved_fields in variants:
+                for spread_fields, spread_unresolved in spread_variants:
+                    merged_fields = fields.copy()
+                    merged_unresolved = unresolved_fields.copy()
+                    for field in spread_unresolved:
+                        merged_fields.pop(field, None)
+                    merged_unresolved.update(spread_unresolved)
+                    merged_unresolved.difference_update(
+                        spread_fields.keys() - spread_unresolved
+                    )
+                    merged_fields.update(spread_fields)
+                    merged_variants.append((merged_fields, merged_unresolved))
+            variants = merged_variants
+        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+            for fields, unresolved_fields in variants:
+                fields[key.value] = value
+                unresolved_fields.discard(key.value)
+                if key.value == "type" and not isinstance(value, ast.Constant):
+                    unresolved_fields.add("type")
+        elif not isinstance(key, ast.Constant):
+            for fields, unresolved_fields in variants:
+                for field in SENSITIVE_PAYLOAD_FIELDS:
+                    fields.pop(field, None)
+                unresolved_fields.update(SENSITIVE_PAYLOAD_FIELDS)
+    return variants
+
+
 def _error_payload_messages(
     node: ast.Call,
     parents: dict[ast.AST, ast.AST],
-    module_non_error_stream_event_builders: set[str],
+    module_helpers: set[str],
 ) -> list[ast.expr]:
     """Client-visible text fields of a recognized error payload."""
     if _called_name(node) not in ERROR_PAYLOAD_SINKS:
         return []
     messages: list[ast.expr] = []
+    scopes = _enclosing_functions(node, parents)
     for raw in (*node.args, *(kw.value for kw in node.keywords)):
         argument = _unwrap_serializer(raw)
         helper_builds_error = False
         if isinstance(argument, ast.Call):
-            helper = _called_name(argument)
+            helper = argument.func.id if isinstance(argument.func, ast.Name) else None
             if helper == "create_terminal_task_error_event":
+                if helper not in module_helpers or _has_local_binding(scopes, helper):
+                    messages.append(argument)
+                    continue
                 message = _call_argument(argument, 1, "message")
                 # A recognized error helper must never disappear from the
                 # sweep merely because its call shape cannot be resolved.
                 messages.append(message if message is not None else argument)
                 continue
             if helper == "create_stream_event":
+                if helper not in module_helpers or _has_local_binding(scopes, helper):
+                    messages.append(argument)
+                    continue
                 event_type = _call_argument(argument, 0, "event_type")
                 if isinstance(event_type, ast.Constant):
                     if event_type.value not in ERROR_PAYLOAD_TYPES:
                         # A literal non-error stream event is outside this sink.
                         continue
-                elif (
-                    isinstance(event_type, ast.Call)
-                    and isinstance(event_type.func, ast.Name)
-                    and event_type.func.id in module_non_error_stream_event_builders
-                    and not _is_parameter(
-                        _enclosing_functions(event_type, parents),
-                        event_type.func.id,
-                    )
-                    and not _local_assignments(
-                        _enclosing_functions(event_type, parents),
-                        event_type.func.id,
-                    )
+                elif _is_known_non_error_event_type(
+                    event_type,
+                    scopes,
+                    module_helpers,
                 ):
                     # Known non-error stream events are not error payloads.
                     continue
@@ -313,27 +403,29 @@ def _error_payload_messages(
                 helper_builds_error = True
         if not isinstance(argument, ast.Dict):
             continue
-        keys = {
-            key.value: value
-            for key, value in zip(argument.keys, argument.values)
-            if isinstance(key, ast.Constant)
-        }
-        kind = keys.get("type")
-        is_error_payload = (
-            (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
-            or helper_builds_error
-            or (
-                None in argument.keys
-                and "type" not in keys
-                and any(field in keys for field in ("message", "error"))
+        for keys, unresolved_fields in _dict_variants(
+            argument,
+            scopes,
+            module_helpers,
+        ):
+            kind = keys.get("type")
+            is_error_payload = not _is_known_non_error_event_type(
+                kind,
+                scopes,
+                module_helpers,
+            ) and (
+                (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
+                or helper_builds_error
+                or "type" in unresolved_fields
             )
-        )
-        if is_error_payload:
-            messages.extend(
-                value
-                for field in ("message", "error")
-                if (value := keys.get(field)) is not None
-            )
+            if is_error_payload:
+                messages.extend(
+                    value
+                    for field in ("message", "error")
+                    if (value := keys.get(field)) is not None
+                )
+                if unresolved_fields.intersection({"message", "error"}):
+                    messages.append(argument)
     return messages
 
 
@@ -348,15 +440,17 @@ def _called_name(node: ast.Call) -> str | None:
 def _is_parameter(scopes: list[ast.AST], name: str) -> bool:
     """A forwarded parameter is vetted at the wrapper's own call sites."""
     for scope in scopes:
-        if not isinstance(scope, FUNCTION_NODES):
+        if not isinstance(scope, READABLE_SCOPE_NODES):
             continue
         arguments = scope.args
         for argument in (
             *arguments.posonlyargs,
             *arguments.args,
             *arguments.kwonlyargs,
+            arguments.vararg,
+            arguments.kwarg,
         ):
-            if argument.arg == name:
+            if argument is not None and argument.arg == name:
                 return True
     return False
 
@@ -364,13 +458,127 @@ def _is_parameter(scopes: list[ast.AST], name: str) -> bool:
 def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
     """Values assigned to `name` inside the given scopes only."""
     values: list[ast.expr] = []
-    for scope in scopes:
-        for node in ast.walk(scope):
+    for scope in _readable_local_scopes(scopes, name):
+        for node in _scope_nodes(scope):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == name:
                         values.append(node.value)
     return values
+
+
+def _readable_local_scopes(scopes: list[ast.AST], name: str) -> list[ast.AST]:
+    """Scopes whose locals remain visible before a ``global`` declaration."""
+    readable: list[ast.AST] = []
+    for scope in scopes:
+        if any(
+            isinstance(node, ast.Global) and name in node.names
+            for node in _scope_nodes(scope)
+        ):
+            return readable
+        readable.append(scope)
+    return readable
+
+
+def _scope_nodes(scope: ast.AST) -> Iterator[ast.AST]:
+    """Walk one function scope without borrowing bindings from child scopes."""
+    pending = (
+        [scope.body]
+        if isinstance(scope, ast.Lambda)
+        else list(getattr(scope, "body", ()))
+    )
+    while pending:
+        node = pending.pop()
+        yield node
+        if isinstance(node, (*READABLE_SCOPE_NODES, ast.ClassDef)):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+
+
+def _binds_name_without_store(node: ast.AST, name: str) -> bool:
+    if isinstance(
+        node,
+        (*FUNCTION_NODES, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar),
+    ):
+        return node.name == name
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return any(
+            (alias.asname or alias.name.split(".")[0]) == name for alias in node.names
+        )
+    return isinstance(node, ast.MatchMapping) and node.rest == name
+
+
+def _has_local_binding(scopes: list[ast.AST], name: str) -> bool:
+    """Whether a trusted module helper name is shadowed in a readable scope."""
+    scopes = _readable_local_scopes(scopes, name)
+    if _is_parameter(scopes, name):
+        return True
+    for scope in scopes:
+        for node in _scope_nodes(scope):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Store)
+                and node.id == name
+            ):
+                return True
+            if _binds_name_without_store(node, name):
+                return True
+    return False
+
+
+def _is_known_non_error_event_type(
+    expr: ast.expr | None,
+    scopes: list[ast.AST],
+    module_builders: set[str],
+) -> bool:
+    """Recognize only module helpers that return a non-error event type."""
+
+    def trusted_builder(candidate: ast.expr, result_index: int | None) -> bool:
+        return (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Name)
+            and candidate.func.id in module_builders
+            and NON_ERROR_STREAM_EVENT_BUILDERS[candidate.func.id] == result_index
+            and not _has_local_binding(scopes, candidate.func.id)
+        )
+
+    if not isinstance(expr, ast.Name):
+        return isinstance(expr, ast.expr) and trusted_builder(expr, None)
+    scopes = _readable_local_scopes(scopes, expr.id)
+    if not scopes:
+        return False
+    if _is_parameter(scopes, expr.id):
+        return False
+
+    bindings: list[tuple[ast.expr, int | None]] = []
+    assignment_stores: set[int] = set()
+    nodes = [node for scope in scopes for node in _scope_nodes(scope)]
+    for node in nodes:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == expr.id:
+                assignment_stores.add(id(target))
+                bindings.append((node.value, None))
+            elif isinstance(target, ast.Tuple):
+                for index, element in enumerate(target.elts):
+                    if isinstance(element, ast.Name) and element.id == expr.id:
+                        assignment_stores.add(id(element))
+                        bindings.append((node.value, index))
+
+    if any(
+        isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id == expr.id
+        and id(node) not in assignment_stores
+        for node in nodes
+    ):
+        return False
+    if any(_binds_name_without_store(node, expr.id) for node in nodes):
+        return False
+    return bool(bindings) and all(
+        trusted_builder(value, result_index) for value, result_index in bindings
+    )
 
 
 def _is_client_safe(expr: ast.expr) -> bool:
@@ -403,6 +611,78 @@ class _ScanResult(NamedTuple):
     used_allowlist: set[tuple[str, str]]
 
 
+def _trusted_module_helpers(tree: ast.Module) -> set[str]:
+    """Helpers with one real module implementation and no other binding."""
+    expected = {
+        *DICT_ERROR_PAYLOAD_BUILDERS,
+        *NON_ERROR_STREAM_EVENT_BUILDERS,
+        "create_stream_event",
+    }
+    trusted: set[str] = set()
+    nodes = list(_scope_nodes(tree))
+    overload_imports = [
+        (node, alias)
+        for node in nodes
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        if (alias.asname or alias.name.split(".")[0]) == "overload"
+    ]
+    canonical_overload = (
+        len(overload_imports) == 1
+        and isinstance(overload_imports[0][0], ast.ImportFrom)
+        and overload_imports[0][0].level == 0
+        and overload_imports[0][0].module == "typing"
+        and overload_imports[0][1].name == "overload"
+        and overload_imports[0][1].asname in {None, "overload"}
+        and not any(
+            id(node) != id(overload_imports[0][0])
+            and (
+                _binds_name_without_store(node, "overload")
+                or (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store)
+                    and node.id == "overload"
+                )
+            )
+            for node in nodes
+        )
+    )
+    for name in expected:
+        definitions = [
+            node
+            for node in nodes
+            if isinstance(node, FUNCTION_NODES) and node.name == name
+        ]
+        overload_stubs = [
+            node
+            for node in definitions
+            if canonical_overload
+            and len(node.decorator_list) == 1
+            and isinstance(node.decorator_list[0], ast.Name)
+            and node.decorator_list[0].id == "overload"
+        ]
+        implementations = [node for node in definitions if not node.decorator_list]
+        unsafe_decorated = len(definitions) != len(overload_stubs) + len(
+            implementations
+        )
+        definition_ids = {id(node) for node in definitions}
+        has_other_binding = any(
+            id(node) not in definition_ids
+            and (
+                _binds_name_without_store(node, name)
+                or (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store)
+                    and node.id == name
+                )
+            )
+            for node in nodes
+        )
+        if len(implementations) == 1 and not unsafe_decorated and not has_other_binding:
+            trusted.add(name)
+    return trusted
+
+
 def _scan(tree: ast.Module) -> _ScanResult:
     """The one copy of the sweep's recognition logic.
 
@@ -420,12 +700,7 @@ def _scan(tree: ast.Module) -> _ScanResult:
         for alias in statement.names
         if alias.asname is None and alias.name in SAFE_MESSAGE_CONSTANTS
     }
-    module_non_error_stream_event_builders = {
-        statement.name
-        for statement in tree.body
-        if isinstance(statement, FUNCTION_NODES)
-        and statement.name in NON_ERROR_STREAM_EVENT_BUILDERS
-    }
+    module_helpers = _trusted_module_helpers(tree)
     producers = 0
     error_payloads = 0
     offenders: list[str] = []
@@ -444,7 +719,7 @@ def _scan(tree: ast.Module) -> _ScanResult:
             expressions = _error_payload_messages(
                 node,
                 parents,
-                module_non_error_stream_event_builders,
+                module_helpers,
             )
             name = f"{name}(error payload)"
         if not expressions:
@@ -501,10 +776,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     helpers, explicit overrides on dict-spread payloads, and the listed
     deferred-delivery wrapper.
 
-    It is not general interprocedural data-flow analysis. Payloads whose
-    ``type`` is built from a variable remain outside its scope (#1547), and
-    the payload-type set is maintained rather than derived. Do not read a
-    passing run as proof that arbitrary Python data flow cannot reach a client.
+    It is not general interprocedural data-flow analysis. Dynamic payload types
+    fail closed unless they come from the listed module helpers, and the type
+    set is maintained rather than derived (#1547). Do not read a passing run as
+    proof that arbitrary Python data flow cannot reach a client.
     """
     # Explicit encoding: this module carries non-ASCII prose, and the
     # platform default would decode it as cp1252/GBK on a Windows runner.
@@ -991,6 +1266,272 @@ async def leak(websocket):
 def _guard_offenders(source: str) -> list[str]:
     """Run the one sweep implementation over an arbitrary module source."""
     return _scan(ast.parse(source)).offenders
+
+
+def _broadcast_source(payload: str, args: str = "task_id", setup: str = "") -> str:
+    """Build compact snippets while keeping bindings in the sink's scope."""
+    return (
+        f"async def leak({args}):\n"
+        f"    {setup}await manager.broadcast_to_task({payload}, task_id)\n"
+    )
+
+
+def _match_capture_source(pattern: str) -> str:
+    return f"""def _agent_outbound_event_type(payload):
+    return "agent_progress"
+async def leak(task_id, value):
+    match value:
+        case {pattern}:
+            pass
+    await manager.broadcast_to_task(create_stream_event(
+        _agent_outbound_event_type(value), task_id,
+        {{"message": str(RuntimeError("raw"))}}), task_id)
+"""
+
+
+RAW_ERROR = 'str(RuntimeError("raw"))'
+SPREAD_PAYLOAD = '{**payload, "timestamp": 0}'
+
+# Dense by design: these are data rows, not executable logic. Fields are
+# id, payload, function arguments, setup statement(s), expected offenders.
+# fmt: off
+BROADCAST_GUARD_SPECS = [
+    ("dynamic-explicit-type", f'{{"type": event_type, "message": {RAW_ERROR}}}', "task_id, event_type", "", True),
+    ("dynamic-key-after-non-error-type", f'{{"type": "task_completed", key: {RAW_ERROR}}}', "task_id, key", "", True),
+    ("explicit-fields-override-dynamic-key", f'{{key: {RAW_ERROR}, "type": "task_completed", "message": "safe", "error": "safe"}}', "task_id, key", "", False),
+    ("local-message", SPREAD_PAYLOAD, "task_id", f'payload = {{"type": "task_error", "message": {RAW_ERROR}}}; ', True),
+    ("local-error", SPREAD_PAYLOAD, "task_id", f'payload = {{"type": "task_error", "error": {RAW_ERROR}}}; ', True),
+    ("nested-direct", f'{{**{{**{{"type": "task_error", "message": {RAW_ERROR}}}}}, "timestamp": 0}}', "task_id", "", True),
+    ("recognized-helper", SPREAD_PAYLOAD, "task_id", f"payload = create_terminal_task_error_event(task_id, {RAW_ERROR}); ", True),
+    ("unresolved", '{**build_untrusted_payload(), "timestamp": 0}', "task_id", "", True),
+    ("unresolved-after-error-type", '{"type": "task_error", **build_untrusted_payload()}', "task_id", "", True),
+    ("dynamic-helper-type", SPREAD_PAYLOAD, "task_id, event_type", f"payload = await _read_task_error_payload_offloop(task_id, {RAW_ERROR}, event_type=event_type); ", True),
+    ("safe-known-helper", SPREAD_PAYLOAD, "task_id", 'safe = client_safe_error_message(RuntimeError("detail")); payload = await _read_task_error_payload_offloop(task_id, safe); ', False),
+    ("explicit-final-non-error-type", '{**build_control_state(), "type": "task_completed"}', "task_id", "", False),
+]
+# fmt: on
+
+DICT_SPREAD_GUARD_CASES = {
+    case: (_broadcast_source(payload, args, setup), expected)
+    for case, payload, args, setup, expected in BROADCAST_GUARD_SPECS
+}
+safe_helper_source, _ = DICT_SPREAD_GUARD_CASES["safe-known-helper"]
+DICT_SPREAD_GUARD_CASES["safe-known-helper"] = (
+    """async def _read_task_error_payload_offloop(task_id, message):
+    return {"type": "task_error", "message": message}
+"""
+    + safe_helper_source,
+    False,
+)
+DICT_SPREAD_GUARD_CASES.update(
+    {
+        "local-function-helper-impostor": (
+            """async def leak(task_id):
+    def _read_task_error_payload_offloop(_task_id, _message):
+        return {"type": "task_error", "message": str(RuntimeError("raw"))}
+    payload = _read_task_error_payload_offloop(task_id, "looks safe")
+    await manager.broadcast_to_task({**payload, "timestamp": 0}, task_id)
+""",
+            True,
+        ),
+        "local-class-terminal-helper-impostor": (
+            """async def leak(task_id):
+    class create_terminal_task_error_event:
+        pass
+    await manager.broadcast_to_task(
+        create_terminal_task_error_event(task_id, "looks safe"), task_id)
+""",
+            True,
+        ),
+        "local-import-stream-helper-impostor": (
+            _broadcast_source(
+                'create_stream_event("task_completed", task_id, {"message": "safe"})',
+                setup="from untrusted import create_stream_event; ",
+            ),
+            True,
+        ),
+        "trusted-helper-then-rebound": (
+            """def _waiting_or_paused_event_fields(status):
+    return "task_paused", "safe"
+async def leak(task_id, status, raw_type):
+    event_type, message = _waiting_or_paused_event_fields(status)
+    event_type = raw_type
+    await manager.broadcast_to_task(
+        {"type": event_type, "message": str(RuntimeError("raw"))}, task_id)
+""",
+            True,
+        ),
+        "nested-safe-assignment-does-not-hide-global-payload": (
+            """payload = {"type": "task_error", "message": str(RuntimeError("raw"))}
+async def leak(task_id):
+    def unrelated():
+        payload = {"type": "task_completed", "message": "safe"}
+    await manager.broadcast_to_task({**payload}, task_id)
+""",
+            True,
+        ),
+        "module-assignment-shadows-spread-helper": (
+            """def _read_task_error_payload_offloop(task_id, message):
+    return {"type": "task_error", "message": message}
+_read_task_error_payload_offloop = untrusted
+async def leak(task_id):
+    await manager.broadcast_to_task(
+        {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+            True,
+        ),
+        "module-import-shadows-direct-helper": (
+            """def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, **data}
+from untrusted import create_stream_event
+async def leak(task_id):
+    await manager.broadcast_to_task(
+        create_stream_event("task_completed", task_id, {"message": "safe"}), task_id)
+""",
+            True,
+        ),
+        "module-redefinition-shadows-non-error-helper": (
+            """def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, **data}
+def _agent_outbound_event_type(payload):
+    return "task_completed"
+def _agent_outbound_event_type(payload):
+    return "error"
+async def leak(task_id, payload):
+    await manager.broadcast_to_task(create_stream_event(
+        _agent_outbound_event_type(payload), task_id,
+        {"message": str(RuntimeError("raw"))}), task_id)
+""",
+            True,
+        ),
+        "decorated-direct-helper-is-not-canonical": (
+            """def replace(helper):
+    return untrusted
+@replace
+def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, **data}
+async def leak(task_id):
+    await manager.broadcast_to_task(
+        create_stream_event("task_completed", task_id, {"message": "safe"}), task_id)
+""",
+            True,
+        ),
+        "decorated-non-error-helper-is-not-canonical": (
+            """def replace(helper):
+    return untrusted
+def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, **data}
+@replace
+def _agent_outbound_event_type(payload):
+    return "task_completed"
+async def leak(task_id, payload):
+    await manager.broadcast_to_task(create_stream_event(
+        _agent_outbound_event_type(payload), task_id,
+        {"message": str(RuntimeError("raw"))}), task_id)
+""",
+            True,
+        ),
+        "same-import-overwrites-overload": (
+            """from typing import overload, no_type_check as overload
+@overload
+def _read_task_error_payload_offloop(task_id, message): ...
+def _read_task_error_payload_offloop(task_id, message):
+    return {"type": "task_error", "message": message}
+async def leak(task_id):
+    await manager.broadcast_to_task(
+        {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+            True,
+        ),
+        "relative-typing-overload-is-not-canonical": (
+            """from .typing import overload
+@overload
+def _read_task_error_payload_offloop(task_id, message): ...
+def _read_task_error_payload_offloop(task_id, message):
+    return {"type": "task_error", "message": message}
+async def leak(task_id):
+    await manager.broadcast_to_task(
+        {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+            True,
+        ),
+        "global-payload-cuts-off-outer-safe-binding": (
+            """payload = {"type": "task_error", "message": str(RuntimeError("raw"))}
+async def outer(task_id):
+    payload = {"type": "task_completed", "message": "safe"}
+    async def leak():
+        global payload
+        await manager.broadcast_to_task({**payload}, task_id)
+""",
+            True,
+        ),
+        "global-event-type-cuts-off-outer-trusted-binding": (
+            """def _waiting_or_paused_event_fields(status):
+    return "task_paused", "safe"
+async def outer(task_id, status):
+    event_type, message = _waiting_or_paused_event_fields(status)
+    async def leak():
+        global event_type
+        await manager.broadcast_to_task(
+            {"type": event_type, "message": str(RuntimeError("raw"))}, task_id)
+""",
+            True,
+        ),
+        "outer-global-keeps-inner-helper-shadow": (
+            """async def _read_task_error_payload_offloop(task_id, message):
+    return {"type": "task_error", "message": message}
+async def outer(task_id):
+    global _read_task_error_payload_offloop
+    async def leak():
+        def _read_task_error_payload_offloop(_task_id, _message):
+            return {"type": "task_error", "message": str(RuntimeError("raw"))}
+        await manager.broadcast_to_task(
+            {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+            True,
+        ),
+        **{
+            f"{kind}-helper-parameter-impostor": (
+                source,
+                True,
+            )
+            for kind, source in {
+                "lambda": """leak = lambda task_id, _read_task_error_payload_offloop: manager.broadcast_to_task(
+    {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+                "vararg": """async def leak(task_id, *_read_task_error_payload_offloop):
+    await manager.broadcast_to_task(
+        {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+                "kwarg": """async def leak(task_id, **_read_task_error_payload_offloop):
+    await manager.broadcast_to_task(
+        {**_read_task_error_payload_offloop(task_id, "safe")}, task_id)
+""",
+            }.items()
+        },
+        **{
+            f"{capture}-capture-shadows-non-error-builder": (
+                _match_capture_source(pattern),
+                True,
+            )
+            for capture, pattern in (
+                ("match-as", '{"kind": _agent_outbound_event_type}'),
+                ("match-star", "[*_agent_outbound_event_type]"),
+                ("match-rest", '{"kind": kind, **_agent_outbound_event_type}'),
+            )
+        },
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "has_offenders"),
+    DICT_SPREAD_GUARD_CASES.values(),
+    ids=DICT_SPREAD_GUARD_CASES,
+)
+def test_dict_spread_guard_cases(source: str, has_offenders: bool) -> None:
+    """Spread resolution rejects raw/opaque error shapes without false positives."""
+    assert bool(_guard_offenders(source)) is has_offenders
 
 
 @pytest.mark.parametrize("source", BYPASS_SHAPES)
