@@ -1,4 +1,9 @@
-"""Fail-closed AST analysis for client-visible WebSocket messages."""
+"""Fail-closed AST analysis for recognized client-visible WebSocket shapes.
+
+This models the direct producers and literal payload grammar declared below,
+not general Python control flow or every possible egress. Unsupported producer
+shapes remain explicit regression xfails tracked outside this module.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ from typing import Iterator, NamedTuple
 
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 TRY_NODES = (ast.Try, ast.TryStar)
+LOOP_NODES = (ast.For, ast.AsyncFor, ast.While)
 COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 # arg name -> positional index of the client-visible message
@@ -206,7 +212,7 @@ def _resolved_assignments(
                     assignments = [
                         value
                         for value in all_assignments
-                        if _precedes(value, reference)
+                        if _can_reach_reference(value, reference, parents)
                     ]
                     if not assignments:
                         return [_incoming_parameter()]
@@ -217,7 +223,9 @@ def _resolved_assignments(
         all_assignments = _local_assignments([scope], name)
         if all_assignments:
             assignments = [
-                value for value in all_assignments if _precedes(value, reference)
+                value
+                for value in all_assignments
+                if _can_reach_reference(value, reference, parents)
             ]
             if not assignments:
                 return [_incoming_parameter()]
@@ -277,6 +285,38 @@ def _precedes(value: ast.expr, reference: ast.AST) -> bool:
     return value_position < reference_position
 
 
+def _can_reach_reference(
+    value: ast.expr, reference: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    """Whether a binding can reach a reference directly or on a loop back-edge."""
+    return _precedes(value, reference) or _reaches_on_loop_backedge(
+        value, reference, parents
+    )
+
+
+def _reaches_on_loop_backedge(
+    value: ast.expr, reference: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    """A later binding in a repeated loop region reaches the next iteration."""
+    if _precedes(value, reference):
+        return False
+    binding_node: ast.AST = getattr(value, "_binding_node", value)
+    current: ast.AST | None = binding_node
+    while current is not None:
+        parent = parents.get(current)
+        if isinstance(parent, LOOP_NODES):
+            binding_branch = _descendant_control_branch(binding_node, parent, parents)
+            reference_branch = _descendant_control_branch(reference, parent, parents)
+            if (binding_branch == "body" and reference_branch == "body") or (
+                isinstance(parent, ast.While)
+                and binding_branch in {"body", "test"}
+                and reference_branch == "test"
+            ):
+                return True
+        current = parent
+    return False
+
+
 def _is_conditional_before_reference(
     value: ast.expr,
     reference: ast.AST,
@@ -284,6 +324,9 @@ def _is_conditional_before_reference(
     parents: dict[ast.AST, ast.AST],
 ) -> bool:
     """Whether an assignment can be skipped on the path to ``reference``."""
+    if _reaches_on_loop_backedge(value, reference, parents):
+        # The binding is unavailable on the first iteration.
+        return True
     current: ast.AST | None = value
     while current is not None and current is not scope:
         parent = parents.get(current)
@@ -476,18 +519,16 @@ def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
                 values.extend(_target_values(node.target, node.value, name))
             elif isinstance(node, ast.AugAssign):
                 if _target_contains_name(node.target, name):
-                    values.append(
-                        ast.copy_location(
-                            ast.Call(
-                                func=ast.Name(
-                                    id="_augmented_assignment", ctx=ast.Load()
-                                ),
-                                args=[node.value],
-                                keywords=[],
-                            ),
-                            node,
-                        )
+                    binding = ast.copy_location(
+                        ast.Call(
+                            func=ast.Name(id="_augmented_assignment", ctx=ast.Load()),
+                            args=[node.value],
+                            keywords=[],
+                        ),
+                        node,
                     )
+                    binding._binding_node = node  # type: ignore[attr-defined]
+                    values.append(binding)
             elif isinstance(node, ast.NamedExpr):
                 values.extend(_target_values(node.target, node.value, name))
             elif isinstance(node, (ast.For, ast.AsyncFor)):
@@ -573,7 +614,9 @@ def _reaching_alias_assignments(
     assignments = _local_assignments([scope], name)
     if not deferred:
         assignments = [
-            assignment for assignment in assignments if _precedes(assignment, reference)
+            assignment
+            for assignment in assignments
+            if _can_reach_reference(assignment, reference, parents)
         ]
     direct = [
         assignment
@@ -630,6 +673,11 @@ def _resolve_alias_values(
     parents: dict[ast.AST, ast.AST],
     visited: frozenset[str],
 ) -> str:
+    """Resolve direct single-name aliases, leaving ambiguous shapes unresolved.
+
+    This is deliberately not a general alias engine: ambiguous or non-name
+    values keep the original name and may remain outside the recognized grammar.
+    """
     resolved: list[str] = []
     for assignment in assignments:
         if not isinstance(assignment, ast.Name) or assignment.id == name:

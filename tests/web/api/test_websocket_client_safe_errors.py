@@ -185,8 +185,8 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         f"expected exactly 23 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 32, (
-        f"expected exactly 32 error payloads, matched {result.error_payloads}; "
+    assert result.error_payloads == 33, (
+        f"expected exactly 33 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -985,6 +985,91 @@ async def handle_intervention(websocket, message):
 
 
 @pytest.mark.parametrize(
+    "loop_header",
+    ["for item in items:", "async for item in items:", "while items:"],
+    ids=["for", "async-for", "while"],
+)
+def test_loop_backedge_rebinding_reaches_an_earlier_sink(loop_header: str) -> None:
+    source = f"""
+async def leak(items, error):
+    message = "safe"
+    {loop_header}
+        await send_message_delivery(message=message)
+        message = str(error)
+"""
+
+    assert _guard_offenders(source), "the next iteration sends the rebound value"
+
+
+def test_loop_backedge_binding_is_unavailable_on_the_first_iteration() -> None:
+    source = """
+async def leak(items, message):
+    for item in items:
+        await send_message_delivery(message=message)
+        message = "safe"
+"""
+
+    assert _guard_offenders(source), "the first iteration still sends the input"
+
+
+def test_while_backedge_rebinding_reaches_the_next_condition() -> None:
+    source = """
+async def leak(error):
+    message = "safe"
+    while await send_message_delivery(message=message):
+        message = str(error)
+"""
+
+    assert _guard_offenders(source), "the next condition sees the rebound value"
+
+
+def test_while_condition_rebinding_reaches_the_next_condition() -> None:
+    source = """
+async def leak(error):
+    message = "safe"
+    while (await send_message_delivery(message=message)) or (message := str(error)):
+        pass
+"""
+
+    assert _guard_offenders(source), "the next condition sees the rebound value"
+
+
+def test_safe_while_condition_backedge_keeps_the_sink_clean() -> None:
+    source = """
+async def deliver():
+    message = "safe"
+    while (await send_message_delivery(message=message)) or (message := "still safe"):
+        pass
+"""
+
+    assert not _guard_offenders(source)
+
+
+def test_loop_backedge_augassign_reaches_an_earlier_sink() -> None:
+    source = """
+async def leak(items, error):
+    message = "safe"
+    for item in items:
+        await send_message_delivery(message=message)
+        message += str(error)
+"""
+
+    assert _guard_offenders(source), "the augmented value reaches iteration two"
+
+
+def test_safe_loop_backedge_keeps_the_sink_clean() -> None:
+    source = """
+async def deliver(items):
+    message = "safe"
+    for item in items:
+        await send_message_delivery(message=message)
+        message = "still safe"
+"""
+
+    assert not _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
     "control_flow",
     [
         'for item in items:\n            message = f"Runtime error: {str(e)}"',
@@ -1469,6 +1554,18 @@ def test_guard_resolves_a_producer_alias_rebound_after_the_sink(scope: str) -> N
     producer = audit
 """
     assert _guard_offenders(source)
+
+
+def test_guard_resolves_a_producer_alias_on_the_next_loop_iteration() -> None:
+    source = """
+async def leak(items, error):
+    producer = audit
+    for item in items:
+        await producer(message=str(error))
+        producer = send_message_delivery
+"""
+
+    assert _guard_offenders(source), "the second iteration calls the producer"
 
 
 @pytest.mark.parametrize(
