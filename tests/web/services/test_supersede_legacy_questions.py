@@ -41,7 +41,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import ops_signals
 from xagent.web.services.assistant_history_safety import (
-    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
 )
 from xagent.web.services.chat_history_service import (
     QUESTION_MESSAGE_TYPE,
@@ -163,7 +163,7 @@ def test_supersede_zeroes_the_whole_waiting_set_with_negative_controls():
         assert first.message_type == SUPERSEDED_MESSAGE_TYPE
         assert second.message_type == SUPERSEDED_MESSAGE_TYPE
         assert user_row.message_type == "question"
-        assert non_question_row.message_type == ASSISTANT_RESPONSE_MESSAGE_TYPE
+        assert non_question_row.message_type == LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE
         assert other_question.message_type == "question"
     finally:
         db.close()
