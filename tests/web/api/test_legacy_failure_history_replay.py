@@ -8,6 +8,9 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+)
 from xagent.web.services.hot_path_cache import cache_version_token
 from xagent.web.services.managed_task_lease import finalize_managed_task_lease_result
 from xagent.web.services.task_lease_service import TaskLease
@@ -191,6 +194,37 @@ async def test_legacy_failure_row_is_redacted_on_cache_miss(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "content",
+    [
+        "This response was interrupted.",
+        "Required MCP servers are unavailable.",
+    ],
+)
+async def test_explicitly_safe_failure_replays_unchanged(
+    _test_db,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+) -> None:
+    task_id, user_id = _failed_task_with_message(
+        content=content,
+        message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    )
+
+    events = await _replay_history(
+        monkeypatch,
+        task_id=task_id,
+        user_id=user_id,
+    )
+
+    assert any(
+        event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("message") == content
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("message_type", "content"),
     [
         ("chat_response", "A legitimate pre-cutover assistant response."),
@@ -274,6 +308,18 @@ async def test_failure_trace_and_chat_are_both_redacted_on_history_replay(
                 },
             )
         )
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id="failed-pattern-end-1730",
+                event_type="dag_execute_end",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "status": "failed",
+                    "result": {"success": False, "error": raw_error},
+                },
+            )
+        )
         db.commit()
     finally:
         db.close()
@@ -285,6 +331,11 @@ async def test_failure_trace_and_chat_are_both_redacted_on_history_replay(
     )
 
     assert raw_error not in repr(events)
+    assert any(
+        event.get("event_type") == "dag_execute_end"
+        and event.get("data", {}).get("result") == {"success": False}
+        for event in events
+    )
     assert any(
         event.get("event_type") == "trace_error"
         and event.get("data")

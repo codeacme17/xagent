@@ -36,6 +36,21 @@ GENERAL_ERROR_PUBLIC_FIELDS = (
     "success",
     "turn_id",
 )
+PATTERN_END_EVENT_TYPES = frozenset(
+    {"dag_execute_end", "react_task_end", "task_end_react"}
+)
+FAILED_PATTERN_END_PUBLIC_FIELDS = (
+    "status",
+    "success",
+    "execution_id",
+    "pattern",
+    "stream_message_id",
+    "turn_id",
+    "iteration",
+    "task_preview",
+    "step_id",
+)
+FAILED_PATTERN_RESULT_PUBLIC_FIELDS = ("success", "status")
 
 WORKFORCE_DELEGATION_PUBLIC_FIELDS = (
     "status",
@@ -115,6 +130,31 @@ def normalize_public_trace_event(
         )
         public_data["error_message"] = CLIENT_SAFE_TASK_FAILURE
         data = public_data
+        event_type = "trace_error"
+    elif event_type in PATTERN_END_EVENT_TYPES and isinstance(data, dict):
+        result = data.get("result")
+        result_is_failure = isinstance(result, dict) and (
+            result.get("success") is False
+            or result.get("status") == "failed"
+            or bool(result.get("error"))
+        )
+        if (
+            data.get("success") is False
+            or data.get("status") == "failed"
+            or result_is_failure
+        ):
+            public_data = {
+                key: data[key]
+                for key in FAILED_PATTERN_END_PUBLIC_FIELDS
+                if key in data
+            }
+            if isinstance(result, dict):
+                public_data["result"] = {
+                    key: result[key]
+                    for key in FAILED_PATTERN_RESULT_PUBLIC_FIELDS
+                    if key in result
+                }
+            data = public_data
 
     if not is_public_workforce_delegation_summary(event_type, data):
         return event_type, data

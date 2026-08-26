@@ -60,7 +60,7 @@ def test_normalize_public_trace_event_redacts_general_failure_diagnostics(
         },
     )
 
-    assert normalized_event_type == event_type
+    assert normalized_event_type == "trace_error"
     assert raw_error not in repr(data)
     assert data == {
         "status": "failed",
@@ -72,12 +72,11 @@ def test_normalize_public_trace_event_redacts_general_failure_diagnostics(
 
 
 @pytest.mark.parametrize(
-    ("trace_event_type", "expected_event_type"),
-    [("task", "task_error_general"), ("step", "step_error_general")],
+    "trace_event_type",
+    ["task", "step"],
 )
 def test_live_general_failure_trace_uses_redacted_public_event(
     trace_event_type: str,
-    expected_event_type: str,
 ) -> None:
     from xagent.core.agent.trace import STEP_ERROR, TASK_ERROR, TraceEvent
     from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
@@ -97,11 +96,102 @@ def test_live_general_failure_trace_uses_redacted_public_event(
     stream_event = WebSocketTraceHandler(42)._convert_trace_event_to_stream_event(event)
 
     assert stream_event is not None
-    assert stream_event["event_type"] == expected_event_type
+    assert stream_event["event_type"] == "trace_error"
     assert raw_error not in repr(stream_event)
     assert stream_event["data"] == {
         "status": "failed",
         "error_message": "Task execution failed.",
+    }
+
+
+@pytest.mark.parametrize("event_type", ["dag_execute_end", "react_task_end"])
+def test_failed_pattern_end_redacts_nested_diagnostics(event_type: str) -> None:
+    raw_error = "provider token=secret host=/srv/private"
+
+    normalized_event_type, data = normalize_public_trace_event(
+        event_type,
+        {
+            "status": "failed",
+            "execution_id": "execution-1730",
+            "pattern": "ReActPattern",
+            "step_id": "step-1",
+            "result": {
+                "success": False,
+                "status": "failed",
+                "error": raw_error,
+                "context": {"messages": [{"content": raw_error}]},
+            },
+        },
+    )
+
+    assert normalized_event_type == event_type
+    assert raw_error not in repr(data)
+    assert data == {
+        "status": "failed",
+        "execution_id": "execution-1730",
+        "pattern": "ReActPattern",
+        "step_id": "step-1",
+        "result": {"success": False, "status": "failed"},
+    }
+
+
+def test_successful_pattern_end_preserves_result() -> None:
+    result = {"success": True, "status": "completed", "output": "safe answer"}
+
+    _, data = normalize_public_trace_event(
+        "react_task_end",
+        {"status": "completed", "result": result},
+    )
+
+    assert data == {"status": "completed", "result": result}
+
+
+def test_top_level_failed_pattern_status_survives_public_normalization() -> None:
+    from xagent.web.api.workforces import _derive_agent_execution_status
+
+    event_type, data = normalize_public_trace_event(
+        "dag_execute_end",
+        {"success": False, "error": "provider token=secret"},
+    )
+
+    assert data == {"success": False}
+    assert (
+        _derive_agent_execution_status(
+            [{"event_type": event_type, "data": data}],
+        )
+        == "failed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("trace_event_type", "expected_event_type"),
+    [("dag", "dag_execute_end"), ("react", "react_task_end")],
+)
+def test_live_failed_pattern_end_redacts_nested_diagnostics(
+    trace_event_type: str,
+    expected_event_type: str,
+) -> None:
+    from xagent.core.agent.trace import TASK_END_DAG, TASK_END_REACT, TraceEvent
+    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+
+    raw_error = "live pattern token=secret"
+    event = TraceEvent(
+        TASK_END_DAG if trace_event_type == "dag" else TASK_END_REACT,
+        task_id="42",
+        data={
+            "status": "failed",
+            "result": {"success": False, "error": raw_error},
+        },
+    )
+
+    stream_event = WebSocketTraceHandler(42)._convert_trace_event_to_stream_event(event)
+
+    assert stream_event is not None
+    assert stream_event["event_type"] == expected_event_type
+    assert raw_error not in repr(stream_event)
+    assert stream_event["data"] == {
+        "status": "failed",
+        "result": {"success": False},
     }
 
 

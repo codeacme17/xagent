@@ -5,9 +5,11 @@ from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 LEGACY_ASSISTANT_RESPONSE_MESSAGE_TYPE = "chat_response"
 ASSISTANT_RESPONSE_MESSAGE_TYPE = "assistant_response"
 TASK_FAILURE_MESSAGE_TYPE = "task_failure"
+CLIENT_SAFE_FAILURE_MESSAGE_TYPE = "client_safe_failure"
 KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES = frozenset(
     {
         ASSISTANT_RESPONSE_MESSAGE_TYPE,
+        CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
         "assistant",
         "question",
         "question_superseded",
