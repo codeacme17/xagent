@@ -145,7 +145,7 @@ def _s3_throttle_fault() -> DurableStorageOperationError:
     translated = OSError(_EIO, _PROVIDER_MESSAGE)
     translated.__cause__ = ClientError()
     fault = DurableStorageOperationError(
-        f"Failed to write durable object: {_STORAGE_KEY}"
+        "Failed to write durable object", storage_key=_STORAGE_KEY
     )
     fault.__cause__ = translated
     return fault
@@ -979,6 +979,11 @@ _DIRECT_HELPER_SITES = frozenset(
     {
         ("web/api/files.py", "upload compensation", ("user_id", "task_id")),
         (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable adoption",
+            ("file_id", "storage_key"),
+        ),
+        (
             "web/api/v1/tasks.py",
             "turn attachment resolution",
             ("task_id", "owner_user_id", "file_ids"),
@@ -1324,8 +1329,11 @@ def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
     # The consumer: split on whitespace, then on the first ``=``. This is what
     # awk, a kv filter, and a grep pipeline all do.
     fields = dict(token.split("=", 1) for token in message_line.split() if "=" in token)
-    assert set(fields) == {"file_ids", "storage_key"}, fields
-    assert "user_id" not in fields and "file_id" not in fields
+    # Not an exact set: the classifier appends its own fields to every line
+    # (``provider_class``, ``retryable``, ...). What must hold is that the
+    # client's value minted none of them.
+    assert "user_id" not in fields and "file_id" not in fields, fields
+    assert "file_ids" in fields and "storage_key" in fields, fields
     # The value survives whole in the one field it belongs to, escaped.
     assert fields["file_ids"].replace("\\x20", " ") == forged
     # Fields the helper renders itself stay untouched and greppable.
@@ -1474,7 +1482,7 @@ def test_a_permanent_fault_is_labelled_but_still_answered_503(
             }
 
     fault = DurableStorageOperationError(
-        f"Failed to write durable object: {_STORAGE_KEY}"
+        "Failed to write durable object", storage_key=_STORAGE_KEY
     )
     fault.__cause__ = ClientError()
 

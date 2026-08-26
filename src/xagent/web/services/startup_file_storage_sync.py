@@ -264,14 +264,14 @@ def _sync_registered_files(
                 user_storage = _user_scoped_storage(storage, user_id)
                 remote_objects = _list_remote_objects_for_user(user_storage)
 
-            expected_key = _expected_storage_key(candidate)
-            remote_object = remote_objects.get(expected_key)
+            expected_storage_key = _expected_storage_key(candidate)
+            remote_object = remote_objects.get(expected_storage_key)
             if remote_object is not None:
                 if not _has_complete_durable_metadata(candidate):
                     try:
                         adopt_result = ManagedFileRef(
                             candidate, storage=user_storage
-                        ).adopt_existing_object(expected_key)
+                        ).adopt_existing_object(expected_storage_key)
                     except DurableStorageOperationError as exc:
                         # Named before the bare arm below so an adoption failure
                         # gets the classified provider fields, not just a
@@ -284,7 +284,7 @@ def _sync_registered_files(
                             "startup durable adoption",
                             exc,
                             file_id=candidate.file_id,
-                            storage_key=expected_key,
+                            storage_key=expected_storage_key,
                         )
                         continue
                     except Exception:
@@ -292,7 +292,7 @@ def _sync_registered_files(
                         logger.exception(
                             "Failed startup durable adoption for file_id=%s key=%s",
                             candidate.file_id,
-                            expected_key,
+                            expected_storage_key,
                         )
                         continue
                     if adopt_result == "missing":
@@ -329,7 +329,7 @@ def _sync_registered_files(
                 stored_object = ManagedFileRef(
                     candidate, storage=user_storage
                 ).sync_to_durable(
-                    storage_key=expected_key,
+                    storage_key=expected_storage_key,
                     mime_type=candidate.mime_type,
                 )
             except Exception:
@@ -338,7 +338,7 @@ def _sync_registered_files(
                     "Failed startup durable sync for file_id=%s path=%s key=%s",
                     candidate.file_id,
                     local_path,
-                    expected_key,
+                    expected_storage_key,
                 )
                 continue
             if not _persist_startup_sync_candidate(
@@ -348,7 +348,7 @@ def _sync_registered_files(
             ):
                 failed += 1
                 continue
-            remote_objects[expected_key] = stored_object
+            remote_objects[expected_storage_key] = stored_object
             uploaded += 1
 
         cursor = next_cursor
