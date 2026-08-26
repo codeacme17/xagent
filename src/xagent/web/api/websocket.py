@@ -1,6 +1,7 @@
 """WebSocket real-time communication handler"""
 
 import asyncio
+import enum
 import json
 import logging
 import re
@@ -3982,6 +3983,47 @@ class BackgroundTaskCancelOutcome:
     requested: bool
 
 
+class ResumeReservationOutcome(enum.Enum):
+    """Result of trying to take the single live-control resume slot."""
+
+    RESERVED = "reserved"
+    # A short window inside one injection: the slot is claimed but its
+    # coordinator is not registered yet. It always self-clears.
+    RESERVATION_HELD = "reservation_held"
+    # Lasts as long as the whole resumed execution: a coordinator is already
+    # registered in ``resume_tasks`` and has not finished.
+    COORDINATOR_RUNNING = "coordinator_running"
+    # This process is draining, so another runner can take the work. Only the
+    # legacy (non-durable) socket path can observe it today: ``shutdown_event``
+    # awaits ``stop_task_command_dispatcher`` before
+    # ``BackgroundTaskManager.shutdown`` sets the flag (``src/xagent/web/
+    # app.py``), so no durable command is mid-execution by then. Deferred
+    # anyway rather than rejected -- that ordering is a property of the
+    # lifespan, not of this module, and deferring is the safe reading if it
+    # ever changes.
+    SHUTTING_DOWN = "shutting_down"
+
+
+# Per-cause rejection wording for a resume-reservation contention that was not
+# deferrable. ``COORDINATOR_RUNNING`` must never invite a resend: the running
+# coordinator may be applying this exact turn, and a resend mints a fresh turn
+# id, so retrying would duplicate work already under way. The other causes
+# never reached an injection, so they may safely ask the sender to resend.
+_RESUME_RESERVATION_REJECTION_MESSAGES = {
+    ResumeReservationOutcome.RESERVATION_HELD: (
+        "This task is busy starting an earlier message. Please send your "
+        "message again shortly."
+    ),
+    ResumeReservationOutcome.SHUTTING_DOWN: (
+        "The server is restarting. Please send your message again shortly."
+    ),
+    ResumeReservationOutcome.COORDINATOR_RUNNING: (
+        "This task is still applying an earlier message. Please wait for it "
+        "to finish rather than sending again."
+    ),
+}
+
+
 # Background task manager: ensures only one active background execution per task
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
@@ -4041,20 +4083,26 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
+    def try_reserve_resume(self, task_id: int) -> ResumeReservationOutcome:
+        """Atomically try to reserve the single live-control resume slot,
+        classifying why it was unavailable when it was not reserved."""
+
+        if self._shutting_down:
+            return ResumeReservationOutcome.SHUTTING_DOWN
+        # Keep this check-and-add block synchronous: asyncio task switches can
+        # only happen at ``await``, so it is the in-process atomic guard.
+        if task_id in self._resume_reservations:
+            return ResumeReservationOutcome.RESERVATION_HELD
+        existing = self.resume_tasks.get(task_id)
+        if existing is not None and not existing.done():
+            return ResumeReservationOutcome.COORDINATOR_RUNNING
+        self._resume_reservations.add(task_id)
+        return ResumeReservationOutcome.RESERVED
+
     def reserve_resume(self, task_id: int) -> bool:
         """Atomically reserve the single live-control resume slot."""
 
-        if self._shutting_down:
-            return False
-        # Keep this check-and-add block synchronous: asyncio task switches can
-        # only happen at ``await``, so it is the in-process atomic guard.
-        existing = self.resume_tasks.get(task_id)
-        if task_id in self._resume_reservations or (
-            existing is not None and not existing.done()
-        ):
-            return False
-        self._resume_reservations.add(task_id)
-        return True
+        return self.try_reserve_resume(task_id) is ResumeReservationOutcome.RESERVED
 
     def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -6113,11 +6161,68 @@ async def _handle_chat_message_unserialized(
             if task_uses_live_control and supports_live_control:
                 logger.info(f"Using agent message control for task {task_id}")
                 assert agent_service is not None
-                if not background_task_manager.reserve_resume(task_id):
+                reservation = background_task_manager.try_reserve_resume(task_id)
+                if reservation is not ResumeReservationOutcome.RESERVED:
+                    # ``suppress_delivery_ack`` gates every deferral: a live
+                    # socket sender retries on its own and must keep its
+                    # synchronous answer.
+                    #
+                    # COORDINATOR_RUNNING defers only alongside a recovered
+                    # delivery -- an earlier attempt of THIS command already
+                    # claimed this payload and left it DELIVERY_PENDING, so
+                    # the row stays pending whether or not the running
+                    # coordinator is the one carrying it, and a later attempt
+                    # injects it once that coordinator clears. That is also
+                    # the arm that stops a delivered message from being
+                    # reported as dropped: once the coordinator marks the row
+                    # dispatched, the executor's pending check no longer
+                    # preempts the rejection below.
+                    #
+                    # With no recovered delivery it keeps rejecting: a
+                    # coordinator lasts as long as its execution, and
+                    # ``_unfinished_earlier_command`` would hold every later
+                    # command for this task behind the wait -- delaying an
+                    # unrelated pause or cancel -- before failing anyway.
+                    deferrable = suppress_delivery_ack and (
+                        reservation
+                        in (
+                            ResumeReservationOutcome.RESERVATION_HELD,
+                            ResumeReservationOutcome.SHUTTING_DOWN,
+                        )
+                        or (
+                            reservation is ResumeReservationOutcome.COORDINATOR_RUNNING
+                            and recovered_delivery is not None
+                        )
+                    )
+                    if deferrable:
+                        # The cause stays in this log line. The deferral's own
+                        # text is built at the raise site from server state,
+                        # like every sibling deferral, so the notice a client
+                        # sees when the budget runs out cannot leak it.
+                        logger.info(
+                            "Deferring durable message %s for task %s: "
+                            "resume slot contention (%s)",
+                            turn_id,
+                            task_id,
+                            reservation.value,
+                        )
+                        message_data["_durable_command_defer"] = turn_id
+                        return
+                    # The table covers every non-RESERVED cause, so the
+                    # default is unreachable. It is here because the
+                    # client-safe-text guard only recognizes a curated table
+                    # as ``.get(key, "<literal>")`` (see
+                    # ``tests/web/api/test_websocket_client_safe_errors.py``):
+                    # a subscript is not a shape it accepts, and a bare
+                    # module-level name would not pass as the default either.
+                    message = _RESUME_RESERVATION_REJECTION_MESSAGES.get(
+                        reservation,
+                        "This task is busy starting an earlier message. "
+                        "Please send your message again shortly.",
+                    )
                     await finish_delivery(
                         False,
-                        "A previous guidance message is still being applied. "
-                        "Please wait for it to finish.",
+                        message,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -8406,6 +8511,15 @@ async def _execute_durable_task_command(
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_durable_command_defer") == command.command_id:
+            # Resume-slot contention the handler judged self-clearing, or
+            # already owned by a coordinator carrying this exact turn (see
+            # ResumeReservationOutcome). Reschedule instead of spending the
+            # failure budget; the cause stays in the handler's log line.
+            raise ClientVisibleTaskCommandDeferred(
+                f"Message {command.command_id} is waiting for the "
+                "live-control resume slot"
+            )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"

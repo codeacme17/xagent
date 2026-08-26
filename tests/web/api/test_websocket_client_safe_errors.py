@@ -1090,6 +1090,9 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     bg_mgr.reserve_resume.return_value = True
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
@@ -1147,6 +1150,9 @@ def _chat_runtime_error_harness(secret_error: Exception):
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
     bg_mgr.reserve_resume.return_value = True
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
