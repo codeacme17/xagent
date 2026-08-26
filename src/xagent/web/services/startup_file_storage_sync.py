@@ -332,6 +332,21 @@ def _sync_registered_files(
                     storage_key=expected_storage_key,
                     mime_type=candidate.mime_type,
                 )
+            except DurableStorageOperationError as exc:
+                # ``sync_to_durable`` wraps the provider fault, so this is a
+                # reporting site rather than a raw boundary: it gets the
+                # classified fields the adoption arm above already gets. Still
+                # counted and skipped -- one file failing to sync at startup
+                # must not stop the rest.
+                failed += 1
+                log_durable_storage_fault(
+                    logger,
+                    "startup durable sync",
+                    exc,
+                    file_id=candidate.file_id,
+                    storage_key=expected_storage_key,
+                )
+                continue
             except Exception:
                 failed += 1
                 logger.exception(

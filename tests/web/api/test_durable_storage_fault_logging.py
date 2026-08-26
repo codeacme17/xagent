@@ -984,6 +984,11 @@ _DIRECT_HELPER_SITES = frozenset(
             ("file_id", "storage_key"),
         ),
         (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable sync",
+            ("file_id", "storage_key"),
+        ),
+        (
             "web/api/v1/tasks.py",
             "turn attachment resolution",
             ("task_id", "owner_user_id", "file_ids"),

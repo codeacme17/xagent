@@ -1,8 +1,9 @@
 """Classify the provider fault behind a failed durable-storage operation.
 
 ``ManagedFileRef`` wraps every provider exception into
-``DurableStorageOperationError`` with only the storage key in its message, and
-#1467 restored the ``__cause__`` chain to the logs. A traceback is readable but
+``DurableStorageOperationError`` -- a static message, with the storage key on
+its ``storage_key`` attribute (#1643) -- and #1467 restored the ``__cause__``
+chain to the logs. A traceback is readable but
 not *queryable*: an operator triaging a burst of 503s wants to know whether
 they are looking at one throttle, a thousand throttles, or a rejected
 credential, and that question is a field aggregation, not a text search.
@@ -17,7 +18,7 @@ in this family still answers 503; see ``ProviderFault.retryable``.
 falls back to ``OSError(EIO, ...)`` for the rest, and sets ``__cause__`` to the
 original ``ClientError``. So the provider code lives two levels below the wrap:
 
-    DurableStorageOperationError("Failed to write durable object: <key>")
+    DurableStorageOperationError("Failed to write durable object")
       __cause__ -> PermissionError("Access Denied")          <- s3fs
         __cause__ -> ClientError(response={"Error": {"Code": "AccessDenied"}})
 
@@ -94,16 +95,25 @@ _PERMANENT_CODES = frozenset(
     }
 )
 
-# The first five are exactly ``s3fs.core.S3_RETRYABLE_ERRORS`` -- the set the
-# installed backend itself retries on -- so anything reaching us wearing one of
-# those names has already exhausted the backend's own attempts.
-_RETRYABLE_EXC_NAMES = frozenset(
+# Exactly ``s3fs.core.S3_RETRYABLE_ERRORS`` -- the set the installed backend
+# itself retries on -- so a fault reaching us wearing one of these names has
+# already exhausted the backend's own attempts. Authoritative: it is copied
+# from a published constant, and drift is visible by diffing against it.
+_S3FS_RETRYABLE_EXC_NAMES = frozenset(
     {
         "ClientPayloadError",
         "FSTimeoutError",
         "HTTPClientError",
         "IncompleteRead",
         "ResponseParserError",
+    }
+)
+
+# Transport-level botocore/urllib3 names not in that constant. Inferred from
+# what each class means, not from a published retry list -- kept separate so
+# the distinction survives a reordering, which a single set could not express.
+_INFERRED_RETRYABLE_EXC_NAMES = frozenset(
+    {
         "ConnectionClosedError",
         "ConnectionError",
         "ConnectTimeoutError",
@@ -115,6 +125,8 @@ _RETRYABLE_EXC_NAMES = frozenset(
         "TimeoutError",
     }
 )
+
+_RETRYABLE_EXC_NAMES = _S3FS_RETRYABLE_EXC_NAMES | _INFERRED_RETRYABLE_EXC_NAMES
 
 # Credential/config faults raised before a request is ever signed.
 _PERMANENT_EXC_NAMES = frozenset(
@@ -133,10 +145,10 @@ _PERMANENT_EXC_NAMES = frozenset(
 def _errnos(*names: str) -> frozenset[int]:
     """Resolve ``errno`` names, skipping any the platform does not define.
 
-    Named lookup rather than attribute access because this module is imported
-    by ``core.file_storage.__init__``, so an ``AttributeError`` here would fail
-    every code path that touches storage -- a far worse outcome than losing one
-    errno from a classification table on an exotic platform.
+    Named lookup rather than attribute access because these tables are built at
+    import time: an ``AttributeError`` for an errno some platform does not
+    define would fail the import of every consumer, which is a far worse
+    outcome than losing one entry from a classification table.
     """
     resolved = (getattr(errno, name, None) for name in names)
     return frozenset(value for value in resolved if isinstance(value, int))

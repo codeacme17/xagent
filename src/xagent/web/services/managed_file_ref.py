@@ -153,6 +153,10 @@ def log_durable_storage_fault(
     # classifier are sanitised on the same terms as request identifiers: a
     # provider ``Code`` is read out of a duck-typed response dict, so a
     # loosely-conforming backend could put a space or newline in it.
+    # Classified fields last: they are derived from the exception itself, so
+    # where a caller passes a key of the same name the exception's own answer
+    # is the one to keep. No caller does today; the precedence is stated so a
+    # future collision is a decision rather than a surprise.
     merged = {**fields, **classify_provider_fault(exc).as_fields()}
     rendered = "".join(
         f" {name}={_sanitize_log_value(value)}"
