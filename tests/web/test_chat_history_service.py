@@ -72,7 +72,7 @@ def test_load_task_transcript_returns_prior_turns_only():
             int(task.id),
             int(task.user_id),
             "The main risks are architecture drift and persistence gaps.",
-            message_type="final_answer",
+            message_type="assistant_response",
         )
         assert assistant is not None
 
@@ -97,6 +97,55 @@ def test_load_task_transcript_returns_prior_turns_only():
                 "content": "The main risks are architecture drift and persistence gaps.",
             },
         ]
+    finally:
+        db_session.close()
+
+
+@pytest.mark.parametrize(
+    ("message_type", "content", "expected_content"),
+    [
+        ("task_failure", "provider token=secret", "Task execution failed."),
+        (
+            "chat_response",
+            "A legitimate pre-cutover assistant response.",
+            "Task execution failed.",
+        ),
+        (
+            "assistant_message",
+            "Legacy managed failure token=secret",
+            "Task execution failed.",
+        ),
+        (
+            "final_answer",
+            "Legacy websocket failure token=secret",
+            "Task execution failed.",
+        ),
+        ("unknown_assistant_type", "unknown token=secret", "Task execution failed."),
+        ("assistant", "A known-safe legacy answer.", "A known-safe legacy answer."),
+        ("assistant_response", "A known-safe answer.", "A known-safe answer."),
+    ],
+)
+def test_load_task_transcript_projects_assistant_history_for_subsequent_turns(
+    message_type: str,
+    content: str,
+    expected_content: str,
+) -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        assistant = persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            content,
+            message_type=message_type,
+        )
+        assert assistant is not None
+
+        transcript = load_task_transcript(db_session, int(task.id))
+
+        assert transcript == [{"role": "assistant", "content": expected_content}]
+        assert "secret" not in repr(transcript)
     finally:
         db_session.close()
 

@@ -9,6 +9,8 @@ from sqlalchemy import or_
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
+from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 
 TOOL_EVENT_TYPES = frozenset(
     {
@@ -26,6 +28,14 @@ WORKFORCE_DELEGATION_EVENT_TYPES = frozenset(
 )
 WORKFORCE_DELEGATION_INTERNAL_EVENT_TYPE = "task_update_general"
 DELEGATED_AGENT_TRACE_SOURCE = "xagent-agent-tool-child"
+GENERAL_ERROR_PUBLIC_FIELDS = (
+    "status",
+    "execution_id",
+    "pattern",
+    "stream_message_id",
+    "success",
+    "turn_id",
+)
 
 WORKFORCE_DELEGATION_PUBLIC_FIELDS = (
     "status",
@@ -97,6 +107,14 @@ def normalize_public_trace_event(
     """
     if event_type in TOOL_EVENT_TYPES:
         data = redact_runtime_sensitive_payload(data)
+    elif event_type in GENERAL_ERROR_EVENT_TYPES:
+        public_data = (
+            {key: data[key] for key in GENERAL_ERROR_PUBLIC_FIELDS if key in data}
+            if isinstance(data, dict)
+            else {}
+        )
+        public_data["error_message"] = CLIENT_SAFE_TASK_FAILURE
+        data = public_data
 
     if not is_public_workforce_delegation_summary(event_type, data):
         return event_type, data

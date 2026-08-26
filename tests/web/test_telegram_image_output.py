@@ -349,7 +349,7 @@ def test_persist_telegram_assistant_turn_stores_failed_text_response(
             "user_id": 7,
             "content": "I could not generate that image.",
             "interactions": [],
-            "message_type": "assistant_message",
+            "message_type": "assistant_response",
         }
     ]
 

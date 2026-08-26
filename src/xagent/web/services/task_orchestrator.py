@@ -59,6 +59,7 @@ from sqlalchemy.orm import Session
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
+from .assistant_history_safety import TASK_FAILURE_MESSAGE_TYPE
 from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -66,6 +67,7 @@ from .chat_history_service import (
     DELIVERY_PENDING,
     mark_user_message_delivery_sync,
 )
+from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
@@ -1354,8 +1356,8 @@ def settle_task_lease_isolated(
                             settle_db,
                             task_id=lease.task_id,
                             user_id=int(task.user_id),
-                            content=error_message,
-                            message_type="chat_response",
+                            content=CLIENT_SAFE_TASK_FAILURE,
+                            message_type=TASK_FAILURE_MESSAGE_TYPE,
                         )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
