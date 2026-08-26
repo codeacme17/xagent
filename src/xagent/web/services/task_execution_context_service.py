@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 from ...core.file_ref import build_file_id_ref
 from ...skills.utils import create_skill_manager
 from ..models.task import TraceEvent
-from .trace_event_types import GENERAL_ERROR_EVENT_TYPES
+from .trace_event_types import (
+    GENERAL_ERROR_EVENT_TYPES,
+    STEP_GENERAL_ERROR_EVENT_TYPE,
+    TASK_GENERAL_ERROR_EVENT_TYPE,
+)
 
 
 @dataclass(frozen=True)
@@ -227,7 +231,10 @@ def summarize_execution_failure_event(
 
     success = result.get("success")
     status = str(result.get("status") or data.get("status") or "").strip()
-    failure_is_proven = event_type in GENERAL_ERROR_EVENT_TYPES
+    failure_is_proven = event_type in {
+        TASK_GENERAL_ERROR_EVENT_TYPE,
+        STEP_GENERAL_ERROR_EVENT_TYPE,
+    }
     if (
         not failure_is_proven
         and success is not False

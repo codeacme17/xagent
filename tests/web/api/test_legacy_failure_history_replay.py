@@ -11,7 +11,11 @@ from xagent.web.models.user import User
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
 )
-from xagent.web.services.hot_path_cache import cache_version_token
+from xagent.web.services.chat_history_service import persist_assistant_message_no_commit
+from xagent.web.services.hot_path_cache import (
+    cache_version_token,
+    web_task_history_key,
+)
 from xagent.web.services.managed_task_lease import finalize_managed_task_lease_result
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_orchestrator import settle_task_lease_isolated
@@ -185,6 +189,44 @@ async def test_legacy_failure_row_is_redacted_on_cache_miss(
     )
 
     assert raw_error not in repr(events)
+    assert any(
+        event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("message") == CLIENT_SAFE_TASK_FAILURE
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_commit_persistence_without_provenance_fails_closed_on_replay(
+    _test_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_content = "unproven no-commit token=secret"
+    task_id, user_id = _running_task(
+        username="unproven-no-commit-history",
+        title="Unproven no-commit history",
+    )
+    db = _direct_db_session()
+    try:
+        row = persist_assistant_message_no_commit(
+            db,
+            task_id,
+            user_id,
+            raw_content,
+        )
+        assert row is not None
+        assert row.message_type == "assistant_message"
+        db.commit()
+    finally:
+        db.close()
+
+    events = await _replay_history(
+        monkeypatch,
+        task_id=task_id,
+        user_id=user_id,
+    )
+
+    assert raw_content not in repr(events)
     assert any(
         event.get("event_type") == "agent_message"
         and event.get("data", {}).get("message") == CLIENT_SAFE_TASK_FAILURE
@@ -386,6 +428,62 @@ async def test_pre_cutover_cached_failure_event_is_not_replayed(
         and event.get("data", {}).get("message") == CLIENT_SAFE_TASK_FAILURE
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_v2_history_cache_hit_replays_cached_events_without_rebuilding(
+    _test_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id, user_id = _failed_task_with_message(
+        content="database history that must not be rebuilt",
+        message_type="chat_response",
+    )
+    cached_event = {
+        "type": "trace_event",
+        "event_id": "distinct-v2-cache-hit",
+        "event_type": "agent_message",
+        "task_id": task_id,
+        "timestamp": 123.0,
+        "data": {
+            "message": "safe cached response",
+            "content": "safe cached response",
+        },
+    }
+    expected_key = web_task_history_key(task_id)
+    requested_keys: list[str] = []
+    cache_set_calls: list[tuple[object, ...]] = []
+    sent_events: list[dict] = []
+
+    def cache_get(key: str) -> object | None:
+        requested_keys.append(key)
+        return _history_cache_entry(task_id, [cached_event])
+
+    async def send_personal_message(event: dict, _websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr(websocket_api, "cache_get", cache_get)
+    monkeypatch.setattr(
+        websocket_api,
+        "cache_set",
+        lambda *args, **kwargs: cache_set_calls.append((*args, kwargs)),
+    )
+    monkeypatch.setattr(
+        websocket_api.manager,
+        "send_personal_message",
+        send_personal_message,
+    )
+
+    await websocket_api.send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    assert requested_keys == [expected_key]
+    assert expected_key == f"task:web:history:v2:{task_id}"
+    assert sent_events == [cached_event]
+    assert cache_set_calls == []
 
 
 @pytest.mark.asyncio

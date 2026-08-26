@@ -19,7 +19,7 @@ from ...core.agent.transcript import (
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
 from .assistant_history_safety import (
-    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
     safe_str,
@@ -650,7 +650,7 @@ def persist_assistant_message(
     user_id: int,
     content: str,
     *,
-    message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
@@ -686,7 +686,7 @@ def persist_assistant_message_no_commit(
     user_id: int,
     content: str,
     *,
-    message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,

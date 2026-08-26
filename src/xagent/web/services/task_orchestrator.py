@@ -73,7 +73,7 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
-    client_safe_error_message,
+    required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
     drain_async_task_cancellation_safe,
@@ -1859,16 +1859,18 @@ def _schedule_bg(
                         # the terminal write.
                         settlement_error = str(setup_or_run_err)
                         client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = (
+                            required_mcp_unavailable_client_message(
+                                setup_or_run_err,
+                                fallback=CLIENT_SAFE_TASK_FAILURE,
+                            )
+                        )
                     else:
                         settlement_error = (
                             "setup/run error: "
                             f"{type(setup_or_run_err).__name__}: {setup_or_run_err}"
                         )
-                    broadcast_error_message = client_safe_error_message(
-                        setup_or_run_err,
-                        safe_for_display=is_public_safe_mcp_error,
-                        fallback=CLIENT_SAFE_TASK_FAILURE,
-                    )
+                        broadcast_error_message = CLIENT_SAFE_TASK_FAILURE
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,

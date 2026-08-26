@@ -2934,6 +2934,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
 ) -> None:
     """An execution exception is persisted by the one fenced settlement."""
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2967,6 +2968,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
         ),
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2989,6 +2991,11 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     assert task.status == TaskStatus.FAILED
     assert task.error_message is not None
     assert "simulated agent boom" in str(task.error_message)
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == "Task execution failed."
+    assert event["error"] == "Task execution failed."
+    assert "simulated agent boom" not in repr(event)
 
 
 @pytest.mark.asyncio

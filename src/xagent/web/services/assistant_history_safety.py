@@ -3,6 +3,7 @@
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 LEGACY_ASSISTANT_RESPONSE_MESSAGE_TYPE = "chat_response"
+LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE = "assistant_message"
 ASSISTANT_RESPONSE_MESSAGE_TYPE = "assistant_response"
 TASK_FAILURE_MESSAGE_TYPE = "task_failure"
 CLIENT_SAFE_FAILURE_MESSAGE_TYPE = "client_safe_failure"

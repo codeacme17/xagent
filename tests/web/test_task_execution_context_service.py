@@ -192,6 +192,31 @@ def test_summarize_execution_failure_event_excludes_raw_diagnostics():
     assert "connection reset" not in summary
 
 
+def test_legacy_trace_error_message_alone_does_not_prove_failure() -> None:
+    summary = summarize_execution_failure_event(
+        {"error_message": "provider token=secret"},
+        event_type="trace_error",
+    )
+
+    assert summary is None
+
+
+def test_empty_legacy_trace_error_does_not_prove_failure() -> None:
+    assert summarize_execution_failure_event({}, event_type="trace_error") is None
+
+
+@pytest.mark.parametrize("event_type", ["task_error_general", "step_error_general"])
+def test_typed_error_event_proves_failure_without_legacy_fields(
+    event_type: str,
+) -> None:
+    summary = summarize_execution_failure_event(
+        {"error_message": "provider token=secret"},
+        event_type=event_type,
+    )
+
+    assert summary == "- Previous execution failed."
+
+
 @pytest.mark.parametrize(
     "event_type",
     [

@@ -102,3 +102,32 @@ def test_project_failed_result_separates_diagnostic_error_from_safe_display() ->
     assert raw_error not in projection.visible_text
     assert interaction_secret not in projection.visible_text
     assert projection.interactions == []
+
+
+def test_project_output_only_failure_keeps_original_text_as_diagnostic() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "error",
+            "output": "provider token=secret",
+            "chat_response": {
+                "interactions": [{"label": "interaction token=secret"}],
+            },
+        }
+    )
+
+    assert projection.visible_text == "Task execution failed."
+    assert projection.transcript_content == "Task execution failed."
+    assert projection.diagnostic_error == "provider token=secret"
+    assert projection.interactions == []
+
+
+def test_project_empty_failure_has_no_diagnostic_and_uses_safe_display() -> None:
+    projection = project_execution_result_for_channel(
+        {"success": False, "status": "error"}
+    )
+
+    assert projection.visible_text == "Task execution failed."
+    assert projection.transcript_content == "Task execution failed."
+    assert projection.diagnostic_error is None
+    assert projection.interactions == []

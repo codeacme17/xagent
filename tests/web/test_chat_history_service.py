@@ -112,6 +112,28 @@ def test_load_task_transcript_returns_prior_turns_only():
         db_session.close()
 
 
+def test_persist_assistant_message_without_provenance_fails_closed_on_load() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        raw_content = "unproven provider token=secret"
+
+        assistant = persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            raw_content,
+        )
+
+        assert assistant is not None
+        assert assistant.message_type == "assistant_message"
+        assert load_task_transcript(db_session, int(task.id)) == [
+            {"role": "assistant", "content": "Task execution failed."}
+        ]
+    finally:
+        db_session.close()
+
+
 def test_load_task_transcript_coerces_nullable_fields_to_empty_strings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

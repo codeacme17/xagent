@@ -42,11 +42,11 @@ def project_execution_result_for_channel(
     base_text = chat_message or output
     transcript_content = base_text
     task_status = _project_task_status(result, status)
-    diagnostic_error = (
-        str(result.get("error") or "").strip() or None
-        if task_status == TaskStatus.FAILED
-        else None
-    )
+    diagnostic_error = None
+    if task_status == TaskStatus.FAILED:
+        diagnostic_error = (
+            str(result.get("error") or "").strip() or base_text.strip() or None
+        )
     if status == "interrupted":
         # An interruption is control state, not an assistant answer. Show a
         # friendly status in every chat channel without adding it to the
