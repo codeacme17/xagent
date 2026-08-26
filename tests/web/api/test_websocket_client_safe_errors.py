@@ -6,6 +6,7 @@ import ast
 import asyncio
 import json
 import logging
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator, NamedTuple
@@ -581,13 +582,26 @@ def _is_known_non_error_event_type(
     )
 
 
-def _is_client_safe(expr: ast.expr) -> bool:
+def _is_client_safe(
+    expr: ast.expr,
+    scopes: list[ast.AST],
+    module_helpers: set[str],
+) -> bool:
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-        if expr.func.id == "client_safe_error_message":
+        helper = expr.func.id
+        if (
+            helper == "client_safe_error_message"
+            and helper in module_helpers
+            and not _has_local_binding(scopes, helper)
+        ):
             return True
-        if expr.func.id == "client_safe_task_command_failure":
+        if (
+            helper == "client_safe_task_command_failure"
+            and helper in module_helpers
+            and not _has_local_binding(scopes, helper)
+        ):
             # The prefix argument must be attribute access on server state
             # (``command.kind``), never a literal or a bare name a caller
             # could point at untrusted text.
@@ -600,7 +614,9 @@ def _is_client_safe(expr: ast.expr) -> bool:
             for arg in expr.args[1:]
         )
     if isinstance(expr, ast.BoolOp):
-        return all(_is_client_safe(value) for value in expr.values)
+        return all(
+            _is_client_safe(value, scopes, module_helpers) for value in expr.values
+        )
     return False
 
 
@@ -611,11 +627,35 @@ class _ScanResult(NamedTuple):
     used_allowlist: set[tuple[str, str]]
 
 
+def _has_nested_global_rebinding(tree: ast.Module, name: str) -> bool:
+    """Whether a function writes the module binding through ``global``."""
+    for scope in ast.walk(tree):
+        if not isinstance(scope, READABLE_SCOPE_NODES):
+            continue
+        nodes = list(_scope_nodes(scope))
+        declares_global = any(
+            isinstance(node, ast.Global) and name in node.names for node in nodes
+        )
+        if declares_global and any(
+            (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Store)
+                and node.id == name
+            )
+            or _binds_name_without_store(node, name)
+            for node in nodes
+            if not isinstance(node, ast.Global)
+        ):
+            return True
+    return False
+
+
 def _trusted_module_helpers(tree: ast.Module) -> set[str]:
     """Helpers with one real module implementation and no other binding."""
     expected = {
         *DICT_ERROR_PAYLOAD_BUILDERS,
         *NON_ERROR_STREAM_EVENT_BUILDERS,
+        *SAFE_MESSAGE_BUILDERS,
         "create_stream_event",
     }
     trusted: set[str] = set()
@@ -678,7 +718,55 @@ def _trusted_module_helpers(tree: ast.Module) -> set[str]:
             )
             for node in nodes
         )
-        if len(implementations) == 1 and not unsafe_decorated and not has_other_binding:
+        if (
+            len(implementations) == 1
+            and not unsafe_decorated
+            and not has_other_binding
+            and not _has_nested_global_rebinding(tree, name)
+        ):
+            trusted.add(name)
+    return trusted
+
+
+def _trusted_imported_safe_constants(tree: ast.Module) -> set[str]:
+    """Constants with one exact relative import and no competing binding."""
+    nodes = list(_scope_nodes(tree))
+    trusted: set[str] = set()
+    for name in SAFE_MESSAGE_CONSTANTS:
+        import_bindings = [
+            (statement, alias)
+            for statement in nodes
+            if isinstance(statement, (ast.Import, ast.ImportFrom))
+            for alias in statement.names
+            if (alias.asname or alias.name.split(".")[0]) == name
+        ]
+        if len(import_bindings) != 1:
+            continue
+        statement, alias = import_bindings[0]
+        is_canonical = (
+            isinstance(statement, ast.ImportFrom)
+            and statement.level == 2
+            and statement.module == "services.client_error_messages"
+            and alias.name == name
+            and alias.asname is None
+        )
+        has_other_binding = any(
+            not isinstance(node, (ast.Import, ast.ImportFrom))
+            and (
+                _binds_name_without_store(node, name)
+                or (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Store)
+                    and node.id == name
+                )
+            )
+            for node in nodes
+        )
+        if (
+            is_canonical
+            and not has_other_binding
+            and not _has_nested_global_rebinding(tree, name)
+        ):
             trusted.add(name)
     return trusted
 
@@ -691,15 +779,7 @@ def _scan(tree: ast.Module) -> _ScanResult:
     tests while silently not applying to the real module (or vice versa).
     """
     parents = _parents(tree)
-    imported_safe_constants = {
-        alias.name
-        for statement in tree.body
-        if isinstance(statement, ast.ImportFrom)
-        and statement.level == 2
-        and statement.module == "services.client_error_messages"
-        for alias in statement.names
-        if alias.asname is None and alias.name in SAFE_MESSAGE_CONSTANTS
-    }
+    imported_safe_constants = _trusted_imported_safe_constants(tree)
     module_helpers = _trusted_module_helpers(tree)
     producers = 0
     error_payloads = 0
@@ -739,9 +819,13 @@ def _scan(tree: ast.Module) -> _ScanResult:
                 isinstance(expr, ast.Name)
                 and expr.id in imported_safe_constants
                 and not candidates
-                and not _is_parameter(scopes, expr.id)
+                and not _has_local_binding(scopes, expr.id)
             )
-            if is_unshadowed_safe_constant or _is_client_safe(expr):
+            if is_unshadowed_safe_constant or _is_client_safe(
+                expr,
+                scopes,
+                module_helpers,
+            ):
                 continue
             if not candidates:
                 # Only a name nothing rebinds is a genuinely forwarded parameter,
@@ -756,7 +840,7 @@ def _scan(tree: ast.Module) -> _ScanResult:
                 "<module>",
             )
             for candidate in candidates:
-                if _is_client_safe(candidate):
+                if _is_client_safe(candidate, scopes, module_helpers):
                     continue
                 key = (enclosing, ast.unparse(candidate))
                 if key in ALLOWED_RAW_MESSAGES:
@@ -932,6 +1016,190 @@ def test_log_level_follows_the_marker_not_the_call_site(
     assert record.levelno == expected_level
     assert (record.exc_info is not None) is expects_traceback
     assert "task 7" in record.getMessage()
+
+
+def test_malformed_curated_failure_remains_a_warning_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket_api.log_client_facing_failure(
+        websocket_api.ClientVisibleValidationError("Authentication required"),
+        "Pause command rejected",
+    )
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert (record.levelno, record.exc_info) == (logging.WARNING, None)
+    assert "malformed client-facing log template" in record.getMessage().lower()
+
+
+@pytest.mark.parametrize(
+    ("template", "args"),
+    [
+        ("Pause command rejected", ()),
+        ("Task %s failed: %s", ()),
+        ("Task %d failed: %s", ()),
+        ("Task %(task_id)s failed: %s", ()),
+        ("%%s", ()),
+    ],
+    ids=[
+        "missing-placeholder",
+        "count-mismatch",
+        "integer-placeholder",
+        "mapping-placeholder",
+        "terminal-escaped-percent-s",
+    ],
+)
+def test_log_helper_rejects_every_malformed_percent_template(
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    args: tuple[object, ...],
+) -> None:
+    try:
+        raise ValueError("operator detail")
+    except ValueError as error:
+        with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+            websocket_api.log_client_facing_failure(error, template, *args)
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[0] is ValueError
+    assert "malformed client-facing log template" in records[0].getMessage().lower()
+    assert "operator detail" in records[0].getMessage()
+
+
+def test_log_helper_accepts_int_enum_for_native_integer_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class TaskNumber(IntEnum):
+        FIRST = 7
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"),
+            "Task %d failed: %s",
+            TaskNumber.FIRST,
+        )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 1
+    assert records[0].getMessage() == "Task 7 failed: operator detail"
+    assert "malformed client-facing log template" not in records[0].getMessage().lower()
+
+
+@pytest.mark.parametrize(
+    ("template", "args", "expected_message"),
+    [
+        ("V=%r: %s", (SimpleNamespace(x="é"),), "V=namespace(x='é'): e"),
+        ("V=%a: %s", (SimpleNamespace(x="é"),), "V=namespace(x='\\xe9'): e"),
+        ("100%%: %s", (), "100%: e"),
+    ],
+)
+def test_log_helper_preserves_native_percent_formatting(
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    args: tuple[object, ...],
+    expected_message: str,
+) -> None:
+    websocket_api.log_client_facing_failure(ValueError("e"), template, *args)
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert record.getMessage() == expected_message
+
+
+def test_log_helper_does_not_raise_for_unprintable_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BrokenText:
+        def __str__(self) -> str:
+            raise RuntimeError("broken text")
+
+    class BrokenStr(str):
+        __str__ = BrokenText.__str__
+
+        def __repr__(self) -> str:
+            raise RuntimeError("broken repr")
+
+    class BadFallback(str):
+        def __str__(self) -> str:
+            return self
+
+        def __repr__(self) -> str:
+            raise RuntimeError("bad repr")
+
+    class StatefulText(str):
+        calls = 0
+
+        def __str__(self) -> str:
+            type(self).calls += 1
+            if type(self).calls >= 3:
+                raise RuntimeError("rendered repeatedly")
+            return self
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            ValueError(BrokenText()), "Data validation error: %s"
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"), "Task %s failed: %s", BrokenStr("x")
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"), "Malformed template", BadFallback("x")
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"),
+            "Task %s failed: %s",
+            StatefulText("stable"),
+        )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 4
+    assert "unprintable ValueError" in records[0].getMessage()
+    assert "unprintable BrokenStr" in records[1].getMessage()
+    assert "malformed client-facing log template" in records[2].getMessage().lower()
+    assert "Task stable failed" in records[3].getMessage()
+
+
+def test_client_visible_error_is_a_subclass_only_marker() -> None:
+    """The marker base cannot escape handlers that catch its typed subclasses."""
+    with pytest.raises(TypeError, match="must be subclassed"):
+        websocket_api.ClientVisibleError("bare marker")
+
+    assert str(websocket_api.ClientVisibleValidationError("curated")) == "curated"
+
+
+@pytest.mark.parametrize("message", ["", "   ", "\t\n"])
+def test_empty_client_visible_message_falls_back_to_the_generic_text(
+    message: str,
+) -> None:
+    error = websocket_api.ClientVisibleValidationError(message)
+
+    assert (
+        websocket_api.client_safe_error_message(error)
+        == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
+def test_client_visible_message_preserves_non_ascii_text() -> None:
+    message = "请求无效：缺少步骤标识"
+
+    assert (
+        websocket_api.client_safe_error_message(
+            websocket_api.ClientVisibleValidationError(message)
+        )
+        == message
+    )
+
+
+def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
+    cause = RuntimeError(SECRET)
+    error = websocket_api.ClientVisibleValidationError("")
+    error.__cause__ = cause
+
+    rendered = websocket_api.client_safe_error_message(error)
+
+    assert rendered == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert SECRET not in rendered
 
 
 @pytest.mark.asyncio
@@ -1317,7 +1585,11 @@ DICT_SPREAD_GUARD_CASES = {
 }
 safe_helper_source, _ = DICT_SPREAD_GUARD_CASES["safe-known-helper"]
 DICT_SPREAD_GUARD_CASES["safe-known-helper"] = (
-    """async def _read_task_error_payload_offloop(task_id, message):
+    """def client_safe_error_message(error):
+    return "safe"
+
+
+async def _read_task_error_payload_offloop(task_id, message):
     return {"type": "task_error", "message": message}
 """
     + safe_helper_source,
@@ -1534,6 +1806,143 @@ def test_dict_spread_guard_cases(source: str, has_offenders: bool) -> None:
     assert bool(_guard_offenders(source)) is has_offenders
 
 
+def _safe_helper_binding_source(
+    helper: str,
+    module_binding: str,
+    *,
+    local_impostor: bool = False,
+) -> str:
+    helper_args = (
+        'command.kind, RuntimeError("raw")'
+        if helper == "client_safe_task_command_failure"
+        else 'RuntimeError("raw")'
+    )
+    function_args = (
+        "task_id, command" if helper_args.startswith("command") else "task_id"
+    )
+    local_binding = (
+        f"    def {helper}(*args):\n        return str(args[-1])\n"
+        if local_impostor
+        else ""
+    )
+    return (
+        f"{module_binding}"
+        f"async def leak({function_args}):\n"
+        f"{local_binding}"
+        "    await manager.broadcast_to_task(\n"
+        f'        {{"type": "task_error", "message": {helper}({helper_args})}},\n'
+        "        task_id,\n"
+        "    )\n"
+    )
+
+
+def _canonical_safe_helper(helper: str) -> str:
+    return f'def {helper}(*args):\n    return "safe"\n'
+
+
+SAFE_MESSAGE_BINDING_GUARD_CASES = {
+    **{
+        f"local-{helper}-impostor": (
+            _safe_helper_binding_source(
+                helper,
+                _canonical_safe_helper(helper),
+                local_impostor=True,
+            ),
+            True,
+        )
+        for helper in sorted(SAFE_MESSAGE_BUILDERS)
+    },
+    **{
+        f"module-{helper}-import-impostor": (
+            _safe_helper_binding_source(
+                helper,
+                f"from untrusted import {helper}\n",
+            ),
+            True,
+        )
+        for helper in sorted(SAFE_MESSAGE_BUILDERS)
+    },
+    **{
+        f"module-{helper}-rebound": (
+            _safe_helper_binding_source(
+                helper,
+                _canonical_safe_helper(helper) + f"{helper} = untrusted\n",
+            ),
+            True,
+        )
+        for helper in sorted(SAFE_MESSAGE_BUILDERS)
+    },
+    **{
+        f"canonical-{helper}": (
+            _safe_helper_binding_source(helper, _canonical_safe_helper(helper)),
+            False,
+        )
+        for helper in sorted(SAFE_MESSAGE_BUILDERS)
+    },
+    "global-safe-helper-rebound": (
+        _canonical_safe_helper("client_safe_error_message")
+        + """async def leak(task_id):
+    global client_safe_error_message
+    client_safe_error_message = lambda error: str(error)
+    await manager.broadcast_to_task(
+        {"type": "task_error", "message": client_safe_error_message(RuntimeError("raw"))},
+        task_id,
+    )
+""",
+        True,
+    ),
+    "canonical-safe-constant-rebound": (
+        "from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE\n"
+        'CLIENT_SAFE_TASK_FAILURE = str(RuntimeError("raw"))\n'
+        + _broadcast_source(
+            '{"type": "task_error", "message": CLIENT_SAFE_TASK_FAILURE}'
+        ),
+        True,
+    ),
+    "global-safe-constant-rebound": (
+        "from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE\n"
+        + """async def leak(task_id):
+    global CLIENT_SAFE_TASK_FAILURE
+    CLIENT_SAFE_TASK_FAILURE = str(RuntimeError("raw"))
+    await manager.broadcast_to_task(
+        {"type": "task_error", "message": CLIENT_SAFE_TASK_FAILURE}, task_id)
+""",
+        True,
+    ),
+    "same-import-safe-constant-alias-collision": (
+        """from ..services.client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    unsafe as CLIENT_SAFE_TASK_FAILURE,
+)
+"""
+        + _broadcast_source(
+            '{"type": "task_error", "message": CLIENT_SAFE_TASK_FAILURE}'
+        ),
+        True,
+    ),
+    "canonical-safe-constant": (
+        "from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE\n"
+        + _broadcast_source(
+            '{"type": "task_error", "message": CLIENT_SAFE_TASK_FAILURE}'
+        ),
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("source", "has_offenders"),
+    SAFE_MESSAGE_BINDING_GUARD_CASES.values(),
+    ids=SAFE_MESSAGE_BINDING_GUARD_CASES,
+)
+def test_safe_message_binding_guard_cases(
+    source: str,
+    has_offenders: bool,
+) -> None:
+    """Only canonical, unshadowed safe-message bindings earn trust."""
+    assert bool(_guard_offenders(source)) is has_offenders
+
+
 @pytest.mark.parametrize("source", BYPASS_SHAPES)
 def test_known_bypass_shapes_are_rejected_by_the_guard(source: str) -> None:
     """The guard rejects every producer shape fixed for #1696."""
@@ -1673,7 +2082,10 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
     connection_manager = MagicMock()
     connection_manager.broadcast_to_task = AsyncMock()
     command = SimpleNamespace(
-        kind=websocket_api.TaskCommandKind.PAUSE, task_id=7, command_id="cmd-7"
+        kind=websocket_api.TaskCommandKind.PAUSE,
+        task_id=7,
+        command_id="cmd-7",
+        payload={},
     )
     with patch.object(websocket_api, "manager", connection_manager):
         await websocket_api._broadcast_terminal_command_error(

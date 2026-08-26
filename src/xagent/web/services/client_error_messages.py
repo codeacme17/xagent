@@ -15,4 +15,8 @@ def client_safe_error_message(
 ) -> str:
     """Return exception text only when the caller proves it is public-safe."""
 
-    return str(error) if safe_for_display else fallback
+    if safe_for_display:
+        message = str(error)
+        if message.strip():
+            return message
+    return fallback
