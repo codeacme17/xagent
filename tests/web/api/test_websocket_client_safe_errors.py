@@ -155,37 +155,9 @@ PRODUCERS: dict[str, int | None] = {
     "send_message_delivery": None,  # keyword-only
 }
 
-# The one deliberate exception: agent RuntimeError text is passed through to
-# the INITIATING SENDER - the rejection ack and the personal error bubble.
-# Narrowing that wording is the product decision tracked in #1479.
-#
-# The broadcast half of the passthrough is closed (maintainer scope ruling on
-# #1514): the task-wide broadcast reaches every connection under the task_id,
-# anonymous widget and share visitors included, and DurableStorageOperation-
-# Error subclasses RuntimeError with tenant-scope text in its message, so
-# broadcasts carry CLIENT_SAFE_TASK_FAILURE instead - pinned by the two
-# audience-boundary tests at the end of this file. Still #1479: whether the
-# sender copy should also be narrowed when the initiator is an anonymous
-# public connection.
-#
-# Anchored to (enclosing function, expression) rather than to the expression
-# alone, which blessed the string in every function it appeared in. This stops
-# reuse in a *different* function only: `_local_assignments` unions every
-# assignment in the enclosing function regardless of branch, so moving the
-# string between branches of an allowlisted function is NOT caught. #1547.
-ALLOWED_RAW_MESSAGES = {
-    ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
-    # The same #1479 flow seen through the closure scope chain: the outer
-    # function's runtime-error string reaches these closures' ``message``
-    # parameter at their call sites. Surfaced when the parameter short-circuit
-    # stopped hiding rebound names; not a new leak.
-    ("finish_delivery", "f'Runtime error: {str(e)}'"),
-    ("finish_delivery_failure", "f'Runtime error: {str(e)}'"),
-    ("handle_execute_task", "f'Runtime error: {str(e)}'"),
-    ("handle_intervention", "f'Runtime error: {str(e)}'"),
-    ("_handle_pause_task_unserialized", "f'Runtime error: {str(e)}'"),
-    ("_handle_resume_task_unserialized", "f'Runtime error: {str(e)}'"),
-}
+# Issue #1479 removes the last deliberate RuntimeError passthroughs. Keep this
+# empty set in the guard so any reintroduced exception interpolation fails.
+ALLOWED_RAW_MESSAGES: set[tuple[str, str]] = set()
 
 
 def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
@@ -227,8 +199,15 @@ ERROR_PAYLOAD_TYPES = {"error", "agent_error"}
 
 # The only functions allowed to mint client-visible text from an exception.
 SAFE_MESSAGE_BUILDERS = {
+    "client_error_message",
     "client_safe_error_message",
     "client_safe_task_command_failure",
+}
+
+SAFE_MESSAGE_CONSTANTS = {
+    "CLIENT_SAFE_GUIDANCE_IN_PROGRESS",
+    "CLIENT_SAFE_TASK_FAILURE",
+    "CLIENT_SAFE_VALIDATION_ERROR",
 }
 
 
@@ -297,7 +276,11 @@ def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
 def _is_client_safe(expr: ast.expr) -> bool:
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return True
+    if isinstance(expr, ast.Name) and expr.id in SAFE_MESSAGE_CONSTANTS:
+        return True
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+        if expr.func.id == "client_error_message":
+            return True
         if expr.func.id == "client_safe_error_message":
             return True
         if expr.func.id == "client_safe_task_command_failure":
@@ -354,6 +337,8 @@ def _scan(tree: ast.Module) -> _ScanResult:
             producers += 1
         else:
             error_payloads += 1
+        if _is_client_safe(expr):
+            continue
         scopes = _enclosing_functions(node, parents)
         candidates = (
             _local_assignments(scopes, expr.id)
@@ -1131,6 +1116,42 @@ async def test_inner_command_validation_redacts_the_client_payload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_name",
+    ["_handle_pause_task_unserialized", "_handle_resume_task_unserialized"],
+    ids=["pause", "resume"],
+)
+async def test_inner_command_runtime_failure_uses_safe_localizable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+) -> None:
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "run_db_io_cancellation_safe",
+        AsyncMock(side_effect=RuntimeError(f"snapshot fault at {SECRET}")),
+    )
+
+    with pytest.raises(RuntimeError):
+        await getattr(websocket_api, handler_name)(
+            MagicMock(),
+            7,
+            {"user": SimpleNamespace(id=1, is_admin=False)},
+        )
+
+    payloads = _client_payloads(connection_manager)
+    assert SECRET not in repr(payloads)
+    assert any(
+        payload.get("error_code") == "message_processing_failed"
+        and payload.get("message") == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        for payload in payloads
+    )
+
+
+@pytest.mark.asyncio
 async def test_intervention_validation_redacts_the_client_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1150,6 +1171,33 @@ async def test_intervention_validation_redacts_the_client_payload(
     assert sent, "the handler must answer the sender"
     assert SECRET not in repr(sent)
     assert sent[-1]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_intervention_runtime_failure_uses_a_safe_localizable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MagicMock(
+        broadcast_to_task=AsyncMock(
+            side_effect=RuntimeError(f"provider response at {SECRET}")
+        ),
+        send_personal_message=AsyncMock(),
+    )
+    monkeypatch.setattr(websocket_api, "manager", manager)
+
+    await websocket_api.handle_intervention(
+        MagicMock(),
+        7,
+        {"step_id": "step-1", "action": "continue"},
+    )
+
+    payload = manager.send_personal_message.await_args.args[0]
+    assert SECRET not in repr(payload)
+    assert payload == {
+        "type": "error",
+        "error_code": "message_processing_failed",
+        "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+    }
 
 
 @pytest.mark.asyncio
@@ -1281,7 +1329,10 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
     bg_mgr.reserve_resume.return_value = True
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
-        return {"type": "agent_error", "message": message, "task_id": task_id}
+        payload = {"type": "agent_error", "message": message, "task_id": task_id}
+        if isinstance(kwargs.get("error_code"), str):
+            payload["error_code"] = kwargs["error_code"]
+        return payload
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -1338,22 +1389,19 @@ def _chat_runtime_error_harness(secret_error: Exception):
     bg_mgr.reserve_resume.return_value = True
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
-        return {"type": "agent_error", "message": message, "task_id": task_id}
+        payload = {"type": "agent_error", "message": message, "task_id": task_id}
+        if isinstance(kwargs.get("error_code"), str):
+            payload["error_code"] = kwargs["error_code"]
+        return payload
 
     return mgr, ws_manager, bg_mgr, _fake_error_payload
 
 
 @pytest.mark.asyncio
-async def test_runtime_error_broadcast_is_redacted_but_the_sender_keeps_the_detail(
+async def test_runtime_error_is_redacted_and_coded_for_every_audience(
     _test_db: None,
 ) -> None:
-    """The audience boundary of the #1479 passthrough (maintainer ruling).
-
-    The initiating sender keeps ``Runtime error: ...`` in the rejection ack -
-    that is the existing contract and #1479 owns narrowing it. The task-wide
-    broadcast reaches every subscriber, anonymous widget/share connections
-    included, so it must carry the fixed string and never the exception text.
-    """
+    """Neither the initiator nor task subscribers may receive exception text."""
     db = _direct_db_session()
     try:
         owner = User(username="runtime-boundary-owner", password_hash="hash")
@@ -1410,13 +1458,22 @@ async def test_runtime_error_broadcast_is_redacted_but_the_sender_keeps_the_deta
     assert task_errors and task_errors[0]["message"] == (
         websocket_api.CLIENT_SAFE_TASK_FAILURE
     )
+    assert task_errors[0]["error_code"] == "task_execution_failed"
 
     personal = [c.args[0] for c in ws_manager.send_personal_message.await_args_list]
+    assert SECRET not in repr(personal), personal
     rejected = [p for p in personal if p.get("type") == "message_rejected"]
-    assert rejected, "the sender still gets the rejection ack"
-    assert rejected[0]["message"] == f"Runtime error: {raised}", (
-        "the sender's copy is the existing #1479 contract and must survive"
-    )
+    assert rejected == [
+        {
+            "type": "message_rejected",
+            "client_message_id": "runtime-boundary",
+            "turn_id": "runtime-boundary",
+            "timestamp": rejected[0]["timestamp"],
+            "message": websocket_api.CLIENT_SAFE_VALIDATION_ERROR,
+            "error_code": "message_processing_failed",
+            "rejection_outcome": "not_accepted",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1456,6 +1513,11 @@ async def test_execute_runtime_error_broadcast_is_redacted(
                 "type": "agent_error",
                 "message": message,
                 "task_id": task_id,
+                **(
+                    {"error_code": kwargs["error_code"]}
+                    if isinstance(kwargs.get("error_code"), str)
+                    else {}
+                ),
             }
         ),
     )
@@ -1478,6 +1540,17 @@ async def test_execute_runtime_error_broadcast_is_redacted(
     assert SECRET not in repr(broadcast), broadcast
     assert any(
         b.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE for b in broadcast
+    )
+    assert any(b.get("error_code") == "task_execution_failed" for b in broadcast)
+    personal = [
+        c.args[0] for c in connection_manager.send_personal_message.await_args_list
+    ]
+    assert SECRET not in repr(personal), personal
+    assert any(
+        payload.get("type") == "error"
+        and payload.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        and payload.get("error_code") == "task_execution_failed"
+        for payload in personal
     )
 
 
@@ -1558,18 +1631,12 @@ def _personal_targets(manager_mock: MagicMock) -> list[tuple[dict, object]]:
 
 
 @pytest.mark.asyncio
-async def test_durable_raw_detail_reaches_only_the_verified_origin(
+async def test_durable_runtime_error_is_safe_for_the_verified_origin(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
     _clean_origins: None,
 ) -> None:
-    """Reviewer-specified ordering: [public, authenticated-origin, broadcast-only].
-
-    Before the registry, the executor picked the first ordinary socket, so
-    the public visitor received the raw RuntimeError text. Now the raw
-    detail goes to the registered origin regardless of order, and the
-    public socket gets nothing personal.
-    """
+    """The verified command origin receives only the stable safe contract."""
     public, owner_origin, sse = (
         MagicMock(name="public"),
         MagicMock(name="origin"),
@@ -1584,13 +1651,15 @@ async def test_durable_raw_detail_reaches_only_the_verified_origin(
 
     await _run_pause_to_runtime_error(monkeypatch, manager_mock, command)
 
-    raw_sends = [
+    personal = _personal_targets(manager_mock)
+    assert SECRET not in repr(personal)
+    safe_sends = [
         (payload, ws)
-        for payload, ws in _personal_targets(manager_mock)
-        if SECRET in repr(payload)
+        for payload, ws in personal
+        if payload.get("error_code") == "message_processing_failed"
     ]
-    assert raw_sends, "the verified origin must still receive the detail"
-    assert all(ws is owner_origin for _, ws in raw_sends), raw_sends
+    assert safe_sends, "the verified origin must receive the safe error"
+    assert all(ws is owner_origin for _, ws in safe_sends), safe_sends
     assert not any(ws is public for _, ws in _personal_targets(manager_mock)), (
         "the public socket must receive nothing personal"
     )
@@ -1601,7 +1670,7 @@ async def test_durable_raw_detail_reaches_only_the_verified_origin(
     "degrade_case",
     ["no-registration", "origin-disconnected", "wrong-task"],
 )
-async def test_durable_raw_detail_degrades_when_origin_is_unverifiable(
+async def test_durable_safe_error_degrades_when_origin_is_unverifiable(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
     _clean_origins: None,
@@ -1629,15 +1698,16 @@ async def test_durable_raw_detail_degrades_when_origin_is_unverifiable(
 
     await _run_pause_to_runtime_error(monkeypatch, manager_mock, command)
 
-    # The handler still emits its personal reply, but the executor gave it a
-    # discarding stub, so the raw text reaches no real socket. Anything else
-    # as the target - the public socket in particular - is a rerouted leak.
-    raw_targets = [
-        ws for payload, ws in _personal_targets(manager_mock) if SECRET in repr(payload)
+    personal = _personal_targets(manager_mock)
+    assert SECRET not in repr(personal)
+    safe_targets = [
+        ws
+        for payload, ws in personal
+        if payload.get("error_code") == "message_processing_failed"
     ]
     assert all(
-        isinstance(ws, websocket_api._DiscardingCommandWebSocket) for ws in raw_targets
-    ), f"raw detail rerouted to a real socket: {raw_targets}"
+        isinstance(ws, websocket_api._DiscardingCommandWebSocket) for ws in safe_targets
+    ), f"durable error rerouted to a real socket: {safe_targets}"
 
 
 @pytest.mark.asyncio
@@ -1693,12 +1763,10 @@ async def test_origin_entry_dies_with_its_command_or_socket(
 
 
 @pytest.mark.asyncio
-async def test_durable_chat_detail_reaches_the_verified_origin_only(
+async def test_durable_chat_runtime_error_is_safe_for_verified_origin(
     _test_db: None,
 ) -> None:
-    """G18: on the durable path the ack is suppressed, so the detail bubble
-    to the verified origin is the sender's only copy - and the broadcast that
-    everyone else sees stays generic."""
+    """Durable chat sends one safe, coded bubble to its verified origin."""
     db = _direct_db_session()
     try:
         owner = User(username="durable-detail-owner", password_hash="hash")
@@ -1755,21 +1823,25 @@ async def test_durable_chat_detail_reaches_the_verified_origin_only(
     personal = [
         (c.args[0], c.args[1]) for c in ws_manager.send_personal_message.await_args_list
     ]
-    # The suppressed ack means no message_rejected; the detail bubble is the
-    # sender's only copy and goes to the socket the executor resolved.
+    # The suppressed ack means no message_rejected; the safe error bubble is
+    # the sender's only copy and goes to the socket the executor resolved.
     assert not any(p.get("type") == "message_rejected" for p, _ in personal)
-    detail = [(p, ws) for p, ws in personal if SECRET in repr(p)]
-    assert detail, "the verified origin must receive the detail bubble"
-    assert all(ws is origin_socket for _, ws in detail), detail
+    assert SECRET not in repr(personal)
+    safe = [
+        (p, ws)
+        for p, ws in personal
+        if p.get("error_code") == "message_processing_failed"
+    ]
+    assert safe, "the verified origin must receive the safe error bubble"
+    assert all(ws is origin_socket for _, ws in safe), safe
 
 
 @pytest.mark.asyncio
-async def test_execute_detail_reaches_the_ingress_socket(
+async def test_execute_safe_error_reaches_the_ingress_socket(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """G18: legacy execute keeps its real ingress socket, so the sender gets
-    the detail personally while the broadcast stays generic."""
+    """Execute keeps its real ingress socket but never exposes raw detail."""
     db = _direct_db_session()
     try:
         owner = User(username="exec-detail-owner", password_hash="hash")
@@ -1801,6 +1873,11 @@ async def test_execute_detail_reaches_the_ingress_socket(
                 "type": "agent_error",
                 "message": message,
                 "task_id": task_id,
+                **(
+                    {"error_code": kwargs["error_code"]}
+                    if isinstance(kwargs.get("error_code"), str)
+                    else {}
+                ),
             }
         ),
     )
@@ -1821,13 +1898,17 @@ async def test_execute_detail_reaches_the_ingress_socket(
         c.args[0] for c in connection_manager.broadcast_to_task.await_args_list
     ]
     assert broadcast and SECRET not in repr(broadcast), broadcast
-    detail = [
+    personal = [
         (c.args[0], c.args[1])
         for c in connection_manager.send_personal_message.await_args_list
-        if SECRET in repr(c.args[0])
     ]
-    assert detail, "the ingress socket must receive the detail personally"
-    assert all(ws is ingress for _, ws in detail), detail
+    assert personal and SECRET not in repr(personal)
+    assert all(ws is ingress for _, ws in personal), personal
+    assert any(
+        payload.get("error_code") == "task_execution_failed"
+        and payload.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        for payload, _ in personal
+    )
 
 
 @pytest.mark.asyncio
@@ -2029,11 +2110,10 @@ def test_same_command_id_on_two_tasks_is_isolated(_clean_origins: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_chat_runtime_error_does_not_double_send_the_detail(
+async def test_live_chat_runtime_error_sends_one_safe_rejection(
     _test_db: None,
 ) -> None:
-    """On the live path the rejection ack already carries the detail, so the
-    origin bubble must not fire a second copy (preflight side-effect)."""
+    """The live path returns one coded rejection and never exposes detail."""
     db = _direct_db_session()
     try:
         owner = User(username="no-double-owner", password_hash="hash")
@@ -2085,11 +2165,14 @@ async def test_live_chat_runtime_error_does_not_double_send_the_detail(
         for c in ws_manager.send_personal_message.await_args_list
         if isinstance(c.args[0], dict)
     ]
-    with_detail = [p for p in personal if SECRET in repr(p)]
-    assert len(with_detail) == 1, (
-        f"live path must carry the detail exactly once, got {with_detail}"
-    )
-    assert with_detail[0].get("type") == "message_rejected"
+    assert SECRET not in repr(personal)
+    safe_rejections = [
+        p
+        for p in personal
+        if p.get("type") == "message_rejected"
+        and p.get("error_code") == "message_processing_failed"
+    ]
+    assert len(safe_rejections) == 1, safe_rejections
 
 
 def test_a_later_duplicate_cannot_rebind_after_the_creator_disconnects(

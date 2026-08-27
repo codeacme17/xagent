@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorFallback, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -51,6 +52,12 @@ interface MessageDeliveryAck {
 
 export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
 
+interface MessageDeliveryErrorOptions {
+  retryWithNewId?: boolean
+  userFacing?: boolean
+  errorCode?: ClientErrorCode | null
+}
+
 export class MessageDeliveryError extends Error {
   readonly disposition: MessageDeliveryDisposition
   readonly retryWithNewId: boolean
@@ -62,18 +69,19 @@ export class MessageDeliveryError extends Error {
    * internal English in front of a visitor.
    */
   readonly userFacing: boolean
+  readonly errorCode: ClientErrorCode | null
 
   constructor(
     message: string,
     disposition: MessageDeliveryDisposition,
-    retryWithNewId = false,
-    userFacing = false,
+    options: MessageDeliveryErrorOptions = {},
   ) {
     super(message)
     this.name = "MessageDeliveryError"
     this.disposition = disposition
-    this.retryWithNewId = retryWithNewId
-    this.userFacing = userFacing
+    this.retryWithNewId = options.retryWithNewId ?? false
+    this.userFacing = options.userFacing ?? false
+    this.errorCode = options.errorCode ?? null
   }
 }
 
@@ -96,9 +104,8 @@ export const resolveReportedTimezone = (): string | undefined => {
 const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
-  retryWithNewId = false,
-  userFacing = false,
-) => new MessageDeliveryError(message, disposition, retryWithNewId, userFacing)
+  options: MessageDeliveryErrorOptions = {},
+) => new MessageDeliveryError(message, disposition, options)
 
 export type WebSocketCredentialOwner =
   | {
@@ -921,13 +928,22 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
                 })
               } else {
+                const errorCode = readClientErrorCode(data.error_code)
+                const rejectionMessage = errorCode
+                  ? clientErrorFallback(errorCode)
+                  : typeof data.error_code === "string"
+                    ? "Message was rejected."
+                    : data.message || "Message was rejected."
                 pending.reject(deliveryError(
-                  data.message || "Message was rejected.",
+                  rejectionMessage,
                   data.rejection_outcome === "not_accepted"
                     ? "rejected"
                     : "outcome_unknown",
-                  data.retry_with_new_id === true,
-                  typeof data.message === "string" && data.message.trim() !== "",
+                  {
+                    retryWithNewId: data.retry_with_new_id === true,
+                    userFacing: errorCode !== null,
+                    errorCode,
+                  },
                 ))
               }
             } else if (
@@ -1271,27 +1287,50 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               body: formData,
             })
             const parsed = await parseApiResponse(response)
-            if (!response.ok || !isJsonRecord(parsed.data)) {
-              throw deliveryError(getUploadErrorMessage(response, parsed, {
-                generic: 'Upload failed',
-                ...UPLOAD_ERROR_MESSAGES,
-              }), "not_sent")
+            const data = isJsonRecord(parsed.data) ? parsed.data : null
+            if (
+              !response.ok
+              || data?.success !== true
+              || !Array.isArray(data.files)
+            ) {
+              const uploadError = classifyUploadError(response, parsed)
+              throw deliveryError(
+                uploadError.message,
+                "not_sent",
+                {
+                  userFacing: true,
+                  errorCode: uploadError.errorCode,
+                },
+              )
             }
-            const data = parsed.data
-            return data.success && Array.isArray(data.files)
-              ? data.files
-                .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
-                  isJsonRecord(file) && typeof file.file_id === 'string'
-                ))
-                .map(file => ({
+            const normalizedFiles = data.files
+              .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
+                isJsonRecord(file) && typeof file.file_id === 'string'
+              ))
+              .map(file => ({
                   file_id: file.file_id,
                   name: typeof file.filename === 'string' ? file.filename : '',
                   size: typeof file.file_size === 'number' ? file.file_size : 0,
                   type: typeof file.mime_type === 'string' ? file.mime_type : '',
-                }))
-              : []
+              }))
+            if (normalizedFiles.length !== filesToUpload.length) {
+              const uploadError = classifyUploadError(response, parsed)
+              throw deliveryError(
+                uploadError.message,
+                "not_sent",
+                { userFacing: true, errorCode: uploadError.errorCode },
+              )
+            }
+            return normalizedFiles
           })()
           uploadedFiles = await Promise.race([uploadRequest, claim.cancellation])
+        }
+        if (uploadedFiles.length !== filesToUpload.length) {
+          throw deliveryError(
+            clientErrorFallback("upload_failed"),
+            "not_sent",
+            { userFacing: true, errorCode: "upload_failed" },
+          )
         }
         messageData.files = [...preUploadedFiles, ...uploadedFiles]
       }
@@ -1387,9 +1426,18 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         attemptTimezonesRef.current.delete(clientMessageId)
       }
       if (error instanceof MessageDeliveryError) throw error
+      const errorCode = typeof error === "object" && error !== null
+        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+        : null
       throw deliveryError(
-        error instanceof Error ? error.message : String(error),
+        errorCode
+          ? clientErrorFallback(errorCode)
+          : error instanceof Error ? error.message : String(error),
         "not_sent",
+        {
+          userFacing: errorCode !== null,
+          errorCode,
+        },
       )
     } finally {
       if (preparationsRef.current.get(clientMessageId) === claim) {

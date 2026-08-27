@@ -1,4 +1,12 @@
 const en = {
+  clientErrors: {
+    messageProcessingFailed: "The message could not be processed. Please try again.",
+    taskExecutionFailed: "Task execution failed.",
+    guidanceInProgress: "A previous guidance message is still being applied. Please wait for it to finish.",
+    uploadTooLarge: "File is too large. Please reduce the upload size and try again.",
+    uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
+    uploadFailed: "Upload failed. Please try again.",
+  },
   common: {
     optional: "(Optional)",
     next: "Next",

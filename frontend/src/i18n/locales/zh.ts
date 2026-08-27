@@ -1,4 +1,12 @@
 const zh = {
+  clientErrors: {
+    messageProcessingFailed: "消息处理失败，请重试。",
+    taskExecutionFailed: "任务执行失败。",
+    guidanceInProgress: "上一条指导消息仍在处理中，请等待处理完成。",
+    uploadTooLarge: "文件过大，请减小上传大小后重试。",
+    uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
+    uploadFailed: "上传失败，请重试。",
+  },
   common: {
     optional: "(可选)",
     next: "下一步",

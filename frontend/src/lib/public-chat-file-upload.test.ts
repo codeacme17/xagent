@@ -23,7 +23,10 @@ describe("uploadPublicChatFile", () => {
       taskType: "task",
       taskId: 42,
       fallbackError: "Upload failed",
-    })).rejects.toThrow("File is too large")
+    })).rejects.toMatchObject({
+      errorCode: "upload_too_large",
+      message: "File is too large. Please reduce the upload size and try again.",
+    })
 
     const [, request] = fetchMock.mock.calls[0]
     expect(new Headers(request?.headers).get("Authorization")).toBe(

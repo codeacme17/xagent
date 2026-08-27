@@ -98,7 +98,13 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
-from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from ..services.client_error_messages import (
+    CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+    CLIENT_SAFE_TASK_FAILURE,
+    CLIENT_SAFE_VALIDATION_ERROR,
+    ClientErrorCode,
+    client_error_message,
+)
 from ..services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -304,11 +310,14 @@ def _task_error_payload(
     message: str,
     *,
     event_type: str = "error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": event_type,
         "message": message,
     }
+    if error_code is not None:
+        payload["error_code"] = error_code
     task_payload = _task_status_payload(db, task_id)
     if task_payload is not None:
         payload["task"] = task_payload
@@ -348,20 +357,9 @@ def _client_message_id(value: Any) -> str | None:
 # error bubble and the message_rejected ack, so an *incidental* validation
 # failure only ever surfaces as this fixed string; the detail stays in the log.
 #
-# Agent RuntimeError text is passed through to the INITIATING SENDER only -
-# the rejection ack and the personal error bubble - which is the existing
-# contract, and narrowing that wording is the product decision left in #1479.
-#
-# The broadcast half of that passthrough is closed (maintainer scope ruling
-# on #1514): once a task resolves, the task-wide broadcast reaches every
-# connection under the task_id, anonymous widget and share visitors included,
-# and DurableStorageOperationError subclasses RuntimeError with tenant-scope
-# text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
-# the exception text. Still #1479: whether the sender copy should also be
-# narrowed when the initiator is an anonymous public connection.
-CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
-
-
+# RuntimeError text follows the same rule for every audience. The task-wide
+# broadcast, rejection ack, and personal error bubble expose stable safe
+# fields; provider responses and internal paths remain operator-only logs.
 class ClientVisibleError(Exception):
     """Marker: this exception's text was written for the end user.
 
@@ -503,6 +501,7 @@ async def send_message_delivery(
     turn_id: str,
     accepted: bool,
     message: str | None = None,
+    error_code: str | None = None,
     retry_with_new_id: bool = False,
     rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
 ) -> None:
@@ -520,6 +519,8 @@ async def send_message_delivery(
     }
     if message:
         payload["message"] = message
+    if error_code is not None:
+        payload["error_code"] = error_code
     if retry_with_new_id:
         payload["retry_with_new_id"] = True
     if rejection_outcome is not None:
@@ -663,16 +664,26 @@ def _read_task_error_payload_isolated(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Read a task error payload in a short Session owned by this worker."""
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         try:
-            return _task_error_payload(db, task_id, message, event_type=event_type)
+            return _task_error_payload(
+                db,
+                task_id,
+                message,
+                event_type=event_type,
+                error_code=error_code,
+            )
         except Exception:
             db.rollback()
             logger.warning("Failed to read terminal task error payload", exc_info=True)
-            return {"type": event_type, "message": message}
+            payload = {"type": event_type, "message": message}
+            if error_code is not None:
+                payload["error_code"] = error_code
+            return payload
 
 
 async def _read_task_error_payload_offloop(
@@ -680,6 +691,7 @@ async def _read_task_error_payload_offloop(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Keep a potentially blocked pool checkout off the asyncio event loop."""
     return await run_db_io_cancellation_safe(
@@ -687,6 +699,7 @@ async def _read_task_error_payload_offloop(
             task_id,
             message,
             event_type=event_type,
+            error_code=error_code,
         )
     )
 
@@ -5962,6 +5975,7 @@ async def _handle_chat_message_unserialized(
         accepted: bool,
         message: str | None = None,
         *,
+        error_code: str | None = None,
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
@@ -5979,11 +5993,16 @@ async def _handle_chat_message_unserialized(
             turn_id=turn_id,
             accepted=accepted,
             message=message,
+            error_code=error_code,
             retry_with_new_id=retry_with_new_id,
             rejection_outcome=rejection_outcome,
         )
 
-    async def finish_delivery_failure(message: str) -> bool:
+    async def finish_delivery_failure(
+        message: str,
+        *,
+        error_code: str | None = None,
+    ) -> bool:
         """Reject pre-dispatch failures; never confuse persistence with delivery."""
 
         nonlocal delivery_failure_persist_attempted, delivery_failure_pool_timeout
@@ -6024,6 +6043,7 @@ async def _handle_chat_message_unserialized(
             await finish_delivery(
                 False,
                 message,
+                error_code=error_code,
                 rejection_outcome=(
                     "outcome_unknown"
                     if delivery_failure_pool_timeout or delivery_injected
@@ -6273,8 +6293,8 @@ async def _handle_chat_message_unserialized(
                 if not background_task_manager.reserve_resume(task_id):
                     await finish_delivery(
                         False,
-                        "A previous guidance message is still being applied. "
-                        "Please wait for it to finish.",
+                        CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+                        error_code=ClientErrorCode.GUIDANCE_IN_PROGRESS.value,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -6867,18 +6887,21 @@ async def _handle_chat_message_unserialized(
             ):
                 return
         except RuntimeError as e:
-            # Runtime error. The sender's rejection ack keeps the wording
-            # (#1479 contract); the task-wide broadcast reaches anonymous
-            # subscribers and gets the fixed string instead.
-            message = f"Runtime error: {str(e)}"
+            # RuntimeError is incidental server detail. Both the initiator and
+            # task subscribers get stable codes with fixed safe fallbacks.
+            message = client_safe_error_message(e)
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
-            if not await finish_delivery_failure(message):
+            if not await finish_delivery_failure(
+                message,
+                error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+            ):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 error_payload = await _read_task_error_payload_offloop(
                     authorized_task_id,
                     CLIENT_SAFE_TASK_FAILURE,
+                    error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
                 )
                 await manager.broadcast_to_task(
                     {
@@ -6887,23 +6910,28 @@ async def _handle_chat_message_unserialized(
                     },
                     authorized_task_id,
                 )
-                # Only the durable path needs this: there the rejection ack
-                # is suppressed, so the detail bubble is the sender's only
-                # copy. On the live path finish_delivery_failure already sent
-                # the ack with the same wording, so a bubble would duplicate
-                # it. The origin socket came from the registry and is a
-                # discarding stub when unverifiable, so this is
-                # origin-or-nowhere by construction.
+                # Only the durable path needs this: there the rejection ack is
+                # suppressed, so the coded fallback bubble is its only answer.
                 if suppress_delivery_ack:
                     await manager.send_personal_message(
-                        {"type": "error", "message": message, "timestamp": timestamp},
+                        {
+                            "type": "error",
+                            "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                            "message": client_error_message(
+                                ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                            ),
+                            "timestamp": timestamp,
+                        },
                         websocket,
                     )
             else:
                 await manager.send_personal_message(
                     {
                         "type": "error",
-                        "message": message,
+                        "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                        "message": client_error_message(
+                            ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                        ),
                         "timestamp": timestamp,
                     },
                     websocket,
@@ -7168,16 +7196,17 @@ async def handle_execute_task(
                 websocket,
             )
     except RuntimeError as e:
-        # Runtime error. The initiating sender keeps the wording (#1479
-        # contract); the task-wide broadcast reaches anonymous subscribers
-        # and gets the fixed string instead.
-        message = f"Runtime error: {str(e)}"
+        # Runtime failures can contain provider responses, paths, and other
+        # operator-only details. Keep those in the log and expose only the
+        # stable client contract to every audience.
+        message = CLIENT_SAFE_TASK_FAILURE
         logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
             )
             await manager.broadcast_to_task(
                 {
@@ -7186,17 +7215,25 @@ async def handle_execute_task(
                 },
                 authorized_task_id,
             )
-            # This handler is invoked with its real ingress socket (it is not
-            # dispatched durably), so the initiating sender keeps the detail.
             await manager.send_personal_message(
-                {"type": "error", "message": message, "timestamp": timestamp},
+                {
+                    "type": "error",
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
+                    "timestamp": timestamp,
+                },
                 websocket,
             )
         else:
             await manager.send_personal_message(
                 {
                     "type": "error",
-                    "message": message,
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
                     "timestamp": timestamp,
                 },
                 websocket,
@@ -8002,10 +8039,19 @@ async def handle_intervention(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
+        # RuntimeError is incidental server detail, never display prose. A
+        # stable code lets current clients localize the fixed fallback while
+        # old clients still receive safe English text.
         logger.error("Runtime error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
     except Exception as e:
         # Re-raised, but the callers do not own the stack: the chat endpoint
@@ -8270,12 +8316,16 @@ async def _handle_pause_task_unserialized(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error pausing task %s: %s", task_id, e)
+        logger.error("Runtime error pausing task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:
@@ -8594,12 +8644,16 @@ async def _handle_resume_task_unserialized(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error resuming task %s: %s", task_id, e)
+        logger.error("Runtime error resuming task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:

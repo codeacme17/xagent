@@ -1129,6 +1129,38 @@ describe("AppProvider websocket message routing", () => {
     ])
   })
 
+  it("rejects an unsuccessful 2xx pre-task upload instead of dropping files", async () => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: false,
+      error_code: "upload_too_large",
+      detail: "private storage detail",
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithFileProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachment",
+        { clientMessageId: "turn-upload-failure" },
+        [new File(["data"], "data.txt")],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithFileProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadTooLarge")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
   it("sends selected task runtime extensions in the create request", async () => {
     let createBody: Record<string, unknown> | undefined
     apiRequestMock.mockImplementation(
@@ -3010,7 +3042,8 @@ describe("AppProvider websocket message routing", () => {
         timestamp: "2026-05-27T05:00:05Z",
         data: {
           type: "agent_error",
-          message: "Runtime error",
+          error_code: "task_execution_failed",
+          message: "provider token=secret",
           task: {
             id: 1,
             status: "failed",
@@ -3023,8 +3056,9 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
       expect(screen.getByTestId("messages").textContent).toContain(
-        "Runtime error"
+        "clientErrors.taskExecutionFailed"
       )
+      expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
     })
   })
 

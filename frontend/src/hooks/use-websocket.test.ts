@@ -300,7 +300,7 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
-  it("marks a rejection that carries the backend's reason as user facing", async () => {
+  it("marks a coded backend rejection as localizable and user facing", async () => {
     // The clarification form only shows a rejection reason that is marked
     // user facing; if this flag regresses, the visitor drops back to the
     // generic "Failed to send response" toast.
@@ -323,6 +323,7 @@ describe("useWebSocket message delivery", () => {
       socket.receive({
         type: "message_rejected",
         client_message_id: "rejected-with-reason",
+        error_code: "guidance_in_progress",
         message: "A previous guidance message is still being applied. Please wait for it to finish.",
         rejection_outcome: "not_accepted",
       })
@@ -332,6 +333,7 @@ describe("useWebSocket message delivery", () => {
       message: "A previous guidance message is still being applied. Please wait for it to finish.",
       disposition: "rejected",
       userFacing: true,
+      errorCode: "guidance_in_progress",
     })
   })
 
@@ -363,6 +365,41 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
+      errorCode: null,
+    })
+  })
+
+  it("does not trust a rejection carrying an unknown error code", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-unknown-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-unknown-code",
+        error_code: "provider_secret",
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
     })
   })
 
@@ -2839,6 +2876,57 @@ describe("useWebSocket normalized connections", () => {
       disposition: "not_sent",
     })
     expect(uploadFiles).not.toHaveBeenCalled()
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: false,
+        error_code: "upload_too_large",
+        detail: "private proxy detail",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_too_large",
+      message: "File is too large. Please reduce the upload size and try again.",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it("rejects an incomplete custom upload result before sending chat", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue([]),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
     expect(socket.send).not.toHaveBeenCalled()
   })
 

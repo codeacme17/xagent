@@ -347,7 +347,8 @@ import {
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -886,7 +887,14 @@ const taskFromTaskInfoData = (
 const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
+  if (typeof (data?.error_code ?? root.error_code) === "string") return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketErrorCode = (message: WebSocketMessage) => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  return readClientErrorCode(data?.error_code ?? root.error_code)
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -5521,7 +5529,10 @@ export function AppProvider({
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorCode = getWebSocketErrorCode(message)
+        const agentErrorMessage = agentErrorCode
+          ? t(clientErrorTranslationKey(agentErrorCode))
+          : getWebSocketErrorMessage(message)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -5565,7 +5576,10 @@ export function AppProvider({
       case "error":
       case "task_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorMessage = getWebSocketErrorMessage(message)
+        const websocketErrorCode = getWebSocketErrorCode(message)
+        const websocketErrorMessage = websocketErrorCode
+          ? t(clientErrorTranslationKey(websocketErrorCode))
+          : getWebSocketErrorMessage(message)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
@@ -6099,19 +6113,24 @@ export function AppProvider({
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-                const uploadData = parsed.data
-                if (uploadData.success && Array.isArray(uploadData.files)) {
-                  uploadData.files
-                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                    .forEach(f => uploadedFileIds.push(f.file_id))
-                }
-              } else {
-                throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-                  generic: t("files.uploadFailed") || "Upload failed",
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
+              if (
+                !uploadResponse.ok
+                || !isJsonRecord(parsed.data)
+                || parsed.data.success !== true
+                || !Array.isArray(parsed.data.files)
+              ) {
+                const uploadError = classifyUploadError(uploadResponse, parsed)
+                throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
+              const newFileIds = parsed.data.files
+                .filter((f): f is { file_id: string } => (
+                  isJsonRecord(f) && typeof f.file_id === 'string'
+                ))
+                .map(f => f.file_id)
+              if (newFileIds.length !== filesToUpload.length) {
+                throw new Error(t("clientErrors.uploadFailed"))
+              }
+              uploadedFileIds.push(...newFileIds)
             } catch (e) {
               console.error('Error uploading files before task creation:', e)
               throw e

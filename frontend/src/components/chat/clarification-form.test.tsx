@@ -423,7 +423,8 @@ describe("ClarificationForm delivery failures", () => {
     message: string,
     disposition: string,
     userFacing = false,
-  ) => Object.assign(new Error(message), { disposition, userFacing })
+    errorCode: string | null = null,
+  ) => Object.assign(new Error(message), { disposition, userFacing, errorCode })
 
   const submitAnswer = async (onSend: ReturnType<typeof vi.fn>) => {
     render(
@@ -438,24 +439,25 @@ describe("ClarificationForm delivery failures", () => {
     )
   }
 
-  it("surfaces the backend rejection reason instead of the generic toast", async () => {
+  it("localizes a coded backend rejection instead of trusting its prose", async () => {
     const onSend = vi.fn().mockRejectedValue(deliveryError(
       "A previous guidance message is still being applied. Please wait for it to finish.",
       "rejected",
       true,
+      "guidance_in_progress",
     ))
 
     await submitAnswer(onSend)
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "A previous guidance message is still being applied. Please wait for it to finish.",
+        "clientErrors.guidanceInProgress",
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
     const alert = await screen.findByRole("alert")
     expect(alert).toHaveTextContent(
-      "A previous guidance message is still being applied.",
+      "clientErrors.guidanceInProgress",
     )
     // The hint lives in the alert too, not only in the toast - without this
     // the inline hint could be deleted with every test still green.

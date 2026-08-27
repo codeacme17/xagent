@@ -9,6 +9,7 @@ import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
@@ -288,6 +289,7 @@ function PublicConversationContent({
           file,
           taskType: "task",
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         })))
         taskPayload.files = uploaded.map((item) => item.file_id)
       }
@@ -617,6 +619,7 @@ export function PublicAgentChatPage({
           taskType: params.taskType,
           taskId: params.taskId,
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         }),
       )),
   }), [authMode, fileAccess, publicAccessToken, t])

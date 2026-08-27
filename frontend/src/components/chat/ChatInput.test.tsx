@@ -1222,6 +1222,38 @@ describe("ChatInput", () => {
     )
   })
 
+  it("localizes coded send failures without displaying their raw message", async () => {
+    const onSend = vi.fn().mockRejectedValue(Object.assign(
+      new Error("provider token=secret"),
+      {
+        errorCode: "message_processing_failed",
+        userFacing: true,
+      },
+    ))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="send safely"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.messageProcessingFailed",
+        { duration: 8000 },
+      )
+    })
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("token=secret"),
+    )
+  })
+
   it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
     // Server-side dedup safety net: a failure that doesn't carry
     // `retryWithNewId` means the send's outcome is unknown (it may have

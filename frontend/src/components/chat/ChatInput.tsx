@@ -9,7 +9,8 @@ import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -401,10 +402,9 @@ export function ChatInput({
             }
           } else {
             failedFiles.add(file);
-            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-              generic: t("files.uploadFailed") || "Failed to upload some files",
-              ...UPLOAD_ERROR_MESSAGES,
-            });
+            const uploadError = classifyUploadError(response, parsed);
+            uploadErrorMessage = uploadErrorMessage
+              || t(clientErrorTranslationKey(uploadError.errorCode));
           }
         }
       } catch (error) {
@@ -413,7 +413,7 @@ export function ChatInput({
         } else {
           console.error("Error uploading file:", error);
           failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
+          uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
         }
       } finally {
         uploadAbortControllersRef.current.delete(fileId);
@@ -789,8 +789,14 @@ export function ChatInput({
       ) {
         deliveryAttemptRef.current = null;
       }
-      toast.error(
-        error instanceof Error
+      const errorCode = typeof error === "object" && error !== null
+        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+        : null;
+      const userFacing = typeof error === "object" && error !== null
+        && (error as { userFacing?: unknown }).userFacing === true;
+      toast.error(errorCode
+        ? t(clientErrorTranslationKey(errorCode))
+        : userFacing && error instanceof Error
           ? error.message
           : t("builds.list.chat.sendFailed") || "Message was not sent"
       );
