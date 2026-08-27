@@ -29,6 +29,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
+from pydantic import JsonValue
+
 logger = logging.getLogger(__name__)
 
 CLARIFICATION_SOURCES = frozenset({"send_message", "ask_user_question", "tool_waiting"})
@@ -63,9 +65,9 @@ class ClarificationRequestItem:
 class ClarificationDraft:
     """A typed view over a waiting turn, common to all clarification sources.
 
-    ``event_id`` names the already-published question occurrence. It is empty
-    only for a draft restored from a checkpoint written before this field
-    existed. ``requests`` carries one item per pending question: the single-source
+    ``event_id`` names the already-published question occurrence. Legacy
+    absence is empty; malformed restored values remain unchanged for web
+    validation. ``requests`` carries one item per pending question: the single-source
     waiting points (``send_message`` / ``ask_user_question``) contribute
     exactly one item, and the multi-tool waiting point contributes one item
     per waiting tool. A malformed or legacy waiting payload can yield an
@@ -99,7 +101,7 @@ class ClarificationDraft:
     origin_execution_id: str
     turn_message_count: int
     turn_marker: str
-    event_id: str = ""
+    event_id: JsonValue = ""
 
     def with_origin_step(self, step_id: str) -> "ClarificationDraft":
         """Return a copy attributed to ``step_id``, with the marker redone.
@@ -329,7 +331,7 @@ def draft_from_waiting_request(
 
     return ClarificationDraft(
         source=source,
-        event_id=str(request.get("event_id") or ""),
+        event_id=request.get("event_id", ""),
         message=message,
         message_type=message_type,
         interactions=interactions,

@@ -17,8 +17,8 @@ row? The answer is one of three outcomes, never folded into a boolean:
   publishable payload (no resume anchor, or the payload could not be shaped
   within the size and character limits below). The caller's own settlement
   proceeds exactly as it would have before this module existed.
-* :class:`FailClosed` -- carries one of six reason strings that split into
-  two different consequences, not one. Three of them do not discard the
+* :class:`FailClosed` -- carries one of seven reason strings that split into
+  two different consequences, not one. Four of them do not discard the
   round at all: no structured row is written, but the finalizer's existing
   path for that status proceeds unchanged. The other three (an unfenced
   lease, a task row no longer owned by the lease that produced this result, or an
@@ -63,6 +63,13 @@ unread today -- removing them now would trade the free "add an optional
 field" path above for a version bump later, to add back exactly what was
 just deleted.
 
+The payload's ``event_id`` is also intentionally outside the v1 question-shape
+readers. It is correlation metadata for the already-published question and the
+authoritative staging identity: the publication path passes the same value to
+``stage()`` separately as ``request_idempotency_key``. Neither
+:func:`parse_clarification_payload` nor the compatibility reader should add an
+``event_id`` field merely to consume metadata that staging already owns.
+
 An application-layer invariant worth stating plainly: a task can have at
 most one *active* interaction row at a time (the database enforces this
 with a unique constraint on the active slot). Nothing in this module
@@ -98,6 +105,7 @@ from .ops_signals import (
     clear_degradation,
     register_degradation,
 )
+from .task_command_transport import COMMAND_ID_PATTERN
 from .task_interaction_staging import InteractionAnchor
 from .task_lease_service import (
     TaskLease,
@@ -201,6 +209,7 @@ FailClosedReason = Literal[
     "missing_draft",
     "draft_status_mismatch",
     "missing_event_id",
+    "invalid_event_id",
     "unfenced_lease",
     "ownership_changed",
     "attempt_mismatch",
@@ -240,13 +249,13 @@ class NotApplicable:
 class FailClosed:
     """No structured row is published this round. What the caller must do
     about the *round itself* depends on which guard produced ``reason`` --
-    the six values split into two different consequences, not one.
+    the seven values split into two different consequences, not one.
 
     ``"missing_draft"``, ``"draft_status_mismatch"``, and
-    ``"missing_event_id"`` do not discard the round: no structured row is
-    written and a stray or unidentified draft is dropped, but the
-    finalizer's existing path for that status proceeds exactly as it
-    already does today.
+    the two event-identity failures (``"missing_event_id"`` and
+    ``"invalid_event_id"``) do not discard the round: no structured row is
+    written and a stray or unidentified draft is dropped, but the finalizer's
+    existing path for that status proceeds exactly as it already does today.
 
     ``"unfenced_lease"``, ``"ownership_changed"``, and ``"attempt_mismatch"``
     come from guards 2 through 4 and mean the opposite: this round's
@@ -275,6 +284,8 @@ def clarification_idempotency_key(draft: ClarificationDraft) -> str:
     move the key because none of the payload content participates in it.
     """
 
+    if not isinstance(draft.event_id, str):
+        raise TypeError("clarification event identity must be validated first")
     return draft.event_id
 
 
@@ -481,10 +492,11 @@ def resolve_publishable_clarification(
     5. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
-    6. ``draft.event_id`` is non-empty -- a question without the identity
-       allocated before publication cannot safely become a native interaction
-       row, because the row could not be tied back to the published question.
-       This fails closed for native publication without discarding the round.
+    6. ``draft.event_id`` is a non-empty string in the downstream command-ID
+       domain -- a question without the identity allocated before publication,
+       or with a restored identity that staging would normalize or reject,
+       cannot safely become a native interaction row. This fails closed for
+       native publication without discarding the round.
     7. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
         (empty after filtering, or reduced to only whitespace, or still
@@ -575,12 +587,18 @@ def resolve_publishable_clarification(
     if anchor is None:
         return NotApplicable("no_anchor")
 
-    if not draft.event_id:
+    if draft.event_id == "":
         logger.warning(
             "a clarification draft had no question event identity",
             extra={"task_id": task.id, "run_id": lease.run_id},
         )
         return FailClosed("missing_event_id")
+
+    if (
+        not isinstance(draft.event_id, str)
+        or COMMAND_ID_PATTERN.fullmatch(draft.event_id) is None
+    ):
+        return FailClosed("invalid_event_id")
 
     payload = build_clarification_payload(draft)
 

@@ -180,6 +180,24 @@ def test_waiting_draft_without_question_event_identity_fails_closed() -> None:
     assert resolution.fail_closed_reason == "missing_event_id"
 
 
+@pytest.mark.parametrize(
+    "event_id",
+    [None, 0, False, [], " id ", "bad/id", "bad\x00id", "a" * 65],
+)
+def test_invalid_question_event_identity_fails_closed(event_id: Any) -> None:
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(event_id=event_id),
+    }
+
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "invalid_event_id"
+
+
 def test_waiting_without_draft_fails_closed_as_missing_draft() -> None:
     result = {"status": "waiting_for_user"}
     resolution = resolve_publishable_clarification(

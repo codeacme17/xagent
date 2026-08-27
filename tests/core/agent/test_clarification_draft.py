@@ -144,6 +144,16 @@ def test_send_message_draft_classifies_and_shapes_requests() -> None:
     assert draft.message == "Choose A or B"
 
 
+def test_restored_non_string_event_identity_is_preserved_for_web_validation() -> None:
+    request = _send_message_request()
+    request["event_id"] = 123
+
+    draft = draft_from_waiting_request(request, execution_id="exec-1", step_id=None)
+
+    assert draft is not None
+    assert draft.event_id == 123
+
+
 def test_ask_user_question_draft_classifies_and_matches_normalized_interactions() -> (
     None
 ):
@@ -370,19 +380,13 @@ def test_distinct_nonempty_tool_call_ids_produce_distinct_markers() -> None:
 
 
 def test_compose_turn_marker_produces_a_fixed_literal_format() -> None:
-    """The replay contract in ``_replay_or_raise_closed``
-    (``task_interaction_staging.py``) rests on ``clarification_idempotency_key``
-    hashing ``turn_marker`` and nothing else, and on ``turn_marker`` staying a
-    function of the waiting turn's own identity. Every existing marker test
-    compares two markers to each other, so this encoding's literal output
-    could change -- a different separator, a dropped length prefix -- without
-    any test here noticing.
+    """``turn_marker`` is descriptive checkpoint state, not publication identity.
 
-    This test failing does not mean the code is wrong: it means the encoding
-    changed, which is exactly the moment ``clarification_idempotency_key``'s
-    output for every already-published row also changes, silently. Whoever
-    causes this test to fail must audit whether that key shift is safe for
-    rows already on disk before touching the assertion below.
+    Every other marker test compares two generated markers, so the literal
+    encoding could change -- a different separator or a dropped length prefix
+    -- without those tests noticing. A change here requires checking marker
+    consumers and restore compatibility, but it cannot rename a published
+    interaction: that identity comes only from the question ``event_id``.
     """
 
     marker = _compose_turn_marker(
