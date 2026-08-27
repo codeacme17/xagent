@@ -39,6 +39,7 @@ from ..services.deployments import (
     new_share_token,
     new_widget_key,
 )
+from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.workforce_access import (
@@ -338,7 +339,7 @@ def _derive_agent_execution_status(
     }
     for event in reversed(trace_events):
         event_type = str(event.get("event_type") or "")
-        if event_type == "trace_error":
+        if event_type in GENERAL_ERROR_EVENT_TYPES:
             return "failed"
         if event_type not in {
             "react_task_end",
@@ -834,7 +835,7 @@ async def archive_or_delete_workforce(
 
         def _load_and_delete_permanently() -> tuple[
             list[WorkforceRunPauseTarget],
-            list[tuple[AgentTrigger, str, dict[str, Any]]],
+            list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
         ]:
             # Offloaded as one unit (load + the cascade-heavy delete
             # itself), not just the delete: a workforce with a large

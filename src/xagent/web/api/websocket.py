@@ -80,6 +80,14 @@ from ...core.file_storage.keys import (
     build_task_output_storage_key,
     build_upload_storage_key,
 )
+from ..services.assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+    assistant_history_has_safe_ancillary_payload,
+    assistant_history_values_for_persistence,
+    client_safe_assistant_history_content,
+    safe_str,
+)
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -137,6 +145,11 @@ from ..services.hot_path_cache import (
     cache_version_token,
     task_cache_ttl_seconds,
     web_task_history_key,
+)
+from ..services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+    log_durable_storage_fault,
 )
 from ..services.task_command_transport import (
     COMMAND_FAILED,
@@ -622,7 +635,7 @@ def _terminal_task_error_payload(
                         task_id=task_id,
                         user_id=int(task_user_id),
                         content=CLIENT_SAFE_TASK_FAILURE,
-                        message_type="chat_response",
+                        message_type=TASK_FAILURE_MESSAGE_TYPE,
                     )
                 except Exception:
                     logger.warning(
@@ -2496,6 +2509,15 @@ def _finalize_task_execution_result_isolated(
                     status=final_status,
                     expected_run_id=expected_run_id,
                 )
+                if final_status == TaskStatus.FAILED:
+                    diagnostic_error = safe_str(result.get("error")).strip()
+                    setattr(
+                        task_updated,
+                        "error_message",
+                        diagnostic_error
+                        or safe_str(ai_response).strip()
+                        or CLIENT_SAFE_TASK_FAILURE,
+                    )
                 sync_workforce_run_status(
                     finalize_db,
                     task_updated,
@@ -2512,17 +2534,25 @@ def _finalize_task_execution_result_isolated(
                         f"Task {task_id}: cannot persist assistant message "
                         "without a resolved user_id"
                     )
+                history_content, history_message_type = (
+                    assistant_history_values_for_persistence(
+                        content=safe_str(ai_response),
+                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        is_failure=task_updated.status == TaskStatus.FAILED,
+                    )
+                )
                 persist_assistant_message_no_commit(
                     finalize_db,
                     task_id=task_id,
                     user_id=task_user_id,
-                    content=str(ai_response),
-                    message_type="chat_response"
-                    if isinstance(chat_response, dict)
-                    else "final_answer",
-                    interactions=chat_response.get("interactions")
-                    if isinstance(chat_response, dict)
-                    else None,
+                    content=history_content,
+                    message_type=history_message_type,
+                    interactions=(
+                        chat_response.get("interactions")
+                        if isinstance(chat_response, dict)
+                        and task_updated.status != TaskStatus.FAILED
+                        else None
+                    ),
                     content_is_reconciled=True,
                 )
                 finalize_db.commit()
@@ -3143,7 +3173,7 @@ def _finalize_resumed_task(
                 task_id=task_id,
                 user_id=task_owner_user_id,
                 content=output,
-                message_type="final_answer",
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
                 turn_id=_latest_result_user_turn_id(result),
                 content_is_reconciled=True,
             )
@@ -3151,9 +3181,23 @@ def _finalize_resumed_task(
             orm_task.output = output
             orm_task.error_message = None
         elif final_task_status == TaskStatus.FAILED:
+            if task_owner_user_id is not None:
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_owner_user_id,
+                    content=CLIENT_SAFE_TASK_FAILURE,
+                    message_type=TASK_FAILURE_MESSAGE_TYPE,
+                    turn_id=_latest_result_user_turn_id(result),
+                    content_is_reconciled=True,
+                )
             orm_task = cast(Any, task)
             orm_task.output = None
-            orm_task.error_message = output or "Task execution failed."
+            orm_task.error_message = (
+                str(result.get("error") or "").strip()
+                or output
+                or CLIENT_SAFE_TASK_FAILURE
+            )
 
         sync_workforce_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
@@ -6008,6 +6052,55 @@ async def _handle_chat_message_unserialized(
             )
         return not delivery_failure_pool_timeout
 
+    async def answer_durable_turn_failure(ack_message: str) -> bool:
+        """Answer a durable turn failure, addressing each audience as #1514 does.
+
+        The two audiences differ deliberately: the sender's rejection ack (and
+        the detail bubble that stands in for it when the ack is suppressed)
+        carries ``ack_message``, while the task-wide broadcast -- which reaches
+        anonymous widget and share guests -- carries the fixed
+        ``CLIENT_SAFE_TASK_FAILURE``.
+
+        The durable arms below precede the ``RuntimeError`` arm they subclass.
+        On main those faults reached that arm and were broadcast from it, so
+        answering with the ack alone would quietly stop notifying the task.
+        This keeps that notification while giving the sender the specific
+        wording each fault deserves.
+
+        Used only by the arms this change adds. The pre-existing arms keep
+        their inline bodies: they landed with #1514, and rewriting them here
+        would re-open reviewed code to no benefit.
+
+        Returns ``False`` when the delivery layer says the caller must stop.
+        """
+        if not await finish_delivery_failure(ack_message):
+            return False
+        timestamp = datetime.now(timezone.utc).timestamp()
+        if authorized_task_id is not None:
+            safe_error_payload = await _read_task_error_payload_offloop(
+                authorized_task_id,
+                CLIENT_SAFE_TASK_FAILURE,
+            )
+            await manager.broadcast_to_task(
+                {**safe_error_payload, "timestamp": timestamp},
+                authorized_task_id,
+            )
+            if suppress_delivery_ack:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": ack_message,
+                        "timestamp": timestamp,
+                    },
+                    websocket,
+                )
+        else:
+            await manager.send_personal_message(
+                {"type": "error", "message": ack_message, "timestamp": timestamp},
+                websocket,
+            )
+        return True
+
     async def finish_existing_delivery(
         claim: Union[UserMessageDeliveryClaim, _UserMessageDeliverySnapshot],
     ) -> None:
@@ -6752,6 +6845,47 @@ async def _handle_chat_message_unserialized(
                     },
                     websocket,
                 )
+        except DurableObjectIntegrityError:
+            # Precedes the durable-fault arm below, which this subclasses. A
+            # checksum mismatch is permanent corruption, already recorded at
+            # ERROR with both checksums where it is raised, so it must not also
+            # be logged as a transient outage. It still owes the client an
+            # answer, and a distinct one: retrying cannot help, the stored copy
+            # has to be replaced.
+            #
+            # The message is a fixed literal, so it is safe for both audiences
+            # and needs no ``client_safe_error_message`` pass.
+            # Spelled out rather than shared with the outer arm's copy: the
+            # client-safe guard in test_websocket_client_safe_errors resolves a
+            # producer's message only as a literal, a traceable local, or a
+            # forwarded parameter -- a module constant reads as unresolvable
+            # and fails it. The duplication is the price of that check.
+            if not await answer_durable_turn_failure(
+                "A stored file for this message failed its integrity check "
+                "and must be re-uploaded."
+            ):
+                return
+        except DurableStorageOperationError as exc:
+            # Must precede the RuntimeError arm below, which this subclasses.
+            # This is the selected-file attachment path: the fault arrives here
+            # first, is answered to the client, and is swallowed -- so this is
+            # both the only place its provider cause can be recorded and the
+            # last place its text could escape.
+            #
+            # Fixed literal outbound rather than ``str(exc)``: the wrap's own
+            # text is not what a client should read, and this arm is also the
+            # sole logging owner for this path -- the fault does not re-raise,
+            # so the endpoint-level arm never sees it and cannot double-record.
+            log_durable_storage_fault(
+                logger,
+                "websocket agent execution",
+                exc,
+                task_id=authorized_task_id,
+            )
+            if not await answer_durable_turn_failure(
+                "A stored file for this message could not be read. Please try again."
+            ):
+                return
         except RuntimeError as e:
             # Runtime error. The sender's rejection ack keeps the wording
             # (#1479 contract); the task-wide broadcast reaches anonymous
@@ -6816,6 +6950,44 @@ async def _handle_chat_message_unserialized(
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
         logger.error("Connection error handling chat message: %s", e)
+        raise
+    except DurableObjectIntegrityError:
+        # Attachment preparation runs in this outer scope (see the
+        # ``_prepare_websocket_turn_sync`` call above), *before* the inner
+        # agent-execution try. So a stored-file fault surfaces here, not in the
+        # arms guarding that inner block -- which is why the fixed detail has to
+        # be applied at this level too.
+        #
+        # Corruption is permanent: the copy has to be replaced, so the client is
+        # told that rather than to retry. No exception text goes outbound; the
+        # integrity ERROR with both checksums is already logged where it is
+        # raised.
+        # Literal for the same reason as the inner arm above: the client-safe
+        # guard resolves only literals, traceable locals, and parameters.
+        await finish_delivery_failure(
+            "A stored file for this message failed its integrity check "
+            "and must be re-uploaded."
+        )
+        raise
+    except DurableStorageOperationError as exc:
+        # Same scope reasoning as above. ``str(exc)`` is the wrap's message and
+        # carries the storage key, whose scope segments encode the owning user's
+        # id -- it must not reach a socket frame, a persisted rejection, or a
+        # broadcast, any more than it may reach an HTTP body or a model (#1467).
+        #
+        # Logging here rather than leaving it to the endpoint arm: the
+        # durable-command route invokes this handler directly and never reaches
+        # that arm. Double-recording is prevented at the logger, which marks the
+        # fault, so both arms are safe to write independently.
+        log_durable_storage_fault(
+            logger,
+            "websocket chat turn preparation",
+            exc,
+            task_id=task_id,
+        )
+        await finish_delivery_failure(
+            "File storage is temporarily unavailable. Please try again."
+        )
         raise
     except Exception as e:
         # Other errors, re-raise
@@ -7363,6 +7535,10 @@ def _load_historical_stream_snapshot_sync(
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
                 if role == "assistant":
+                    content = client_safe_assistant_history_content(
+                        content=content,
+                        message_type=str(chat_message.message_type),
+                    )
                     content = reconcile_assistant_file_references(
                         db,
                         task_id=int(task_id),
@@ -7373,7 +7549,14 @@ def _load_historical_stream_snapshot_sync(
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the
                 # chip metadata reaches the synthesized user_message event.
-                _attachments_raw = chat_message.attachments
+                assistant_ancillary_is_safe = role != "assistant" or (
+                    assistant_history_has_safe_ancillary_payload(
+                        str(chat_message.message_type)
+                    )
+                )
+                _attachments_raw = (
+                    chat_message.attachments if assistant_ancillary_is_safe else None
+                )
                 row_attachments: Optional[list] = (
                     _attachments_raw
                     if isinstance(_attachments_raw, list) and _attachments_raw
@@ -7420,7 +7603,11 @@ def _load_historical_stream_snapshot_sync(
                         in trace_message_keys
                     ):
                         continue
-                    interactions = chat_message.interactions
+                    interactions = (
+                        chat_message.interactions
+                        if assistant_ancillary_is_safe
+                        else None
+                    )
                     data = {
                         "message": content,
                         "content": content,
@@ -7675,6 +7862,36 @@ async def handle_status_request(
     await send_historical_data_as_stream(websocket, task_id, user)
 
 
+# Operation labels for the endpoint-level fault arms, keyed by message type.
+# A closed map rather than interpolation: ``type`` is client-supplied, and
+# ``operation`` is meant to be a bounded, aggregatable value -- it is also not
+# sanitised the way rendered fields are (#1520), so a client must not be able to
+# reach it.
+#
+# Only the message types whose handler lets a fault propagate are listed.
+# ``execute_task`` and ``intervention`` end in ``except RuntimeError``
+# with no re-raise, so a durable fault from either is swallowed there and can
+# never reach the arms below; giving them a label would claim a reachability
+# that does not exist, and the label would read as covered while never being
+# emitted. Making them reachable means giving those two handlers a durable arm
+# of their own, which is absorber work and belongs to #1515 -- at which point
+# they get a label here. ``_SWALLOWED_DISPATCH_TYPES`` in the tests pins the
+# omission against the handlers, so this cannot silently become wrong.
+# ``chat`` is absent for a third reason, distinct from the two above: every
+# fault arm of its handler that re-raises reports through
+# ``log_durable_storage_fault`` first, and the logger marks the instance, so
+# the call here is a no-op rather than a second record. A label for it would
+# name a line that is never emitted.
+# ``test_chat_is_unlabelled_only_because_its_arms_report_first`` pins the
+# report-before-re-raise half against the handler's own arms.
+_DISPATCH_OPERATIONS = {
+    "status_request": "websocket status request",
+    "pause_task": "websocket pause_task",
+    "resume_task": "websocket resume_task",
+}
+_UNKNOWN_DISPATCH_OPERATION = "websocket unknown message type"
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -7693,6 +7910,13 @@ async def websocket_chat_endpoint(
 
     await manager.connect(websocket, task_id)
 
+    # Which message the loop is currently applying, for the fault arms below:
+    # they guard the whole dispatch, so a fixed label would report a resume or
+    # an execute_task fault as a chat turn in the one line meant to name it.
+    # Initialised here, not in the loop, because the initial status request runs
+    # before the first message is ever parsed.
+    dispatching = "websocket initial status request"
+
     try:
         # Send initial state
         await handle_status_request(websocket, task_id, user)
@@ -7709,6 +7933,15 @@ async def websocket_chat_endpoint(
             # Add user info to message data
             message_data["user_id"] = user.id
             message_data["user"] = user
+
+            # ``str()`` before the lookup, not for the ``None`` case -- a
+            # missing type misses the map either way -- but because ``type``
+            # is client-supplied and need not be hashable: ``{"type": []}``
+            # would raise ``TypeError`` from ``dict.get`` itself. Every value
+            # that does not name a handler lands on the bounded fallback.
+            dispatching = _DISPATCH_OPERATIONS.get(
+                str(message_data.get("type")), _UNKNOWN_DISPATCH_OPERATION
+            )
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
@@ -7730,6 +7963,20 @@ async def websocket_chat_endpoint(
 
     except WebSocketDisconnect:
         pass
+    except DurableObjectIntegrityError:
+        # Precedes the parent arm: permanent corruption, already recorded at
+        # ERROR with both checksums where it is raised, so it must not also be
+        # logged as a transient outage. Swallowed exactly as the parent arm
+        # swallows -- the socket is going away either way.
+        pass
+    except DurableStorageOperationError as exc:
+        # Must precede the RuntimeError arm below, which this subclasses. A
+        # storage fault reaching here would otherwise be logged as "Connection
+        # error in WebSocket" and swallowed -- mislabelled and cause-less on
+        # the very path #1467 was filed about. Still swallowed, as before:
+        # the socket is going away regardless and the client has already been
+        # answered; only the diagnosis changes.
+        log_durable_storage_fault(logger, dispatching, exc, task_id=task_id)
     except (ConnectionError, RuntimeError) as e:
         # Connection error
         logger.error(f"Connection error in WebSocket: {e}")

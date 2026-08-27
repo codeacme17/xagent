@@ -776,6 +776,8 @@ def test_get_workforce_agent_execution_marks_orphan_interrupted() -> None:
         ("dag_execute_end", {"success": True}, "completed"),
         ("dag_execute_end", {"success": False}, "failed"),
         ("trace_error", {}, "failed"),
+        ("task_error_general", {}, "failed"),
+        ("step_error_general", {}, "failed"),
     ],
 )
 def test_agent_execution_status_recognizes_dag_terminal_events(
@@ -1205,10 +1207,13 @@ def test_permanent_delete_unregisters_cascade_deleted_trigger_bindings(
 
     assert response.status_code == 200, response.text
     assert len(captured) == 1
-    [(captured_trigger, captured_type, captured_config)] = captured[0]
+    [(captured_trigger, captured_type, captured_config, captured_resource)] = captured[
+        0
+    ]
     assert int(captured_trigger.id) == trigger_id
     assert captured_type == "webhook"
     assert captured_config == {"marker": "should-be-passed-to-teardown"}
+    assert captured_resource is None
 
     db = _direct_db_session()
     try:
@@ -1267,9 +1272,14 @@ def test_unregister_deleted_trigger_bindings_isolates_per_trigger_failures(
 
     class _StubProvider:
         async def unregister(
-            self, db: Any, trigger: Any, config: dict[str, Any]
+            self,
+            db: Any,
+            trigger: Any,
+            config: dict[str, Any],
+            *,
+            resource_id: str | None = None,
         ) -> None:
-            del db, trigger
+            del db, trigger, resource_id
             calls.append(dict(config))
             if config.get("marker") == "failing-trigger":
                 raise RuntimeError("boom")

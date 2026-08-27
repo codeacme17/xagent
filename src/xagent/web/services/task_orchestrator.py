@@ -60,6 +60,10 @@ from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
+from .assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+)
 from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -69,7 +73,7 @@ from .chat_history_service import (
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
-    client_safe_error_message,
+    required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
     drain_async_task_cancellation_safe,
@@ -1335,6 +1339,7 @@ def settle_task_lease_isolated(
     *,
     error_message: str | None = None,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
+    client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1377,7 +1382,7 @@ def settle_task_lease_isolated(
                             task_id=lease.task_id,
                             user_id=int(task.user_id),
                             content=client_error_message,
-                            message_type="chat_response",
+                            message_type=client_message_type,
                         )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
@@ -1693,6 +1698,7 @@ def _schedule_bg(
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
         settlement_error: str | None = None
         client_history_error_message: str | None = None
+        client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
@@ -1820,6 +1826,7 @@ def _schedule_bg(
                 if task_source == EXTERNAL_TASK_SOURCE:
                     settlement_error = EXTERNAL_TURN_INTERRUPTED_MESSAGE
                     client_history_error_message = settlement_error
+                    client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                 else:
                     settlement_error = "task execution cancelled"
                 raise
@@ -1851,16 +1858,19 @@ def _schedule_bg(
                         # though the fenced settlement remains the sole owner of
                         # the terminal write.
                         settlement_error = str(setup_or_run_err)
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = (
+                            required_mcp_unavailable_client_message(
+                                setup_or_run_err,
+                                fallback=CLIENT_SAFE_TASK_FAILURE,
+                            )
+                        )
                     else:
                         settlement_error = (
                             "setup/run error: "
                             f"{type(setup_or_run_err).__name__}: {setup_or_run_err}"
                         )
-                    broadcast_error_message = client_safe_error_message(
-                        setup_or_run_err,
-                        safe_for_display=is_public_safe_mcp_error,
-                        fallback=CLIENT_SAFE_TASK_FAILURE,
-                    )
+                        broadcast_error_message = CLIENT_SAFE_TASK_FAILURE
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,
@@ -1909,6 +1919,7 @@ def _schedule_bg(
                                     or broadcast_error_message
                                     or CLIENT_SAFE_TASK_FAILURE
                                 ),
+                                client_message_type=client_history_message_type,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":

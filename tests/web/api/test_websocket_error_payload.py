@@ -112,6 +112,7 @@ def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
             .all()
         )
         assert len(messages) == 1
+        assert messages[0].message_type == "task_failure"
         assert messages[0].content == websocket_api.CLIENT_SAFE_TASK_FAILURE
         assert secret not in messages[0].content
         persisted_task = db.get(Task, task_id)
