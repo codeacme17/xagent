@@ -133,6 +133,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
@@ -164,6 +165,30 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # too would just be a second place scope changes have to be
             # kept in sync.
             "default_scopes": ["user:read:user"],
+        },
+        {
+            "provider_name": "github",
+            "name": "GitHub",
+            "client_id": os.environ.get("GITHUB_CLIENT_ID", ""),
+            "client_secret": os.environ.get("GITHUB_CLIENT_SECRET", ""),
+            "auth_url": "https://github.com/login/oauth/authorize",
+            "token_url": "https://github.com/login/oauth/access_token",
+            "redirect_uri": os.environ.get("GITHUB_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.github.com/user",
+            "user_id_path": "id",
+            # GitHub's /user "email" field is null unless the account has a
+            # public email set or the connecting token carries user:email
+            # (only requested via this app's own oauth_scopes below, not the
+            # provider's bare default_scopes) -- "login" (the username) is
+            # always present on any valid token and is what the connector UI
+            # actually needs for a display label, same rationale as slack's
+            # team-name-in-email-slot above.
+            "email_path": "login",
+            # Identity-only for this provider row, same pattern as zoom
+            # above: the functional scopes (repo access, email) live on
+            # the app row's oauth_scopes and are merged in at authorize
+            # time by _merge_oauth_scopes.
+            "default_scopes": ["read:user"],
         },
         {
             "provider_name": "intercom",
@@ -205,6 +230,121 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # Intercom's actual behavior instead of sending a param it
             # ignores.
             "default_scopes": [],
+        },
+        {
+            "provider_name": "salesforce",
+            "name": "Salesforce",
+            "client_id": os.environ.get("SALESFORCE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("SALESFORCE_CLIENT_SECRET", ""),
+            # The generic login.salesforce.com/test.salesforce.com hosts
+            # (rather than a customer's own My Domain, e.g.
+            # acme.my.salesforce.com) work for any org: Salesforce resolves
+            # the actual org during login and issues a token scoped to it,
+            # returning that org's real API host as `instance_url` in the
+            # token response -- see the userinfo_url note below and
+            # UserOAuth.instance_url (api/auth.py persists it generically
+            # for any provider that returns this key).
+            "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
+            "token_url": "https://login.salesforce.com/services/oauth2/token",
+            "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
+            # Salesforce's OIDC userinfo endpoint IS a fixed host
+            # (login.salesforce.com, same as auth_url/token_url -- see
+            # salesforce.py's USERINFO_URL), not the per-org instance_url
+            # used by every other endpoint. Left empty anyway, on purpose:
+            # populating it here would add a network round-trip to every
+            # OAuth connect just to fill in email/provider_user_id, which
+            # this connector doesn't otherwise need -- identity is instead
+            # fetched lazily, on demand, via salesforce_get_current_user.
+            # UserOAuth.email/provider_user_id stay NULL for every Salesforce
+            # grant as a result; is_connected still works from access_token
+            # alone (see test_salesforce_oauth.py's dedicated coverage).
+            "userinfo_url": "",
+            "user_id_path": "user_id",
+            "email_path": "email",
+            # refresh_token: required to get a refresh_token back at all.
+            # openid: required for the OIDC userinfo endpoint
+            # salesforce_get_current_user calls.
+            "default_scopes": ["api", "refresh_token", "openid"],
+        },
+        {
+            "provider_name": "deputy",
+            "name": "Deputy",
+            "client_id": os.environ.get("DEPUTY_CLIENT_ID", ""),
+            "client_secret": os.environ.get("DEPUTY_CLIENT_SECRET", ""),
+            "auth_url": "https://once.deputy.com/my/oauth/login",
+            "token_url": "https://once.deputy.com/my/oauth/access_token",
+            "redirect_uri": os.environ.get("DEPUTY_REDIRECT_URI", ""),
+            # Deputy has no fixed userinfo host -- each customer's actual API
+            # host (e.g. "acme.au.deputy.com", no scheme) is returned as
+            # `endpoint` in the token response instead, similar in spirit to
+            # Salesforce's instance_url above but under a different response
+            # key and without a scheme, so api/auth.py normalizes it into
+            # UserOAuth.instance_url itself rather than reusing the generic
+            # token_data.get("instance_url") persistence every other provider
+            # shares. Left empty so generic_oauth_callback's `elif
+            # userinfo_url and access_token:` branch is skipped; identity
+            # instead comes from a dedicated `elif provider.lower() ==
+            # "deputy"` branch there that calls the per-install
+            # GET /api/v1/me once instance_url is known.
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # Deputy's only documented OAuth scope. Not a permission scope in
+            # the usual sense -- it just tells Deputy to also issue a
+            # refresh_token -- but the authorize, code-exchange, and refresh
+            # requests all require it to be present verbatim.
+            "default_scopes": ["longlife_refresh_token"],
+        },
+        {
+            "provider_name": "linear",
+            "name": "Linear",
+            "client_id": os.environ.get("LINEAR_CLIENT_ID", ""),
+            "client_secret": os.environ.get("LINEAR_CLIENT_SECRET", ""),
+            "auth_url": "https://linear.app/oauth/authorize",
+            "token_url": "https://api.linear.app/oauth/token",
+            "redirect_uri": os.environ.get("LINEAR_REDIRECT_URI", ""),
+            # Linear's API is GraphQL-only (POST-only, nested response shape)
+            # -- there is no flat REST endpoint this callback's GET-plus-flat-
+            # dict.get() userinfo lookup can use. Left empty so that lookup is
+            # skipped entirely (generic_oauth_callback's `if userinfo_url and
+            # access_token:` guard); identity comes instead from a dedicated
+            # `elif provider.lower() == "linear"` branch there that runs a
+            # `viewer` GraphQL query (_fetch_linear_viewer_identity), which
+            # also doubles as post-exchange token verification.
+            "userinfo_url": "",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Identity-only convention (see zoom's comment above) — the
+            # functional "write" scope this connector actually calls for
+            # lives on the app row's oauth_scopes below and is merged in at
+            # authorize time by _merge_oauth_scopes, so listing it here too
+            # would just be a second place scope changes have to be kept in
+            # sync, and would survive a narrowing of the app row's scopes
+            # since _merge_oauth_scopes is a pure union.
+            "default_scopes": ["read"],
+        },
+        {
+            "provider_name": "jira",
+            "name": "Jira",
+            "client_id": os.environ.get("JIRA_CLIENT_ID", ""),
+            "client_secret": os.environ.get("JIRA_CLIENT_SECRET", ""),
+            "auth_url": "https://auth.atlassian.com/authorize",
+            "token_url": "https://auth.atlassian.com/oauth/token",
+            "redirect_uri": os.environ.get("JIRA_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.atlassian.com/me",
+            "user_id_path": "account_id",
+            "email_path": "email",
+            # offline_access is required to get a refresh_token back at all
+            # (Atlassian omits it from the token response otherwise); read/
+            # write:jira-work cover issue and comment access, read:jira-user
+            # covers the user-search tool, and read:me backs jira_get_current_user.
+            "default_scopes": [
+                "offline_access",
+                "read:jira-work",
+                "write:jira-work",
+                "read:jira-user",
+                "read:me",
+            ],
         },
     ]
 
@@ -267,7 +407,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -364,6 +504,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.google_analytics"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "google-search-console",
+            "name": "Google Search Console",
+            "description": "Connect to Google Search Console to list verified sites, query search analytics (clicks, impressions, CTR, position), inspect URLs, and list sitemaps.",
+            "icon": "https://www.google.com/s2/favicons?domain=search.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            # "Analytics" (not "Marketing", which google-analytics uses —
+            # a pre-existing mismatch, not a precedent to repeat) since this
+            # connector is squarely a search-analytics tool.
+            "category": "Analytics",
+            "oauth_scopes": ["https://www.googleapis.com/auth/webmasters.readonly"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_search_console"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -568,7 +727,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "slack",
             "name": "Slack",
-            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
+            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, upload files, and join public channels when asked to, e.g. incident summaries and recommended fixes.",
             "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
             "transport": "oauth",
             "provider_name": "slack",
@@ -578,6 +737,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
@@ -657,6 +817,45 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "AWS_SECRET_ACCESS_KEY",
                     "AWS_REGION",
                 ],
+            },
+        },
+        {
+            "app_id": "posthog",
+            "name": "PostHog",
+            "description": "Connect to PostHog Cloud (US or EU) to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations. Self-hosted PostHog is not supported.",
+            "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Analytics" is already one of the connect dialog's fixed
+            # sidebar category filters (connect-mcp-dialog.tsx) with no
+            # connector using it before this one -- an always-empty filter
+            # button. google-analytics uses "Marketing" instead, but that's
+            # its own pre-existing mismatch, not a reason to leave this
+            # button empty too.
+            "category": "Analytics",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps: PostHog's only
+            # documented OAuth path is Client ID Metadata Document (CIMD),
+            # where the client_id is a URL hosting a metadata document *we*
+            # would have to serve publicly -- infrastructure this connector
+            # doesn't have, and a materially different model (no client
+            # secret at all) than every oauth_providers row in this file.
+            # Personal API keys sidestep that entirely: each user generates
+            # their own (posthog.com/docs/api/personal-api-keys), same
+            # no-review self-serve bar as an OAuth App, without needing
+            # xagent to host anything. POSTHOG_HOST is required alongside
+            # the key because US/EU Cloud are separate deployments -- a key
+            # from one host is not valid against the other (unlike, say,
+            # Intercom's single auto-routing API host). posthog.py's
+            # _base_url() restricts this to exactly those two hosts (not a
+            # broader "*.posthog.com" allowlist): self-hosted PostHog is
+            # not a documented target of this connector, so there's no
+            # reason to let this key be sent anywhere else.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.posthog"],
+                "required_env": ["POSTHOG_API_KEY", "POSTHOG_HOST"],
             },
         },
         {
@@ -741,6 +940,39 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "github",
+            "name": "GitHub",
+            # Explicitly discloses the "repo" scope's blast radius (all
+            # repositories -- public and private -- the connecting account
+            # can access, not just ones the user picks) rather than leaving
+            # it implicit, since this is an OAuth App with no per-repository
+            # allowlist (unlike a GitHub App's repository-selection step).
+            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
+            "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "github",
+            "category": "Development",
+            # read:org dropped: no tool here calls any organization endpoint
+            # (no org listing/membership lookup), so it was requested
+            # without a corresponding capability -- principle of least
+            # privilege. user:email is kept: unlike a separate unused
+            # endpoint, it changes what /user's own "email" field returns
+            # (populates it for accounts without a public email), which
+            # github_get_current_user's output relies on directly -- see
+            # test_get_current_user_returns_profile in test_github_mcp.py,
+            # which asserts the email field is surfaced, and
+            # test_github_login_requests_exact_canonical_scope in
+            # test_generic_oauth_login.py, which asserts this exact scope
+            # is what gets requested at authorize time.
+            "oauth_scopes": ["repo", "user:email"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.github"],
+                "env_mapping": {"GITHUB_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "intercom",
             "name": "Intercom",
             "description": "Connect to Intercom to search contacts, review conversations, and reply to customers.",
@@ -767,6 +999,119 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],
                 "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "salesforce",
+            "name": "Salesforce",
+            "description": "Connect to Salesforce to query and manage records (accounts, contacts, leads, opportunities, and custom objects) with SOQL/SOSL, and browse object schemas.",
+            "icon": "https://www.google.com/s2/favicons?domain=salesforce.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "salesforce",
+            "category": "CRM",
+            "oauth_scopes": ["api", "refresh_token", "openid"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+                # instance_url is the per-org API host from the OAuth grant
+                # (UserOAuth.instance_url) -- see the oauth_providers row
+                # above for why Salesforce needs this second mapping entry
+                # that no other connector here does.
+                "env_mapping": {
+                    "SALESFORCE_ACCESS_TOKEN": "access_token",
+                    "SALESFORCE_INSTANCE_URL": "instance_url",
+                },
+            },
+        },
+        {
+            "app_id": "deputy",
+            "name": "Deputy",
+            "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+            "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "deputy",
+            "category": "Scheduling",
+            "oauth_scopes": ["longlife_refresh_token"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.deputy"],
+                # instance_url is the per-install API host from the OAuth
+                # grant (UserOAuth.instance_url) -- see the oauth_providers
+                # row above for why Deputy needs this second mapping entry,
+                # the same reason Salesforce's row above does.
+                "env_mapping": {
+                    "DEPUTY_ACCESS_TOKEN": "access_token",
+                    "DEPUTY_INSTANCE_URL": "instance_url",
+                },
+            },
+        },
+        {
+            "app_id": "linear",
+            "name": "Linear",
+            "description": "Connect to Linear to search and manage issues, comments, teams, and projects.",
+            "icon": "https://www.google.com/s2/favicons?domain=linear.app&sz=128",
+            "transport": "oauth",
+            "provider_name": "linear",
+            "category": "Productivity",
+            "oauth_scopes": ["read", "write"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.linear"],
+                "env_mapping": {"LINEAR_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "jira",
+            "name": "Jira",
+            "description": "Connect to Jira to search issues with JQL, read and create issues and comments, transition issues through their workflow, and browse projects and users.",
+            "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "jira",
+            "category": "Productivity",
+            "oauth_scopes": [
+                "offline_access",
+                "read:jira-work",
+                "write:jira-work",
+                "read:jira-user",
+                "read:me",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.jira"],
+                "env_mapping": {"JIRA_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "stripe",
+            "name": "Stripe",
+            "description": "Connect to Stripe with a Restricted API Key (not your full secret key) to look up customers, charges, invoices, and subscriptions, and issue refunds.",
+            "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Payments",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps/posthog: Stripe's
+            # own OAuth flow (Connect "Standard accounts") is for a platform
+            # aggregating many *other* merchants' accounts, not for a single
+            # user granting a tool access to their own account -- Stripe's
+            # docs explicitly discourage it for new integrations, and since
+            # June 2021 a read_write OAuth connection fails outright if the
+            # account is already connected to another platform. A
+            # Restricted API Key (rk_live_.../rk_test_...) sidesteps both
+            # problems entirely and is what Stripe's own agent-toolkit/MCP
+            # server recommends for exactly this use case (see
+            # github.com/stripe/agent-toolkit tools/README.md) -- same
+            # no-review self-serve bar as an OAuth App, scoped to only the
+            # permissions the user grants it.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.stripe"],
+                "required_env": ["STRIPE_API_KEY"],
             },
         },
     ]

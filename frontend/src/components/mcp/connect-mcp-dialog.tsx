@@ -38,7 +38,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useEffect } from "react"
-import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
+import { sanitizeAppIntegrations, sanitizeConnectorStatus } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
@@ -266,6 +266,25 @@ export function ConnectMcpDialog({
   // second would 404 on /{server_id}/oauth/connect.
   const canAuthorize = (app: AppIntegration) => Boolean(app.can_authorize)
 
+  // Whether this viewer may open this entry's configuration surface, decided
+  // by the backend (list_mcp_apps.can_configure) rather than re-derived from
+  // is_connected. A connector whose tokens arrive through a
+  // deployment-installed resolver hook is never "connected" for its own
+  // creator -- no personal grant row is ever written -- so the connected gate
+  // hid the edit route from the one person entitled to it.
+  //
+  // The `??` default reproduces the pre-field gate and exists only for a
+  // rolling deploy of the multi-container layout, where a new frontend
+  // container can briefly talk to an older backend. It is a UI hint, never a
+  // permission: the edit route itself answers 404 without a personal
+  // association row (GET/PUT /api/mcp/servers/{id}, /api/custom-apis/{id}).
+  // Producer-side coverage is not in question -- all three emitting branches
+  // are pinned to emit a bool by
+  // test_every_listed_entry_carries_all_three_decisions (tests/web, which CI
+  // runs) -- so dropping this default needs no repository audit, only a
+  // decision that the supported backend floor emits the field.
+  const canConfigure = (app: AppIntegration) => Boolean(app.can_configure ?? app.is_connected)
+
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300)
     return () => clearTimeout(timer)
@@ -338,8 +357,7 @@ export function ConnectMcpDialog({
         body: JSON.stringify({ refs }),
       })
       if (!response.ok) return
-      const status: Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }> =
-        await response.json()
+      const status = sanitizeConnectorStatus(await response.json())
       setApps((prev) =>
         prev.map((app) => {
           const ref = connectorRef(app)
@@ -1468,7 +1486,19 @@ export function ConnectMcpDialog({
                                   {app.is_local ? <Home className="h-3 w-3 mr-1.5 text-slate-400" /> : <Globe className="h-3 w-3 mr-1.5 text-slate-400" />}
                                   {app.is_local ? t('tools.mcp.dialog.local') : t('tools.mcp.dialog.remote')}
                                 </Badge>
-                                {inTeam && isGloballyConnected && connectorRef(app) && (
+                                {/* The ownership badge reports team-sharing status, which is not a
+                                    credential fact, so it does not gate on isGloballyConnected.
+                                    connectorRef(app) requires the entry to have a sharing identity
+                                    at all (a numeric server_id); without it an unconnected catalog
+                                    entry would render "Private" from a shared field nobody set.
+                                    typeof app.shared === "boolean" holds for a well-formed answer
+                                    from the sharing route (the merge above only ever writes a
+                                    sanitized triple), or for a shared field the /api/mcp/apps
+                                    listing itself chose to supply -- sanitizeAppIntegrations does
+                                    not strip unknown fields. connectorRef(app) is what keeps that
+                                    second case from rendering a badge on an entry with no sharing
+                                    identity at all. */}
+                                {inTeam && connectorRef(app) && typeof app.shared === "boolean" && (
                                   <Badge variant="secondary" className={`font-medium px-2 py-0.5 rounded-md border shadow-none ${app.shared ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
                                     {!app.shared
                                       ? t('tools.mcp.sharing.private')
@@ -1483,53 +1513,74 @@ export function ConnectMcpDialog({
                                   </Badge>
                                 )}
                               </div>
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-2 flex-wrap">
                                 {isLoading ? (
                                   <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
-                                ) : isGloballyConnected ? (
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className="h-7 text-xs text-slate-600 hover:text-slate-900 px-2 bg-slate-100 hover:bg-slate-200"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setSelectedApp(app);
-                                    }}
-                                  >
-                                    <Settings className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.configure')}
-                                  </Button>
-                                ) : isSelectMode && canAuthorize(app) ? (
-                                  // One-click entry to the per-server OAuth
-                                  // flow repaired in #1323, kept from #1332
-                                  // where the card click stopped reaching the
-                                  // detail modal it is started from.
-                                  //
-                                  // Driven by can_authorize alone (#1347), not
-                                  // by the attach gate: those two now select
-                                  // disjoint populations. An entry that is
-                                  // attachable-but-unconnected got there
-                                  // through hook-supplied credentials or a team
-                                  // link, and has no consent this editor could
-                                  // complete — the button asserted "needs
-                                  // authorization" and opened a popup that
-                                  // could never finish. What is left is the
-                                  // connector whose consent was never started:
-                                  // not attachable until it is, so its card
-                                  // click still opens the modal, and this
-                                  // labels that route rather than leaving the
-                                  // one card in a grid of toggles unexplained.
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className="h-7 text-xs text-blue-600 hover:text-blue-700 px-2 bg-blue-50 hover:bg-blue-100"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setSelectedApp(app);
-                                    }}
-                                  >
-                                    <Plug className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.authorize')}
-                                  </Button>
-                                ) : null}
+                                ) : (
+                                  <>
+                                    {isSelectMode && canAuthorize(app) && !isGloballyConnected && (
+                                      // One-click entry to the per-server OAuth
+                                      // flow repaired in #1323, kept from #1332
+                                      // where the card click stopped reaching the
+                                      // detail modal it is started from.
+                                      //
+                                      // Driven by can_authorize alone (#1347), not
+                                      // by the attach gate: those two now select
+                                      // disjoint populations. An entry that is
+                                      // attachable-but-unconnected got there
+                                      // through hook-supplied credentials or a team
+                                      // link, and has no consent this editor could
+                                      // complete — the button asserted "needs
+                                      // authorization" and opened a popup that
+                                      // could never finish. What is left is the
+                                      // connector whose consent was never started:
+                                      // not attachable until it is, so its card
+                                      // click still opens the modal, and this
+                                      // labels that route rather than leaving the
+                                      // one card in a grid of toggles unexplained.
+                                      //
+                                      // !isGloballyConnected keeps a connected
+                                      // entry showing Configure only, never
+                                      // Authorize: re-consenting an already
+                                      // granted server is legitimate (can_authorize
+                                      // can be true here too), but the picker
+                                      // suppresses the trigger on connected state
+                                      // itself. It has to be spelled out because
+                                      // this block and Configure below are
+                                      // independent: both can apply at once -- a
+                                      // connector can need a URL fix and consent.
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 text-xs text-blue-600 hover:text-blue-700 px-2 bg-blue-50 hover:bg-blue-100"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setSelectedApp(app);
+                                        }}
+                                      >
+                                        <Plug className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.authorize')}
+                                      </Button>
+                                    )}
+                                    {canConfigure(app) && (
+                                      // Independent of the Authorize block above:
+                                      // whether the edit route resolves for this
+                                      // viewer (list_mcp_apps.can_configure) has
+                                      // nothing to do with whether consent is
+                                      // outstanding.
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 text-xs text-slate-600 hover:text-slate-900 px-2 bg-slate-100 hover:bg-slate-200"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setSelectedApp(app);
+                                        }}
+                                      >
+                                        <Settings className="h-3 w-3 mr-1" /> {t('tools.mcp.dialog.configure')}
+                                      </Button>
+                                    )}
+                                  </>
+                                )}
                               </div>
                             </div>
                           </CardContent>
@@ -1691,6 +1742,7 @@ export function ConnectMcpDialog({
         }}
         app={selectedApp}
         isGloballyConnected={selectedApp ? isAppConnected(selectedApp) : false}
+        canConfigure={selectedApp ? canConfigure(selectedApp) : false}
         isConnecting={!!selectedApp && loadingApps.has(selectedApp.id)}
         onSuccess={() => {
           if (onSuccess) onSuccess();

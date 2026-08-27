@@ -30,6 +30,13 @@ export interface AppIntegration {
   platform_env_available?: boolean
   // Key-based apps: this user has set their own per-user key.
   user_env_configured?: boolean
+  // Key-based apps: which of launch_config.required_env this user already
+  // has a stored value for - a per-key breakdown of user_env_configured's
+  // all-or-nothing flag (see _app_configured_env_keys in
+  // src/xagent/web/api/mcp.py), so a reconnect for an app with more than
+  // one required key doesn't have to blank a key it can't tell is already
+  // set (submitting blank for a key clears it - see connect_mcp_app).
+  configured_env_keys?: string[]
   // Key-based apps: the user's current env-source pick, if any.
   env_source?: "own" | "shared" | "platform" | null
   // Whether this entry may be selected into an agent, decided by the backend
@@ -46,6 +53,16 @@ export interface AppIntegration {
   // a deployment whose tokens arrive through the resolver hook, where no
   // interactive consent exists at all.
   can_authorize?: boolean
+  // Whether this viewer's Configure route would resolve, decided by the
+  // backend (_local_mcp_can_configure in src/xagent/web/api/mcp.py for
+  // local entries; the connection state for a catalog entry, whose
+  // Configure equivalent is
+  // "manage my key" or "re-run OAuth" and only exists once connected) rather
+  // than re-derived here from is_connected. A connector whose tokens arrive
+  // through a deployment-installed resolver hook is never "connected" for
+  // its own creator -- no personal grant row is ever written -- so the
+  // connected gate hid the edit route from the one person entitled to it.
+  can_configure?: boolean
   // Team-sharing status (from POST /api/connectors/status), merged in after list load.
   shared?: boolean
   is_owner?: boolean

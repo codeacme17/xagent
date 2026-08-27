@@ -20,6 +20,7 @@ from xagent.web.api.chat import (
 )
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.schemas.chat import MAX_SEED_INTERACTIONS
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 
@@ -636,6 +637,170 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
     ]
     assert payload["cached_input_tokens"] == 60
     assert payload["cache_write_input_tokens"] == 15
+
+
+def test_get_task_returns_media_usage_grouped_by_model_and_unit(test_db, user1_headers):
+    """Pin ``media_usage`` at the real route, not just at the aggregator.
+
+    The aggregator has its own unit tests and the frontend tests mock this
+    response, so both sides can stay green while the handler omits, renames or
+    fails to serialise the field. This asserts the exact payload the client
+    actually receives.
+    """
+    from xagent.web.models.task import Task
+
+    create_resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "media-usage-test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert create_resp.status_code == 200
+    task_id = create_resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.token_usage_details = [
+            # Two calls on the same (model, unit, call_type, resolution) key
+            # must collapse into one row with summed quantity and calls.
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 2,
+                "provider_tokens": 30,
+            },
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 1,
+                "provider_tokens": 12,
+                "tokens_estimated": True,
+            },
+            # Zero quantity is meaningful and must survive: the call happened,
+            # its size is not known yet.
+            {
+                "type": "media",
+                "model": "veo-3",
+                "model_id": "veo",
+                "unit": "seconds",
+                "call_type": "video",
+                "quantity": 0,
+            },
+            # An LLM entry must not leak into media_usage.
+            {
+                "type": "input",
+                "tokens": 100,
+                "model": "gpt-4.1",
+                "model_id": "main",
+            },
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["media_usage"] == [
+        {
+            "model_id": "sd",
+            "model_name": "stable-diffusion-xl",
+            "unit": "images",
+            "call_type": "generate_image",
+            "resolution": "1K",
+            "quantity": 3.0,
+            "calls": 2,
+            "provider_tokens": 42,
+            # True because one of the two merged entries was estimated: a mixed
+            # group must never be priced as if it were fully measured.
+            "tokens_estimated": True,
+        },
+        {
+            "model_id": "veo",
+            "model_name": "veo-3",
+            "unit": "seconds",
+            "call_type": "video",
+            "resolution": "",
+            "quantity": 0.0,
+            "calls": 1,
+            "provider_tokens": 0,
+            "tokens_estimated": False,
+        },
+    ]
+    # The LLM entry stayed on its own side of the split.
+    assert [row["model_id"] for row in payload["model_usage"]] == ["main"]
+
+
+def test_web_task_detail_cache_serves_media_usage_on_cache_hit(test_db, user1_headers):
+    """A cache hit must carry ``media_usage``, not drop it on the second read.
+
+    The detail response is cached wholesale, so a field added to the miss path
+    only is invisible on every subsequent poll -- which is the path the usage
+    popover actually hits while a task runs.
+    """
+    from xagent.web.models.task import Task
+    from xagent.web.services.hot_path_cache import (
+        InMemoryTTLCache,
+        set_cache_backend_for_testing,
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        create_resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "media-cache-test", "description": "desc"},
+            headers=user1_headers,
+        )
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["task_id"]
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            task.token_usage_details = [
+                {
+                    "type": "media",
+                    "model": "elevenlabs-tts",
+                    "model_id": "tts-1",
+                    "unit": "characters",
+                    "call_type": "tts",
+                    "quantity": 480,
+                }
+            ]
+            db.commit()
+        finally:
+            db.close()
+
+        first = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 200
+        expected = [
+            {
+                "model_id": "tts-1",
+                "model_name": "elevenlabs-tts",
+                "unit": "characters",
+                "call_type": "tts",
+                "resolution": "",
+                "quantity": 480.0,
+                "calls": 1,
+                "provider_tokens": 0,
+                "tokens_estimated": False,
+            }
+        ]
+        assert first.json()["media_usage"] == expected
+
+        cached = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert cached.status_code == 200
+        assert cached.json()["media_usage"] == expected
+    finally:
+        set_cache_backend_for_testing(None)
 
 
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
@@ -1780,3 +1945,230 @@ def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
             db.close()
     finally:
         unregister_task_extension("failing_runtime")
+
+
+def test_task_create_seeds_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` should land as the task's first (and only)
+    chat history row, committed in the same request as task creation - the
+    AI Team Marketplace's "Hire" flow relies on this to let a persona speak
+    first without ever running the LLM."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo, your Email Lead Response Agent.",
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter_by(task_id=task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert len(messages) == 1
+        assert messages[0].role == "assistant"
+        assert messages[0].message_type == "assistant_response"
+        assert messages[0].content == "Hi — I'm Leo, your Email Lead Response Agent."
+    finally:
+        db.close()
+
+
+def test_task_create_seeds_interactions_alongside_the_assistant_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` should ride along on the seeded assistant message's
+    row - the AI Team Marketplace's "connect your apps" card is delivered
+    this way, attached to the same seeded intro message."""
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.user import User
+
+    connect_apps_interaction = {
+        "type": "connect_apps",
+        "field": "connect_apps",
+        "label": "Connect your apps",
+        "apps": ["Gmail", "Google Calendar"],
+    }
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo.",
+            "seed_interactions": [connect_apps_interaction],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        message = db.query(TaskChatMessage).filter_by(task_id=task_id).one()
+        assert message.interactions == [connect_apps_interaction]
+        user1_id = db.query(User).filter_by(username="user1").one().id
+    finally:
+        db.close()
+
+    # The DB row alone doesn't prove a client ever actually sees the card
+    # again - assert what historical websocket replay (websocket.py) emits
+    # for it too, so a regression there (e.g. dropping metadata.interactions,
+    # or flipping expect_response back to True and re-opening a stale
+    # question) can't silently remove the card on reload without any test
+    # noticing.
+    from xagent.web.api import websocket as websocket_api
+
+    snapshot = websocket_api._load_historical_stream_snapshot_sync(
+        task_id, actor_user_id=user1_id, actor_is_admin=False
+    )
+    assert snapshot is not None
+    agent_events = [
+        event["data"]
+        for event in snapshot.events
+        if event.get("event_type") == "agent_message"
+    ]
+    assert len(agent_events) == 1
+    replayed = agent_events[0]
+    assert replayed["source"] == "chat_history"
+    assert replayed["expect_response"] is False
+    assert replayed["metadata"] == {"interactions": [connect_apps_interaction]}
+
+
+def test_task_create_ignores_seed_interactions_without_a_seed_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` has no row to attach to without
+    `seed_assistant_message` - documented as a no-op, not a 400, since a
+    client omitting the message by mistake shouldn't fail task creation."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "No seed message",
+            "seed_interactions": [{"type": "connect_apps", "apps": ["Gmail"]}],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_more_than_five_seed_interactions(test_db, user1_headers):
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Too many interactions",
+            "seed_assistant_message": "Hi.",
+            "seed_interactions": [{"type": "connect_apps"}]
+            * (MAX_SEED_INTERACTIONS + 1),
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_task_create_without_seed_message_creates_no_chat_messages(
+    test_db, user1_headers
+):
+    """Omitting `seed_assistant_message` (the existing behavior for every
+    other task-creation caller) must not start writing empty history rows."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "No seed"},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_overlong_seed_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` is bounded (max_length=8000) since it is a
+    public request field, not just internal marketplace-authored content."""
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "Too long", "seed_assistant_message": "x" * 8001},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_task_create_warns_when_seed_assistant_message_normalizes_to_empty(
+    test_db, user1_headers, caplog
+):
+    """A non-empty `seed_assistant_message` that `persist_assistant_message_no_commit`
+    drops (normalizes to whitespace-only) must leave a log trail - otherwise a
+    'speak first' flow silently produces zero chat history with no way to
+    tell why."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Blank seed", "seed_assistant_message": "   "},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )
+
+
+def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
+    test_db, user1_headers, caplog
+):
+    """A truthy check (`if request.seed_assistant_message:`) would drop a
+    literal "" with zero log output - only the whitespace-only case above
+    would reach the warning. Checking `is not None` instead covers both,
+    since both are the same "seeder passed a value that normalizes to
+    nothing" situation worth a log trail."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Empty seed", "seed_assistant_message": ""},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )

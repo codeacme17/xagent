@@ -29,7 +29,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.db_teardown import drop_all_tables
+from tests.web.pool_contention_shared import (
+    CONTENTION_POOL_TIMEOUT,
+    EXHAUSTION_POOL_TIMEOUT,
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
@@ -45,6 +54,9 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
+from xagent.web.services.assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+)
 from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -99,22 +111,36 @@ def db_session(tmp_path):
 
 
 @pytest.fixture()
-def queue_pool_runtime_db(tmp_path):
-    """A real one-slot QueuePool used to exercise checkout contention."""
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'orchestrator-queue-pool.db'}",
-        connect_args={"check_same_thread": False},
-        poolclass=QueuePool,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=0.4,
-    )
-    Base.metadata.create_all(bind=engine)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def queue_pool_runtime_db_factory(tmp_path):
+    """Build one-slot QueuePool engines with a caller-chosen checkout timeout."""
+    engines = []
+
+    def _make(*, pool_timeout: float = EXHAUSTION_POOL_TIMEOUT):
+        db_path = tmp_path / f"orchestrator-queue-pool-{len(engines)}.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False},
+            poolclass=QueuePool,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=pool_timeout,
+        )
+        engines.append(engine)
+        Base.metadata.create_all(bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        return engine, SessionLocal
+
     try:
-        yield engine, SessionLocal
+        yield _make
     finally:
-        engine.dispose()
+        for engine in engines:
+            engine.dispose()
+
+
+@pytest.fixture()
+def queue_pool_runtime_db(queue_pool_runtime_db_factory):
+    """A real one-slot QueuePool used to exercise checkout exhaustion."""
+    return queue_pool_runtime_db_factory()
 
 
 def _create_user(db) -> User:
@@ -252,6 +278,37 @@ def test_payload_uses_execution_when_provided() -> None:
         execution_message="summarize this\n\n[file context]",
     )
     assert p.for_agent == "summarize this\n\n[file context]"
+
+
+def test_execution_context_carries_path_stripped_turn_attachments() -> None:
+    files = [{"file_id": "image-id", "name": "screen.png", "type": "image/png"}]
+
+    context = task_orchestrator_module._execution_context_with_turn_id(
+        {"existing": True},
+        "turn-1",
+        files=files,
+    )
+
+    assert context == {
+        "existing": True,
+        "turn_id": "turn-1",
+        "files": files,
+    }
+    assert context["files"] is not files
+
+
+def test_execution_context_preserves_existing_turn_attachments() -> None:
+    existing_files = [
+        {"file_id": "existing", "name": "existing.png", "type": "image/png"}
+    ]
+
+    context = task_orchestrator_module._execution_context_with_turn_id(
+        {"files": existing_files},
+        "turn-2",
+        files=[{"file_id": "new", "name": "new.png", "type": "image/png"}],
+    )
+
+    assert context["files"] is existing_files
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1084,39 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
     assert persisted.error_message is None
     assert persisted.runner_id is None
     assert persisted.lease_expires_at is None
+
+
+def test_error_settlement_persists_client_safe_history(db_session) -> None:
+    secret = "orchestrator-provider-secret"
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    lease = acquire_task_lease_isolated(task_id)
+    assert lease is not None
+
+    assert (
+        settle_task_lease_isolated(
+            lease,
+            error_message=f"setup/run failed: {secret}",
+        )
+        is True
+    )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, task_id)
+    assert persisted is not None
+    assert persisted.error_message == f"setup/run failed: {secret}"
+    messages = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "assistant",
+        )
+        .all()
+    )
+    assert len(messages) == 1
+    assert messages[0].content == "Task execution failed."
+    assert secret not in messages[0].content
 
 
 @pytest.mark.asyncio
@@ -1853,7 +1943,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
 @pytest.mark.asyncio
 async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     db_session,
-    queue_pool_runtime_db,
+    queue_pool_runtime_db_factory,
 ) -> None:
     """A contended scope lookup must not block the main event loop."""
     from xagent.web.api.websocket import background_task_manager
@@ -1862,7 +1952,10 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     task_id = int(task.id)
     fake_lease = TaskLease(task_id=task_id, runner_id="test-runner")
-    engine, SessionLocal = queue_pool_runtime_db
+    # The scope lookup must wait for the slot, never give up on it.
+    engine, SessionLocal = queue_pool_runtime_db_factory(
+        pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     events: list[str] = []
     resolver_threads: list[int] = []
     loop_thread = get_ident()
@@ -1895,6 +1988,7 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
             ticks += 1
 
     with (
+        gated_pool_checkout(engine) as gate,
         patch(
             "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=fake_lease,
@@ -1936,12 +2030,16 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            await asyncio.sleep(0.12)
-            assert ticks >= 3, "scope QueuePool checkout blocked the event loop"
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS, (
+                "scope QueuePool checkout blocked the event loop"
+            )
             assert not bg_task.done(), "execution started before scope resolution"
         finally:
             held_connection.close()
-            await asyncio.wait_for(bg_task, timeout=1)
+            gate.let_through()
+            await asyncio.wait_for(bg_task, timeout=GUARD_TIMEOUT)
             ticker_stop.set()
             await ticker_task
 
@@ -2300,13 +2398,16 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
 
 @pytest.mark.asyncio
 async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
-    queue_pool_runtime_db,
+    queue_pool_runtime_db_factory,
     monkeypatch,
 ) -> None:
     """Final status read and workforce-aware release share one worker session."""
     from xagent.web.api.websocket import background_task_manager
 
-    engine, SessionLocal = queue_pool_runtime_db
+    # The release path must wait for the slot, never give up on it.
+    engine, SessionLocal = queue_pool_runtime_db_factory(
+        pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     runner_id = get_runner_id()
     with SessionLocal() as seed_db:
         user = _create_user(seed_db)
@@ -2330,6 +2431,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
             ticks += 1
 
     with (
+        gated_pool_checkout(engine) as gate,
         patch(
             "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=TaskLease(
@@ -2373,12 +2475,16 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         )
         ticker_task = asyncio.create_task(ticker())
         try:
-            await asyncio.sleep(0.12)
-            assert ticks >= 3, "lease release QueuePool checkout blocked the loop"
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS, (
+                "lease release QueuePool checkout blocked the loop"
+            )
             assert not bg_task.done(), "lease release skipped the contended checkout"
         finally:
             held_connection.close()
-            await asyncio.wait_for(bg_task, timeout=1)
+            gate.let_through()
+            await asyncio.wait_for(bg_task, timeout=GUARD_TIMEOUT)
             ticker_stop.set()
             await ticker_task
 
@@ -2676,6 +2782,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     transaction pushes the exact run to ``FAILED`` while releasing it.
     """
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2708,6 +2815,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             new=AsyncMock(),
         ) as mock_exec,
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2738,6 +2846,15 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     assert task.runner_id is None
     assert task.error_message is not None
     assert "simulated snapshot load failure" in str(task.error_message)
+    task_errors = [
+        call.args[0]
+        for call in broadcast.call_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(task_errors) == 1
+    assert task_errors[0]["message"] == "Task execution failed."
+    assert task_errors[0]["error"] == "Task execution failed."
+    assert "simulated snapshot load failure" not in repr(task_errors[0])
     assert get_ephemeral_runtime_values(payload.turn_id) is None
     assert pop_ephemeral_runtime_values(payload.turn_id) is None
 
@@ -2791,11 +2908,77 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
 
 
 @pytest.mark.asyncio
+async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
+    db_session,
+) -> None:
+    """A typed, curated setup failure remains actionable to the client."""
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    public_message = "Required MCP servers are unavailable."
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            side_effect=RequiredMCPUnavailableError([]),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    assert persisted is not None
+    assert persisted.error_message == public_message
+    assistant = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task.id,
+            TaskChatMessage.role == "assistant",
+        )
+        .one()
+    )
+    assert assistant.content == public_message
+    assert assistant.message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == public_message
+    assert event["error"] == public_message
+
+
+@pytest.mark.asyncio
 async def test_schedule_bg_marks_task_failed_when_execute_raises(
     db_session,
 ) -> None:
     """An execution exception is persisted by the one fenced settlement."""
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2829,6 +3012,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
         ),
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2851,6 +3035,11 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     assert task.status == TaskStatus.FAILED
     assert task.error_message is not None
     assert "simulated agent boom" in str(task.error_message)
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == "Task execution failed."
+    assert event["error"] == "Task execution failed."
+    assert "simulated agent boom" not in repr(event)
 
 
 @pytest.mark.asyncio

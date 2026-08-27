@@ -149,23 +149,32 @@ async def _send_live_message(task: Task, message_data: dict) -> MagicMock:
 async def test_try_reserve_resume_separates_the_three_contention_causes() -> None:
     manager = BackgroundTaskManager()
 
-    assert manager.try_reserve_resume(1) is ResumeReservationOutcome.RESERVED
+    assert (
+        manager.try_reserve_resume(1, expected_run_id="run-a")
+        is ResumeReservationOutcome.RESERVED
+    )
 
     # Held by an injection that has not registered its coordinator yet.
-    assert manager.try_reserve_resume(1) is ResumeReservationOutcome.RESERVATION_HELD
+    assert (
+        manager.try_reserve_resume(1, expected_run_id="run-a")
+        is ResumeReservationOutcome.RESERVATION_HELD
+    )
     assert not manager.reserve_resume(1)
 
     running = asyncio.get_running_loop().create_future()
     coordinator = asyncio.ensure_future(running)
     try:
-        manager.register_reserved_resume(1, coordinator)
+        manager.register_reserved_resume(1, coordinator, run_id="run-a")
         assert (
-            manager.try_reserve_resume(1)
+            manager.try_reserve_resume(1, expected_run_id="run-a")
             is ResumeReservationOutcome.COORDINATOR_RUNNING
         )
 
         manager._shutting_down = True
-        assert manager.try_reserve_resume(2) is ResumeReservationOutcome.SHUTTING_DOWN
+        assert (
+            manager.try_reserve_resume(2, expected_run_id="run-b")
+            is ResumeReservationOutcome.SHUTTING_DOWN
+        )
     finally:
         running.cancel()
         await asyncio.gather(coordinator, return_exceptions=True)

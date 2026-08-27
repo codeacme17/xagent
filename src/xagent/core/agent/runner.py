@@ -9,13 +9,14 @@ from uuid import uuid4
 
 from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..context_materializer import WorkspaceContextReferenceResolver
-from ..context_ref import CONTEXT_REFS_KEY
+from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
 from ..workspace import WorkspaceManager
+from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
@@ -45,6 +46,7 @@ class AgentRunner:
         callbacks: list[Any] | None = None,
         context_manager: ContextManager | None = None,
         workspace_base_dir: str = "workspace",
+        workspace_enabled: bool = True,
         scope_segments: tuple[str, ...] = (),
         outbound_message_handler: Any | None = None,
     ) -> None:
@@ -55,6 +57,7 @@ class AgentRunner:
         self.callbacks = callbacks or []
         self.context_manager = context_manager or ContextManager()
         self.workspace_base_dir = workspace_base_dir
+        self.workspace_enabled = workspace_enabled
         self.scope_segments = scope_segments
         self.outbound_message_handler = outbound_message_handler
         self._active_controls: dict[str, ExecutionControl] = {}
@@ -77,6 +80,7 @@ class AgentRunner:
         extra_tools: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
+        task_context_refs: tuple[ContextReference, ...] = (),
     ) -> dict[str, Any]:
         execution_id = execution_id or str(uuid4())
         checkpoint = checkpoint or (
@@ -113,13 +117,62 @@ class AgentRunner:
                 base_dir=base_dir,
                 metadata=metadata,
             )
-            for message in initial_messages or []:
+            replay_messages = initial_messages or []
+            if (
+                replay_messages
+                and str(replay_messages[0].get("role") or "").strip() == "assistant"
+            ):
+                # A task's persisted history can begin with an
+                # assistant-role message today only via a marketplace Hire
+                # flow's seeded persona greeting - there is no other path
+                # that persists an assistant row before any user message.
+                # Anthropic's Messages API (and every claude_compatible
+                # provider routed through it) rejects a request whose first
+                # message isn't role "user", so correct it once here,
+                # before this history is ever replayed into context. This
+                # is deliberately not done in get_messages_for_llm(), which
+                # also serves truncated windows and tool-call/tool-result
+                # pairs that legitimately start mid-conversation.
+                context.add_user_message(
+                    "(conversation start)",
+                    metadata={"_xagent_synthetic": "leading_user_turn"},
+                )
+            for message in replay_messages:
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()
                 context_refs = message.get(
                     CONTEXT_REFS_KEY, message.get("context_refs", ())
                 )
-                if role and (content or context_refs):
+                if not role:
+                    continue
+                if not (
+                    content
+                    or context_refs
+                    or message.get("tool_calls")
+                    or role == "tool"
+                ):
+                    continue
+                if (
+                    role == "tool"
+                    and message.get("tool_name") is not None
+                    and "raw_result" in message
+                ):
+                    # Replay through add_tool_result so it gets the same
+                    # sanitization/formatting and metadata (raw_result,
+                    # tool_name) as a live tool observation would.
+                    context.add_tool_result(
+                        tool_name=str(message["tool_name"]),
+                        result=message["raw_result"],
+                        tool_call_id=message.get("tool_call_id"),
+                        context_refs=context_refs,
+                    )
+                elif role == "assistant" and message.get("tool_calls"):
+                    context.add_assistant_message(
+                        content,
+                        tool_calls=message["tool_calls"],
+                        context_refs=context_refs,
+                    )
+                else:
                     context.add_message(
                         role,
                         content,
@@ -131,6 +184,7 @@ class AgentRunner:
                 context.add_user_message(
                     task,
                     metadata=self._initial_user_message_metadata(context),
+                    context_refs=task_context_refs,
                 )
 
         runtime = runtime or PatternRuntime(
@@ -139,7 +193,7 @@ class AgentRunner:
             interrupt_checker=interrupt_checker,
             outbound_message_handler=self.outbound_message_handler,
         )
-        if runtime.context_ref_resolver is None:
+        if self.workspace_enabled and runtime.context_ref_resolver is None:
             if workspace is None:
                 workspace_base = base_dir or self.workspace_base_dir
                 if context.workspace_path:
@@ -471,7 +525,11 @@ class AgentRunner:
             metadata["turn_id"] = requested_turn_id
         self._ensure_user_message_turn_id(metadata)
 
-        added = context.add_user_message(resolved_execution_message, metadata=metadata)
+        added = context.add_user_message(
+            resolved_execution_message,
+            metadata=metadata,
+            context_refs=build_image_context_references(files),
+        )
         # Set a "this turn is waiting to be traced" pending marker before
         # we persist. The resume catch-up logic uses this to disambiguate
         # an old checkpoint that pre-dates this PR (no watermark, no
@@ -663,24 +721,30 @@ class AgentRunner:
         allowed_external_dirs: list[str] | None,
         base_dir: str | None,
         metadata: dict[str, Any] | None,
-    ) -> tuple[ExecutionContext, Any]:
-        workspace = self.workspace_manager.get_or_create_workspace(
-            base_dir=base_dir or self.workspace_base_dir,
-            task_id=workspace_id or execution_id,
-            allowed_external_dirs=allowed_external_dirs,
-            scope_segments=self.scope_segments,
-        )
-        if inspect.isawaitable(workspace):
-            workspace = await workspace
+    ) -> tuple[ExecutionContext, Any | None]:
+        workspace = None
+        context_kwargs: dict[str, Any] = {}
+        if self.workspace_enabled:
+            workspace = self.workspace_manager.get_or_create_workspace(
+                base_dir=base_dir or self.workspace_base_dir,
+                task_id=workspace_id or execution_id,
+                allowed_external_dirs=allowed_external_dirs,
+                scope_segments=self.scope_segments,
+            )
+            if inspect.isawaitable(workspace):
+                workspace = await workspace
+            context_kwargs = {
+                "workspace_id": workspace.id,
+                "workspace_path": str(workspace.workspace_dir),
+                "cwd": str(workspace.workspace_dir),
+                "workspace_state": self._workspace_state(workspace),
+            }
         context = self.context_manager.create_context(
             execution_id=execution_id,
             user_id=user_id,
             session_id=session_id,
             system_prompt=getattr(self.agent, "system_prompt", None),
-            workspace_id=workspace.id,
-            workspace_path=str(workspace.workspace_dir),
-            cwd=str(workspace.workspace_dir),
-            workspace_state=self._workspace_state(workspace),
+            **context_kwargs,
         )
         # Snapshotted at task start. On resume the context (and this threshold)
         # is restored verbatim from the checkpoint, so a context-window or ratio

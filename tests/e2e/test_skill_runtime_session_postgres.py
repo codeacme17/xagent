@@ -14,7 +14,6 @@ from uuid import uuid4
 
 import psycopg2
 import pytest
-from docker.errors import APIError
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
@@ -29,7 +28,7 @@ from tests.e2e.app_harness import (
 from tests.e2e.minio_harness import (
     _docker_available,
     _docker_client,
-    _free_port,
+    run_container_with_dynamic_ports,
 )
 from xagent.core.agent.service import AgentService
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -43,6 +42,9 @@ pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
 POSTGRES_PASSWORD = "xagent_test"
 POSTGRES_DATABASE = "xagent_test"
+# WHY: the image tag is a floating major, so a drifted pull would otherwise keep
+# this suite green while silently testing against PostgreSQL 16.
+MIN_SERVER_VERSION_NUM = 170000
 SKILL_INDEX_SENTINEL = "Pool handoff regression fixture"
 QUESTION = "Which deployment target should I use?"
 EXPECTED_SKILL_INDEX_LINE = (
@@ -78,34 +80,18 @@ def postgres_url() -> Iterator[str]:
         pytest.skip("Requires reachable Docker daemon")
 
     client = _docker_client()
-    container = None
-    host_port = 0
-    for _ in range(5):
-        host_port = _free_port()
-        container_name = f"xagent-postgres-e2e-{uuid4().hex[:12]}"
-        try:
-            container = client.containers.run(
-                "postgres:16-bookworm",
-                detach=True,
-                name=container_name,
-                ports={"5432/tcp": host_port},
-                tmpfs={"/var/lib/postgresql/data": "rw,size=256m"},
-                environment={
-                    "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
-                    "POSTGRES_DB": POSTGRES_DATABASE,
-                },
-            )
-            break
-        except APIError as exc:
-            if "address already in use" not in str(exc):
-                raise
-            try:
-                stale = client.containers.get(container_name)
-                stale.remove(force=True)
-            except Exception:
-                pass
-    if container is None:
-        pytest.skip("Could not allocate a free host port for PostgreSQL")
+    container, host_ports = run_container_with_dynamic_ports(
+        client,
+        "postgres:17-bookworm",
+        name=f"xagent-postgres-e2e-{uuid4().hex[:12]}",
+        container_ports=("5432/tcp",),
+        tmpfs={"/var/lib/postgresql/data": "rw,size=256m"},
+        environment={
+            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+            "POSTGRES_DB": POSTGRES_DATABASE,
+        },
+    )
+    host_port = host_ports["5432/tcp"]
 
     database_url = (
         "postgresql+psycopg2://postgres:"
@@ -126,7 +112,15 @@ def postgres_url() -> Iterator[str]:
             except psycopg2.OperationalError:
                 time.sleep(0.25)
             else:
+                with connection.cursor() as cursor:
+                    cursor.execute("SHOW server_version_num")
+                    server_version_num = int(cursor.fetchone()[0])
                 connection.close()
+                if server_version_num < MIN_SERVER_VERSION_NUM:
+                    raise RuntimeError(
+                        "e2e fixture requires PostgreSQL 17 or newer, got "
+                        f"server_version_num={server_version_num}"
+                    )
                 break
         else:
             raise RuntimeError("PostgreSQL did not become ready")

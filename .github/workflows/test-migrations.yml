@@ -19,6 +19,8 @@ on:
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/api_keys.py'
       - 'tests/web/services/test_runtime_key_transition_postgres.py'
+      - 'src/xagent/web/api/auth.py'
+      - 'tests/web/services/test_user_preferences_lock_postgres.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
       - 'src/xagent/web/models/task.py'
@@ -45,6 +47,8 @@ on:
       - 'tests/web/services/test_task_interaction_close_postgresql.py'
       - 'src/xagent/web/models/chat_message.py'
       - 'src/xagent/web/models/user.py'
+      - 'src/xagent/web/models/user_oauth.py'
+      - 'tests/web/test_user_oauth_actor_ownership.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
   pull_request:
@@ -102,6 +106,8 @@ jobs:
             src/xagent/web/services/agent_management.py
             src/xagent/web/services/api_keys.py
             tests/web/services/test_runtime_key_transition_postgres.py
+            src/xagent/web/api/auth.py
+            tests/web/services/test_user_preferences_lock_postgres.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
             src/xagent/web/models/task.py
@@ -128,6 +134,8 @@ jobs:
             tests/web/services/test_task_interaction_close_postgresql.py
             src/xagent/web/models/chat_message.py
             src/xagent/web/models/user.py
+            src/xagent/web/models/user_oauth.py
+            tests/web/test_user_oauth_actor_ownership.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
           )
@@ -232,7 +240,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-bookworm
+        image: postgres:17-bookworm
         env:
           POSTGRES_USER: xagent
           POSTGRES_PASSWORD: xagent
@@ -322,6 +330,13 @@ jobs:
       # added to this list -- the fast job deselects the marker and
       # provisions no database, so an unlisted file's postgres tests run
       # nowhere.
+      - name: Test owner-aware OAuth migrations (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_migration_integration.py -m postgresql -q
+        env:
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -333,6 +348,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_runtime_key_transition_postgres.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test preferences update locking (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_user_preferences_lock_postgres.py -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

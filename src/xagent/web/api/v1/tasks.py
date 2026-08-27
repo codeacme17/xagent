@@ -76,7 +76,11 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
-from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -89,6 +93,7 @@ from ...services.task_orchestrator import (
     _ClaimedTurn,
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
+    timezone_schedule_context,
 )
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
@@ -179,11 +184,7 @@ async def upload_task_files(
         # stable {"error": {"code": ...}} shape. 503 (durable storage) stays 503 so
         # callers can retry; 413 (too large) stays 413; other client errors -> 400.
         if exc.status_code == 503:
-            raise V1ApiError(
-                V1ErrorCode.INTERNAL_ERROR,
-                503,
-                message="File storage is temporarily unavailable.",
-            ) from exc
+            _raise_v1_storage_unavailable(exc)
         if 400 <= exc.status_code < 500:
             raise V1ApiError(
                 V1ErrorCode.INVALID_INPUT,
@@ -228,13 +229,29 @@ def _resolve_turn_files_or_400(
             db=db,
             task_id=task_id,
         )
+    except DurableObjectIntegrityError as exc:
+        # Precedes the parent arm: permanent corruption, already logged at
+        # ERROR with both checksums where it is raised. The envelope is left
+        # as-is deliberately -- reclassifying it for the SDK is a compatibility
+        # change, not a logging one -- but it must not also emit a
+        # transient-outage warning.
+        _raise_v1_storage_unavailable(exc)
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
-        raise V1ApiError(
-            V1ErrorCode.INTERNAL_ERROR,
-            503,
-            message="File storage is temporarily unavailable.",
-        ) from exc
+        # The V1ApiError envelope reaches the client without a traceback, so
+        # this log line is the only record of the provider fault (#1467).
+        # ``task_id`` is None on the create path -- one of this function's two
+        # callers, not an edge case -- so the owner and the requested ids carry
+        # the identification there.
+        log_durable_storage_fault(
+            logger,
+            "turn attachment resolution",
+            exc,
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            file_ids=",".join(file_ids),
+        )
+        _raise_v1_storage_unavailable(exc)
     if missing:
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT,
@@ -259,6 +276,22 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
         attachments=normalize_attachments_for_persistence(file_infos) or None,
         file_ids=tuple(str(info["file_id"]) for info in file_infos),
     )
+
+
+def _raise_v1_storage_unavailable(exc: Exception) -> NoReturn:
+    """The retryable-503 envelope every durable-fault arm in this module answers with.
+
+    One helper rather than the envelope inline at each arm, matching this
+    module's other ``_raise_v1_*`` helpers. It always chains ``from exc``: the
+    ``v1_api_error_handler`` does not render ``exc_info`` today, so no arm loses
+    anything by chaining, and an arm that dropped the cause would lose it
+    silently the day that boundary starts logging one (#1521).
+    """
+    raise V1ApiError(
+        V1ErrorCode.INTERNAL_ERROR,
+        503,
+        message="File storage is temporarily unavailable.",
+    ) from exc
 
 
 def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:
@@ -633,6 +666,7 @@ async def create_chat_task(
                 actor_user_id=actor_user_id,
                 payload=prepared.payload,
                 claimed=prepared.claimed_turn,
+                context=timezone_schedule_context(request.timezone),
             )
         except TaskTurnError as exc:
             pop_ephemeral_runtime_values(prepared.payload.turn_id)
@@ -1211,73 +1245,276 @@ async def stream_chat_task_events(
     task_id: int,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
 ) -> StreamingResponse:
-    """Stream a task's lifecycle as Server-Sent Events.
-
-    Transport layer only: emits ``task.status``, ``task.completed``,
-    ``task.input_required``, and ``stream.error``. Step-by-step and
-    token-by-token content
-    (``step.*`` / ``message.*``) is not projected onto this stream yet --
-    poll ``GET /v1/chat/tasks/{task_id}/steps`` for that in the meantime.
+    """Stream a task's lifecycle and step/message content as Server-Sent
+    Events.
 
     This endpoint declares no ``responses=`` schema, so the field lists
-    below are the only OpenAPI-visible contract for its four SSE event
-    types (each a ``event: <name>`` / ``data: <json>`` frame pair):
+    below are the only OpenAPI-visible contract for its 8 SSE event
+    types (each a ``event: <name>`` / ``data: <json>`` frame pair). Four
+    are lifecycle-only:
       - ``task.status``: ``{status}``.
       - ``task.completed``: ``{status, output, error}``. A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
-      - ``task.input_required``: ``{task_id, prompt: null}`` -- ``prompt``
-        is always ``null`` at this transport layer (see module docstring
-        for why).
+      - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the
+        agent's pending question when one is on record (the same value
+        ``GET /v1/chat/tasks/{task_id}`` returns as
+        ``pending_interaction.question``), or ``null`` if none is.
+        Earlier versions of this endpoint sent ``null`` here in every
+        case, so a client that assumed the field was never populated
+        must accept a string: the field's name and type (nullable
+        string) are unchanged, only the value can now be present.
+        Answer it with ``POST /v1/chat/tasks/{task_id}/reply`` -- calling
+        ``POST .../messages`` (append) on a task in this state 409s.
       - ``stream.error``: ``{code, message}``, a flat shape distinct
         from the nested error envelope ``V1ApiError`` HTTP responses use
         elsewhere in this router; the two error-code vocabularies do
         not overlap.
 
+      On the two attach-time fast paths described under Behavior below,
+      whichever of these two conclusion frames the path emits carries two
+      extra fields, ``snapshot_truncated: true`` and
+      ``snapshot_total_steps`` (the task's full public step count at
+      attach time), whenever that attach's one-shot step snapshot sent
+      fewer steps than the task has -- absent otherwise, and absent on
+      every other producer of these two frames. They ride the conclusion
+      rather than a ``step.*`` frame because the snapshot's byte budget
+      can admit no steps at all, leaving no ``step.*`` frame to carry
+      them.
+
+    The other four project the task's step-by-step execution and
+    streamed message text onto the same connection, from the same
+    ``PublicStep`` shape and public step-type list ``GET
+    .../steps`` uses (``thinking``/``tool_call``/``agent_delegation``/
+    ``message``):
+      - ``step.started``: ``{step}``, a running ``PublicStep``.
+      - ``step.completed``: ``{step}``, the same step once its end event
+        (or failure) resolves it -- ``status`` is ``"completed"`` or
+        ``"failed"``. On the two attach-time fast paths below (the task
+        is already finished, or already waiting on user input), these
+        frames are that attach's one-shot step snapshot: in
+        ``started_at`` order, drawn from the task's most recent steps
+        up to a step-count cap (512) and a total-wire-bytes budget over the
+        snapshot's serialized frames. When the byte budget is what binds,
+        it keeps that window's oldest contiguous run, so the very latest
+        steps may be the ones missing. Whether the snapshot was cut short
+        is reported on the conclusion frame, not on these -- ``GET
+        .../steps`` is the authoritative full history either way.
+      - ``message.delta``: ``{message_id, text}``, one chunk of a
+        streamed final answer as the agent generates it.
+      - ``message.completed``: ``{message_id, content}``, that same
+        message's full text once the stream ends successfully. A
+        ``message.delta`` sequence is not guaranteed a matching
+        ``message.completed`` -- see Behavior below.
+        Each frame is capped on its own and the delta sequence has no
+        aggregate cap, so on a long answer a ``message.completed``
+        carrying ``"truncated": true`` can hold less text than the
+        deltas the client already accumulated. It is not authoritative
+        over them: prefer the accumulated deltas, or ``steps()`` for the
+        full persisted text.
+      A ``message`` ``PublicStep``'s ``id`` cannot be correlated between
+      this stream and ``GET .../steps``: the live frame mints a fresh id
+      per broadcast, while ``steps()`` returns the persisted trace
+      event's own id as that step's id.
+      A ``thinking`` step whose id begins with ``thinking:plan:`` or
+      ``thinking:planning:`` cannot be correlated either, and is the one
+      case where trying to actively corrupts client state. Both ids end
+      in a count of the planning cycles the projection has seen, and
+      this stream's projection starts empty at attach: it numbers the
+      first planning cycle it observes ``:1`` however many already
+      happened, while ``steps()`` counts from the start of the task's
+      persisted history. A client attaching during a task's second
+      planning cycle is therefore sent ``thinking:plan:{task_id}:1`` for
+      a step ``steps()`` calls ``thinking:plan:{task_id}:2`` -- and
+      ``thinking:plan:{task_id}:1`` already exists in ``steps()`` as the
+      first cycle, a different step. Merging the two surfaces by id
+      overwrites one with the other. These ids are stable within one
+      connection and nowhere else: a re-attach after ``stream_expired``
+      (the 1-hour cap) or ``resync_required`` (queue overflow) opens a
+      new connection whose count starts over. Reconcile planning steps
+      against ``steps()`` by ``started_at`` and content, not by id.
+      Every other public step type -- ``tool_call``,
+      ``agent_delegation``, and ``thinking`` steps whose id carries the
+      originating step id rather than a count -- keeps the same id
+      across both surfaces. That holds because those ids are derived
+      from a key the event itself carries: a tool invocation's own id,
+      or the id of the step that produced the event. Both surfaces read
+      that same key off that same event, which is what makes the two
+      ids equal rather than merely similar. An event carrying neither
+      key would instead be identified by a per-delivery id that differs
+      between the two surfaces and so would not correlate; no event
+      type this stream projects reaches that state.
+      A final answer the agent streams live reaches the client twice on
+      this stream: once as its ``message.delta``/``message.completed``
+      sequence, and again as a ``message``-type ``step.completed`` once
+      the underlying ``ai_message`` trace event folds in -- the same
+      step ``steps()`` already shows for that row. This is duplication,
+      not loss: a client that already rendered the delta/completed
+      sequence can ignore the matching step, or use it as the
+      authoritative record instead, but should not expect the two to be
+      mutually exclusive.
+      A ``step.*``/``message.*`` frame whose content-bearing field would
+      exceed a per-frame byte cap has that field truncated (or, for a
+      step's structured ``data``, replaced) and flagged with
+      ``"truncated": true`` rather than sent whole. The cap is 64 KiB of
+      the field's own JSON wire form. A replaced step ``data`` carries
+      ``truncated: true``, ``original_bytes`` (what the original
+      sub-object would have measured on the wire), and -- as long as
+      they fit -- that step type's identifying key: ``name`` for a
+      ``tool_call``, ``sub_agent_name`` for an ``agent_delegation``,
+      ``phase`` for a ``thinking`` step, ``role`` for a ``message``. So
+      a client can render "the ``search`` tool ran and its result was
+      too large" rather than "a step was too large". A truncated
+      ``message.delta``/``message.completed`` carries the shortened text
+      itself plus ``truncated: true`` and no ``original_bytes``. A raw
+      broadcast frame that runs past 256 KiB -- measured without the
+      internal task-description stamp such frames carry -- is dropped
+      whole instead of truncated (see Behavior below): no marker, no
+      content.
+      This cap is specific to this stream -- ``GET .../steps`` applies
+      no such cap and always returns a step's full, untruncated
+      ``data``, so the two surfaces can disagree on content for the
+      same step once it's large enough to trip this stream's cap.
+
     Behavior:
       - Normal attach: opens the stream, emits ``task.status`` for the
-        task's current state, then a status update each time it
-        changes (consecutive duplicates are suppressed), and
+        task's current state, then goes live -- a status update each
+        time the task's status changes (consecutive duplicates are
+        suppressed), ``step.*``/``message.*`` frames as new trace
+        events and streamed answer chunks arrive, and
         ``task.completed`` when the task finishes. A ``: ping`` comment
         line is sent whenever 15s pass without any other frame going
         out, to keep the connection alive -- not on a fixed 15s
         cadence regardless of activity.
+      - A stream that goes live carries only what happens after the
+        connection opens; it never resends the steps that already
+        happened. (The two attach-time fast paths below are the
+        exception: they send a one-shot snapshot of the task's steps
+        and close, rather than going live at all.) That has one
+        consequence a client must handle: a step that was already
+        running at attach time does not appear on this stream at all.
+        Its ``step.started`` was broadcast before this connection
+        existed, and its end event arrives here with no matching
+        start, so that end is dropped rather than sent -- the client
+        sees neither half of the step. ``GET .../steps`` reads the
+        database and is unaffected by when the stream was opened, so a
+        client attaching to an already-running task reconciles there
+        rather than expecting this stream to fill the gap.
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
-        frame. This is best-effort, not guaranteed: closing a stream
-        drains its queued backlog before inserting the close frame, so
-        an already-queued ``task.status`` (``"failed"``) can be dropped
-        rather than delivered. No failure information is lost when that
-        happens -- ``task.completed`` still carries ``status: "failed"``
-        and a populated ``error``. A task that succeeds has no such
-        intermediate broadcast, so it goes straight to ``task.completed``
-        with no preceding ``task.status``. Attaching to a task that's
-        already terminal (the fast path below) always sends both frames
-        regardless.
+        frame. Delivery of every ``step.*``/``message.*`` content frame
+        on this stream is best-effort, not guaranteed, for four
+        separate reasons: (1) closing a stream for any reason drains its
+        queued backlog before inserting the close frame, so any
+        already-queued frame -- a ``task.status``, a ``step.*``, a
+        ``message.*`` -- can be dropped rather than delivered; this is
+        not specific to a failure closing the stream, it's the
+        queue-drain behavior every close goes through. (2) one content
+        frame that fails to project (a malformed field the projector
+        can't fold) is dropped on its own -- it does not close the
+        stream or affect any other frame, so a step or message can go
+        missing from an otherwise unremarkable stream. (3) an oversized
+        raw broadcast frame is dropped whole rather than projected,
+        so its content never reaches the per-field truncation cap
+        described above and leaves no ``"truncated": true`` marker --
+        this is a full drop, not a truncation. The size measured
+        excludes the task description that the broadcast conversion
+        stamps onto every trace event, so a task's description alone
+        can no longer blank out its step stream this way -- a frame is
+        only dropped here when its content, apart from that field, is
+        still over the cap. (4) a planning step can be left unresolved:
+        when a planning round ends without emitting its own terminal
+        event (a plan-generation error escaping before it), the next
+        round clears the pairing key that step was waiting on, so the
+        step's ``step.completed`` is never produced and the client
+        keeps a ``thinking`` step at ``"running"`` for the rest of the
+        stream's life (``_step_mapping.py``'s ``dag_execute_start``
+        branch). This one is not a stream-only artifact: ``GET
+        .../steps`` folds the same events and shows that step the same
+        way. (2), (3) and (4) are silent: none of them ever produces a
+        ``stream.error`` frame or any other signal on the wire. (1) is
+        not silent in the same way -- the
+        close frame that follows a queue-drain is often itself a
+        ``stream.error`` (``resync_required``/``unauthorized``/
+        ``task_deleted``/``stream_expired``) -- but that close frame
+        carries no record of what it drained on its way out, so its
+        presence or absence proves nothing about whether a content frame
+        was lost this way: a ``stream.error`` does not mean content was
+        dropped, and its absence does not mean nothing was. Only
+        reconciling against ``steps()`` answers that. No failure
+        information is lost when a status frame is dropped this way --
+        ``task.completed`` still carries ``status: "failed"`` and a
+        populated ``error`` -- but a dropped content frame has no such
+        backstop: a ``message.delta`` sequence can end with no
+        ``message.completed``, and a step can be left ``"running"`` on
+        this stream even though it actually resolved. Reconcile via
+        ``steps()`` for the authoritative picture; don't treat "no
+        content frame arrived" as "nothing happened". A task that
+        succeeds has no intermediate status broadcast, so it goes
+        straight to ``task.completed`` with no preceding
+        ``task.status``. Attaching to a task that's already terminal
+        (the fast path below) always sends the conclusion frame; the
+        generation reread below decides only whether step content
+        accompanies it, sending ``resync_required`` in place of the
+        steps on a confirmed change.
       - Attaching to an already-finished task is not an error: the
-        stream opens, emits ``task.status`` then ``task.completed``,
-        and closes immediately.
-      - The stream force-closes with ``task.input_required``
-        (``prompt`` always ``null`` at this stage) if the task is
-        found waiting on user input; with ``stream.error`` if the
-        API key is revoked/paused, the task row disappears (within one
-        watchdog cycle, 30s in production, of the delete), the
-        client can't keep up (``resync_required``), or the stream has
-        been open for the 1-hour maximum (``stream_expired``, emitted
-        before the connection closes so it's distinguishable from a
-        clean end). After any ``stream.error``, re-attaching is the
-        supported recovery path (no replay -- reconcile via
-        ``steps()`` first).
+        stream opens, emits ``task.status``, the task's steps, then
+        ``task.completed``, and closes immediately. If reading those
+        steps fails, this fast path (and the waiting-for-user one
+        below) still sends its conclusion frame -- ``task.completed``
+        here, ``task.input_required`` there -- before closing with a
+        ``stream.error`` frame naming why -- ``task_deleted`` when the
+        row is gone by the time the steps are read, ``resync_required``
+        otherwise: a step-read failure on either fast path never
+        costs the client the lifecycle conclusion it already had in
+        hand from the snapshot that picked this path. Step content goes
+        out at all only once the task row has been read once more and
+        confirmed to still be the same run/state generation as the
+        snapshot that picked this path, *and* the steps cursor
+        (``max_event_id``) is confirmed unmoved since -- a task that
+        restarted in between (a ``POST reply`` resuming a waiting task,
+        or a WS append resuming a finished one) moves the row to a new
+        generation, which means the steps just read may already belong
+        to it while the conclusion still describes the old one; a trace
+        row landing in that same window can advance the cursor without
+        touching ``run_id``/``state_version`` at all (trace rows write
+        through their own commit, which can update the task row's own
+        checkpoint-pointer columns while the task is running but never
+        touches those two fields), so the generation check alone cannot
+        see it. Both checks have to pass for the steps to go out: a
+        confirmed match on both sends the steps, then the conclusion; a
+        confirmed change on either still sends the conclusion but
+        withholds the steps, closing with ``resync_required`` instead;
+        and a reread that fails outright is treated like the steps-read
+        failure above -- no step content goes out, but the conclusion
+        (already known-good, independent of this reread) still does,
+        followed by ``stream.error`` naming why -- ``task_deleted`` or
+        ``resync_required`` by the same rule. A failure while
+        serializing an individual step is handled the same way: the
+        conclusion frame goes out, followed by
+        ``stream.error(resync_required)``, and the step list sent
+        before the failure may be partial.
+      - The stream force-closes with ``task.input_required`` if the task
+        is found waiting on user input (same steps-then-close shape:
+        ``task.status``, the task's steps, then ``task.input_required``);
+        with ``stream.error`` if the API key is revoked/paused, the task
+        row disappears (within one watchdog cycle, 30s in production, of
+        the delete), the client can't keep up (``resync_required``), or
+        the stream has been open for the 1-hour maximum
+        (``stream_expired``, emitted before the connection closes so
+        it's distinguishable from a clean end). After any
+        ``stream.error``, re-attaching is the supported recovery path
+        (no replay of missed frames -- reconcile via ``steps()`` first).
       - A task that's ``paused`` does not close the stream (matching
         SDK ``wait()`` semantics: another process may resume it); the
         1-hour cap is what eventually ends an orphaned paused stream.
       - No ``task.status`` frame is guaranteed to be fresh or in order,
-        at any point in the stream's life, not only at attach -- this
-        transport-only layer never buffers or reconciles frame order.
-        Accepted because only the three close frames above are treated
-        as authoritative; each comes from a direct read of the task
-        row, never from frame ordering.
+        at any point in the stream's life, not only at attach: this
+        endpoint never buffers or reconciles ``task.status`` frame
+        order against anything. Accepted because only the three close
+        frames above are treated as authoritative; each comes from a
+        direct read of the task row, never from frame ordering.
 
     Args:
         task_id: Path parameter; the target task's primary key.
@@ -1307,15 +1544,39 @@ async def stream_chat_task_events(
             times the worker count. An attach that takes the terminal
             or waiting-for-user fast path (see Behavior above) never
             registers a sink at all, so it never counts toward either
-            cap. Broadcast delivery is per-process too: a sink only
-            receives the broadcasts fanned out by its own worker
+            cap -- its step snapshot read goes through the same
+            ``max_event_id``-keyed cache ``GET .../steps`` uses. That
+            snapshot is bounded by a step-count cap and a
+            total-wire-bytes budget; a snapshot cut short by either
+            carries the ``snapshot_truncated``/``snapshot_total_steps``
+            marker on its conclusion frame as described above. When a
+            shared cache backend is configured (Redis; see
+            ``hot_path_cache.get_cache_backend``), a burst of fast-path
+            attaches on one task (or repeated attaches after it's
+            already terminal) usually collapses into cache hits rather
+            than each one re-reading and re-projecting the task's full
+            trace history. Without one configured -- ``NoOpCache``, what
+            this reads through whenever Redis is disabled -- every
+            attach re-reads and re-projects the task's full trace
+            history regardless of this shared code path; the cache-hit
+            collapsing only actually happens with a real backend behind
+            it. Broadcast delivery is per-process
+            too: a sink only receives the broadcasts fanned out by its
+            own worker
             process's connection manager, so a task transition driven
             by a different worker reaches this stream only once the
             watchdog's 30s database poll picks it up, not via broadcast.
-            Some transitions -- lease-expiry recovery among them --
-            never broadcast at all, in any deployment shape, so the
-            watchdog poll is their only delivery path regardless of
-            worker count.
+            That poll only ever reads task status, though, never step
+            content: an attach routed to a different worker than the one
+            executing the task still gets the authoritative close frame
+            (the watchdog reads the task row), but receives none of the
+            live ``step.*``/``message.*`` frames produced in between --
+            there is no equivalent fallback delivery for content the way
+            there is for a status transition, so such an attach
+            degrades to the lifecycle-only shape. Some transitions --
+            lease-expiry recovery among them -- never broadcast at all,
+            in any deployment shape, so the watchdog poll is their only
+            delivery path regardless of worker count.
     """
     snapshot = await run_db_io_cancellation_safe(
         lambda: _load_task_info_snapshot(task_id, principal)
@@ -1325,4 +1586,6 @@ async def stream_chat_task_events(
         principal=principal,
         initial_snapshot=snapshot,
         read_task_snapshot=_load_task_info_snapshot,
+        read_task_steps_response=_get_chat_task_steps_sync,
+        read_task_steps_version=_load_task_steps_version_snapshot,
     )

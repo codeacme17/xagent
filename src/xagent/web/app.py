@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import suppress
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
@@ -16,6 +19,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
@@ -24,6 +28,7 @@ from ..config import (
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
     get_taskless_upload_ttl_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -112,9 +117,44 @@ logger = logging.getLogger(__name__)
 __all__ = ["app"]
 
 
+@contextmanager
+def _startup_phase(name: str) -> Iterator[None]:
+    """Log a begin/end pair with duration around a startup phase.
+
+    A slow phase awaited inline with no logs makes a multi-minute stall look
+    like a fast start. One line in, one line out per phase (never per
+    loop/tick) makes the next slow start obvious. A failing phase still logs
+    its end line before the error propagates.
+    """
+    logger.info("startup phase begin: %s", name)
+    started = time.monotonic()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # WHY: CancelledError is a BaseException, so the Exception handler
+        # below misses it and the terminal line would be dropped.
+        logger.error(
+            "startup phase cancelled: %s (after %.2fs)",
+            name,
+            time.monotonic() - started,
+        )
+        raise
+    except Exception:
+        logger.error(
+            "startup phase failed: %s (after %.2fs)", name, time.monotonic() - started
+        )
+        raise
+    else:
+        logger.info("startup phase done: %s (%.2fs)", name, time.monotonic() - started)
+
+
 # Ensure web, uploads directory exists before configuring static files
 uploads_dir = get_uploads_dir()
 uploads_dir.mkdir(parents=True, exist_ok=True)
+# Validate deployment-owned external roots independently of whether a sandbox
+# backend is enabled or supports runtime-spec readiness. Otherwise an ambiguous
+# path can pass health checks and fail only when the first task reads it.
+get_external_upload_dirs()
 
 
 # FastAPI app creation here
@@ -598,6 +638,91 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
                 "Orphan upload GC loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_temp_file_cleanup_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the background orphaned temp-file cleanup sweep for this process.
+
+    This walks the entire uploads tree and can take minutes on a large tree,
+    so it runs in the background (fire-and-forget scheduling like the
+    uploaded-files reconcile step) instead of being awaited inline, letting
+    the lifespan finish and /health open immediately regardless of tree size.
+
+    Unlike that reconcile task, this one is tracked on app_instance.state and
+    stopped at shutdown: the threading.Event lets the walk unwind
+    cooperatively so a mid-sweep restart does not block process exit on the
+    executor thread. Extracted into its own function (matching
+    start_orphan_upload_gc_task above) so the pytest gate below can be
+    exercised directly in a test without also spinning up the other
+    startup_event background loops.
+    """
+
+    existing_cleanup_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "temp_file_cleanup_task", None),
+    )
+    if existing_cleanup_task is not None and not existing_cleanup_task.done():
+        # WHY: never schedule a second concurrent walk -- it would orphan the
+        # in-flight one and discard its only stop handle. An already-signalled
+        # generation is unwinding, not sweeping, so say so instead of "running".
+        existing_stop = getattr(app_instance.state, "temp_file_cleanup_stop", None)
+        if existing_stop is not None and existing_stop.is_set():
+            logger.warning(
+                "Previous orphaned temp-file cleanup is still unwinding after a "
+                "shutdown signal; this startup gets no sweep"
+            )
+        else:
+            logger.debug(
+                "Orphaned temp-file cleanup already running; not scheduling another"
+            )
+        return existing_cleanup_task
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        # The sweep walks the real uploads tree, which tests must not trigger.
+        logger.info("Skipping orphaned temp-file cleanup (test environment)")
+        return None
+
+    temp_file_cleanup_stop = threading.Event()
+    app_instance.state.temp_file_cleanup_stop = temp_file_cleanup_stop
+
+    async def run_temp_file_cleanup_background() -> None:
+        from .services.storage_maintenance import cleanup_orphaned_temp_files
+
+        started = time.monotonic()
+        logger.info("Background orphaned temp-file cleanup started")
+        try:
+            cleaned_count = await asyncio.to_thread(
+                cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
+            )
+        except Exception:  # noqa: BLE001
+            # WHY: keep the traceback (exc_info) even at WARNING -- the sweep
+            # runs unattended, so a failure has no other surface.
+            logger.warning(
+                "Background orphaned temp-file cleanup failed after %.2fs",
+                time.monotonic() - started,
+                exc_info=True,
+            )
+            return
+        # WHY: this reports duration/count only, and deliberately does NOT
+        # re-read temp_file_cleanup_stop to label the run interrupted. Shutdown
+        # sets that flag as its first statement, so it can flip between the
+        # walk finishing and this coroutine being resumed -- and the walk can
+        # also complete its last directory after the flag is set. Either way a
+        # completed sweep would be logged as truncated. cleanup_orphaned_temp_files
+        # tracks that state internally and logs it authoritatively.
+        logger.info(
+            "Background orphaned temp-file cleanup finished in %.2fs "
+            "(removed %d file(s))",
+            time.monotonic() - started,
+            cleaned_count,
+        )
+
+    task = asyncio.create_task(run_temp_file_cleanup_background())
+    app_instance.state.temp_file_cleanup_task = task
+    logger.info("Scheduled background orphaned temp-file cleanup")
+    return task
 
 
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
@@ -1093,9 +1218,8 @@ async def startup_event() -> None:
     global _migration_task
     logger.info("Agent runtime configured: %s", get_agent_runtime())
     validate_interaction_rollout_at_startup()
-    logger.info("Initializing database...")
-    init_db()
-    logger.info("Database initialized successfully")
+    with _startup_phase("database init"):
+        init_db()
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
@@ -1157,7 +1281,8 @@ async def startup_event() -> None:
     from ..skills.utils import create_skill_manager
 
     skill_manager = create_skill_manager()
-    await skill_manager.initialize()
+    with _startup_phase("skill manager init"):
+        await skill_manager.initialize()
     app.state.skill_manager = skill_manager
     logger.info(
         f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
@@ -1167,7 +1292,8 @@ async def startup_event() -> None:
     from ..templates.utils import create_template_manager
 
     template_manager = create_template_manager()
-    await template_manager.initialize()
+    with _startup_phase("template manager init"):
+        await template_manager.initialize()
     app.state.template_manager = template_manager
     logger.info(
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
@@ -1523,29 +1649,13 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements
-        try:
-            from .api.kb import cleanup_orphaned_temp_files
-
-            def _run_temp_file_cleanup() -> int:
-                return cleanup_orphaned_temp_files()
-
-            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
-            if cleaned_count > 0:
-                logger.info(
-                    "Startup cleanup: removed %d orphaned temporary file(s)",
-                    cleaned_count,
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Temporary file cleanup skipped due to error: %s",
-                e,
-            )
-
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
-    sandbox_mgr = get_sandbox_manager()
+    # WHY: the getter can construct the backend service and inventory
+    # containers on a cold process, so a hang here needs its own phase line.
+    with _startup_phase("sandbox manager init"):
+        sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         # Readiness runs before cleanup/warmup and is deliberately not
         # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/
@@ -1554,9 +1664,15 @@ async def startup_event() -> None:
         # This also resolves and caches the backend-capability probe as a
         # side effect, so cleanup() below reads the cached value instead of
         # resolving it again.
-        await check_sandbox_static_readiness(sandbox_mgr)
-        await sandbox_mgr.cleanup()
-        await sandbox_mgr.warmup()
+        # cleanup() quiesce can be awaited inline for minutes with no logs.
+        # Time each sub-phase so the next slow start names the exact one; the
+        # quiesce summary breaks it down further.
+        with _startup_phase("sandbox static readiness"):
+            await check_sandbox_static_readiness(sandbox_mgr)
+        with _startup_phase("sandbox cleanup"):
+            await sandbox_mgr.cleanup()
+        with _startup_phase("sandbox warmup"):
+            await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
 
         from ..config import get_sandbox_idle_ttl
@@ -1617,6 +1733,19 @@ async def startup_event() -> None:
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
 
+    # Kept under the same migration toggle as the uploaded-files reconcile above;
+    # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
+    #
+    # WHY LAST: a startup exception skips Starlette's ``async with`` teardown, so
+    # shutdown_event -- the only place the sweep's stop flag is set -- never runs.
+    # Scheduling before a step that can raise (sandbox static readiness raises on
+    # a mount conflict) leaves the walk sweeping the whole uploads tree in an
+    # executor thread that asyncio.run()'s teardown joins, untimed before 3.12.
+    # WARN: anything appended below must not raise, or must set the flag itself;
+    # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
+    if auto_migrate:
+        start_temp_file_cleanup_task(app)
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
@@ -1626,6 +1755,16 @@ async def shutdown_event() -> None:
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
+
+    # WHY: signal the background temp-file cleanup walk to unwind before any other
+    # teardown runs. It sweeps in an executor thread that a task cancel cannot
+    # stop, and asyncio.run()'s teardown joins that thread at loop close, so if an
+    # earlier shutdown step hangs (e.g. an unresponsive flush_langfuse) the walk
+    # would keep running and block process exit — the exact F1 regression this
+    # guards against. Setting the flag first is unconditional and cannot hang.
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
 
     flush_langfuse()
 
@@ -1727,6 +1866,42 @@ async def shutdown_event() -> None:
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
+
+    # Wait briefly for the background orphaned temp-file cleanup to unwind (its
+    # stop flag was already set at the top of this handler). This runs LAST on
+    # purpose: the wait has no ordering dependency on anything above -- the stop
+    # signal is already delivered and this only collects the task -- so putting
+    # it here donates every preceding teardown step's duration to the walk as
+    # free grace time, and keeps its timeout off the critical path of lease
+    # draining and sandbox cleanup, which must finish inside the orchestrator's
+    # termination grace period.
+    #
+    # Use asyncio.wait rather than asyncio.wait_for: wait_for's cancellation only
+    # kills the awaiting coroutine, not the executor thread doing the real work,
+    # so cancelling early buys nothing. It also keeps the walk collectable after
+    # this wait -- on the timeout branch the completion/failure log is lost
+    # either way, since asyncio.run()'s teardown cancels the pending task and
+    # CancelledError is a BaseException the coroutine's handler does not catch.
+    if hasattr(app.state, "temp_file_cleanup_task"):
+        cleanup_task = app.state.temp_file_cleanup_task
+        if cleanup_task and not cleanup_task.done():
+            timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
+            done, _pending = await asyncio.wait({cleanup_task}, timeout=timeout)
+            if not done:
+                logger.warning(
+                    "Orphaned temp-file cleanup still running %ss after stop "
+                    "signal; the executor thread will unwind at its next "
+                    "stop-check boundary",
+                    timeout,
+                )
+        # WHY: only release the handles once the task is actually finished.
+        # Clearing them while the walk is still running would discard its only
+        # stop handle and let a re-entrant startup schedule a second concurrent
+        # sweep over the same tree -- exactly what the guard in
+        # start_temp_file_cleanup_task exists to prevent.
+        if cleanup_task is None or cleanup_task.done():
+            app.state.temp_file_cleanup_task = None
+            app.state.temp_file_cleanup_stop = None
 
 
 from ..config import get_frontend_dist_dir  # noqa: E402

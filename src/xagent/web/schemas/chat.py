@@ -7,6 +7,12 @@ from pydantic import BaseModel, Field, model_validator
 
 from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
 
+# Only ever read here (TaskCreateRequest.seed_interactions is passed straight
+# through to create_task_with_message as-is - see api/chat.py), unlike
+# MAX_TASK_RUNTIME_EXTENSIONS above, which is re-checked at bind time too and
+# so lives in core.task_runtime instead.
+MAX_SEED_INTERACTIONS = 5
+
 
 class ChatMessage(BaseModel):
     """Chat message model"""
@@ -79,6 +85,13 @@ class TaskCreateRequest(BaseModel):
     )
     is_preview: bool = False  # Backward-compatible alias for is_visible=False.
     is_visible: bool = True
+    # Only consumed by entry points that start the first turn inside task
+    # creation. Unresolvable names degrade to UTC at the render site rather
+    # than 422 here, matching how the websocket path treats the same field.
+    # max_length bounds this guest-reachable free-text field to IANA lengths.
+    timezone: Optional[str] = Field(
+        default=None, max_length=64
+    )  # IANA name for the caller's local clock
 
     # Execution mode field
     execution_mode: Optional[str] = None  # "flash", "balanced", "think", or "auto"
@@ -87,6 +100,34 @@ class TaskCreateRequest(BaseModel):
     )
     examples: Optional[List[ExampleItem]] = (
         None  # Process mode: input/output examples (deprecated)
+    )
+    seed_assistant_message: Optional[str] = Field(
+        default=None,
+        max_length=8000,
+        description=(
+            "Plain-text assistant message to seed as the task's first chat "
+            "history entry, in the same transaction as task creation - lets "
+            "an agent 'speak first' (e.g. a marketplace persona's opening "
+            "intro) without running the LLM. Never triggers execution or "
+            "sets task status to waiting_for_user; it is purely a transcript "
+            "row a client reading the task's history will see immediately."
+        ),
+    )
+    seed_interactions: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        max_length=MAX_SEED_INTERACTIONS,
+        description=(
+            "Structured interaction descriptors (the same shape the "
+            "ask_user_question agent tool produces) attached to the "
+            "seed_assistant_message's chat history row. Not validated "
+            "against a fixed schema here - same permissive contract as "
+            "every other interactions list in this codebase - the frontend's "
+            "normalizeInteractions drops any entry with an unrecognized type "
+            "before it ever renders; the 'unsupported' notice is reachable "
+            "only for a recognized type ClarificationForm has no render case "
+            "for. Ignored if seed_assistant_message is not also set, since "
+            "there is no row to attach interactions to."
+        ),
     )
 
     @model_validator(mode="before")

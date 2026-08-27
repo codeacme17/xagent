@@ -59,6 +59,16 @@ def test_restrict_to_app_scoped_oauth_grant_normalizes_admin_created_app_id():
     assert requires_app_scoped_oauth_grant("FACEBOOK") is True
 
 
+def test_requires_app_scoped_oauth_grant_github_addition_leaves_meta_unaffected():
+    """github was added to APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT alongside
+    facebook -- pin that this didn't also flip instagram or the bare
+    "meta" provider string, which must stay unaffected."""
+    assert requires_app_scoped_oauth_grant("github") is True
+    assert requires_app_scoped_oauth_grant("GitHub") is True
+    assert requires_app_scoped_oauth_grant("instagram") is False
+    assert requires_app_scoped_oauth_grant("meta") is False
+
+
 def test_restrict_to_app_scoped_oauth_grant_dedupes_and_preserves_order():
     assert restrict_to_app_scoped_oauth_grant(
         "instagram", ["meta", "meta", "instagram", None, ""]
@@ -112,6 +122,29 @@ def test_legacy_token_resolution_still_uses_bare_meta_grant_for_instagram(db_ses
     )
 
     assert resolution.access_token == "bare-meta-token"
+
+
+def test_ordinary_token_resolution_ignores_actor_owned_grant(db_session):
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="instagram",
+            resource_owner_key="toby:slack:41:UALICE",
+            access_token="actor-token",
+        )
+    )
+    db_session.commit()
+
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(
+            provider_name="meta",
+            app_id="instagram",
+        )
+    )
+
+    assert resolution.access_token is None
 
 
 def test_legacy_token_resolution_uses_app_scoped_facebook_grant(db_session):

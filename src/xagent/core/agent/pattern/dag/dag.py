@@ -95,6 +95,19 @@ class _DAGStepRuntime:
     def active_react_step_id(self) -> str:
         return self.step_id
 
+    @property
+    def active_turn_id(self) -> str | None:
+        # Unlike active_react_step_id (fixed to this step at construction),
+        # this is resolved from root_context on every access rather than
+        # cached: on_pattern_start never fires for a DAG step's inner ReAct
+        # run (this adapter's own on_pattern_start below is a no-op), so
+        # there is no per-step hook to compute it once. root_context is the
+        # DAG's real conversation context (unlike the synthetic per-step
+        # child_context ReActPattern actually runs against), so this reaches
+        # the same turn_id PatternRuntime._dag_turn_id already surfaces for
+        # the on_dag_step_start/end hooks.
+        return self.parent._dag_turn_id(self.root_context)
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 
@@ -350,6 +363,7 @@ class DAGPattern(AgentPattern):
         | str = ReActReasoningMode.TOOL_CALLING,
         max_concurrency: int = 4,
         max_completion_replans: int = 3,
+        user_interaction_enabled: bool = True,
     ) -> None:
         self.plan_generator = (
             plan_generator
@@ -360,6 +374,7 @@ class DAGPattern(AgentPattern):
         self.react_reasoning_mode = ReActReasoningMode(react_reasoning_mode)
         self.max_concurrency = max(1, max_concurrency)
         self.max_completion_replans = max(0, max_completion_replans)
+        self.user_interaction_enabled = user_interaction_enabled
         self.status = "idle"
         self.plan: ExecutionPlan | None = None
         self.active_step_id: str | None = None
@@ -975,6 +990,7 @@ class DAGPattern(AgentPattern):
             max_iterations=self.react_max_iterations,
             reasoning_mode=self.react_reasoning_mode,
             finalize_after_tool_result=False,
+            user_interaction_enabled=self.user_interaction_enabled,
         )
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:

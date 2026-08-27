@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.templates import (
+    get_agent_capability_lists,
     get_or_create_template_stats,
     increment_template_likes,
     increment_template_used_count,
@@ -298,6 +299,111 @@ def workforce_mock_app_state(workforce_template_manager):
 
 
 @pytest.fixture(scope="function")
+def persona_templates_dir(tmp_path):
+    """A separate templates directory holding three templates - one with a
+    full `persona` block, one with a name+role-only persona, and one with
+    no persona at all - isolated from `templates_dir` so its exact-count
+    assertions elsewhere aren't affected.
+    """
+    templates_dir = tmp_path / "persona_templates"
+    templates_dir.mkdir()
+
+    (templates_dir / "with_persona.yaml").write_text(
+        """
+id: with_persona
+name: Social Media Content Manager
+category: Marketing
+descriptions:
+  en: Turns a brief into platform-native posts.
+  zh: 将简报转化为平台原生帖子。
+persona:
+  name: Maya
+  role:
+    en: Social Media Content Manager
+    zh: 社媒内容经理
+  avatar: /marketplace/avatars/maya.png
+  intro:
+    en: "Hi there — I'm Maya, your Social Media Content Manager."
+    zh: 你好，我是 Maya，你的社媒内容经理。
+  kickoff_questions:
+    en:
+    - Which platforms are in scope?
+    - Do you have brand guidelines?
+    zh:
+    - 涉及哪些平台？
+    - 有品牌规范吗？
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are the Social Media Content Manager.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "no_persona.yaml").write_text(
+        """
+id: no_persona
+name: Plain Template
+category: Support
+descriptions:
+  en: A template authored with no marketplace persona.
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are a plain agent.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "role_only_persona.yaml").write_text(
+        """
+id: role_only_persona
+name: Role Only Template
+category: Support
+descriptions:
+  en: A template whose persona authors only a name and role.
+persona:
+  name: Nia
+  role:
+    en: Some Role
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are Nia.
+  skills: []
+  tool_categories: []
+"""
+    )
+    return templates_dir
+
+
+@pytest.fixture(scope="function")
+def persona_template_manager(persona_templates_dir):
+    """Create a TemplateManager fixture over `persona_templates_dir`"""
+    from xagent.templates.manager import TemplateManager
+
+    return TemplateManager(templates_root=persona_templates_dir)
+
+
+@pytest.fixture(scope="function")
+def persona_mock_app_state(persona_template_manager):
+    """Mock app.state.template_manager backed by the persona templates dir"""
+    import asyncio
+
+    asyncio.run(persona_template_manager.initialize())
+
+    mock_state = MagicMock()
+    mock_state.template_manager = persona_template_manager
+    return mock_state
+
+
+@pytest.fixture(scope="function")
 def admin_user(test_db):
     """Create admin user for testing"""
     ensure_system_initialized()
@@ -397,6 +503,110 @@ class TestTemplatesAPI:
             assert "customer support assistant" in agent_config["instructions"].lower()
             assert agent_config["skills"] == ["product_knowledge"]
             assert agent_config["tool_categories"] == ["web_search"]
+
+            # The top-level tool_categories/skills mirror agent_config's,
+            # so a marketplace card can render capability tags without a
+            # second detail fetch (see test_list_templates_exposes_capabilities).
+            assert template["skills"] == ["product_knowledge"]
+            assert template["tool_categories"] == ["web_search"]
+
+    def test_get_template_detail_survives_non_string_elements_in_authored_lists(
+        self, mock_app_state, admin_headers, monkeypatch
+    ):
+        """A template-authoring typo like `tool_categories: [123, "web_search"]`
+        must not 500 the detail endpoint via an unhandled Pydantic
+        ValidationError. Covers every field this round's fix touched
+        (tool_categories, skills, features, tags) at the actual HTTP
+        response, not just the get_agent_capability_lists unit-level path -
+        including the detail endpoint's own inline agent_config
+        construction, a second, independent call site 170 lines away from
+        get_agent_capability_lists that has the identical gap."""
+        original_get_template = mock_app_state.template_manager.get_template
+
+        async def malformed_get_template(template_id):
+            template = await original_get_template(template_id)
+            if template is not None and template_id == "customer_support":
+                template = dict(template)
+                template["agent_config"] = dict(template["agent_config"])
+                template["agent_config"]["tool_categories"] = [123, "web_search", None]
+                template["agent_config"]["skills"] = [
+                    "product_knowledge",
+                    {"bad": "shape"},
+                ]
+                template["features"] = {"en": [123, "Real feature"]}
+                template["tags"] = ["support", 456, "customer"]
+            return template
+
+        monkeypatch.setattr(
+            mock_app_state.template_manager, "get_template", malformed_get_template
+        )
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get(
+                "/api/templates/customer_support?lang=en", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["agent_config"]["tool_categories"] == ["web_search"]
+        assert body["agent_config"]["skills"] == ["product_knowledge"]
+        assert body["tool_categories"] == ["web_search"]
+        assert body["skills"] == ["product_knowledge"]
+        assert body["features"] == ["Real feature"]
+        assert body["tags"] == ["support", "customer"]
+
+    def test_list_templates_exposes_capabilities(self, mock_app_state, admin_headers):
+        """The list endpoint's TemplateInfo carries the same tool_categories/
+        skills as the detail endpoint, since PersonaCard rendering needs
+        them at list-render time, not just on a per-template detail fetch."""
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            assert response.status_code == 200
+            listed = {t["id"]: t for t in response.json()}
+
+            assert listed["customer_support"]["tool_categories"] == ["web_search"]
+            assert listed["customer_support"]["skills"] == ["product_knowledge"]
+            assert listed["sales_assistant"]["tool_categories"] == ["file_operations"]
+            assert listed["sales_assistant"]["skills"] == ["sales_techniques"]
+
+    def test_workforce_template_exposes_no_capabilities(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """A workforce-type template's real configuration lives in
+        workforce_config, not agent_config - tool_categories/skills must
+        report empty rather than leaking a stray/unused agent_config."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.get(
+                "/api/templates/growth_workforce", headers=admin_headers
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["tool_categories"] == []
+            assert body["skills"] == []
+
+    def test_get_agent_capability_lists_ignores_malformed_agent_config(self):
+        """A truthy but non-dict agent_config (corrupt data, not just a
+        missing/empty one) must fall back to empty lists rather than raise
+        - `.get()` on a str/list would blow up the whole endpoint."""
+        assert get_agent_capability_lists(
+            {"type": "agent", "agent_config": "not-a-dict"}
+        ) == ([], [])
+
+    def test_get_agent_capability_lists_drops_non_string_elements(self):
+        """A non-string element (an authoring typo like `[123, "web_search"]`)
+        must be dropped rather than passed through - it would otherwise 500
+        as an unhandled Pydantic ValidationError once TemplateInfo/
+        TemplateDetail try to construct their `tool_categories: list[str]` /
+        `skills: list[str]` fields."""
+        assert get_agent_capability_lists(
+            {
+                "type": "agent",
+                "agent_config": {
+                    "tool_categories": [123, "web_search", None],
+                    "skills": ["real_skill", {"bad": "shape"}],
+                },
+            }
+        ) == (["web_search"], ["real_skill"])
 
     def test_sample_prompts_localization_and_default(
         self, mock_app_state, admin_headers
@@ -769,9 +979,279 @@ class TestTemplatesAPI:
                 "likes",
                 "used_count",
                 "is_liked",
+                "persona",
+                "hired",
+                "hired_agent_id",
             ]
             for field in required_fields:
                 assert field in template, f"Missing field: {field}"
+
+
+class TestTemplatePersona:
+    """测试 marketplace persona 字段的解析与本地化"""
+
+    def test_persona_included_and_localized(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/with_persona?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            persona = response.json()["persona"]
+            assert persona["name"] == "Maya"
+            assert persona["role"] == "Social Media Content Manager"
+            assert persona["avatar"] == "/marketplace/avatars/maya.png"
+            assert "Maya" in persona["intro"]
+            assert len(persona["kickoff_questions"]) == 2
+
+            response_zh = client.get(
+                "/api/templates/with_persona?lang=zh", headers=admin_headers
+            )
+            assert response_zh.json()["persona"]["role"] == "社媒内容经理"
+
+            # The list endpoint carries the same field.
+            response = client.get("/api/templates/?lang=en", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["with_persona"]["persona"]["name"] == "Maya"
+            assert listed["no_persona"]["persona"] is None
+
+    def test_persona_absent_when_not_authored(
+        self, persona_mock_app_state, admin_headers
+    ):
+        """A template with no `persona` block (e.g. a workforce-type
+        template, or one just not yet given marketplace treatment) reports
+        `persona: null` rather than a missing field or a 500."""
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get("/api/templates/no_persona", headers=admin_headers)
+            assert response.status_code == 200
+            assert response.json()["persona"] is None
+
+    def test_persona_falls_back_to_english_when_lang_is_omitted(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get("/api/templates/with_persona", headers=admin_headers)
+            assert response.status_code == 200
+            assert response.json()["persona"]["role"] == "Social Media Content Manager"
+
+    def test_persona_falls_back_to_english_for_an_unrecognized_locale(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/with_persona?lang=fr", headers=admin_headers
+            )
+            assert response.status_code == 200
+            assert response.json()["persona"]["role"] == "Social Media Content Manager"
+
+    def test_persona_with_only_role_authored_yields_pydantic_defaults_not_a_500(
+        self, persona_mock_app_state, admin_headers
+    ):
+        """A persona authoring only name/role (no intro/kickoff_questions -
+        both fully optional, see TestValidatePersona) must resolve through
+        PersonaInfo's own field defaults (`intro=""`,
+        `kickoff_questions=[]`), not raise a pydantic ValidationError."""
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/role_only_persona?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            persona = response.json()["persona"]
+            assert persona["name"] == "Nia"
+            assert persona["role"] == "Some Role"
+            assert persona["intro"] == ""
+            assert persona["kickoff_questions"] == []
+
+
+class TestTemplateHiredFlag:
+    """测试 hired / hired_agent_id 是否正确反映当前用户的 quick-access agent"""
+
+    def test_false_when_no_quick_access_agent_exists(
+        self, mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            for template in response.json():
+                assert template["hired"] is False
+                assert template["hired_agent_id"] is None
+
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is False
+            assert detail["hired_agent_id"] is None
+
+    def test_true_for_the_users_own_quick_access_agent(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        db = next(get_db())
+        agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent (mine)",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = agent.id
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == agent_id
+            # A different template the user has no quick-access agent for
+            # must not be marked hired just because *some* template is.
+            assert listed["sales_assistant"]["hired"] is False
+            assert listed["sales_assistant"]["hired_agent_id"] is None
+
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is True
+            assert detail["hired_agent_id"] == agent_id
+
+    def test_archived_quick_access_agent_still_counts_as_hired(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """hired deliberately has no status filter (see
+        get_hired_agent_map's docstring): the resolve flow returns a found
+        quick-access agent as-is whatever its status - DRAFT and ARCHIVED
+        alike - so an archived one is still "what Hire returns" and must
+        report hired (PR #1498 round-3 review)."""
+        db = next(get_db())
+        agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent (archived)",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+            status=AgentStatus.ARCHIVED,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = agent.id
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            listed = {
+                t["id"]: t
+                for t in client.get("/api/templates/", headers=admin_headers).json()
+            }
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == agent_id
+
+    def test_hired_resolves_to_the_quick_access_agent_not_a_user_origin_one(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """A plain user-origin agent that happens to carry the same
+        template_id (e.g. minted by the workforce-builder UI under a
+        user-chosen name via the plain POST /from-template path) must not
+        count as hired - hired specifically means the quick-access
+        instance, matching resolve_agent_from_template's own
+        origin-scoped reuse query.
+
+        Creates a real TEMPLATE_QUICK_ACCESS-origin agent for the same
+        template too, deliberately with a *lower* id than the USER-origin
+        row: `get_hired_agent_map` has no ORDER BY (last row wins in a
+        filterless dict build), so with the quick-access row inserted
+        first, an implementation missing the origin filter would resolve
+        to the later USER-origin row and fail here - mutation testing on
+        the round-1 version of this test (quick-access inserted second)
+        showed removing the filter still passed (PR #1498 round-2 review,
+        N4)."""
+        db = next(get_db())
+        quick_access_agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(quick_access_agent)
+        db.commit()
+        db.refresh(quick_access_agent)
+        quick_access_agent_id = quick_access_agent.id
+
+        user_origin_agent = Agent(
+            user_id=admin_user["id"],
+            name="My Own Copy",
+            template_id="customer_support",
+            origin=AgentOrigin.USER.value,
+        )
+        db.add(user_origin_agent)
+        db.commit()
+        db.refresh(user_origin_agent)
+        assert user_origin_agent.id > quick_access_agent_id
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == quick_access_agent_id
+
+    def test_false_when_the_only_agent_is_user_origin(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """The complementary case to the test above: a template whose only
+        agent for this user is a plain USER-origin one must not report
+        hired at all."""
+        db = next(get_db())
+        user_origin_agent = Agent(
+            user_id=admin_user["id"],
+            name="My Own Copy Only",
+            template_id="customer_support",
+            origin=AgentOrigin.USER.value,
+        )
+        db.add(user_origin_agent)
+        db.commit()
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is False
+            assert listed["customer_support"]["hired_agent_id"] is None
+
+    def test_scoped_to_the_current_user(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """Another user's quick-access agent for the same template must
+        not mark it hired for the current user."""
+        db = next(get_db())
+        other_user = User(
+            username="other_user_hired_flag_test",
+            password_hash=hash_password("other123"),
+        )
+        db.add(other_user)
+        db.commit()
+        db.refresh(other_user)
+        agent = Agent(
+            user_id=other_user.id,
+            name="Someone Else's Copy",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is False
+            assert listed["customer_support"]["hired_agent_id"] is None
+
+            # Same scoping on the detail endpoint (a separate call site
+            # computing hired from the same map).
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is False
+            assert detail["hired_agent_id"] is None
 
 
 class TestUseTemplateAsWorkforce:

@@ -14,6 +14,7 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
@@ -493,6 +494,91 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_runner_inserts_synthetic_user_turn_before_a_leading_assistant_initial_message(
+    tmp_path: Path,
+) -> None:
+    # The marketplace Hire flow seeds a persona greeting as a task's very
+    # first persisted message (see seed_assistant_message in
+    # src/xagent/web/api/chat.py) - initial_messages then starts with role
+    # "assistant" and no prior user turn. Anthropic's Messages API (and
+    # every claude_compatible provider routed through it) rejects a request
+    # whose first message isn't role "user", so the runner must correct
+    # this before it's ever replayed into context.
+    workspace_manager = FakeWorkspaceManager(tmp_path)
+    memory_manager = FakeMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern], tools=[], llm="fake-llm")
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=workspace_manager,
+        memory_manager=memory_manager,
+        workspace_base_dir=str(tmp_path / "workspaces"),
+    )
+
+    result = await runner.run(
+        task="Let's get started",
+        execution_id="exec-seed",
+        user_id="user-1",
+        initial_messages=[
+            {
+                "role": "assistant",
+                "content": "Hi - I'm Maya, your Social Media Content Manager.",
+            }
+        ],
+    )
+
+    context = result["context"]
+    assert [message.role for message in context.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert context.messages[0].content == "(conversation start)"
+    assert context.messages[0].metadata.get("_xagent_synthetic") == "leading_user_turn"
+    assert (
+        context.messages[1].content
+        == "Hi - I'm Maya, your Social Media Content Manager."
+    )
+    assert context.messages[2].content == "Let's get started"
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_insert_synthetic_turn_for_user_first_initial_messages(
+    tmp_path: Path,
+) -> None:
+    workspace_manager = FakeWorkspaceManager(tmp_path)
+    memory_manager = FakeMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern], tools=[], llm="fake-llm")
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=workspace_manager,
+        memory_manager=memory_manager,
+        workspace_base_dir=str(tmp_path / "workspaces"),
+    )
+
+    result = await runner.run(
+        task="Follow up",
+        execution_id="exec-normal",
+        user_id="user-1",
+        initial_messages=[
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello, how can I help?"},
+        ],
+    )
+
+    context = result["context"]
+    assert [message.role for message in context.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert context.messages[0].content == "Hi"
+
+
+@pytest.mark.asyncio
 async def test_runner_passes_waiting_status_to_tool_teardown(tmp_path: Path) -> None:
     tool = StatusAwareTeardownTool()
     agent = Agent(
@@ -709,6 +795,200 @@ async def test_runner_does_not_add_empty_user_message_for_missing_task(
 
     assert result["success"] is True
     assert result["context"].messages == []
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_replay_tool_pairs(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "read_file",
+            "tool_call_id": "call-1",
+            "raw_result": {"output": "file contents"},
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-replay",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    # initial_messages[0] is role "assistant", so AgentRunner.run prepends a
+    # synthetic leading user turn (Anthropic's Messages API rejects a request
+    # whose first message isn't role "user") before replaying the
+    # assistant/tool pair.
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+
+    synthetic_message = messages[0]
+    assert synthetic_message.content == "(conversation start)"
+    assert synthetic_message.metadata["_xagent_synthetic"] == "leading_user_turn"
+
+    assistant_message = messages[1]
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == initial_messages[0]["tool_calls"]
+
+    tool_message = messages[2]
+    assert tool_message.content == "Tool read_file returned: file contents"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.metadata["raw_result"] == {"output": "file contents"}
+    assert tool_message.metadata["tool_name"] == "read_file"
+    # The synthetic turn is prepended, not interleaved, so tool-call pairing
+    # is undisturbed: every "tool" message is still immediately preceded by
+    # the assistant message declaring its tool_call_id.
+    for index, message in enumerate(messages):
+        if message.role == "tool":
+            assert messages[index - 1].role == "assistant"
+            assert message.tool_call_id in {
+                call["id"] for call in (messages[index - 1].tool_calls or [])
+            }
+
+
+@pytest.mark.asyncio
+async def test_initial_assistant_with_empty_content_and_tool_calls_survives(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-empty-content-tool-calls",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    # The original defect this test guards: an assistant message with
+    # content="" and non-empty tool_calls must not be dropped by the replay
+    # loop's "is there anything to keep" check. The leading synthetic user
+    # turn (added because initial_messages[0] is role "assistant") must not
+    # mask that — the assistant message must still be present right after it.
+    assert [message.role for message in messages] == ["user", "assistant"]
+
+    synthetic_message = messages[0]
+    assert synthetic_message.content == "(conversation start)"
+    assert synthetic_message.metadata["_xagent_synthetic"] == "leading_user_turn"
+
+    assistant_message = messages[1]
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == initial_messages[0]["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_starting_with_user_no_synthetic_turn(
+    tmp_path: Path,
+) -> None:
+    """A realistically-shaped reconstruction that already starts with a user
+    transcript message, followed by an assistant/tool pair, must NOT trigger
+    the synthetic leading-user-turn correction: it is only needed when the
+    replay would otherwise start with role "assistant".
+    """
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {"role": "user", "content": "Please read the file"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-3",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "read_file",
+            "tool_call_id": "call-3",
+            "raw_result": {"output": "file contents"},
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-replay-user-first",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+    assert messages[0].content == "Please read the file"
+    assert not any(
+        message.metadata.get("_xagent_synthetic") == "leading_user_turn"
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_plain_roles_unchanged(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hello there"},
+        {"role": "user", "content": ""},  # dropped: no content/context_refs
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-plain-initial",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [(message.role, message.content) for message in messages] == [
+        ("system", "You are helpful."),
+        ("user", "Hello there"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1275,6 +1555,58 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     )
     assert user_event["data"]["message"] == "Read file"
     assert user_event["data"]["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_uploaded_image_refs_to_initial_user_message(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="vision",
+        patterns=[FakePattern({"success": True, "response": "Done"})],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    references = build_image_context_references(
+        [{"file_id": "image-123", "name": "diagram.png", "type": "image/png"}]
+    )
+
+    result = await runner.run(
+        task="What is shown?",
+        execution_id="exec-initial-image",
+        task_context_refs=references,
+    )
+
+    first_user = next(
+        message for message in result["context"].messages if message.role == "user"
+    )
+    assert first_user.context_refs == references
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="vision", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Start", execution_id="exec-injected-image")
+
+    context = await runner.inject_user_message(
+        "exec-injected-image",
+        "Inspect the new image",
+        files=[{"file_id": "image-456", "name": "screen.jpg", "type": "image/jpeg"}],
+        request_interrupt=False,
+    )
+
+    assert context is not None
+    assert context.messages[-1].context_refs[0].file_id == "image-456"
 
 
 @pytest.mark.asyncio

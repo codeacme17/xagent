@@ -10,6 +10,7 @@ and configuration management.
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,7 +23,7 @@ from .....config import get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
-from .base import AbstractBaseTool, Tool
+from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
     BaseToolConfig,
     MCPFailurePolicy,
@@ -166,6 +167,7 @@ class ToolRegistry:
                 audio_tool,
                 basic_tools,
                 browser_tools,
+                current_time_tool,
                 custom_api_factory,
                 file_ingestion_tool,
                 image_tool,
@@ -195,6 +197,11 @@ class ToolRegistry:
         spec: ToolSelectionSpec | None,
         selection_gate: str | None,
     ) -> bool:
+        if selection_gate == "intrinsic":
+            # Always-available tool: assemble for every non-NONE spec, but an
+            # explicit zero-tools agent still gets nothing.
+            return spec is None or not spec.is_none()
+
         if spec is None or declared_cats is None or spec.categories is None:
             return True
 
@@ -209,6 +216,11 @@ class ToolRegistry:
             # or a server-only spec would skip the MCP creator entirely.
             return spec.includes_mcp()
 
+        # After the gates above: a creator carrying both a gate and a
+        # binding-authorized category must honour its gate first.
+        if declared_cats & BINDING_AUTHORIZED_CATEGORIES:
+            return spec.includes_binding_authorized()
+
         return bool(declared_cats & spec.categories)
 
     @classmethod
@@ -218,8 +230,10 @@ class ToolRegistry:
         When ``config.get_tool_selection_spec()`` returns a spec,
         creators whose declared categories don't intersect
         ``spec.categories`` are skipped at the registry level (no
-        creator call, no I/O). Creators with no declared categories
-        (dynamic ones: MCP / Custom API / Image / Audio) are always
+        creator call, no I/O) -- except a creator declaring a
+        ``BINDING_AUTHORIZED_CATEGORIES`` category, dispatched per
+        ``spec.includes_binding_authorized()``. Creators with no declared
+        categories (dynamic ones: MCP / Custom API / Image / Audio) are always
         dispatched and are responsible for
         short-circuiting internally based on the spec.
 
@@ -241,7 +255,8 @@ class ToolRegistry:
         for creator, declared_cats, selection_gate in cls._tool_creators:
             # Registry-level skip: declared categories known and no
             # intersection with the spec's allowed categories. The helper
-            # keeps the published-agent workforce exception in one place.
+            # keeps both exceptions (published-agent, binding-authorized)
+            # in one place.
             if not cls._should_run_creator(declared_cats, spec, selection_gate):
                 continue
             try:
@@ -755,12 +770,44 @@ class ToolFactory:
             if workspace is None:
                 workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
-                from .sandboxed_tool.sandboxed_tool_wrapper import (
-                    create_workspace_in_sandbox,
+                directories = workspace.get_allowed_dirs()
+                # Mount coverage is sufficient only when the backend-side
+                # directories already exist. TaskWorkspace creates them in
+                # its constructor; MockWorkspace deliberately does not, so it
+                # must retain the historical in-sandbox mkdir fallback.
+                directories_exist_on_backend_storage = all(
+                    Path(directory).is_dir() for directory in directories
                 )
+                # Resolve on the concrete type: getattr(instance, ...) against
+                # unittest.mock.Mock auto-creates an attribute and would make
+                # an unimplemented capability look present. Instance-only
+                # duck-typed capabilities intentionally keep the safe fallback.
+                host_mount_check = getattr(
+                    type(sandbox), "workspace_dirs_are_host_mounted", None
+                )
+                workspace_is_host_mounted = False
+                if directories_exist_on_backend_storage and callable(host_mount_check):
+                    try:
+                        workspace_is_host_mounted = (
+                            host_mount_check(sandbox, directories) is True
+                        )
+                    except Exception:
+                        # This is an optimization probe. If it cannot prove
+                        # coverage, preserve the pre-optimization behavior
+                        # instead of failing task/tool creation.
+                        logger.warning(
+                            "Workspace host-mount coverage check failed; "
+                            "falling back to sandbox directory setup",
+                            exc_info=True,
+                        )
+                if not workspace_is_host_mounted:
+                    from .sandboxed_tool.sandboxed_tool_wrapper import (
+                        create_workspace_in_sandbox,
+                        resolve_primary_sandbox,
+                    )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
-                await create_workspace_in_sandbox(setup_sandbox, workspace)
+                    setup_sandbox = resolve_primary_sandbox(sandbox)
+                    await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools

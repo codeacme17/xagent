@@ -29,6 +29,7 @@ from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.template_stats import TemplateStats
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
@@ -43,6 +44,7 @@ from xagent.web.services.task_runtime import (
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     task_extension_bindings_from_agent_config,
 )
+from xagent.web.services.task_setup_snapshot import RuntimeUserFields
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
@@ -292,6 +294,20 @@ def _install_resolve_template_stub(
     )
 
 
+class _MalformedCapabilitiesTemplateManagerStub(_ResolveTemplateManagerStub):
+    """A template whose authored tool_categories/skills contain a
+    non-string element (e.g. an authoring typo) - agent_management.py's
+    _spec_from_template must filter these out rather than let them reach
+    AgentResponse's strict list[str] fields as an unhandled Pydantic
+    ValidationError."""
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        template = await super().get_template(template_id)
+        template["agent_config"]["tool_categories"] = [123, "web_search", None]
+        template["agent_config"]["skills"] = ["real_skill", {"bad": "shape"}]
+        return template
+
+
 def test_resolve_from_template_creates_and_publishes_on_first_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -341,6 +357,74 @@ def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
     listed = client.get("/api/agents", headers=headers).json()
     matching = [a for a in listed if a.get("template_id") == "resolve-template"]
     assert len(matching) == 1
+
+
+def test_resolve_from_template_drops_non_string_capability_elements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed tool_categories/skills entry in the template's authored
+    agent_config must not 500 the resolve endpoint - it must be filtered
+    out, the same way get_agent_capability_lists filters it for the
+    marketplace list/detail endpoints."""
+    headers = _admin_headers()
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _MalformedCapabilitiesTemplateManagerStub(),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "malformed-capabilities-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["agent"]
+    assert body["tool_categories"] == ["web_search"]
+    assert body["skills"] == ["real_skill"]
+
+
+def test_resolve_from_template_increments_used_count_only_on_the_fresh_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hire is the primary adoption path for every currently-featured
+    template, and the Featured section's hero ranking sorts by used_count -
+    a resolve call that mints a fresh agent must record a use, exactly once,
+    not on every repeat/idempotent call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def used_count() -> int:
+        db = _direct_db_session()
+        try:
+            stats = (
+                db.query(TemplateStats)
+                .filter(TemplateStats.template_id == "resolve-template")
+                .first()
+            )
+            return stats.used_count if stats else 0
+        finally:
+            db.close()
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] is True
+    assert used_count() == 1
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert used_count() == 1
 
 
 def test_resolve_from_template_does_not_adopt_a_workforce_builder_draft(
@@ -766,6 +850,7 @@ def _create_agent_row(
     share_token: str | None = None,
     widget_key: str | None = None,
     generate_widget_key: bool = True,
+    suggested_prompts: list[str] | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -784,6 +869,7 @@ def _create_agent_row(
             share_enabled=share_enabled,
             share_token=share_token,
             widget_key=widget_key,
+            suggested_prompts=suggested_prompts or [],
         )
         db.add(agent)
         db.commit()
@@ -974,6 +1060,52 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["access"] == "policy"
     assert items_by_id[shared_draft_id]["status"] == "draft"
     assert items_by_id[shared_draft_id]["readonly"] is True
+
+
+def test_list_agents_response_carries_suggested_prompts_through_owner_and_policy_rows() -> (
+    None
+):
+    # tests/web/test_agent_visibility.py only exercises
+    # AgentStore.agent_to_list_item_dict directly - this drives the real
+    # GET /api/agents route so a future regression in AgentListItem's
+    # response-model validation or the permission-merge step in
+    # _serialize_agent_list_item would actually be caught here, not just
+    # at the store layer the /task "My Team" picker's auto-fill depends on.
+    _admin_headers()
+    bob_headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    bob_with_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Draft a status update"],
+    )
+    bob_without_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob Without Prompts",
+        status=AgentStatus.PUBLISHED,
+    )
+    shared_with_prompts_id = _create_agent_row(
+        user_id=admin_id,
+        name="Shared With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Summarize today's meetings"],
+    )
+    set_workforce_policy(_VisibleAgentPolicy({shared_with_prompts_id}))
+
+    response = client.get("/api/agents", headers=bob_headers)
+    assert response.status_code == 200, response.text
+    items_by_id = {item["id"]: item for item in response.json()}
+
+    assert items_by_id[bob_with_prompts_id]["suggested_prompts"] == [
+        "Draft a status update"
+    ]
+    assert items_by_id[bob_without_prompts_id]["suggested_prompts"] == []
+    assert items_by_id[shared_with_prompts_id]["suggested_prompts"] == [
+        "Summarize today's meetings"
+    ]
 
 
 def test_agent_lists_keep_reusable_managers_and_hide_generated_managers() -> None:
@@ -3598,3 +3730,109 @@ def test_policy_shared_non_admin_reads_agent_detail_read_only():
     body = resp.json()
     assert body["readonly"] is True
     assert body["can_edit"] is False
+
+
+def _set_preferences(user_id: int, preferences: dict[str, Any]) -> None:
+    db = _direct_db_session()
+    try:
+        user = db.get(User, user_id)
+        assert user is not None
+        user.preferences = preferences
+        db.commit()
+    finally:
+        db.close()
+
+
+class TestApplyUserVoice:
+    """Unit tests for apply_user_voice - the onboarding Launch-step voice
+    preference's system-prompt injection, alongside enhance_system_prompt_with_kb."""
+
+    def test_no_voice_returns_prompt_unchanged(self):
+        assert agents_api.apply_user_voice("Be helpful.", None) == "Be helpful."
+
+    def test_unrecognized_voice_value_returns_prompt_unchanged(self):
+        assert agents_api.apply_user_voice("Be helpful.", "sarcastic") == "Be helpful."
+
+    def test_list_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        # The JSON `preferences` column has no nested-type constraint, so a
+        # corrupted/hand-edited row could hold a list here. A list is truthy
+        # but unhashable - `dict.get` on it would raise TypeError instead of
+        # degrading to plain output.
+        assert agents_api.apply_user_voice("Be helpful.", ["concise"]) == "Be helpful."
+
+    def test_dict_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        assert (
+            agents_api.apply_user_voice("Be helpful.", {"voice": "concise"})
+            == "Be helpful."
+        )
+
+    def test_known_voice_appends_output_voice_section(self):
+        result = agents_api.apply_user_voice("Be helpful.", "concise")
+
+        assert result.startswith("Be helpful.\n\n## OUTPUT VOICE\n")
+        assert "As short as possible" in result
+
+    def test_none_system_prompt_with_voice_omits_leading_blank_lines(self):
+        result = agents_api.apply_user_voice(None, "warm")
+
+        assert result.startswith("## OUTPUT VOICE\n")
+
+    def test_every_valid_voice_has_a_matching_instruction(self):
+        # Guards the module-level consistency assertion in agents.py itself
+        # (VALID_USER_VOICES vs _VOICE_INSTRUCTIONS) with an explicit test,
+        # so a future divergence fails a test, not just an import-time assert.
+        assert set(agents_api._VOICE_INSTRUCTIONS) == agents_api.VALID_USER_VOICES
+
+
+class TestVoiceFromRuntimeUser:
+    """Unit tests for voice_from_runtime_user - extracts the voice
+    preference without issuing a new query, from whichever runtime-user
+    shape a caller already has in hand (see apply_user_voice's docstring
+    for why a fresh query is deliberately avoided here)."""
+
+    def test_none_runtime_user_returns_none(self):
+        assert agents_api.voice_from_runtime_user(None) is None
+
+    def test_runtime_user_fields_with_voice_set(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False, voice="friendly")
+        assert agents_api.voice_from_runtime_user(runtime_user) == "friendly"
+
+    def test_runtime_user_fields_with_no_voice(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False)
+        assert agents_api.voice_from_runtime_user(runtime_user) is None
+
+    def test_full_user_orm_row_reads_from_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {"voice": "playful"})
+
+        db = _direct_db_session()
+        try:
+            user = db.get(User, user_id)
+            assert agents_api.voice_from_runtime_user(user) == "playful"
+        finally:
+            db.close()
+
+    def test_full_user_orm_row_with_no_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {})
+
+        db = _direct_db_session()
+        try:
+            user = db.get(User, user_id)
+            assert agents_api.voice_from_runtime_user(user) is None
+        finally:
+            db.close()
+
+    def test_unexpected_shape_does_not_raise(self):
+        # A caller passing something that's neither RuntimeUserFields nor a
+        # real User row (e.g. a mismatched test double) must degrade to "no
+        # voice" rather than crash agent construction over a cosmetic
+        # preference - see test_agent_manager_reconstruction.py's
+        # test_admin_task_uses_task_owner_workspace_dirs, which broke this
+        # way when apply_user_voice used to query on its own.
+        class _NotAUser:
+            pass
+
+        assert agents_api.voice_from_runtime_user(_NotAUser()) is None

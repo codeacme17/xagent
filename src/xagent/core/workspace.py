@@ -29,9 +29,17 @@ from typing import (
 )
 from uuid import uuid4
 
-from ..config import get_file_materialize_dir, get_uploads_dir
+from ..config import (
+    get_file_materialize_dir,
+    get_uploads_dir,
+    in_sandbox_tool_runner,
+)
 from .execution_scope import validate_scope_component
-from .file_ref import parse_file_id_ref
+from .file_ref import (
+    SANDBOX_FILE_ID_PREFIX,
+    is_sandbox_local_file_id,
+    parse_file_id_ref,
+)
 from .file_storage.keys import build_user_key_prefix
 
 if TYPE_CHECKING:
@@ -393,6 +401,11 @@ class TaskWorkspace:
 
         if not files:
             return ()
+        if in_sandbox_tool_runner():
+            return tuple(
+                self._remember_sandbox_registration(path, file_id)
+                for path, file_id in files
+            )
         with self._registration_lock:
             return self._register_files_locked(files, db_session=db_session)
 
@@ -979,6 +992,28 @@ class TaskWorkspace:
             )
         return resolved_path
 
+    def _remember_sandbox_registration(
+        self, file_path: str, file_id: Optional[str]
+    ) -> str:
+        """Mint a process-local id inside the sandbox runner.
+
+        The sandbox reaches no real database or object storage, so the host
+        process re-registers these files once the tool call returns. Minted ids
+        carry a prefix so anything the host fails to re-register stays
+        recognizable instead of passing as a database-backed id.
+        """
+        resolved_path = Path(file_path).resolve()
+        with self._registration_lock:
+            cached = self._recently_registered_files.get(str(resolved_path))
+        resolved_id = file_id or cached or f"{SANDBOX_FILE_ID_PREFIX}{uuid4()}"
+        self._remember_file_registration(resolved_id, resolved_path)
+        logger.debug(
+            "Sandbox-local file id %s for %s; host process owns registration",
+            resolved_id,
+            resolved_path,
+        )
+        return resolved_id
+
     def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
         with self._registration_lock:
             path_str = str(file_path)
@@ -1269,6 +1304,13 @@ class TaskWorkspace:
                 file_id,
             )
             return None
+        if is_sandbox_local_file_id(file_id):
+            logger.warning(
+                "resolve_file_id: Sandbox-minted id never reached the database, so "
+                "host re-registration failed for it: %s",
+                file_id,
+            )
+            return None
 
         # Query from database
         from .storage.manager import create_db_session
@@ -1319,7 +1361,13 @@ class TaskWorkspace:
                 if should_close:
                     db.close()
         except Exception as e:
-            logger.warning(f"Failed to resolve file_id from database: {e}")
+            # ``exc_info`` because this fault is swallowed -- the caller only
+            # sees ``None`` -- so this is its only record. A durable-storage
+            # fault arrives here from ``materialize()`` carrying just the
+            # storage key; its cause lives in ``__cause__`` (#1467).
+            logger.warning(
+                f"Failed to resolve file_id from database: {e}", exc_info=True
+            )
             return None
 
     def _file_operation_path_in_authorized_storage(self, path: Path) -> bool:

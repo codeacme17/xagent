@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...config import get_tool_max_concurrency, get_tool_parallel_enabled
+from ..context_ref import ContextReference
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
 from .agent import Agent
+from .attachments import build_image_context_references
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .result import NO_OUTPUT_PLACEHOLDER
@@ -33,12 +35,14 @@ class AgentExecutionConfig:
     tracer: Any | None = None
     system_prompt: str | None = None
     workspace_base_dir: str = "workspace"
+    workspace_enabled: bool = True
     allowed_external_dirs: list[str] | None = None
     scope_segments: tuple[str, ...] = ()
     current_task_id: str | None = None
     service_id: str | None = None
     registry: ExecutionRegistry | None = None
     dag_max_concurrency: int = 4
+    react_max_iterations: int = 200
     tool_parallel_enabled: bool = field(default_factory=get_tool_parallel_enabled)
     tool_max_concurrency: int = field(default_factory=get_tool_max_concurrency)
     outbound_message_handler: Any | None = None
@@ -53,7 +57,11 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    # Capability gate: False overrides an explicitly supplied manager/list.
+    skills_enabled: bool = True
+    user_interaction_enabled: bool = True
     preferred_input_modalities: tuple[str, ...] = ()
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentExecutionAdapter:
@@ -102,6 +110,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         if handle.task is None:
@@ -140,6 +149,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         return handle.to_dict()
@@ -235,6 +245,7 @@ class AgentExecutionAdapter:
         include_request_context: bool = False,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
+            **self.config.execution_metadata,
             "execution_type": execution_type,
             "pattern": self.config.pattern,
         }
@@ -252,8 +263,10 @@ class AgentExecutionAdapter:
 
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()
-        skill_manager = self.config.skill_manager
-        if skill_manager is None:
+        skill_manager = (
+            self.config.skill_manager if self.config.skills_enabled else None
+        )
+        if self.config.skills_enabled and skill_manager is None:
             from ...skills.utils import create_skill_manager
 
             skill_manager = create_skill_manager(
@@ -266,11 +279,16 @@ class AgentExecutionAdapter:
             llm=self.config.llm,
             compact_llm=self.config.compact_llm,
             system_prompt=self.config.system_prompt,
-            metadata={"pattern": self.config.pattern},
+            metadata={
+                **self.config.execution_metadata,
+                "pattern": self.config.pattern,
+            },
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
-            allowed_skills=self.config.allowed_skills,
+            allowed_skills=(
+                self.config.allowed_skills if self.config.skills_enabled else None
+            ),
         )
         return (
             AgentRunner(
@@ -278,6 +296,7 @@ class AgentExecutionAdapter:
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
+                workspace_enabled=self.config.workspace_enabled,
                 scope_segments=self.config.scope_segments,
                 outbound_message_handler=self.config.outbound_message_handler,
             ),
@@ -290,6 +309,7 @@ class AgentExecutionAdapter:
                 DAGPattern(
                     LLMPlanGenerator(),
                     max_concurrency=self.config.dag_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_dag",
             )
@@ -297,12 +317,15 @@ class AgentExecutionAdapter:
             return (
                 AutoPattern(
                     react_pattern=ReActPattern(
+                        max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                 ),
                 "agent_auto",
@@ -314,13 +337,16 @@ class AgentExecutionAdapter:
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
                     tool_max_concurrency=self.config.tool_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_single_call",
             )
         return (
             ReActPattern(
+                max_iterations=self.config.react_max_iterations,
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
+                user_interaction_enabled=self.config.user_interaction_enabled,
             ),
             "agent_react",
         )
@@ -330,6 +356,22 @@ class AgentExecutionAdapter:
             *self.config.execution_context_messages,
             *self.config.conversation_history,
         ]
+
+    @staticmethod
+    def _request_context_refs(
+        context: dict[str, Any] | None,
+    ) -> tuple[ContextReference, ...]:
+        if not isinstance(context, dict):
+            return ()
+        references: list[ContextReference] = []
+        seen: set[str] = set()
+        for key in ("file_info", "files", "attachments"):
+            for reference in build_image_context_references(context.get(key)):
+                if reference.file_id in seen:
+                    continue
+                seen.add(reference.file_id)
+                references.append(reference)
+        return tuple(references)
 
     def _execution_type(self) -> str:
         if self.config.pattern == "dag_plan_execute":
@@ -391,6 +433,7 @@ class AgentExecutionAdapter:
             "success": result.get("success", False),
             "error": result.get("error"),
             "metadata": {
+                **self.config.execution_metadata,
                 "agent_name": self.config.name,
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,

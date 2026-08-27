@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    JSON,
     Boolean,
     Column,
     DateTime,
@@ -31,6 +32,20 @@ class User(Base):  # type: ignore
     refresh_token_expires_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token_hash = Column(String(64), index=True, nullable=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Onboarding-collected settings: {onboarded, department, industry, voice,
+    # goals}. Written incrementally (one PATCH per onboarding step merges
+    # into this dict, not replaces it) - see update_current_user_preferences
+    # in api/auth.py. `voice` feeds apply_user_voice's system-prompt
+    # injection in api/agents.py.
+    #
+    # Any writer of this column MUST go through api/auth.py's
+    # _merge_user_preferences_locked (which takes the row lock
+    # _lock_user_row_for_preferences_update acquires) - it is the only
+    # thing preventing a lost-update race between two concurrent merges.
+    # There is no structural enforcement of this; a future direct write
+    # (an admin endpoint, a seed script, a provisioning path) can silently
+    # bypass it.
+    preferences = Column(JSON, nullable=True, default=dict)
 
     # Relationships
     tasks = relationship("Task", back_populates="user")
@@ -60,8 +75,22 @@ class User(Base):  # type: ignore
     user_default_models = relationship(
         "UserDefaultModel", back_populates="user", cascade="all, delete-orphan"
     )
+    # This historical relationship represents the user's ordinary OAuth
+    # accounts. Actor-owned credentials share the table for storage only and
+    # must be loaded through explicit owner-scoped service queries. Their user
+    # deletion depends on the database ``ON DELETE CASCADE``; SQLite engine
+    # initialization enables and monitors the required foreign-key pragma.
     oauth_accounts = relationship(
-        "UserOAuth", back_populates="user", cascade="all, delete-orphan"
+        "UserOAuth",
+        primaryjoin=(
+            "and_(User.id == UserOAuth.user_id, UserOAuth.resource_owner_key.is_(None))"
+        ),
+        back_populates="user",
+        cascade="all, delete-orphan",
+        # SQL predicates do not filter Python-side back-reference updates.
+        # Disable synchronization so assigning an actor row's ``user`` cannot
+        # inject it into this ordinary-only delete-orphan collection.
+        sync_backref=False,
     )
     identities = relationship(
         "UserIdentity", back_populates="user", cascade="all, delete-orphan"

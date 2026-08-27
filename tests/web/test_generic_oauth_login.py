@@ -8,6 +8,8 @@ Covers two bugs the PR fixed:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -16,11 +18,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.utils.encryption import encrypt_value
+from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
+    _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
     generic_oauth_login,
+    verify_token,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -164,6 +168,173 @@ def test_zoom_provider_sets_prompt_login(db_session):
     assert qs.get("prompt") == ["login"], f"zoom prompt missing: {url}"
 
 
+def test_salesforce_provider_includes_pkce_code_challenge(db_session):
+    """Newer Salesforce orgs enforce PKCE on this grant with no per-app
+    opt-out; the authorize redirect must carry a code_challenge derived from
+    a verifier that (a) round-trips through the signed state token via
+    decrypt_value (not left as plaintext in it) and (b) actually matches the
+    S256 challenge sent to Salesforce."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+    # The real regression this guards: encryption actually changed the
+    # value. `encrypted_verifier != qs["code_challenge"][0]` alone proves
+    # nothing -- a verifier trivially differs from its own derived S256
+    # hash regardless of whether encryption ever ran.
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("SALESFORCE", True),
+        ("salesforce-sandbox", True),
+        ("salesforce-govcloud", True),
+        ("salesforcelite", False),
+        ("salesforce2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_is_salesforce_provider_requires_exact_name_or_hyphenated_suffix(
+    provider, expected
+):
+    """Anchored to a "-" separator, not a bare prefix: oauth_providers.name
+    is admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    startswith("salesforce") would also match an unrelated custom provider
+    an admin happened to name e.g. "salesforcelite" -- silently routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy."""
+    assert _is_salesforce_provider(provider) is expected
+
+
+def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):
+    """PKCE is gated on a provider-name *prefix* match
+    (_is_salesforce_provider), not exact equality -- specifically so an
+    admin-created "salesforce-sandbox" row (example.env's documented
+    workaround for sandbox orgs, which have no per-user toggle otherwise)
+    also gets it. An exact match here would silently skip PKCE for that row
+    and then fail opaquely against a PKCE-enforcing sandbox org."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://test.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce-sandbox",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+
+def test_salesforce_login_returns_clear_error_when_encryption_key_missing(
+    db_session, monkeypatch
+):
+    """encrypt_value() raises a bare ValueError when ENCRYPTION_KEY is unset
+    outside development. Every other provider's login route never calls
+    encrypt_value at all, so this misconfiguration would otherwise be
+    invisible until the first Salesforce connect attempt -- and uncaught,
+    it would 500 with an opaque traceback instead of a clear cause."""
+    from xagent.core.utils.encryption import get_cipher
+
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        resp = generic_oauth_login(
+            provider="salesforce",
+            token=token,
+            app_id=None,
+            redirect=None,
+            db=db,
+            db_provider=provider,
+        )
+    finally:
+        get_cipher.cache_clear()
+
+    assert resp.status_code == 500
+    assert "ENCRYPTION_KEY" in resp.body.decode()
+
+
+def test_non_salesforce_provider_omits_pkce_code_challenge(db_session):
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://example.com/oauth/authorize",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="custom",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload
+
+
 def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     """Sanity: only Zoom gets prompt=login (Google gets prompt=consent, others none)."""
     db, user = db_session
@@ -229,6 +400,164 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
         "public_profile,pages_manage_posts,pages_read_engagement,"
         "pages_read_user_content,pages_show_list"
     ]
+
+
+def test_github_login_requests_exact_canonical_scope(db_session):
+    """The requested scope must be exactly the provider's default_scopes
+    ("read:user") merged with the github app row's canonical oauth_scopes
+    ("repo", "user:email", sorted) -- read:org must NOT reappear even if a
+    stale/incorrect DB row still lists it, since get_app_by_id overlays the
+    canonical registry's oauth_scopes for a builtin app_id regardless of
+    what is persisted."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="github",
+            name="GitHub",
+            description="GitHub connector",
+            transport="oauth",
+            provider_name="github",
+            category="Development",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["repo", "read:org", "user:email"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id="github",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["read:user repo user:email"]
+
+
+def test_bare_github_login_config_error_takes_precedence_over_bare_route_guard(
+    db_session,
+):
+    """A bare (app_id-less) login persists to the exact same
+    UserOAuth.provider="github" key an app-scoped login uses, since
+    github's app_id and provider name are the same string. Left unblocked,
+    re-running this route would silently replace a fully-scoped
+    connection's grant with an identity-only one on the next callback --
+    that guard exists and still runs before any state token is minted.
+
+    But the guard is checked AFTER config/auth resolution, not before: a
+    misconfigured provider (missing client_id) must still get the
+    actionable CLIENT_ID config error, not a 404 that would incorrectly
+    read as "this route doesn't support a normal connect attempt" to an
+    operator debugging their setup."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+        client_id="",  # deliberately unconfigured
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 500
+    assert "GITHUB_CLIENT_ID" in resp.body.decode()
+
+
+def test_bare_github_login_unauthenticated_gets_401_not_404(db_session):
+    """Same ordering point as the config-error case above: an
+    unauthenticated bare-route request must get the generic 401, not a 404
+    that implies the route itself is unsupported."""
+    db, _user = db_session
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=None,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 401
+
+
+def test_bare_github_login_is_rejected_once_authenticated_and_configured(db_session):
+    """Once config and auth both resolve cleanly, the bare-route guard for
+    providers requiring an app-scoped grant still fires -- before any
+    state token is minted, which is the property it actually needs to
+    hold."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 404
+
+
+def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
+    """Sanity: the bare-route guard is scoped to
+    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT members only -- an ordinary
+    provider's bare login (no collision risk) must be unaffected."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
 
 
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
@@ -573,3 +902,38 @@ def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
 
     assert resp.status_code == 500
     assert "MICROSOFT_CLIENT_ID" in resp.body.decode()
+
+
+def test_deputy_login_sends_scope_and_omits_pkce(db_session):
+    """generic_oauth_login has no Deputy-specific branch (its
+    longlife_refresh_token scope flows through the existing generic
+    default_scopes -> scope_str path) -- this locks that in, since nothing
+    previously exercised generic_oauth_login with provider="deputy" at
+    all (only the callback side had coverage)."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://once.deputy.com/my/oauth/login",
+        default_scopes=["longlife_refresh_token"],
+        redirect_uri="https://app.example.com/api/auth/deputy/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="deputy",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    location = _location(resp)
+    qs = parse_qs(urlparse(location).query)
+
+    assert location.startswith("https://once.deputy.com/my/oauth/login?")
+    assert qs.get("scope") == ["longlife_refresh_token"]
+    assert qs.get("response_type") == ["code"]
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload

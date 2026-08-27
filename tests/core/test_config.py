@@ -1,5 +1,8 @@
 """Unit tests for core/config.py configuration functions."""
 
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from tempfile import gettempdir
@@ -79,6 +82,7 @@ from xagent.config import (
     SANDBOX_MEMORY,
     SANDBOX_NAMESPACE,
     SANDBOX_SWEEP_INTERVAL,
+    SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
     SLACK_APP_TOKEN,
     SLACK_CLIENT_ID,
@@ -98,6 +102,7 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -109,6 +114,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
@@ -202,6 +208,7 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -213,6 +220,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    in_sandbox_tool_runner,
     validate_sandbox_namespace,
 )
 
@@ -265,6 +273,45 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+
+    def test_sandbox_tool_runner_constant(self):
+        assert SANDBOX_TOOL_RUNNER == "XAGENT_SANDBOX_TOOL_RUNNER"
+
+    def test_in_sandbox_tool_runner_defaults_to_false(self):
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_reads_the_env_at_process_start(self, monkeypatch):
+        for value, expected in (
+            ("1", True),
+            ("true", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("no", False),
+            ("off", False),
+            ("", False),
+        ):
+            monkeypatch.setenv(SANDBOX_TOOL_RUNNER, value)
+            assert config._get_bool_env(SANDBOX_TOOL_RUNNER, False) is expected
+
+    def test_in_sandbox_tool_runner_ignores_later_env_mutation(self, monkeypatch):
+        """Agent-authored code runs late; it must not flip the whole process."""
+        monkeypatch.setenv(SANDBOX_TOOL_RUNNER, "1")
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_does_read_the_env_at_import(self):
+        """The other tests patch the snapshot, so pin that it is populated."""
+        probe = "import xagent.config as c; print(c.in_sandbox_tool_runner())"
+        env = {**os.environ, SANDBOX_TOOL_RUNNER: "1"}
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert proc.stdout.strip() == "True"
 
     def test_lancedb_path_constant(self):
         assert LANCEDB_PATH == "LANCEDB_PATH"
@@ -696,6 +743,28 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_interval_seconds() == 60
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
+
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
 
 class TestGetWebSearchProvider:
@@ -1164,6 +1233,47 @@ class TestGetExternalUploadDirs:
             assert len(result) == 2
             assert dir1 in result
             assert dir2 in result
+
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = "relative-external"
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
 
 
 class TestGetExternalSkillsDirs:

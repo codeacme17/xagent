@@ -4,7 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -12,7 +12,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...core.agent.language import (
+    detect_prose_script_mismatch,
+    response_language_rules,
+)
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
+from ...core.agent.voice_policy import apply_output_voice, voice_from_preferences
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
@@ -32,6 +38,10 @@ from ..services.agent_access import (
     accessible_agent_permissions,
     list_accessible_agents,
 )
+
+if TYPE_CHECKING:
+    from ..services.task_setup_snapshot import RuntimeUserFields
+    from .websocket_auth import WebSocketPrincipal
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
@@ -57,6 +67,8 @@ from ..services.llm_utils import UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
+from .auth import VALID_USER_VOICES
+from .templates import get_or_create_template_stats, increment_template_used_count
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +172,7 @@ class AgentListItem(BaseModel):
     description: Optional[str]
     template_id: Optional[str] = None
     logo_url: Optional[str]
+    suggested_prompts: List[str] = []
     status: str
     visibility: str = "team"
     created_at: str
@@ -298,6 +311,60 @@ def enhance_system_prompt_with_kb(
     if system_prompt:
         return system_prompt + kb_prompt
     return kb_prompt.lstrip("\n")
+
+
+# Re-exported from core.agent.voice_policy (not defined here) so a
+# delegated AgentTool child - built in core/tools/adapters/vibe/agent_tool.py,
+# which cannot import a web route module - applies the exact same policy.
+# See VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py for the
+# schema-level source of truth this module-level check guards.
+_VOICE_INSTRUCTIONS = _core_voice_instructions
+if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
+    # A plain assert would be stripped under `python -O`, silently losing
+    # this consistency guarantee in production rather than failing loudly.
+    raise ValueError(
+        "core.agent.voice_policy._VOICE_INSTRUCTIONS must define exactly the "
+        "voices UpdatePreferencesRequest accepts (api/auth.py's "
+        "VALID_USER_VOICES) - otherwise a valid, storable voice preference "
+        "could silently have no prompt effect."
+    )
+
+
+def apply_user_voice(
+    system_prompt: Optional[str], voice: Optional[str]
+) -> Optional[str]:
+    """Append the given output voice (the current user's onboarding Launch
+    step choice, set via PATCH /api/auth/me/preferences) as a `##
+    OUTPUT VOICE` section - see core.agent.voice_policy.apply_output_voice
+    for the actual policy (shared with delegated AgentTool children).
+
+    Takes the already-resolved voice string rather than a db/user_id:
+    callers already have a runtime user object in hand by the time a
+    system prompt is assembled (either the full `User` ORM row, or the
+    detached `RuntimeUserFields` from an off-loop snapshot -
+    task_setup_snapshot.py resolves `voice` onto it from the very same
+    query that fetches `id`/`is_admin`), and issuing a fresh query here
+    would either duplicate that lookup or - worse - run one against a
+    request session that may already have been released back to the
+    pool by this point in agent construction."""
+    return apply_output_voice(system_prompt, voice)
+
+
+def voice_from_runtime_user(
+    runtime_user: Optional[Union[User, "RuntimeUserFields", "WebSocketPrincipal"]],
+) -> Optional[str]:
+    """Extract the voice preference from whichever runtime-user shape a
+    caller has in hand, without issuing a new query - see
+    apply_user_voice's docstring for why. Handles the full `User` ORM row
+    (has `.preferences`, a raw JSON dict) and the detached
+    `RuntimeUserFields`/`WebSocketPrincipal` snapshots (both already have
+    a plain `.voice` string)."""
+    if runtime_user is None:
+        return None
+    voice = getattr(runtime_user, "voice", None)
+    if voice is not None:
+        return cast(Optional[str], voice)
+    return voice_from_preferences(getattr(runtime_user, "preferences", None))
 
 
 # ===== Helper Functions =====
@@ -492,7 +559,10 @@ async def optimize_instructions(
             "You are an expert agent builder and prompt engineer. "
             "Your task is to refine and optimize the user's draft instructions for an AI agent. "
             "The output should be clear, structured, and effective for an LLM to follow. "
-            "Do not include any conversational filler. Just output the optimized instructions."
+            "Do not include any conversational filler. Just output the optimized instructions. "
+            "Preserve the draft's natural language and Chinese script; do not switch languages "
+            "because the surrounding API prompt is written in English. "
+            f"{response_language_rules(subject='draft instructions')}"
         )
 
         user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
@@ -506,9 +576,19 @@ async def optimize_instructions(
         )
 
         if isinstance(response, dict) and "content" in response:
-            content = response["content"]
+            content = str(response["content"])
         else:
             content = response if isinstance(response, str) else str(response)
+
+        mismatch = detect_prose_script_mismatch(request.instructions, content)
+        if mismatch is not None:
+            logger.warning(
+                "Instruction optimization returned %s-script prose for a "
+                "%s-script draft; returning the original draft",
+                mismatch.observed_script,
+                mismatch.expected_script,
+            )
+            content = request.instructions
 
         return {"optimized_instructions": content}
 
@@ -573,6 +653,32 @@ async def resolve_agent_from_template(
             template_id=data.template_id,
             name=data.name,
         )
+        if created:
+            # This endpoint is the entry point for two frontend flows that
+            # never touch /use or /use-as-workforce, the two endpoints that
+            # otherwise record usage: the marketplace Hire flow AND the
+            # task page's quick-access template picker
+            # (frontend/src/app/task/page.tsx, resolveAgentForTemplate).
+            # Both genuinely put the template into use, so counting either
+            # here is correct - without this, used_count would stay
+            # permanently stale for any template only ever adopted through
+            # one of these paths, which matters because the featured
+            # section's hero ranking (templates/page.tsx) sorts by exactly
+            # that count. An analytics-counter failure must not fail an
+            # already-successful agent creation, so it's caught and logged
+            # the same way use_template_as_workforce's counter update is.
+            try:
+                get_or_create_template_stats(db, data.template_id)
+                increment_template_used_count(db, data.template_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to record used_count for template_id=%s after "
+                    "successfully resolving a fresh agent for user_id=%s",
+                    data.template_id,
+                    user_id,
+                )
         return ResolvedTemplateAgentResponse(
             agent=AgentResponse.model_validate(snapshot.to_response_dict()),
             created=created,
@@ -1643,6 +1749,7 @@ async def preview_agent(
             exclude_custom_api_when_unconfigured=True,
         )
 
+        current_user_voice = voice_from_runtime_user(current_user)
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
@@ -1662,6 +1769,10 @@ async def preview_agent(
             # on. The live agent (once promoted) can still diverge from
             # this preview for a team connector -- a known, accepted gap.
             connector_team_id=None,
+            # Threaded through so a delegated AgentTool child the preview
+            # calls also honors the previewing user's voice (see
+            # BaseToolConfig.get_voice's docstring).
+            voice=current_user_voice,
         )
 
         # Determine execution mode (default to "think")
@@ -1686,6 +1797,9 @@ async def preview_agent(
         enhanced_system_prompt = enhance_system_prompt_with_kb(
             request.instructions if request.instructions else None,
             request.knowledge_bases if request.knowledge_bases is not None else None,
+        )
+        enhanced_system_prompt = apply_user_voice(
+            enhanced_system_prompt, current_user_voice
         )
 
         # Create agent service (Langfuse only, no database/websocket logging)

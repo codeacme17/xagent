@@ -45,6 +45,18 @@ AGENT_CONFIG_UNASSIGNABLE_CATEGORIES: frozenset[str] = frozenset(
     {ToolCategory.OTHER.value, ToolCategory.AGENT.value}
 )
 
+# Categories granted by a per-agent binding the creator enforces itself. Not
+# selectable in the builder's picker, so never gate them on a selection.
+BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.value})
+
+# Tools available regardless of category selection for spec-driven
+# (``ToolSelectionSpec``) configs: their creator registers with
+# ``selection_gate="intrinsic"`` and ``compute_allowed_names`` admits their
+# names outside the category match. An explicit NONE (zero-tools) spec still
+# excludes them. Legacy allow-list / per-user override paths do a plain name
+# intersection and are not aware of this set, so they can still drop these.
+INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset({"get_current_time"})
+
 
 class ToolMetadata(BaseModel):
     name: str
