@@ -808,11 +808,12 @@ async def test_an_exhausted_deferral_closes_out_the_standing_delivery(
         with patch(
             "xagent.web.api.websocket._fail_terminal_message_delivery",
             side_effect=RuntimeError("delivery database unavailable"),
-        ):
+        ) as fail_delivery:
             await report_terminal_task_command(
                 command,
-                RuntimeError("internal secret detail"),
+                TaskCommandRejected("internal secret detail"),
             )
+        fail_delivery.assert_called_once_with(command)
         event = ws_manager.broadcast_to_task.await_args.args[0]
         assert "internal secret detail" not in event["message"]
         assert "delivery database unavailable" not in event["message"]
