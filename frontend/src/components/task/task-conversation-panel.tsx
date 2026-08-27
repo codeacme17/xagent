@@ -155,6 +155,11 @@ const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
     return undefined
   }
+  if (currentTask.waitingRequestId) {
+    return currentTask.waitingInteractions?.length
+      ? currentTask.waitingInteractions
+      : undefined
+  }
   if (currentTask.waitingInteractions?.length) {
     return currentTask.waitingInteractions
   }
@@ -856,6 +861,12 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
+              currentInteractionRequestId={
+                state.currentTask?.status === "waiting_for_user" &&
+                state.currentTask.id === String(state.taskId)
+                  ? state.currentTask.waitingRequestId
+                  : undefined
+              }
               isLoading={
                 state.isProcessing
                 || isConversationResetPending

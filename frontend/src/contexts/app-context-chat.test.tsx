@@ -3075,6 +3075,64 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("keeps the request identity when paired waiting producers publish the same prompt", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 1,
+        data: {
+          event_id: "agent-r1",
+          event_type: "agent_message",
+          data: {
+            message: "Which file should I use?",
+            content: "Which file should I use?",
+            role: "assistant",
+            expect_response: true,
+            request_id: "inputreq_r1",
+          },
+        },
+      })
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 1,
+        question: "Which file should I use?",
+        interactions: [],
+        request_id: "inputreq_r1",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const rendered = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]",
+      ) as Array<{
+        role: string
+        content: string
+        interactionRequestId?: string
+      }>
+      const matchingAssistantMessages = rendered.filter(
+        (message) =>
+          message.role === "assistant" &&
+          message.content === "Which file should I use?",
+      )
+      expect(matchingAssistantMessages).toEqual([expect.objectContaining({
+        interactionRequestId: "inputreq_r1",
+      })])
+    })
+  })
+
   it("keeps a projected waiting occurrence together over stale nested legacy fields", async () => {
     render(
       <AppProvider token="token">
