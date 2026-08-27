@@ -811,7 +811,7 @@ async def test_an_exhausted_deferral_closes_out_the_standing_delivery(
         ) as fail_delivery:
             await report_terminal_task_command(
                 command,
-                TaskCommandRejected("internal secret detail"),
+                TaskCommandDeferred("internal secret detail", resend_safe=True),
             )
         fail_delivery.assert_called_once_with(command)
         event = ws_manager.broadcast_to_task.await_args.args[0]
