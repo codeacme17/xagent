@@ -180,6 +180,7 @@ function StateProbe() {
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
+      <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
       <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
@@ -3068,6 +3069,41 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("messages").textContent).toContain(
         "inputreq_0011223344556677889900aabbccddee"
       )
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_0011223344556677889900aabbccddee"
+      )
+    })
+  })
+
+  it("keeps a projected waiting occurrence together over stale nested legacy fields", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId("task-status").textContent).toBe("running"))
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        question: "Which projected hotel should I use?",
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        request_id: "inputreq_0011223344556677889900aabbccddee",
+        data: {
+          question: "Which stale city should I use?",
+          interactions: [{ type: "text_input", field: "city", label: "City" }],
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Which projected hotel should I use?")
+      expect(screen.getByTestId("messages").textContent).not.toContain("Which stale city should I use?")
+      expect(screen.getByTestId("waiting-interactions").textContent).toContain("hotel")
+      expect(screen.getByTestId("waiting-interactions").textContent).not.toContain("city")
       expect(screen.getByTestId("waiting-request-id").textContent).toBe(
         "inputreq_0011223344556677889900aabbccddee"
       )

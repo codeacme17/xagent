@@ -397,11 +397,12 @@ export function ClarificationForm({
   // formState machinery handleSubmit above uses (there's nothing to gather).
   const handleSkipConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.skip")
+    const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
-        await onSend(message, [], {})
+        await onSend(message, [], metadata)
       } else if (sendMessage) {
-        await sendMessage(message, { force: true }, [])
+        await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)

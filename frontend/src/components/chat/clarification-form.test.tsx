@@ -355,6 +355,28 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("binds a connect_apps skip to the rendered interaction request", async () => {
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+      />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.skip",
+        {
+          force: true,
+          metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
+        },
+        [],
+      )
+    })
+  })
+
   it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
     // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
     // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly

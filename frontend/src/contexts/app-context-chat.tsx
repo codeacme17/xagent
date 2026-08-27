@@ -5487,11 +5487,18 @@ export function AppProvider({
 
       case "task_waiting_for_user":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_waiting_for_user)')
-        const waitingData = isJsonRecord(message.data) ? message.data : message as any
-        const waitingMessage = waitingData?.question || waitingData?.message || ""
-        const interactions = normalizeInteractions(waitingData?.interactions)
-        const waitingRequestId = typeof waitingData?.request_id === "string"
-          ? waitingData.request_id
+        const waitingRoot = asMessageRecord(message)
+        const waitingData = asMessageRecord(message.data)
+        const waitingMessage = getString(waitingRoot.question)
+          || getString(waitingData.question)
+          || getString(waitingRoot.message)
+          || getString(waitingData.message)
+        const interactions = normalizeInteractions(
+          waitingRoot.interactions ?? waitingData.interactions
+        )
+        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
+        const waitingRequestId = typeof waitingRequestIdValue === "string"
+          ? waitingRequestIdValue
           : undefined
         dispatch({
           type: "UPDATE_TASK_STATUS",
