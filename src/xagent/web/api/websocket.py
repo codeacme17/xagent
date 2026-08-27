@@ -6105,12 +6105,13 @@ async def _handle_chat_message_unserialized(
             )
         return not delivery_failure_pool_timeout
 
-    async def answer_durable_turn_failure(error_code: ClientErrorCode) -> bool:
+    async def answer_durable_turn_failure(sender_error_code: ClientErrorCode) -> bool:
         """Answer a durable turn failure, addressing each audience as #1514 does.
 
-        The rejection ack, its suppressed-ack replacement bubble, and the
-        task-wide broadcast all carry the same allowlisted code and fixed
-        fallback. This keeps every consumer on one localization contract.
+        The rejection ack and its suppressed-ack replacement bubble carry the
+        specific sender code. The task-wide broadcast also reaches widget and
+        share subscribers who did not initiate the turn, so it carries only the
+        neutral task-failure code and fallback.
 
         The durable arms below precede the ``RuntimeError`` arm they subclass.
         On main those faults reached that arm and were broadcast from it, so
@@ -6120,18 +6121,18 @@ async def _handle_chat_message_unserialized(
 
         Returns ``False`` when the delivery layer says the caller must stop.
         """
-        ack_message = client_error_message(error_code)
+        ack_message = client_error_message(sender_error_code)
         if not await finish_delivery_failure(
             ack_message,
-            error_code=error_code.value,
+            error_code=sender_error_code.value,
         ):
             return False
         timestamp = datetime.now(timezone.utc).timestamp()
         if authorized_task_id is not None:
             safe_error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
-                ack_message,
-                error_code=error_code.value,
+                CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
             )
             await manager.broadcast_to_task(
                 {**safe_error_payload, "timestamp": timestamp},
@@ -6142,7 +6143,7 @@ async def _handle_chat_message_unserialized(
                     {
                         "type": "error",
                         "message": ack_message,
-                        "error_code": error_code.value,
+                        "error_code": sender_error_code.value,
                         "timestamp": timestamp,
                     },
                     websocket,
@@ -6152,7 +6153,7 @@ async def _handle_chat_message_unserialized(
                 {
                     "type": "error",
                     "message": ack_message,
-                    "error_code": error_code.value,
+                    "error_code": sender_error_code.value,
                     "timestamp": timestamp,
                 },
                 websocket,
@@ -8197,8 +8198,17 @@ async def handle_pause_task(
         log_client_facing_failure(
             exc, "Pause command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return
@@ -8471,8 +8481,17 @@ async def handle_resume_task(
         log_client_facing_failure(
             exc, "Resume command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return

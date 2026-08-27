@@ -242,6 +242,37 @@ def test_missing_task_keeps_its_wording_for_the_sender(_test_db: None) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "handler_name", ["handle_pause_task", "handle_resume_task"], ids=["pause", "resume"]
+)
+async def test_missing_task_control_uses_stable_error_code(
+    _test_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    handler_name: str,
+) -> None:
+    connection_manager = MagicMock(
+        send_personal_message=AsyncMock(),
+        broadcast_to_task=AsyncMock(),
+    )
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    await getattr(websocket_api, handler_name)(
+        MagicMock(),
+        424242,
+        {"user": SimpleNamespace(id=1, is_admin=False)},
+    )
+
+    payloads = _client_payloads(connection_manager)
+    assert payloads == [
+        {
+            "type": "error",
+            "message": "Task is no longer available.",
+            "error_code": "task_unavailable",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("handler_name", "extra_message_data"),
     ENQUEUE_FAILURE_HANDLERS,
     ids=[name for name, _ in ENQUEUE_FAILURE_HANDLERS],
@@ -568,18 +599,12 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
 @pytest.mark.parametrize(
     "handler_name", ["handle_pause_task", "handle_resume_task"], ids=["pause", "resume"]
 )
-async def test_permission_wording_survives_redaction_in_every_handler(
+async def test_permission_rejection_uses_stable_error_code(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
     handler_name: str,
 ) -> None:
-    """All three handlers share one raise site; only one of them was asserted.
-
-    ``test_websocket_error_payload.py`` pins this wording for
-    ``handle_chat_message``. A regression in either sibling's ``except`` - one
-    that redacted the refusal to the generic string, or leaked something else
-    through it - would have gone unnoticed.
-    """
+    """Pause and resume preserve the same coded denial contract as chat."""
     db = _direct_db_session()
     try:
         owner = User(username=f"owner-{handler_name}", password_hash="hash")
@@ -614,8 +639,8 @@ async def test_permission_wording_survives_redaction_in_every_handler(
     payloads = _client_payloads(connection_manager)
     assert payloads, "the handler must refuse the intruder out loud"
     assert any(
-        payload.get("message")
-        == f"Access denied: Task {task_id} does not belong to you"
+        payload.get("message") == "You do not have access to this task."
+        and payload.get("error_code") == "task_access_denied"
         for payload in payloads
     ), payloads
 

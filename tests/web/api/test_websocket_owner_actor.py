@@ -56,6 +56,10 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import task_orchestrator
 from xagent.web.services.chat_history_service import DELIVERY_FAILED, DELIVERY_PENDING
+from xagent.web.services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+)
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -1596,18 +1600,55 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error",
+    ("error", "sender_error_code", "sender_message"),
     [
-        CheckpointCorruptError("all matching rows undecodable"),
-        CheckpointAccessRefusedError("active lease is not bound to this reader"),
+        (
+            CheckpointCorruptError("all matching rows undecodable"),
+            "task_checkpoint_unreadable",
+            "The task's saved progress could not be read.",
+        ),
+        (
+            CheckpointAccessRefusedError("active lease is not bound to this reader"),
+            "task_checkpoint_unreadable",
+            "The task's saved progress could not be read.",
+        ),
+        (
+            DurableObjectIntegrityError(
+                "checksum mismatch",
+                storage_key="users/1/uploads/corrupt.txt",
+            ),
+            "message_attachment_corrupt",
+            "A stored file for this message failed its integrity check and must be re-uploaded.",
+        ),
+        (
+            DurableStorageOperationError(
+                "provider unavailable",
+                storage_key="users/1/uploads/unavailable.txt",
+            ),
+            "message_attachment_unavailable",
+            "A stored file for this message could not be read. Please try again.",
+        ),
+    ],
+    ids=[
+        "checkpoint-corrupt",
+        "checkpoint-access-refused",
+        "attachment-corrupt",
+        "attachment-unavailable",
     ],
 )
-async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
+@pytest.mark.parametrize(
+    "durable_ack_sent",
+    [False, True],
+    ids=["live-ack", "suppressed-ack"],
+)
+async def test_durable_failure_keeps_detail_sender_only(
     db_session,
     error: Exception,
+    sender_error_code: str,
+    sender_message: str,
+    durable_ack_sent: bool,
 ) -> None:
-    """Corrupt/refused are not retryable by deferring -- reject the claimed
-    delivery outright instead of scheduling a resume attempt."""
+    """Answer a durable turn failure without disclosing it to subscribers."""
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
     task.runner_id = "rejected-runner"
@@ -1626,6 +1667,15 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
     bg_mgr = MagicMock()
     bg_mgr.reserve_resume.return_value = True
     bg_mgr.running_tasks.get.return_value = None
+    origin_socket = MagicMock(name="origin-socket")
+    payload = {
+        "message": "Wait for the checkpoint",
+        "client_message_id": "rejected-turn-1",
+        "user": owner,
+        "files": [],
+    }
+    if durable_ack_sent:
+        payload["_durable_ack_sent"] = True
 
     with (
         patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
@@ -1634,14 +1684,9 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
         patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
     ):
         await _handle_chat_message_unserialized(
-            MagicMock(),
+            origin_socket,
             int(task.id),
-            {
-                "message": "Wait for the checkpoint",
-                "client_message_id": "rejected-turn-1",
-                "user": owner,
-                "files": [],
-            },
+            payload,
         )
 
     resume_bg.assert_not_awaited()
@@ -1651,11 +1696,23 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
         for call in ws_manager.send_personal_message.call_args_list
         if call.args[0].get("type") == "message_rejected"
     ]
-    assert len(rejected) == 1
-    assert rejected[0]["client_message_id"] == "rejected-turn-1"
-    assert rejected[0]["error_code"] == "task_checkpoint_unreadable"
-    assert rejected[0]["message"] == "The task's saved progress could not be read."
-    assert rejected[0]["rejection_outcome"] == "not_accepted"
+    if durable_ack_sent:
+        assert not rejected
+        sender_errors = [
+            call
+            for call in ws_manager.send_personal_message.call_args_list
+            if call.args[0].get("type") == "error"
+        ]
+        assert len(sender_errors) == 1
+        assert sender_errors[0].args[0]["error_code"] == sender_error_code
+        assert sender_errors[0].args[0]["message"] == sender_message
+        assert sender_errors[0].args[1] is origin_socket
+    else:
+        assert len(rejected) == 1
+        assert rejected[0]["client_message_id"] == "rejected-turn-1"
+        assert rejected[0]["error_code"] == sender_error_code
+        assert rejected[0]["message"] == sender_message
+        assert rejected[0]["rejection_outcome"] == "not_accepted"
     task_errors = [
         call.args[0]
         for call in ws_manager.broadcast_to_task.call_args_list
@@ -1663,8 +1720,8 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
     ]
     assert task_errors
     assert all(
-        payload["error_code"] == "task_checkpoint_unreadable"
-        and payload["message"] == "The task's saved progress could not be read."
+        payload["error_code"] == "task_execution_failed"
+        and payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
         for payload in task_errors
     )
     db_session.expire_all()
