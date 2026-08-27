@@ -153,7 +153,6 @@ from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
     MAX_COMMAND_DEFERS,
-    MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
     TaskCommandDeferred,
@@ -4214,7 +4213,10 @@ class BackgroundTaskManager:
         # to resume. A lingering old-run task must not complete a command for
         # a newer run as an idempotent success.
         self._resume_run_ids: dict[int, str | None] = {}
-        self._resume_reservations: set[int] = set()
+        # The timestamp is diagnostic, not an ownership lease: admission
+        # remains process-local and the durable delivery row is the only
+        # cross-worker delivery evidence.
+        self._resume_reservations: dict[int, float] = {}
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -4318,8 +4320,16 @@ class BackgroundTaskManager:
         )
         if existing_state is not None:
             return existing_state
-        self._resume_reservations.add(task_id)
+        self._resume_reservations[task_id] = time.monotonic()
         return ResumeReservationOutcome.RESERVED
+
+    def resume_reservation_age(self, task_id: int) -> float | None:
+        """Return the current reservation holder age for contention logs."""
+
+        acquired_at = self._resume_reservations.get(task_id)
+        if acquired_at is None:
+            return None
+        return max(0.0, time.monotonic() - acquired_at)
 
     def reserve_resume(self, task_id: int) -> bool:
         """Boolean compatibility wrapper for callers that cannot classify.
@@ -4345,7 +4355,7 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
-        self._resume_reservations.discard(task_id)
+        self._resume_reservations.pop(task_id, None)
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
@@ -4353,7 +4363,7 @@ class BackgroundTaskManager:
     def release_resume_reservation(self, task_id: int) -> None:
         if self._shutting_down:
             return
-        self._resume_reservations.discard(task_id)
+        self._resume_reservations.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4434,7 +4444,7 @@ class BackgroundTaskManager:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
-            self._resume_reservations.discard(task_id)
+            self._resume_reservations.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -6456,21 +6466,28 @@ async def _handle_chat_message_unserialized(
                 if reservation is not ResumeReservationOutcome.RESERVED:
                     deferrable = reservation in (
                         ResumeReservationOutcome.RESERVATION_HELD,
+                        ResumeReservationOutcome.COORDINATOR_RUNNING,
                         ResumeReservationOutcome.SHUTTING_DOWN,
                     )
                     if suppress_delivery_ack and deferrable:
                         # The durable command owns the retry here. Failing the
                         # delivery would burn the whole budget inside seconds
                         # over a condition that clears on its own, and nothing
-                        # would ever re-dispatch the message. Neither cause
-                        # reached an injection, so the message is safe to
-                        # resend if the budget does run out.
+                        # would ever re-dispatch the message. Occupancy alone
+                        # is not evidence that this turn reached an injection;
+                        # only a recovered delivery makes that outcome unknown.
+                        reservation_age = (
+                            background_task_manager.resume_reservation_age(task_id)
+                            if reservation is ResumeReservationOutcome.RESERVATION_HELD
+                            else None
+                        )
                         logger.info(
                             "Deferring message %s for task %s: resume slot "
-                            "unavailable (%s)",
+                            "unavailable (%s, holder_age_seconds=%s)",
                             turn_id,
                             task_id,
                             reservation.value,
+                            reservation_age,
                         )
                         message_data["_durable_command_defer"] = turn_id
                         message_data["_durable_command_defer_reason"] = (
@@ -6478,14 +6495,19 @@ async def _handle_chat_message_unserialized(
                             f"resume slot ({reservation.value})"
                         )
                         if recovered_delivery is not None:
-                            # An earlier attempt already claimed this payload and
-                            # may have injected it, so this one cannot claim the
-                            # work provably never landed.
+                            # A durable earlier attempt claimed this payload and
+                            # may have injected it. Process-local task/run
+                            # occupancy cannot prove that this command owns the
+                            # coordinator, especially after a worker handoff.
                             message_data["_durable_command_defer_unsafe"] = turn_id
                         return
                     await finish_delivery(
                         False,
-                        _resume_contention_rejection(reservation),
+                        client_safe_error_message(
+                            ClientVisibleTaskCommandDeferred(
+                                _resume_contention_rejection(reservation)
+                            )
+                        ),
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -9233,9 +9255,9 @@ async def _execute_durable_task_command(
         )
         if message_data.get("_durable_command_defer") == command.command_id:
             # Resume-slot contention is transient, so it reschedules instead of
-            # spending the failure budget. The handler only defers on causes
-            # that never reached an injection, which is what makes a resend
-            # safe if the budget is exhausted.
+            # spending the failure budget. A recovered durable delivery is the
+            # only evidence that this turn may already have reached injection;
+            # task/run-local coordinator occupancy is not turn ownership.
             raise TaskCommandDeferred(
                 str(message_data["_durable_command_defer_reason"]),
                 resend_safe=(
@@ -9267,6 +9289,12 @@ async def _execute_durable_task_command(
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"
             )
+        if delivery_status in {DELIVERY_DISPATCHED, DELIVERY_COMPLETED}:
+            # The delivery row is the durable fact. A handler can record a
+            # predictive error immediately before the live coordinator moves
+            # the same delivery forward; do not let that stale observation
+            # reject work the runtime has already accepted.
+            message_data.pop("_durable_command_error", None)
     else:
         try:
             if command.kind == TaskCommandKind.PAUSE:
@@ -9455,7 +9483,7 @@ def _fail_terminal_message_delivery(command: ClaimedTaskCommand) -> None:
 
 async def report_terminal_task_command(
     command: ClaimedTaskCommand,
-    message: str,
+    error: BaseException,
 ) -> None:
     """Close out a command the transport confirmed terminal, and say so.
 
@@ -9465,20 +9493,50 @@ async def report_terminal_task_command(
     delivery failed, since that runner may still apply it.
     """
 
+    _command_origins.discard_command(command.command_id, command.task_id)
     if command.kind is TaskCommandKind.MESSAGE:
-        await run_db_io_cancellation_safe(
-            lambda: _fail_terminal_message_delivery(command)
+        # DELIVERY_FAILED is absorbing. Only write it when the terminal error
+        # itself proves the turn was not accepted. An unsafe deferral or a
+        # generic failure can race a coordinator on another worker; preserving
+        # PENDING is preferable to declaring failure before that coordinator
+        # performs its monotonic DISPATCHED transition.
+        delivery_proven_not_applied = isinstance(error, TaskCommandRejected) or (
+            isinstance(error, TaskCommandDeferred) and error.resend_safe
         )
-    await manager.broadcast_to_task(
-        {
-            "type": "agent_error",
-            "message": message,
-            "task_id": command.task_id,
-            "command_id": command.command_id,
-            "timestamp": datetime.now(timezone.utc).timestamp(),
-        },
-        command.task_id,
-    )
+        if delivery_proven_not_applied:
+            try:
+                await run_db_io_cancellation_safe(
+                    lambda: _fail_terminal_message_delivery(command)
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to close terminal message delivery for task %s command %s",
+                    command.task_id,
+                    command.command_id,
+                )
+
+    # Preserve the established control-command behavior: a terminal rejection
+    # is already represented by its state correction, while messages need an
+    # explicit task-level failure because their personal rejection was
+    # suppressed after the durable enqueue acknowledgement.
+    if (
+        isinstance(error, TaskCommandRejected)
+        and command.kind is not TaskCommandKind.MESSAGE
+    ):
+        return
+    if (
+        isinstance(error, TaskCommandDeferred)
+        and command.kind is TaskCommandKind.MESSAGE
+    ):
+        message = error.terminal_client_message or _exhausted_deferral_notice(
+            command, error
+        )
+        await _broadcast_terminal_command_error(
+            command,
+            ClientVisibleTaskCommandDeferred(message),
+        )
+        return
+    await _broadcast_terminal_command_error(command, error)
 
 
 async def _broadcast_terminal_command_error(
@@ -9581,11 +9639,6 @@ async def execute_durable_task_command(
         # frontend drops a late rejection for an id it already resolved.
         if command.kind is TaskCommandKind.MESSAGE:
             exc.terminal_client_message = _terminal_command_error_text(command, exc)
-        raise
-    except Exception as exc:
-        if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
-            _command_origins.discard_command(command.command_id, command.task_id)
-            await _broadcast_terminal_command_error(command, exc)
         raise
     _command_origins.discard_command(command.command_id, command.task_id)
     return result

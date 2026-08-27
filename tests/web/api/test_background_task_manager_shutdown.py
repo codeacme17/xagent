@@ -46,7 +46,7 @@ async def test_shutdown_cancels_snapshot_once_and_drains_before_clearing() -> No
     # Registrations remain visible until every task's cleanup has settled.
     assert manager.running_tasks == {1: first, 2: second}
     assert manager.resume_tasks == {1: first}
-    assert manager._resume_reservations == {99}
+    assert set(manager._resume_reservations) == {99}
     assert not shutdown.done()
 
     # Cancelling application shutdown must not abandon task cleanup.
@@ -74,7 +74,7 @@ async def test_shutdown_cancels_snapshot_once_and_drains_before_clearing() -> No
     assert second.cancelled()
     assert manager.running_tasks == {}
     assert manager.resume_tasks == {}
-    assert manager._resume_reservations == set()
+    assert manager._resume_reservations == {}
 
 
 @pytest.mark.asyncio

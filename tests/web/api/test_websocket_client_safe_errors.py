@@ -1944,7 +1944,9 @@ async def test_chat_validation_redacts_both_the_ack_and_the_broadcast(
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
         return {"type": "agent_error", "message": message, "task_id": task_id}
@@ -2001,7 +2003,9 @@ def _chat_runtime_error_harness(secret_error: Exception):
         send_personal_message=AsyncMock(),
     )
     bg_mgr = MagicMock()
-    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.try_reserve_resume.return_value = (
+        websocket_api.ResumeReservationOutcome.RESERVED
+    )
 
     def _fake_error_payload(task_id: int, message: str, **kwargs: object) -> dict:
         return {"type": "agent_error", "message": message, "task_id": task_id}
@@ -2324,9 +2328,12 @@ async def test_origin_entry_dies_with_its_command_or_socket(
         "_execute_durable_task_command",
         AsyncMock(side_effect=websocket_api.TaskCommandRejected("done")),
     )
-    with pytest.raises(websocket_api.TaskCommandRejected):
+    with pytest.raises(websocket_api.TaskCommandRejected) as rejection:
         await websocket_api.execute_durable_task_command(command)
     assert origins.resolve(command.command_id, command.task_id) is None
+    assert origins.has(command.command_id, command.task_id)
+    monkeypatch.setattr(websocket_api, "manager", _origin_test_manager({socket}))
+    await websocket_api.report_terminal_task_command(command, rejection.value)
     assert not origins.has(command.command_id, command.task_id)
 
     # A deferral that will retry keeps it; exhaustion clears it.
@@ -2344,8 +2351,13 @@ async def test_origin_entry_dies_with_its_command_or_socket(
     )
     exhausted = _pause_command(command_id="pause:cleanup")
     exhausted.defer_count = websocket_api.MAX_COMMAND_DEFERS
-    with pytest.raises(websocket_api.TaskCommandDeferred):
+    with pytest.raises(websocket_api.TaskCommandDeferred) as exhausted_deferral:
         await websocket_api.execute_durable_task_command(exhausted)
+    assert origins.has(command.command_id, command.task_id)
+    await websocket_api.report_terminal_task_command(
+        exhausted,
+        exhausted_deferral.value,
+    )
     assert not origins.has(command.command_id, command.task_id)
 
     # Disconnect clears every entry for that socket.

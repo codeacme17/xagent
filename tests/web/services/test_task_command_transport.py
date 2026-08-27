@@ -603,7 +603,7 @@ async def test_pause_command_with_a_real_actor_gets_past_the_actor_check(
 
 
 @pytest.mark.asyncio
-async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
+async def test_executor_never_broadcasts_before_disposition(db_session) -> None:
     _user, task = _create_running_task(db_session)
     task.runner_id = None
     task.lease_expires_at = None
@@ -642,11 +642,7 @@ async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
 
         with pytest.raises(ValueError, match="Agent ID is missing"):
             await execute_durable_task_command(terminal)
-        broadcast.assert_awaited_once()
-        event, event_task_id = broadcast.await_args.args
-        assert event_task_id == int(task.id)
-        assert event["type"] == "agent_error"
-        assert event["command_id"] == "terminal-cancel-failure"
+        broadcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2947,15 +2943,17 @@ async def test_terminal_notice_waits_for_the_confirmed_write(db_session) -> None
         kind=TaskCommandKind.PAUSE,
         payload={"type": "pause_task"},
     )
-    notices: list[tuple[str, str]] = []
+    db_session.query(TaskExecutionCommand).filter(
+        TaskExecutionCommand.id == enqueued.command_id
+    ).update({TaskExecutionCommand.failure_count: MAX_COMMAND_FAILURES - 1})
+    db_session.commit()
+    notices: list[tuple[str, BaseException]] = []
 
-    async def notifier(command: ClaimedTaskCommand, message: str) -> None:
-        notices.append((command.command_id, message))
+    async def notifier(command: ClaimedTaskCommand, error: BaseException) -> None:
+        notices.append((command.command_id, error))
 
     async def execute(_command: ClaimedTaskCommand) -> None:
-        exc = TaskCommandRejected("run rotated", reason="stale_run")
-        exc.terminal_client_message = "this command was not applied"
-        raise exc
+        raise RuntimeError("runtime exploded")
 
     set_terminal_command_notifier(notifier)
     try:
@@ -2963,7 +2961,11 @@ async def test_terminal_notice_waits_for_the_confirmed_write(db_session) -> None
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert notices == [("terminal-notice", "this command was not applied")]
+        assert len(notices) == 1
+        command_id, error = notices[0]
+        assert command_id == "terminal-notice"
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "runtime exploded"
 
         # A disposition that could not land must stay silent: the command is
         # left for another runner rather than finished.
@@ -3061,10 +3063,10 @@ async def test_a_non_terminal_disposition_is_never_announced(db_session) -> None
     task.runner_id = None
     task.lease_expires_at = None
     db_session.commit()
-    notices: list[str] = []
+    notices: list[BaseException] = []
 
-    async def notifier(_command: ClaimedTaskCommand, message: str) -> None:
-        notices.append(message)
+    async def notifier(_command: ClaimedTaskCommand, error: BaseException) -> None:
+        notices.append(error)
 
     async def execute(_command: ClaimedTaskCommand) -> None:
         exc = TaskCommandDeferred("still waiting")
@@ -3103,6 +3105,8 @@ async def test_a_non_terminal_disposition_is_never_announced(db_session) -> None
         db_session.commit()
 
         await dispatch_with("landed-terminal", terminal=True)
-        assert notices == ["this command was not applied"]
+        assert len(notices) == 1
+        assert isinstance(notices[0], TaskCommandDeferred)
+        assert notices[0].terminal_client_message == "this command was not applied"
     finally:
         set_terminal_command_notifier(None)

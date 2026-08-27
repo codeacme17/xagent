@@ -1047,7 +1047,9 @@ def task_has_live_runner(
 
 CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
 CommandDisposition = Callable[[], CommandDispositionResult | bool]
-TerminalCommandNotifier = Callable[["ClaimedTaskCommand", str], Awaitable[None]]
+TerminalCommandNotifier = Callable[
+    ["ClaimedTaskCommand", BaseException], Awaitable[None]
+]
 _terminal_command_notifier: TerminalCommandNotifier | None = None
 
 
@@ -1060,13 +1062,13 @@ def set_terminal_command_notifier(notifier: TerminalCommandNotifier | None) -> N
 
 async def notify_terminal_task_command(
     command: "ClaimedTaskCommand",
-    message: str,
+    error: BaseException,
 ) -> None:
     notifier = _terminal_command_notifier
     if notifier is None:
         return
     try:
-        await notifier(command, message)
+        await notifier(command, error)
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to report terminal task command %s to its clients",
@@ -1151,7 +1153,7 @@ async def dispatch_one_task_command(
     )
     disposition_name: str | None = None
     disposition_operation: CommandDisposition | None = None
-    terminal_client_message: str | None = None
+    terminal_error: BaseException | None = None
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
@@ -1163,7 +1165,7 @@ async def dispatch_one_task_command(
     except TaskCommandDeferred as exc:
         reason = str(exc)
         deferral_resend_safe = exc.resend_safe
-        terminal_client_message = exc.terminal_client_message
+        terminal_error = exc
 
         def persist_deferral() -> CommandDispositionResult:
             return defer_task_command(
@@ -1178,7 +1180,7 @@ async def dispatch_one_task_command(
         disposition_operation = persist_deferral
     except TaskCommandRejected as exc:
         error = str(exc)
-        terminal_client_message = exc.terminal_client_message
+        terminal_error = exc
         rejection_result = (
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
@@ -1213,6 +1215,7 @@ async def dispatch_one_task_command(
                 exc_info=True,
             )
         else:
+            terminal_error = exc
             logger.exception(
                 "Task command %s (%s) failed on attempt %s",
                 command.command_id,
@@ -1273,12 +1276,8 @@ async def dispatch_one_task_command(
             # so earlier can contradict itself: a lost claim or an unresolved
             # heartbeat leaves the row for another runner, which may still
             # apply the very work the sender was told to send again.
-            if (
-                terminal_client_message is not None
-                and outcome.persisted
-                and outcome.terminal
-            ):
-                await notify_terminal_task_command(command, terminal_client_message)
+            if terminal_error is not None and outcome.persisted and outcome.terminal:
+                await notify_terminal_task_command(command, terminal_error)
         return True
 
 

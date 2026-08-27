@@ -7,10 +7,10 @@ terminal rejection: the command row reached ``failed`` in seconds and nothing
 ever re-dispatched it, so the task stayed in ``WAITING_FOR_USER`` with the
 pending tool call unrun (#1469).
 
-Contention is not one condition. A held reservation and a draining process both
-clear on their own and never reached an injection. A running resume coordinator
-lasts as long as the execution does, and may be applying this very turn, so it
-is neither deferrable nor safe to tell the sender to resend.
+Contention is not one condition. A held reservation, a running coordinator, and
+a draining process all defer on the durable path. Resending is safe only when
+this command has no recovered delivery proving that an earlier attempt claimed
+the payload; task/run-local occupancy alone is not turn ownership.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from xagent.web.api.websocket import (
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
@@ -40,11 +41,17 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_PENDING,
 )
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    COMMAND_PENDING,
     MAX_COMMAND_DEFERS,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
+    dispatch_one_task_command,
+    enqueue_task_command,
+    set_terminal_command_notifier,
 )
 
 
@@ -106,6 +113,46 @@ def _message_command(
         attempt_count=kwargs.pop("attempt_count", 1),
         **kwargs,
     )
+
+
+def _enqueue_message(
+    db,
+    task: Task,
+    owner: User,
+    command_id: str,
+    *,
+    delivery_status: str | None = None,
+):
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    enqueued = enqueue_task_command(
+        db,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=command_id,
+        kind=TaskCommandKind.MESSAGE,
+        payload={
+            "type": "chat_message",
+            "message": "apply this once",
+            "client_message_id": command_id,
+            "files": [],
+        },
+    )
+    if delivery_status is not None:
+        db.add(
+            TaskChatMessage(
+                task_id=int(task.id),
+                user_id=int(owner.id),
+                role="user",
+                message_type="user_message",
+                content="apply this once",
+                turn_id=command_id,
+                delivery_status=delivery_status,
+            )
+        )
+    db.commit()
+    return enqueued
 
 
 def _durable_payload(owner: User, turn_id: str) -> dict:
@@ -178,6 +225,20 @@ async def test_try_reserve_resume_separates_the_three_contention_causes() -> Non
     finally:
         running.cancel()
         await asyncio.gather(coordinator, return_exceptions=True)
+
+
+def test_resume_reservation_reports_holder_age() -> None:
+    manager = BackgroundTaskManager()
+
+    with patch("xagent.web.api.websocket.time.monotonic", side_effect=[10.0, 12.5]):
+        assert (
+            manager.try_reserve_resume(1, expected_run_id="run-a")
+            is ResumeReservationOutcome.RESERVED
+        )
+        assert manager.resume_reservation_age(1) == 2.5
+
+    manager.release_resume_reservation(1)
+    assert manager.resume_reservation_age(1) is None
 
 
 @pytest.mark.asyncio
@@ -257,10 +318,141 @@ async def test_a_contended_message_defers_through_the_real_executor(
 
 
 @pytest.mark.asyncio
-async def test_a_running_coordinator_is_rejected_without_inviting_a_resend(
+async def test_held_then_unrelated_coordinator_exhausts_as_safe_to_resend(
     db_session,
 ) -> None:
-    """The coordinator may be applying this same turn, so a resend duplicates."""
+    """A different turn's coordinator is not evidence this message was claimed."""
+
+    owner = _user(db_session, "registered-coordinator-owner")
+    task = _live_task(db_session, int(owner.id))
+    enqueued = _enqueue_message(db_session, task, owner, "registered-coordinator-turn")
+    manager = BackgroundTaskManager()
+    assert (
+        manager.try_reserve_resume(int(task.id), expected_run_id="live-run")
+        is ResumeReservationOutcome.RESERVED
+    )
+    coordinator_gate = asyncio.Event()
+    coordinator = asyncio.create_task(coordinator_gate.wait())
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    set_terminal_command_notifier(report_terminal_task_command)
+    try:
+        with (
+            patch(
+                "xagent.web.api.chat.get_agent_manager",
+                return_value=MagicMock(
+                    get_agent_for_task=AsyncMock(return_value=agent)
+                ),
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch("xagent.web.api.websocket.background_task_manager", manager),
+        ):
+            # Attempt 1 sees the real held reservation and defers without
+            # claiming a delivery row.
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+
+            db_session.expire_all()
+            stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+            assert stored is not None
+            assert stored.status == COMMAND_PENDING
+            assert stored.defer_count == 1
+
+            # The holder becomes a coordinator for an earlier turn. Force the
+            # next real dispatcher attempt to the existing bounded limit: this
+            # command still has no delivery claim, so the terminal result must
+            # remain safe to resend.
+            manager.register_reserved_resume(
+                int(task.id), coordinator, run_id="live-run"
+            )
+            stored.defer_count = MAX_COMMAND_DEFERS - 1
+            stored.claim_expires_at = None
+            db_session.commit()
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+    finally:
+        set_terminal_command_notifier(None)
+        coordinator_gate.set()
+        await coordinator
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored is not None
+    assert stored.status == COMMAND_FAILED
+    assert stored.failure_count == 0
+    assert stored.defer_count == MAX_COMMAND_DEFERS
+    assert stored.result == {"resend_safe": True}
+    event = ws_manager.broadcast_to_task.await_args.args[0]
+    assert "was not applied" in event["message"]
+    assert "send it again" in event["message"]
+    agent.post_user_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatched_delivery_overrides_a_stale_handler_error(db_session) -> None:
+    """A progressed delivery is stronger evidence than a predictive error."""
+
+    owner = _user(db_session, "dispatched-overrides-error-owner")
+    task = _live_task(db_session, int(owner.id))
+    command_id = "dispatched-overrides-error"
+    enqueued = _enqueue_message(
+        db_session,
+        task,
+        owner,
+        command_id,
+        delivery_status=DELIVERY_PENDING,
+    )
+
+    async def race_delivery(
+        _websocket: object,
+        _task_id: int,
+        message_data: dict,
+    ) -> None:
+        message_data["_durable_command_error"] = "resume coordinator was busy"
+        row = (
+            db_session.query(TaskChatMessage)
+            .filter(TaskChatMessage.turn_id == command_id)
+            .one()
+        )
+        row.delivery_status = DELIVERY_DISPATCHED
+        db_session.commit()
+
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+    with (
+        patch(
+            "xagent.web.api.websocket._handle_chat_message_unserialized",
+            new=race_delivery,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        assert await dispatch_one_task_command(
+            execute_durable_task_command,
+            command_db_id=enqueued.command_id,
+        )
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored is not None
+    assert stored.status == COMMAND_COMPLETED
+    ws_manager.broadcast_to_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_running_coordinator_without_a_delivery_is_safe_to_resend(
+    db_session,
+) -> None:
+    """Task/run occupancy alone does not prove this turn was ever claimed."""
 
     owner = _user(db_session, "coordinator-owner")
     task = _live_task(db_session, int(owner.id))
@@ -272,11 +464,9 @@ async def test_a_running_coordinator_is_rejected_without_inviting_a_resend(
     ):
         await _send_live_message(task, message_data)
 
-    assert "_durable_command_defer" not in message_data
-    error = message_data["_durable_command_error"]
-    assert "still applying an earlier message" in error
-    assert "rather than sending again" in error
-    assert "was not applied" not in error
+    assert message_data["_durable_command_defer"] == "late-turn"
+    assert "_durable_command_defer_unsafe" not in message_data
+    assert "_durable_command_error" not in message_data
 
 
 @pytest.mark.asyncio
@@ -603,10 +793,29 @@ async def test_an_exhausted_deferral_closes_out_the_standing_delivery(
     db_session.commit()
 
     command = _message_command(task, owner, turn_id)
-    with patch(
-        "xagent.web.api.websocket.manager", MagicMock(broadcast_to_task=AsyncMock())
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+    idle_manager = MagicMock()
+    idle_manager.resume_admission_state.return_value = None
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", idle_manager),
     ):
-        await report_terminal_task_command(command, "this message was not applied")
+        await report_terminal_task_command(
+            command,
+            TaskCommandRejected("this message was not applied"),
+        )
+        ws_manager.broadcast_to_task.reset_mock()
+        with patch(
+            "xagent.web.api.websocket._fail_terminal_message_delivery",
+            side_effect=RuntimeError("delivery database unavailable"),
+        ):
+            await report_terminal_task_command(
+                command,
+                RuntimeError("internal secret detail"),
+            )
+        event = ws_manager.broadcast_to_task.await_args.args[0]
+        assert "internal secret detail" not in event["message"]
+        assert "delivery database unavailable" not in event["message"]
 
     db_session.expire_all()
     stored = (
@@ -618,10 +827,39 @@ async def test_an_exhausted_deferral_closes_out_the_standing_delivery(
 
 
 @pytest.mark.asyncio
-async def test_a_delivery_that_already_progressed_is_left_alone(
+@pytest.mark.parametrize(
+    ("delivery_status", "error", "expected_status"),
+    [
+        (
+            DELIVERY_DISPATCHED,
+            TaskCommandRejected("this message was not applied"),
+            DELIVERY_DISPATCHED,
+        ),
+        (
+            DELIVERY_PENDING,
+            TaskCommandDeferred("outcome unknown", resend_safe=False),
+            DELIVERY_PENDING,
+        ),
+        (DELIVERY_PENDING, RuntimeError("outcome unknown"), DELIVERY_PENDING),
+        (
+            DELIVERY_PENDING,
+            TaskCommandDeferred("nothing claimed", resend_safe=True),
+            DELIVERY_FAILED,
+        ),
+        (
+            DELIVERY_PENDING,
+            TaskCommandRejected("this message was not applied"),
+            DELIVERY_FAILED,
+        ),
+    ],
+)
+async def test_terminal_report_uses_durable_delivery_evidence(
     db_session,
+    delivery_status: str,
+    error: BaseException,
+    expected_status: str,
 ) -> None:
-    """The command is terminal, but this delivery really was dispatched."""
+    """Only a proven not-applied outcome may make PENDING irreversible."""
 
     owner = _user(db_session, "dispatched-delivery-owner")
     task = _live_task(db_session, int(owner.id))
@@ -634,16 +872,19 @@ async def test_a_delivery_that_already_progressed_is_left_alone(
             message_type="user_message",
             content="here is the form response",
             turn_id=turn_id,
-            delivery_status=DELIVERY_DISPATCHED,
+            delivery_status=delivery_status,
         )
     )
     db_session.commit()
 
     command = _message_command(task, owner, turn_id)
-    with patch(
-        "xagent.web.api.websocket.manager", MagicMock(broadcast_to_task=AsyncMock())
+    with (
+        patch(
+            "xagent.web.api.websocket.manager",
+            MagicMock(broadcast_to_task=AsyncMock()),
+        ),
     ):
-        await report_terminal_task_command(command, "this message was not applied")
+        await report_terminal_task_command(command, error)
 
     db_session.expire_all()
     stored = (
@@ -651,4 +892,4 @@ async def test_a_delivery_that_already_progressed_is_left_alone(
         .filter(TaskChatMessage.turn_id == turn_id)
         .one()
     )
-    assert stored.delivery_status == DELIVERY_DISPATCHED
+    assert stored.delivery_status == expected_status
