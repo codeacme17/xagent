@@ -2333,7 +2333,9 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     ]
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
-    assert "inject failed" in rejected[0]["message"]
+    assert "inject failed" not in repr(rejected[0])
+    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert rejected[0]["error_code"] == "message_processing_failed"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
