@@ -14,17 +14,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.web.api.client_safe_ast_guard import (
+    ALLOWED_RAW_MESSAGES,
+    SAFE_MESSAGE_BUILDERS,
+    _scan,
+)
+from tests.web.api.client_safe_ast_guard import guard_offenders as _guard_offenders
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
 
-from .client_safe_ast_guard import (
-    ALLOWED_RAW_MESSAGES,
-    SAFE_MESSAGE_BUILDERS,
-    _scan,
-)
-from .client_safe_ast_guard import guard_offenders as _guard_offenders
 from .conftest import _direct_db_session
 
 SECRET = "/srv/xagent/secrets/prod.key"
@@ -181,12 +181,12 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 23, (
-        f"expected exactly 23 producers, matched {result.producers}; "
+    assert result.producers == 26, (
+        f"expected exactly 26 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 33, (
-        f"expected exactly 33 error payloads, matched {result.error_payloads}; "
+    assert result.error_payloads == 35, (
+        f"expected exactly 35 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
