@@ -1417,6 +1417,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt = new Date().toISOString()
         }
       }
+      const replacesWaitingOccurrence = isWaitingForUser
+        && action.payload.waitingRequestId !== undefined
+        && action.payload.waitingRequestId !== state.currentTask.waitingRequestId
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -1435,10 +1438,14 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt,
           dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
-            ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
+            ? action.payload.waitingQuestion ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingQuestion
+            )
             : undefined,
           waitingInteractions: isWaitingForUser
-            ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
+            ? action.payload.waitingInteractions ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingInteractions
+            )
             : undefined,
           waitingRequestId: isWaitingForUser
             ? action.payload.waitingRequestId ?? (

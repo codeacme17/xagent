@@ -3291,6 +3291,39 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("replaces structured interactions when a concurrent wait becomes text-only", async () => {
+    await renderRunningTaskProbe()
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 1,
+        question: "Which city should I use?",
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        request_id: "inputreq_r1",
+      } as TestWebSocketMessage)
+      webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:07Z",
+        task_id: 1,
+        question: "Anything else I should know?",
+        interactions: [],
+        request_id: "inputreq_r2",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_r2"
+      )
+      expect(screen.getByTestId("waiting-interactions").textContent).toBe("[]")
+      expect(assistantMessagesFor("Anything else I should know?")).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
+    })
+  })
+
   it("passes the persistent Session transport contract and sends the first taskless turn only through the socket", async () => {
     const transport = makeSessionTransport()
     const acknowledgement = deferred<{
