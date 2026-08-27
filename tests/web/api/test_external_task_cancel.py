@@ -901,11 +901,12 @@ async def test_terminal_command_error_text_external(
     """An exhausted external cancel broadcasts the neutral sentence.
 
     Driven by a deleted task row, which is a real raise site outside the
-    external core: the failure budget runs out and the broadcast reaches the
-    visitor's conversation, where the default wording would carry command
-    and exception detail. The row being gone means the status read cannot
-    answer, so the wording is the conservative "didn't go through" sentence,
-    not the terminal one - the deletion is not proof the turn is over.
+    external core, then handed to the reporter the dispatcher invokes after
+    persisting the terminal disposition. The broadcast reaches the visitor's
+    conversation, where the default wording would carry command and exception
+    detail. The row being gone means the status read cannot answer, so the
+    wording is the conservative "didn't go through" sentence, not the terminal
+    one - the deletion is not proof the turn is over.
     """
     agent_id, owner_user_id = _create_agent()
     task_id = _create_task(
@@ -939,6 +940,7 @@ async def test_terminal_command_error_text_external(
 
     with pytest.raises(ValueError) as raised:
         await websocket_api.execute_durable_task_command(command)
+    await websocket_api.report_terminal_task_command(command, raised.value)
 
     payloads = _broadcast_payloads(manager)
     assert [payload["type"] for payload in payloads] == ["agent_error"]
