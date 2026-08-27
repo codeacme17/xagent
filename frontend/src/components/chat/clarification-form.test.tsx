@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -684,6 +685,44 @@ describe("ClarificationForm delivery failures", () => {
 })
 
 describe("ClarificationForm interaction identity", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("resets the reused form and ignores completion from the previous request", async () => {
+    let resolveR1!: () => void
+    const onSend = vi.fn(() => new Promise<void>((resolve) => { resolveR1 = resolve }))
+    const form = (requestId: string, messageId?: string) => (
+      <ClarificationForm
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        requestId={requestId}
+        messageId={messageId}
+        onSend={onSend}
+      />
+    )
+    const { container, rerender } = render(form("inputreq_r1"))
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Sydney" } })
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+
+    rerender(form("inputreq_r1", "unrelated-rerender"))
+    expect(screen.getByRole("textbox")).toHaveValue("Sydney")
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.submit" }))
+
+    rerender(form("inputreq_r2"))
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(container.querySelector('[aria-expanded="true"]')).not.toBeNull()
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    await act(async () => resolveR1())
+
+    expect(screen.getByRole("textbox")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "chatPage.clarification.submit" })).toBeEnabled()
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
   it("submits the request id bound to this rendered form", async () => {
     const onSend = vi.fn().mockResolvedValue(undefined)
     render(

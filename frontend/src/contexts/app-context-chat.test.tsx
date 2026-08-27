@@ -3133,6 +3133,129 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  const renderRunningTaskProbe = async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    await waitFor(() => expect(screen.getByTestId("task-status").textContent).toBe("running"))
+  }
+
+  const publishTraceEvent = (
+    event_type: string,
+    data: Record<string, unknown>,
+    timestamp = "2026-05-27T05:00:05Z",
+  ) => webSocketOptions.current?.onMessage?.({
+    type: "trace_event",
+    timestamp,
+    task_id: 1,
+    data: { event_type, data },
+  })
+
+  const publishWaitingOccurrence = (
+    prompt: string,
+    requestId?: string,
+    timestamp = "2026-05-27T05:00:05Z",
+  ) => {
+    publishTraceEvent("agent_message", {
+      message: prompt, role: "assistant", expect_response: true, request_id: requestId,
+    }, timestamp)
+    webSocketOptions.current?.onMessage?.({
+      type: "task_waiting_for_user",
+      timestamp,
+      task_id: 1,
+      question: prompt,
+      interactions: [],
+      request_id: requestId,
+    } as TestWebSocketMessage)
+  }
+
+  const assistantMessagesFor = (prompt: string) => (
+    JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      role: string
+      content: string
+      interactionRequestId?: string
+    }>
+  ).filter((message) => message.role === "assistant" && message.content === prompt)
+
+  it("keeps identical prompts from different waiting occurrences separate", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      publishWaitingOccurrence("Which file should I use?", "inputreq_r1")
+      publishWaitingOccurrence("Which file should I use?", "inputreq_r2", "2026-05-27T05:00:07Z")
+    })
+
+    await waitFor(() => {
+      expect(assistantMessagesFor("Which file should I use?")).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r1" }),
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "inputreq_r2",
+      )
+    })
+  })
+
+  it("keeps ai_message dedupe independent of request identity", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      for (const request_id of ["inputreq_r1", "inputreq_r2"]) {
+        publishTraceEvent("ai_message", {
+          message: "Same final answer", role: "assistant", request_id,
+        })
+      }
+    })
+    expect(assistantMessagesFor("Same final answer")).toHaveLength(1)
+  })
+
+  it("keeps delimiter-like legacy content distinct from an identified occurrence", async () => {
+    await renderRunningTaskProbe()
+    act(() => {
+      publishTraceEvent("agent_message", {
+        message: "Choose file:occurrence:inputreq_r2", role: "assistant",
+      })
+      publishWaitingOccurrence("Choose file", "inputreq_r2")
+    })
+    expect(assistantMessagesFor("Choose file:occurrence:inputreq_r2")).toHaveLength(1)
+    expect(assistantMessagesFor("Choose file")).toEqual([
+      expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+    ])
+  })
+
+  it("continues to content-dedupe id-less legacy waiting siblings", async () => {
+    await renderRunningTaskProbe()
+    act(() => publishWaitingOccurrence("Which legacy file should I use?"))
+    await waitFor(() => expect(
+      assistantMessagesFor("Which legacy file should I use?"),
+    ).toHaveLength(1))
+  })
+
+  it("lets the latest identified occurrence suppress an id-less legacy sibling for 30 seconds", async () => {
+    await renderRunningTaskProbe()
+    const prompt = "Which compatibility file should I use?"
+    vi.useFakeTimers()
+    try {
+      act(() => {
+        publishWaitingOccurrence(prompt, "inputreq_r1")
+        vi.advanceTimersByTime(20_000)
+        publishWaitingOccurrence(prompt, "inputreq_r2")
+        vi.advanceTimersByTime(11_000)
+        publishTraceEvent("react_task_end", {
+          result: { status: "waiting_for_user", message: prompt },
+        })
+      })
+
+      expect(assistantMessagesFor(prompt)).toEqual([
+        expect.objectContaining({ interactionRequestId: "inputreq_r1" }),
+        expect.objectContaining({ interactionRequestId: "inputreq_r2" }),
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("keeps a projected waiting occurrence together over stale nested legacy fields", async () => {
     render(
       <AppProvider token="token">

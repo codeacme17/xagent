@@ -1900,20 +1900,29 @@ export function AppProvider({
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
-  const recentMessagesRef = useRef(new Set<string>())
+  const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   const isDuplicateMessage = useCallback((
     content: string | React.ReactNode,
     type = "general",
     force = false,
     shouldCache = true,
+    occurrenceIdentity?: string,
   ) => {
     const contentStr = normalizeMessageContent(content)
-    const key = `${type}:${contentStr}`
+    const key = JSON.stringify([type, contentStr])
+    const occurrenceKey = occurrenceIdentity
+      ? JSON.stringify([type, contentStr, occurrenceIdentity])
+      : undefined
     const cache = recentMessagesRef.current
-    if (!force && cache.has(key)) return true
+    if (!force && cache.has(occurrenceKey || key)) return true
     if (shouldCache) {
-      cache.add(key)
-      setTimeout(() => cache.delete(key), 30_000)
+      for (const cacheKey of occurrenceKey ? [key, occurrenceKey] : [key]) {
+        clearTimeout(cache.get(cacheKey))
+        const expiry = setTimeout(() => {
+          if (cache.get(cacheKey) === expiry) cache.delete(cacheKey)
+        }, 30_000)
+        cache.set(cacheKey, expiry)
+      }
     }
     return false
   }, [])
@@ -2523,7 +2532,8 @@ export function AppProvider({
     const isDuplicateMessageForViewedTask = (
       content: string | React.ReactNode,
       type = "general",
-    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
+      occurrenceIdentity?: string,
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask, occurrenceIdentity)
     // Shared by both dag_execution shapes this handler processes below (the
     // modern trace_event-wrapped one, and the legacy bare "dag_execution"
     // message type) - duplicating this logic per call site is exactly how a
@@ -3064,7 +3074,11 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(
+              messageContent,
+              'agent-message',
+              isAgentMessage ? interactionRequestId : undefined,
+            )) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -5516,7 +5530,11 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(
+            waitingMessage,
+            'agent-message',
+            waitingRequestId,
+          )
         ) {
           dispatch({
             type: "ADD_MESSAGE",

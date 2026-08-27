@@ -25,10 +25,7 @@ vi.mock("@/lib/api-wrapper", async () => {
 vi.mock("@/lib/utils", () => ({
   cn: (...classes: Array<string | false | null | undefined>) =>
     classes.filter(Boolean).join(" "),
-  generateClientMessageId: vi.fn()
-    .mockReturnValueOnce("client-message-1")
-    .mockReturnValueOnce("client-message-2")
-    .mockReturnValue("client-message-next"),
+  generateClientMessageId: vi.fn(),
   getApiUrl: () => "http://api.local",
   getUploadApiUrl: () => "http://upload.local",
 }))
@@ -92,6 +89,10 @@ const emptyJsonResponse = () =>
 
 describe("ChatInput", () => {
   beforeEach(() => {
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
     authUserMock.current = { id: "1", is_admin: true }
     apiRequestMock.mockReset()
     apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
@@ -1457,10 +1458,7 @@ describe("ChatInput", () => {
     // the send is confirmed to have never landed, so a retry - even with
     // identical content - should get its own fresh id rather than being
     // conflated with the failed attempt.
-    // Override the shared module mock's queue for just these two calls -
-    // by this point in the suite it's already fallen through to its
-    // catch-all return value, which would make both ids look identical
-    // and defeat the point of this test regardless of the real behavior.
+    // Keep this scenario's two delivery identities explicit.
     vi.mocked(generateClientMessageId)
       .mockImplementationOnce(() => "retry-with-new-id-1")
       .mockImplementationOnce(() => "retry-with-new-id-2")
