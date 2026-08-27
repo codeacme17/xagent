@@ -266,6 +266,125 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
 
 
 @pytest.mark.asyncio
+async def test_chat_without_an_actor_uses_the_authentication_contract() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await handle_chat_message(
+            MagicMock(),
+            7,
+            {
+                "message": "do not echo this request",
+                "client_message_id": "unauthenticated-turn",
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(
+        payload["error_code"] == "authentication_required" for payload in payloads
+    )
+    assert all(
+        payload["message"] == "Authentication is required to send this message."
+        for payload in payloads
+    )
+    assert "do not echo this request" not in repr(payloads)
+
+
+@pytest.mark.asyncio
+async def test_chat_non_owner_uses_the_access_denied_contract(db_session) -> None:
+    owner = _user(db_session, "chat-access-owner")
+    stranger = _user(db_session, "chat-access-stranger")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "try another owner's task",
+                "client_message_id": "access-denied-turn",
+                "user": stranger,
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "task_access_denied" for payload in payloads)
+    assert all(
+        payload["message"] == "You do not have access to this task."
+        for payload in payloads
+    )
+    assert f"Task {task.id} does not belong to you" not in repr(payloads)
+
+
+@pytest.mark.asyncio
+async def test_unserialized_chat_non_owner_keeps_the_access_contract(
+    db_session,
+) -> None:
+    owner = _user(db_session, "direct-chat-access-owner")
+    stranger = _user(db_session, "direct-chat-access-stranger")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "try direct execution",
+                "client_message_id": "direct-access-denied-turn",
+                "user": stranger,
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "task_access_denied" for payload in payloads)
+    assert all(
+        payload["message"] == "You do not have access to this task."
+        for payload in payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_invalid_shape_uses_the_invalid_message_contract() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            7,
+            {
+                "message": {"operator_detail": "must not escape"},
+                "client_message_id": "invalid-message-turn",
+                "user": SimpleNamespace(id=1, is_admin=False),
+                "files": [],
+            },
+        )
+
+    payloads = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert payloads
+    assert all(payload["error_code"] == "invalid_message" for payload in payloads)
+    assert all(
+        payload["message"] == "The message format is invalid." for payload in payloads
+    )
+    assert "operator_detail" not in repr(payloads)
+
+
+@pytest.mark.asyncio
 async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
     db_session,
 ) -> None:
@@ -956,11 +1075,17 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
     event_loop_thread = threading.get_ident()
     payload_threads: list[int] = []
     payload_messages: list[str] = []
+    payload_codes: list[str | None] = []
 
     def read_payload(_task_id, default_message, *_args, **_kwargs):
         payload_threads.append(threading.get_ident())
         payload_messages.append(default_message)
-        return {"type": "agent_error", "message": "busy"}
+        payload_codes.append(_kwargs.get("error_code"))
+        return {
+            "type": "agent_error",
+            "message": "busy",
+            "error_code": _kwargs.get("error_code"),
+        }
 
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -994,10 +1119,19 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
 
     assert len(payload_threads) == 1
     assert payload_threads[0] != event_loop_thread
+    assert payload_codes == ["workforce_unavailable"]
     assert payload_messages == [
-        "This workforce has been archived; the conversation can no longer "
-        "accept new messages."
+        "This workforce conversation can no longer accept messages; "
+        "please start a new conversation."
     ]
+    broadcast = ws_manager.broadcast_to_task.await_args.args[0]
+    assert broadcast["error_code"] == "workforce_unavailable"
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert rejected[0]["error_code"] == "workforce_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1165,9 +1299,16 @@ async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
         call.args[0] for call in ws_manager.send_personal_message.call_args_list
     ]
     assert any(
-        message.get("message") == "Task does not support message continuation"
+        message.get("message") == "Task does not support message continuation."
+        and message.get("error_code") == "message_continuation_unsupported"
         for message in sent_messages
     )
+    rejection = next(
+        message
+        for message in sent_messages
+        if message.get("type") == "message_rejected"
+    )
+    assert rejection["error_code"] == "message_continuation_unsupported"
 
 
 @pytest.mark.asyncio
@@ -1512,7 +1653,20 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
     ]
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "rejected-turn-1"
+    assert rejected[0]["error_code"] == "task_checkpoint_unreadable"
+    assert rejected[0]["message"] == "The task's saved progress could not be read."
     assert rejected[0]["rejection_outcome"] == "not_accepted"
+    task_errors = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") in {"error", "agent_error", "task_error"}
+    ]
+    assert task_errors
+    assert all(
+        payload["error_code"] == "task_checkpoint_unreadable"
+        and payload["message"] == "The task's saved progress could not be read."
+        for payload in task_errors
+    )
     db_session.expire_all()
     stored = (
         db_session.query(TaskChatMessage)
@@ -2509,6 +2663,7 @@ async def test_reusing_client_id_with_different_content_is_rejected(
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
+    assert rejected[0]["error_code"] == "message_id_conflict"
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["rejection_outcome"] == "not_accepted"
 
@@ -2560,6 +2715,7 @@ async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> N
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
+    assert rejected[0]["error_code"] == "message_delivery_failed"
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["rejection_outcome"] == "not_accepted"
 
@@ -2604,6 +2760,7 @@ async def test_pending_same_id_delivery_reports_unknown_outcome(db_session) -> N
     ]
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "pending-turn-1"
+    assert rejected[0]["error_code"] == "guidance_in_progress"
     assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
@@ -4020,7 +4177,6 @@ async def test_durable_attachment_failure_keeps_the_storage_key_off_the_socket(
     # answering the client with anything at all.
     frames = [str(call) for call in ws_manager.send_personal_message.await_args_list]
     assert any("message_rejected" in frame for frame in frames), frames
-
     # Every outbound egress: nothing may carry the key or the provider text.
     outbound = frames + [
         str(call) for call in ws_manager.broadcast_to_task.await_args_list

@@ -1,5 +1,6 @@
 import { classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import type { ClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 
 export interface PublicChatUploadedFile {
   file_id: string
@@ -51,7 +52,7 @@ export async function uploadPublicChatFile({
   })
   const parsed = await parseApiResponse(response)
   const data = isJsonRecord(parsed.data) ? parsed.data : null
-  const fileId = typeof data?.file_id === "string" ? data.file_id : null
+  const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null
 
   if (!response.ok || data?.success !== true || !fileId) {
     const classified = classifyUploadError(response, parsed)

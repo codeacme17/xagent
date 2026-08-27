@@ -403,6 +403,46 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it.each([
+    ["object", {}],
+    ["number", 7],
+    ["array", ["provider_secret"]],
+    ["boolean", false],
+    ["null", null],
+  ])("does not trust a rejection carrying a malformed %s error code", async (_label, malformedCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-malformed-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-malformed-code",
+        error_code: malformedCode,
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
+    })
+  })
+
   it("rejects concurrent reuse of a pending client message id without replacing its owner", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -2923,6 +2963,38 @@ describe("useWebSocket normalized connections", () => {
     await expect(result.current.sendChatMessage(
       "with file",
       [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      uploadResult: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      uploadResult: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name custom upload identifiers before sending chat", async ({ uploadResult }) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue(uploadResult),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
     )).rejects.toMatchObject({
       errorCode: "upload_failed",
       userFacing: true,

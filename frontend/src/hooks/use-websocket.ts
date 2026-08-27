@@ -5,6 +5,7 @@ import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorFallback, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
@@ -928,10 +929,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
                 })
               } else {
+                const hasErrorCode = Object.prototype.hasOwnProperty.call(data, "error_code")
                 const errorCode = readClientErrorCode(data.error_code)
                 const rejectionMessage = errorCode
                   ? clientErrorFallback(errorCode)
-                  : typeof data.error_code === "string"
+                  : hasErrorCode
                     ? "Message was rejected."
                     : data.message || "Message was rejected."
                 pending.reject(deliveryError(
@@ -1325,14 +1327,37 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           })()
           uploadedFiles = await Promise.race([uploadRequest, claim.cancellation])
         }
-        if (uploadedFiles.length !== filesToUpload.length) {
+        const normalizedUploadedFileIds = normalizeUploadFileIds(
+          uploadedFiles.map(file => file.file_id),
+          filesToUpload.length,
+        )
+        if (!normalizedUploadedFileIds) {
           throw deliveryError(
             clientErrorFallback("upload_failed"),
             "not_sent",
             { userFacing: true, errorCode: "upload_failed" },
           )
         }
-        messageData.files = [...preUploadedFiles, ...uploadedFiles]
+        const normalizedUploadedFiles = uploadedFiles.map((file, index) => ({
+          ...file,
+          file_id: normalizedUploadedFileIds[index],
+        }))
+        const allFiles = [...preUploadedFiles, ...normalizedUploadedFiles]
+        const normalizedFileIds = normalizeUploadFileIds(
+          allFiles.map(file => file.file_id),
+          filesWithUploadIds.length,
+        )
+        if (!normalizedFileIds) {
+          throw deliveryError(
+            clientErrorFallback("upload_failed"),
+            "not_sent",
+            { userFacing: true, errorCode: "upload_failed" },
+          )
+        }
+        messageData.files = allFiles.map((file, index) => ({
+          ...file,
+          file_id: normalizedFileIds[index],
+        }))
       }
 
       if (

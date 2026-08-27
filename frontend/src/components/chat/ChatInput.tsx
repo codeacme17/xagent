@@ -11,6 +11,7 @@ import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -360,6 +361,7 @@ export function ChatInput({
     });
 
     const failedFiles = new Set<File>();
+    const uploadedFileIds = new Map<File, string>();
     let uploadErrorMessage: string | null = null;
 
     // Upload files individually to ensure better reliability and progress tracking
@@ -373,8 +375,9 @@ export function ChatInput({
 
         if (uploadFile) {
           const result = await uploadFile(file, { taskType: currentTaskType });
-          if (result && typeof result.file_id === 'string') {
-            (file as File & { file_id?: string }).file_id = result.file_id;
+          const fileId = normalizeUploadFileIds([result?.file_id], 1)?.[0] ?? null;
+          if (fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
           }
@@ -392,14 +395,10 @@ export function ChatInput({
 
           const parsed = await parseApiResponse(response);
 
-          if (response.ok && isJsonRecord(parsed.data)) {
-            const data = parsed.data;
-            if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
-              (file as File & { file_id?: string }).file_id = data.file_id;
-            } else {
-              failedFiles.add(file);
-            }
+          const data = isJsonRecord(parsed.data) ? parsed.data : null;
+          const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null;
+          if (response.ok && data?.success === true && fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
             const uploadError = classifyUploadError(response, parsed);
@@ -424,6 +423,30 @@ export function ChatInput({
         });
       }
     }));
+
+    const successfulFiles = newFiles.filter(file => (
+      !failedFiles.has(file) && uploadedFileIds.has(file)
+    ));
+    const existingUploadedFileIds = filesRef.current
+      .filter(file => !newFiles.includes(file))
+      .map(file => (file as File & { file_id?: unknown }).file_id)
+      .filter(fileId => fileId !== undefined);
+    const normalizedFileIds = normalizeUploadFileIds(
+      [
+        ...existingUploadedFileIds,
+        ...successfulFiles.map(file => uploadedFileIds.get(file)),
+      ],
+      existingUploadedFileIds.length + successfulFiles.length,
+    );
+    if (!normalizedFileIds) {
+      successfulFiles.forEach(file => failedFiles.add(file));
+      uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+    } else {
+      const newFileIds = normalizedFileIds.slice(existingUploadedFileIds.length);
+      successfulFiles.forEach((file, index) => {
+        (file as File & { file_id?: string }).file_id = newFileIds[index];
+      });
+    }
 
     // Handle failed files
     if (failedFiles.size > 0) {

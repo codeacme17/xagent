@@ -341,7 +341,8 @@ async def test_handle_chat_message_access_denied_does_not_fail_task(
     assert broadcasts == []
     assert sent_messages
     assert sent_messages[0]["type"] == "error"
-    assert "Access denied" in sent_messages[0]["message"]
+    assert sent_messages[0]["message"] == "You do not have access to this task."
+    assert sent_messages[0]["error_code"] == "task_access_denied"
 
     db = _direct_db_session()
     try:
@@ -401,7 +402,10 @@ async def test_handle_execute_task_unauthenticated_does_not_fail_task(
     assert broadcasts == []
     assert sent_messages
     assert sent_messages[0]["type"] == "error"
-    assert "authentication required" in sent_messages[0]["message"].lower()
+    assert sent_messages[0]["message"] == (
+        "Authentication is required to send this message."
+    )
+    assert sent_messages[0]["error_code"] == "authentication_required"
 
     db = _direct_db_session()
     try:

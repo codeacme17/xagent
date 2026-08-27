@@ -349,6 +349,7 @@ import {
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -884,17 +885,31 @@ const taskFromTaskInfoData = (
   controlState: taskData.control_state as TaskControlState | undefined,
 })
 
+const getWebSocketErrorCodeField = (message: WebSocketMessage): {
+  present: boolean
+  value: unknown
+} => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  if (data && Object.prototype.hasOwnProperty.call(data, "error_code")) {
+    return { present: true, value: data.error_code }
+  }
+  if (Object.prototype.hasOwnProperty.call(root, "error_code")) {
+    return { present: true, value: root.error_code }
+  }
+  return { present: false, value: undefined }
+}
+
 const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
-  if (typeof (data?.error_code ?? root.error_code) === "string") return "Unknown error"
+  if (getWebSocketErrorCodeField(message).present) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
 }
 
 const getWebSocketErrorCode = (message: WebSocketMessage) => {
-  const root = message as unknown as Record<string, unknown>
-  const data = isJsonRecord(message.data) ? message.data : null
-  return readClientErrorCode(data?.error_code ?? root.error_code)
+  const errorCode = getWebSocketErrorCodeField(message)
+  return errorCode.present ? readClientErrorCode(errorCode.value) : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -6122,12 +6137,11 @@ export function AppProvider({
                 const uploadError = classifyUploadError(uploadResponse, parsed)
                 throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
-              const newFileIds = parsed.data.files
-                .filter((f): f is { file_id: string } => (
-                  isJsonRecord(f) && typeof f.file_id === 'string'
-                ))
-                .map(f => f.file_id)
-              if (newFileIds.length !== filesToUpload.length) {
+              const newFileIds = normalizeUploadFileIds(
+                parsed.data.files.map(f => isJsonRecord(f) ? f.file_id : null),
+                filesToUpload.length,
+              )
+              if (!newFileIds) {
                 throw new Error(t("clientErrors.uploadFailed"))
               }
               uploadedFileIds.push(...newFileIds)
@@ -6137,9 +6151,14 @@ export function AppProvider({
             }
           }
 
-          if (uploadedFileIds.length > 0) {
-            requestBody.files = uploadedFileIds
+          const normalizedFileIds = normalizeUploadFileIds(
+            uploadedFileIds,
+            files.length,
+          )
+          if (!normalizedFileIds) {
+            throw new Error(t("clientErrors.uploadFailed"))
           }
+          requestBody.files = normalizedFileIds
         }
 
         // Agent chats should use the published agent's own model configuration.

@@ -60,4 +60,24 @@ describe("uploadPublicChatFile", () => {
       type: "text/plain",
     })
   })
+
+  it("rejects a successful response with a whitespace-only file identifier", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: true, file_id: "   " }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+
+    await expect(uploadPublicChatFile({
+      url: "http://api.local/api/share/files/upload",
+      accessToken: "guest-token",
+      file: new File(["trip"], "trip.txt", { type: "text/plain" }),
+      taskType: "task",
+      fallbackError: "Upload failed",
+    })).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      message: "Upload failed",
+    })
+  })
 })

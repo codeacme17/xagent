@@ -133,11 +133,11 @@ async def test_execute_task_redacts_an_incidental_validation_error(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_keeps_a_message_written_for_the_sender(
+async def test_execute_task_uses_the_authentication_error_contract(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A validation failure raised as client-visible keeps its own wording."""
+    """A curated authentication failure uses its fixed code and fallback."""
     connection_manager = MagicMock()
     connection_manager.send_personal_message = AsyncMock()
     connection_manager.broadcast_to_task = AsyncMock()
@@ -148,7 +148,8 @@ async def test_execute_task_keeps_a_message_written_for_the_sender(
 
     payloads = _client_payloads(connection_manager)
     assert any(
-        "authentication required" in str(payload.get("message", "")).lower()
+        payload.get("message") == "Authentication is required to send this message."
+        and payload.get("error_code") == "authentication_required"
         for payload in payloads
     )
 
@@ -190,8 +191,8 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         f"expected exactly 26 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 35, (
-        f"expected exactly 35 error payloads, matched {result.error_payloads}; "
+    assert result.error_payloads == 36, (
+        f"expected exactly 36 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -739,7 +740,8 @@ async def test_unresolvable_task_answers_the_sender_instead_of_dropping_them(
 
     payloads = _client_payloads(connection_manager)
     assert any(
-        payload.get("message") == f"Task {missing_task_id} not found or access denied"
+        payload.get("message") == "Task is no longer available."
+        and payload.get("error_code") == "task_unavailable"
         for payload in payloads
     ), payloads
 

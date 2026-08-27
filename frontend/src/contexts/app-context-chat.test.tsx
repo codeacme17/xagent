@@ -7,6 +7,8 @@ type TestWebSocketMessage = {
   type: string
   timestamp: string
   data?: unknown
+  error_code?: unknown
+  message?: string
   task_id?: number
   step_id?: string
   task?: Record<string, unknown>
@@ -1157,6 +1159,49 @@ describe("AppProvider websocket message routing", () => {
     )
 
     await expect(send?.()).rejects.toThrow("clientErrors.uploadTooLarge")
+    expect(apiRequestMock).toHaveBeenCalledOnce()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      files: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      files: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name pre-task upload identifiers before task creation", async ({ files }) => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      files,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    let send: (() => Promise<void>) | undefined
+    function CreateTaskWithMalformedFilesProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage(
+        "analyze attachments",
+        { clientMessageId: "turn-malformed-upload" },
+        [
+          new File(["first"], "first.txt"),
+          new File(["second"], "second.txt"),
+        ],
+      )
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <CreateTaskWithMalformedFilesProbe />
+      </AppProvider>
+    )
+
+    await expect(send?.()).rejects.toThrow("clientErrors.uploadFailed")
     expect(apiRequestMock).toHaveBeenCalledOnce()
     expect(sendChatMessageMock).not.toHaveBeenCalled()
   })
@@ -3060,6 +3105,52 @@ describe("AppProvider websocket message routing", () => {
       )
       expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
     })
+  })
+
+  it.each(
+    [
+      { name: "object", value: { code: "task_execution_failed" } },
+      { name: "number", value: 42 },
+      { name: "array", value: ["task_execution_failed"] },
+      { name: "boolean", value: true },
+      { name: "null", value: null },
+    ].flatMap(({ name, value }) => [
+      { location: "nested", name, value },
+      { location: "root", name, value },
+    ]),
+  )("fails closed for a $location $name WebSocket error code", async ({ location, value }) => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: "agent_error",
+              error_code: value,
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: "agent_error",
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: value,
+            message: "provider token=secret",
+          })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
   })
 
   it("stops processing when a task waits for user input", async () => {

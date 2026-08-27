@@ -441,27 +441,28 @@ describe("ClarificationForm delivery failures", () => {
 
   it("localizes a coded backend rejection instead of trusting its prose", async () => {
     const onSend = vi.fn().mockRejectedValue(deliveryError(
-      "A previous guidance message is still being applied. Please wait for it to finish.",
+      "checkpoint row includes storage-key=secret",
       "rejected",
       true,
-      "guidance_in_progress",
+      "task_checkpoint_unreadable",
     ))
 
     await submitAnswer(onSend)
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "clientErrors.guidanceInProgress",
+        "clientErrors.taskCheckpointUnreadable",
         { description: "chatPage.clarification.sendNotSent" },
       )
     })
     const alert = await screen.findByRole("alert")
     expect(alert).toHaveTextContent(
-      "clientErrors.guidanceInProgress",
+      "clientErrors.taskCheckpointUnreadable",
     )
     // The hint lives in the alert too, not only in the toast - without this
     // the inline hint could be deleted with every test still green.
     expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
+    expect(alert).not.toHaveTextContent("storage-key=secret")
   })
 
   it("keeps the form submittable after a failure that never reached the agent", async () => {

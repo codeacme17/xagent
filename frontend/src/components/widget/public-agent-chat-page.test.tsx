@@ -20,6 +20,7 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend?: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
   },
 }))
@@ -575,6 +576,29 @@ describe("PublicAgentChatPage", () => {
     await waitFor(() => {
       expect(localStorage.getItem("widget_task_wf8_guest-1")).toBe("43")
     })
+  })
+
+  it("rejects duplicate workforce upload identifiers before task creation", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: "file-1" }))
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: " file-1 " }))
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await expect(app.startScreenProps?.onSend?.(
+      "analyze attachments",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
+    )).rejects.toThrow("clientErrors.uploadFailed")
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.some(([url]) => (
+      url === "https://api.example/api/widget/chat/task/create"
+    ))).toBe(false)
   })
 
   it("authenticates a share link and persists the guest token for reuse", async () => {
