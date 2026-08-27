@@ -1168,6 +1168,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     files?: File[],
     force: boolean = false,
     requestedClientMessageId?: string,
+    requestId?: string,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1246,6 +1247,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         type: 'chat',
         message,
         client_message_id: clientMessageId,
+        ...(requestId ? { request_id: requestId } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }

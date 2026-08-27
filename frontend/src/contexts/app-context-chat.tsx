@@ -636,6 +636,7 @@ interface Message {
   streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
+  interactionRequestId?: string
   isSystemNotice?: boolean
   isOptimistic?: boolean
 }
@@ -675,6 +676,7 @@ export interface Task {
   runtimeExtensionBindings?: string[]
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
+  waitingRequestId?: string
   runId?: string | null
   stateVersion?: number
   controlState?: TaskControlState
@@ -1079,7 +1081,7 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1438,6 +1440,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt = new Date().toISOString()
         }
       }
+      const replacesWaitingOccurrence = isWaitingForUser
+        && action.payload.waitingRequestId !== undefined
+        && action.payload.waitingRequestId !== state.currentTask.waitingRequestId
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -1456,10 +1461,22 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt,
           dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
-            ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
+            ? action.payload.waitingQuestion ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingQuestion
+            )
             : undefined,
           waitingInteractions: isWaitingForUser
-            ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
+            ? action.payload.waitingInteractions ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingInteractions
+            )
+            : undefined,
+          waitingRequestId: isWaitingForUser
+            ? action.payload.waitingRequestId ?? (
+              action.payload.waitingQuestion === undefined
+              && action.payload.waitingInteractions === undefined
+                ? state.currentTask.waitingRequestId
+                : undefined
+            )
             : undefined,
           runId: action.payload.runId ?? state.currentTask.runId,
           stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
@@ -1771,6 +1788,7 @@ interface PendingMessage {
   targetTaskId?: number
   force?: boolean
   clientMessageId?: string
+  requestId?: string
   resolve?: () => void
   reject?: (error: Error) => void
 }
@@ -1912,20 +1930,29 @@ export function AppProvider({
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
-  const recentMessagesRef = useRef(new Set<string>())
+  const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   const isDuplicateMessage = useCallback((
     content: string | React.ReactNode,
     type = "general",
     force = false,
     shouldCache = true,
+    occurrenceIdentity?: string,
   ) => {
     const contentStr = normalizeMessageContent(content)
-    const key = `${type}:${contentStr}`
+    const key = JSON.stringify([type, contentStr])
+    const occurrenceKey = occurrenceIdentity
+      ? JSON.stringify([type, contentStr, occurrenceIdentity])
+      : undefined
     const cache = recentMessagesRef.current
-    if (!force && cache.has(key)) return true
+    if (!force && cache.has(occurrenceKey || key)) return true
     if (shouldCache) {
-      cache.add(key)
-      setTimeout(() => cache.delete(key), 30_000)
+      for (const cacheKey of occurrenceKey ? [key, occurrenceKey] : [key]) {
+        clearTimeout(cache.get(cacheKey))
+        const expiry = setTimeout(() => {
+          if (cache.get(cacheKey) === expiry) cache.delete(cacheKey)
+        }, 30_000)
+        cache.set(cacheKey, expiry)
+      }
     }
     return false
   }, [])
@@ -2386,6 +2413,7 @@ export function AppProvider({
           pendingMessage.files,
           pendingMessage.force,
           pendingMessage.clientMessageId,
+          pendingMessage.requestId,
         )
       ).then(() => {
         pendingMessage.resolve?.()
@@ -2534,7 +2562,8 @@ export function AppProvider({
     const isDuplicateMessageForViewedTask = (
       content: string | React.ReactNode,
       type = "general",
-    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
+      occurrenceIdentity?: string,
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask, occurrenceIdentity)
     // Shared by both dag_execution shapes this handler processes below (the
     // modern trace_event-wrapped one, and the legacy bare "dag_execution"
     // message type) - duplicating this logic per call site is exactly how a
@@ -3024,6 +3053,9 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            const interactionRequestId = typeof eventData.request_id === "string"
+              ? eventData.request_id
+              : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -3061,6 +3093,7 @@ export function AppProvider({
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
+                  waitingRequestId: interactionRequestId,
                 }
               })
             }
@@ -3071,7 +3104,11 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(
+              messageContent,
+              'agent-message',
+              isAgentMessage ? interactionRequestId : undefined,
+            )) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -3087,6 +3124,7 @@ export function AppProvider({
                 isResult: true,
                 streamMessageId,
                 interactions: interactions.length > 0 ? interactions : undefined,
+                interactionRequestId,
               }
             })
             if (eventData.status === "completed") {
@@ -5493,15 +5531,26 @@ export function AppProvider({
 
       case "task_waiting_for_user":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_waiting_for_user)')
-        const waitingData = message.data as any
-        const waitingMessage = waitingData?.question || waitingData?.message || ""
-        const interactions = normalizeInteractions(waitingData?.interactions)
+        const waitingRoot = asMessageRecord(message)
+        const waitingData = asMessageRecord(message.data)
+        const waitingMessage = getString(waitingRoot.question)
+          || getString(waitingData.question)
+          || getString(waitingRoot.message)
+          || getString(waitingData.message)
+        const interactions = normalizeInteractions(
+          waitingRoot.interactions ?? waitingData.interactions
+        )
+        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
+        const waitingRequestId = typeof waitingRequestIdValue === "string"
+          ? waitingRequestIdValue
+          : undefined
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: controlEnvelope.status || "waiting_for_user",
             waitingQuestion: waitingMessage && waitingMessage !== "Task waiting for user response" ? waitingMessage : undefined,
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
+            waitingRequestId,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
@@ -5511,7 +5560,11 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(
+            waitingMessage,
+            'agent-message',
+            waitingRequestId,
+          )
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -5524,6 +5577,7 @@ export function AppProvider({
               status: "running",
               isResult: true,
               interactions: interactions.length > 0 ? interactions : undefined,
+              interactionRequestId: waitingRequestId,
             }
           })
         }
@@ -5907,6 +5961,9 @@ export function AppProvider({
     const clientMessageId = typeof config?.clientMessageId === 'string'
       ? config.clientMessageId
       : generateClientMessageId()
+    const requestId = typeof config?.metadata?.request_id === 'string'
+      ? config.metadata.request_id
+      : undefined
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
         ? {
@@ -6024,6 +6081,7 @@ export function AppProvider({
           files,
           config?.force,
           clientMessageId,
+          requestId,
         )
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
@@ -6261,6 +6319,7 @@ export function AppProvider({
             targetTaskId: newTaskId,
             force: config?.force,
             clientMessageId,
+            requestId,
           })
           addOptimisticUserMessage(newTaskId)
         } else {
@@ -6306,7 +6365,7 @@ export function AppProvider({
       // deliberately runs only after this succeeds - clearing dagExecution/
       // steps first and then throwing would remove the Progress panel and its
       // header toggle for a run that never actually changed.
-      await sendChatMessage(message, files, config?.force, clientMessageId)
+      await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
 
       // A prior turn's DAG plan/steps must not linger into this turn - otherwise
       // the Progress panel would auto-open (or stay open) showing stale steps
