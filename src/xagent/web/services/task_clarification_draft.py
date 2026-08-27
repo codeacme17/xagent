@@ -17,12 +17,11 @@ row? The answer is one of three outcomes, never folded into a boolean:
   publishable payload (no resume anchor, or the payload could not be shaped
   within the size and character limits below). The caller's own settlement
   proceeds exactly as it would have before this module existed.
-* :class:`FailClosed` -- carries one of five reason strings that split into
-  two different consequences, not one. Two of them (from the guard that
-  pairs waiting status against draft presence) do not discard the round at
-  all: no structured row is written, but the finalizer's existing path for
-  that status proceeds unchanged. The other three (an unfenced lease, a
-  task row no longer owned by the lease that produced this result, or an
+* :class:`FailClosed` -- carries one of six reason strings that split into
+  two different consequences, not one. Three of them do not discard the
+  round at all: no structured row is written, but the finalizer's existing
+  path for that status proceeds unchanged. The other three (an unfenced
+  lease, a task row no longer owned by the lease that produced this result, or an
   attempt that is no longer current) do mean the caller must discard this
   round's settlement wholesale, the same way it already discards a late,
   no-longer-owned result. See :class:`FailClosed` itself for which reason
@@ -85,7 +84,6 @@ is the caller's obligation, not this module's.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -202,6 +200,7 @@ NotApplicableReason = Literal["no_anchor", "payload_too_large", "empty_question"
 FailClosedReason = Literal[
     "missing_draft",
     "draft_status_mismatch",
+    "missing_event_id",
     "unfenced_lease",
     "ownership_changed",
     "attempt_mismatch",
@@ -241,12 +240,12 @@ class NotApplicable:
 class FailClosed:
     """No structured row is published this round. What the caller must do
     about the *round itself* depends on which guard produced ``reason`` --
-    the five values split into two different consequences, not one.
+    the six values split into two different consequences, not one.
 
-    ``"missing_draft"`` and ``"draft_status_mismatch"`` come from guard 1
-    (the waiting-status/draft-presence pairing) and do not discard the
-    round: no structured row is written and a stray draft is dropped, but
-    the finalizer's existing path for that status proceeds exactly as it
+    ``"missing_draft"``, ``"draft_status_mismatch"``, and
+    ``"missing_event_id"`` do not discard the round: no structured row is
+    written and a stray or unidentified draft is dropped, but the
+    finalizer's existing path for that status proceeds exactly as it
     already does today.
 
     ``"unfenced_lease"``, ``"ownership_changed"``, and ``"attempt_mismatch"``
@@ -267,18 +266,16 @@ ClarificationResolution = Publishable | NotApplicable | FailClosed
 
 
 def clarification_idempotency_key(draft: ClarificationDraft) -> str:
-    """Derive a ``stage()`` idempotency key from the draft's content.
+    """Reuse the question event identity as the ``stage()`` idempotency key.
 
-    Reads only ``turn_marker`` -- never ``message`` or ``interactions`` --
-    so that truncating or otherwise reshaping the payload in
-    :func:`build_clarification_payload` can never change the key a re-entrant
-    resume of the same turn produces. A key that moved with the payload
-    would turn a replay that should cost nothing (the active row already
-    matches) into a fresh request every time the payload's shape changed.
+    The runtime generates this identity before publishing the question and
+    carries it through the waiting checkpoint. Reusing it here makes the
+    outbound TraceEvent, checkpoint draft, and durable interaction row name
+    the same question occurrence. Payload truncation or reshaping cannot
+    move the key because none of the payload content participates in it.
     """
 
-    digest = hashlib.sha256(draft.turn_marker.encode("utf-8")).hexdigest()[:32]
-    return f"clarification.{digest}"
+    return draft.event_id
 
 
 def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
@@ -364,6 +361,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         interactions_dropped = True
 
     payload: dict[str, Any] = {
+        "event_id": draft.event_id,
         "message": question,
         "interactions": interactions_payload,
         "message_type": _strip_control_characters(draft.message_type),
@@ -483,7 +481,11 @@ def resolve_publishable_clarification(
     5. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
-    5b. The payload built from the draft fits the character domain and size
+    6. ``draft.event_id`` is non-empty -- a question without the identity
+       allocated before publication cannot safely become a native interaction
+       row, because the row could not be tied back to the published question.
+       This fails closed for native publication without discarding the round.
+    7. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
         (empty after filtering, or reduced to only whitespace, or still
         oversized after truncation), that also degrades rather than fails.
@@ -572,6 +574,13 @@ def resolve_publishable_clarification(
 
     if anchor is None:
         return NotApplicable("no_anchor")
+
+    if not draft.event_id:
+        logger.warning(
+            "a clarification draft had no question event identity",
+            extra={"task_id": task.id, "run_id": lease.run_id},
+        )
+        return FailClosed("missing_event_id")
 
     payload = build_clarification_payload(draft)
 
