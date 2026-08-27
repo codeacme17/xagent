@@ -223,6 +223,8 @@ def test_terminal_task_error_payload_rejects_replacement_runner_same_run(_test_d
     )
 
     assert payload is not None
+    assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert "late old failure" not in repr(payload)
     assert payload["task"]["status"] == TaskStatus.RUNNING.value
     db = _direct_db_session()
     try:
@@ -235,6 +237,27 @@ def test_terminal_task_error_payload_rejects_replacement_runner_same_run(_test_d
         assert persisted.error_message is None
     finally:
         db.close()
+
+
+def test_terminal_task_error_payload_fallback_never_returns_raw_detail(
+    monkeypatch,
+) -> None:
+    secret = "terminal-session-secret"
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError(secret)
+    session_factory = MagicMock(return_value=db)
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: session_factory)
+
+    payload = _terminal_task_error_payload(42, f"raw diagnostic: {secret}")
+
+    assert payload == {
+        "type": "agent_error",
+        "message": websocket_api.CLIENT_SAFE_TASK_FAILURE,
+        "task": {"id": 42, "status": TaskStatus.FAILED.value},
+    }
+    assert secret not in repr(payload)
+    db.rollback.assert_called_once_with()
+    db.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio

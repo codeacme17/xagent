@@ -3408,7 +3408,7 @@ async def test_resume_failure_rejection_redacts_exception_text(db_session) -> No
         if call.args[0].get("type") == "message_rejected"
     ]
     assert len(rejected) == 1
-    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
+    assert rejected[0]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
     assert secret not in repr(rejected[0])
 
 

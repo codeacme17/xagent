@@ -102,9 +102,6 @@ from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
 )
-from ..services.client_error_messages import (
-    client_safe_error_message as _client_safe_error_message,
-)
 from ..services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -419,11 +416,10 @@ def client_safe_error_message(
     Read a passing sweep as "the recognized egress shapes are clean", never
     as "arbitrary Python data flow cannot reach a client raw".
     """
-    return _client_safe_error_message(
-        error,
-        safe_for_display=isinstance(error, ClientVisibleError),
-        fallback=fallback,
-    )
+    if not isinstance(error, ClientVisibleError):
+        return fallback
+    message = str(error)
+    return message if message.strip() else fallback
 
 
 def client_safe_task_command_failure(
@@ -3875,7 +3871,7 @@ async def execute_resume_background(
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
                         False,
-                        broadcast_error_message,
+                        CLIENT_SAFE_VALIDATION_ERROR,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
@@ -3899,14 +3895,22 @@ async def execute_resume_background(
                 )
                 return
         if lease is None:
-            assert broadcast_error_message is not None
-            await manager.broadcast_to_task(
-                create_terminal_task_error_event(
+            if broadcast_error_message is not None:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        broadcast_error_message,
+                    ),
                     task_id,
-                    broadcast_error_message,
-                ),
-                task_id,
-            )
+                )
+            else:
+                await manager.broadcast_to_task(
+                    create_terminal_task_error_event(
+                        task_id,
+                        CLIENT_SAFE_TASK_FAILURE,
+                    ),
+                    task_id,
+                )
     finally:
 
         async def finalize_resume_resources() -> None:
@@ -7840,7 +7844,10 @@ async def send_historical_data_as_stream(
             "error",
             task_id,
             {
-                "message": client_safe_error_message(e),
+                "message": client_safe_error_message(
+                    e,
+                    fallback="Task history could not be loaded. Please try again.",
+                ),
             },
         )
         await manager.send_personal_message(error_event, websocket)

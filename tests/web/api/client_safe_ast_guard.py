@@ -234,6 +234,25 @@ def _dict_variants(
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Name)
+        and expr.func.id == "create_stream_event"
+        and expr.func.id in module_helpers
+        and not _has_local_binding(expr, expr.func.id, parents)
+    ):
+        event_type = _call_argument(expr, 0, "event_type")
+        data = _call_argument(expr, 2, "data")
+        if event_type is None or data is None:
+            return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
+        variants = _dict_variants(data, reference, parents, module_helpers, resolving)
+        for fields, unresolved_fields in variants:
+            fields["type"] = event_type
+            if isinstance(event_type, ast.Constant):
+                unresolved_fields.discard("type")
+            else:
+                unresolved_fields.add("type")
+        return variants
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
         and expr.func.id in DICT_ERROR_PAYLOAD_BUILDERS
         and expr.func.id in module_helpers
         and not _has_local_binding(expr, expr.func.id, parents)
@@ -313,70 +332,54 @@ def _error_payload_messages(
     module_helpers: set[str],
 ) -> list[ast.expr]:
     """Client-visible text fields of a recognized error payload."""
-    if _called_name(node, parents) not in ERROR_PAYLOAD_SINKS:
+    sink_name = _called_name(node, parents)
+    if sink_name not in ERROR_PAYLOAD_SINKS:
         return []
+    payload_keyword = "data" if sink_name == "send_text" else "message"
+    payload = _call_argument(node, 0, payload_keyword)
+    if payload is None:
+        return []
+    argument = _unwrap_serializer(payload, parents)
     messages: list[ast.expr] = []
-    for raw in (*node.args, *(kw.value for kw in node.keywords)):
-        argument = _unwrap_serializer(raw, parents)
-        helper_builds_error = False
-        if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name):
-            helper = argument.func.id
+    if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name):
+        helper = argument.func.id
+        if helper == "create_terminal_task_error_event":
             helper_is_trusted = helper in module_helpers and not _has_local_binding(
                 argument, helper, parents
             )
-            if helper == "create_terminal_task_error_event":
-                if not helper_is_trusted:
-                    messages.append(argument)
-                    continue
-                message = _call_argument(argument, 1, "message")
-                messages.append(message if message is not None else argument)
-                continue
-            if helper == "create_stream_event":
-                if not helper_is_trusted:
-                    messages.append(argument)
-                    continue
-                event_type = _call_argument(argument, 0, "event_type")
-                if isinstance(event_type, ast.Constant):
-                    if event_type.value not in ERROR_PAYLOAD_TYPES:
-                        continue
-                elif _is_known_non_error_event_type(
-                    event_type, argument, parents, module_helpers
-                ):
-                    continue
-                else:
-                    messages.append(argument)
-                    continue
-                data = _call_argument(argument, 2, "data")
-                if data is None:
-                    messages.append(argument)
-                    continue
-                if not isinstance(data, ast.Dict):
-                    messages.append(data)
-                    continue
-                argument = data
-                helper_builds_error = True
-        if not isinstance(argument, ast.Dict):
+            if not helper_is_trusted:
+                return [argument]
+            message = _call_argument(argument, 1, "message")
+            return [message if message is not None else argument]
+        if helper != "create_stream_event":
+            return []
+    if not isinstance(argument, (ast.Call, ast.Dict, ast.Name, ast.Await)):
+        return []
+    if sink_name == "send_text" and isinstance(argument, (ast.Name, ast.Await)):
+        # ``ConnectionManager`` serializes payloads already vetted at its
+        # public send/broadcast boundary. Keep direct dict/json payloads
+        # visible without treating that forwarding layer as a second
+        # unresolved producer.
+        return []
+    for fields, unresolved_fields in _dict_variants(
+        argument, node, parents, module_helpers
+    ):
+        kind = fields.get("type")
+        is_error_payload = not _is_known_non_error_event_type(
+            kind, node, parents, module_helpers
+        ) and (
+            (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
+            or "type" in unresolved_fields
+        )
+        if not is_error_payload:
             continue
-        for fields, unresolved_fields in _dict_variants(
-            argument, node, parents, module_helpers
-        ):
-            kind = fields.get("type")
-            is_error_payload = not _is_known_non_error_event_type(
-                kind, node, parents, module_helpers
-            ) and (
-                (isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES)
-                or helper_builds_error
-                or "type" in unresolved_fields
-            )
-            if not is_error_payload:
-                continue
-            messages.extend(
-                value
-                for field in ("message", "error")
-                if (value := fields.get(field)) is not None
-            )
-            if unresolved_fields.intersection({"message", "error"}):
-                messages.append(argument)
+        messages.extend(
+            value
+            for field in ("message", "error")
+            if (value := fields.get(field)) is not None
+        )
+        if unresolved_fields.intersection({"message", "error"}):
+            messages.append(argument)
     return messages
 
 
@@ -522,9 +525,33 @@ def _can_reach_reference(
     value: ast.expr, reference: ast.AST, parents: dict[ast.AST, ast.AST]
 ) -> bool:
     """Whether a binding can reach a reference directly or on a loop back-edge."""
+    if _is_in_mutually_exclusive_if_branch(value, reference, parents):
+        return False
     return _precedes(value, reference) or _reaches_on_loop_backedge(
         value, reference, parents
     )
+
+
+def _is_in_mutually_exclusive_if_branch(
+    value: ast.expr,
+    reference: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    """Whether a binding and sink sit in opposite branches of one ``if``."""
+    current: ast.AST | None = value
+    while current is not None:
+        parent = parents.get(current)
+        if isinstance(parent, ast.If):
+            value_branch = _descendant_control_branch(value, parent, parents)
+            reference_branch = _descendant_control_branch(reference, parent, parents)
+            if (
+                value_branch in {"body", "orelse"}
+                and reference_branch in {"body", "orelse"}
+                and value_branch != reference_branch
+            ):
+                return True
+        current = parent
+    return False
 
 
 def _reaches_on_loop_backedge(
@@ -1137,7 +1164,17 @@ def _is_client_safe(
         if expr.func.id == "client_safe_error_message" and _is_unshadowed_module_name(
             expr.func, parents, ast.FunctionDef
         ):
-            return True
+            fallback = next(
+                (
+                    keyword.value
+                    for keyword in expr.keywords
+                    if keyword.arg == "fallback"
+                ),
+                None,
+            )
+            return fallback is None or _is_client_safe(
+                fallback, parents, imported_safe_constants
+            )
         if expr.func.id == "client_safe_task_command_failure" and (
             _is_unshadowed_module_name(expr.func, parents, ast.FunctionDef)
         ):
@@ -1163,6 +1200,10 @@ def _is_client_safe(
             _is_client_safe(value, parents, imported_safe_constants)
             for value in expr.values
         )
+    if isinstance(expr, ast.IfExp):
+        return _is_client_safe(
+            expr.body, parents, imported_safe_constants
+        ) and _is_client_safe(expr.orelse, parents, imported_safe_constants)
     return False
 
 

@@ -9,21 +9,6 @@ CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try a
 CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
 
 
-def client_safe_error_message(
-    error: BaseException,
-    *,
-    safe_for_display: bool = False,
-    fallback: str = CLIENT_SAFE_VALIDATION_ERROR,
-) -> str:
-    """Return exception text only when the caller proves it is public-safe."""
-
-    if safe_for_display:
-        message = str(error)
-        if message.strip():
-            return message
-    return fallback
-
-
 def required_mcp_unavailable_client_message(
     error: BaseException,
     *,

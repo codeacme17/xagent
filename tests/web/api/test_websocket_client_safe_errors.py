@@ -181,8 +181,8 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
         f"expected exactly 30 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads == 48, (
-        f"expected exactly 48 error payloads, matched {result.error_payloads}; "
+    assert result.error_payloads == 53, (
+        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -492,6 +492,18 @@ def test_client_visible_message_preserves_non_ascii_text() -> None:
     )
 
 
+def test_incidental_exception_uses_the_requested_safe_fallback() -> None:
+    fallback = "The requested operation could not be completed."
+
+    rendered = websocket_api.client_safe_error_message(
+        RuntimeError(SECRET),
+        fallback=fallback,
+    )
+
+    assert rendered == fallback
+    assert SECRET not in rendered
+
+
 def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
     cause = RuntimeError(SECRET)
     error = websocket_api.ClientVisibleValidationError("")
@@ -643,11 +655,12 @@ async def leak(websocket, task_id):
     try:
         pass
     except Exception as e:
-        await manager.broadcast_to_task(
-            create_stream_event("error", task_id, {"message": str(e)}), task_id
+        error_event = create_stream_event(
+            "error", task_id, {"message": str(e)}
         )
+        await manager.send_personal_message(error_event, websocket)
 """,
-        id="helper-built",
+        id="helper-built-then-passed-by-name",
     ),
     pytest.param(
         """
@@ -1609,6 +1622,56 @@ if flag:
 async def leak(error):
     await send_message_delivery(message=client_safe_error_message(error))
 """
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    ("fallback", "imported_constant", "accepted"),
+    [
+        ('f"raw: {error}"', "", False),
+        ("raw_fallback", "", False),
+        ('"fixed safe text"', "", True),
+        (
+            "CLIENT_SAFE_TASK_FAILURE",
+            "from ..services.client_error_messages import CLIENT_SAFE_TASK_FAILURE\n",
+            True,
+        ),
+    ],
+    ids=["formatted-exception", "unresolved-name", "literal", "trusted-constant"],
+)
+def test_guard_checks_an_explicit_client_safe_fallback(
+    fallback: str, imported_constant: str, accepted: bool
+) -> None:
+    source = f"""{imported_constant}
+def client_safe_error_message(error, *, fallback="safe"):
+    return fallback
+async def safe(websocket, error):
+    await manager.send_personal_message(
+        {{
+            "type": "error",
+            "message": client_safe_error_message(error, fallback={fallback}),
+        }},
+        websocket,
+    )
+"""
+
+    assert bool(_guard_offenders(source)) is not accepted
+
+
+def test_guard_rejects_a_stream_builder_rebound_through_global() -> None:
+    source = """
+def create_stream_event(event_type, task_id, data):
+    return {"type": event_type, "task_id": task_id, **data}
+def configure(raw_builder):
+    global create_stream_event
+    create_stream_event = raw_builder
+async def send(websocket, task_id):
+    await manager.send_personal_message(
+        create_stream_event("error", task_id, {"message": "fixed text"}),
+        websocket,
+    )
+"""
+
     assert _guard_offenders(source)
 
 

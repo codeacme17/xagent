@@ -632,7 +632,8 @@ async def test_historical_stream_format_error_redacts_exception_text(
     assert len(sent_events) == 1
     assert sent_events[0]["event_type"] == "error"
     assert (
-        sent_events[0]["data"]["message"] == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+        sent_events[0]["data"]["message"]
+        == "Task history could not be loaded. Please try again."
     )
     assert secret not in repr(sent_events[0])
 
