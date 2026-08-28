@@ -374,9 +374,7 @@ async def test_legacy_handler_does_not_steal_live_foreign_lease(
 
 
 @pytest.mark.asyncio
-async def test_handle_chat_message_access_denied_does_not_fail_task(
-    _test_db, monkeypatch
-):
+async def test_handle_chat_message_non_owner_does_not_fail_task(_test_db, monkeypatch):
     db = _direct_db_session()
     try:
         owner = User(username="owner", password_hash="hash")
@@ -431,8 +429,8 @@ async def test_handle_chat_message_access_denied_does_not_fail_task(
     assert broadcasts == []
     assert sent_messages
     assert sent_messages[0]["type"] == "error"
-    assert sent_messages[0]["message"] == "You do not have access to this task."
-    assert sent_messages[0]["error_code"] == "task_access_denied"
+    assert sent_messages[0]["message"] == "Task is no longer available."
+    assert sent_messages[0]["error_code"] == "task_unavailable"
 
     db = _direct_db_session()
     try:

@@ -5542,9 +5542,11 @@ def _enqueue_websocket_task_command_sync(
                 error_code=ClientErrorCode.TASK_UNAVAILABLE,
             )
         if not actor_is_admin and int(task.user_id) != actor_user_id:
+            # Keep the permission-specific text for operator logs, but expose
+            # the same code as a missing task so task IDs cannot be probed.
             raise ClientVisiblePermissionError(
                 f"Access denied: Task {task_id} does not belong to you",
-                error_code=ClientErrorCode.TASK_ACCESS_DENIED,
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
             )
         if kind == TaskCommandKind.MESSAGE:
             from ..services.chat_history_service import (
@@ -5890,9 +5892,10 @@ def _prepare_websocket_turn_sync(
                     requested_task_id,
                     existing_task.user_id,
                 )
+                # Match the public opacity contract at command enqueue above.
                 raise ClientVisiblePermissionError(
                     f"Access denied: Task {requested_task_id} does not belong to you",
-                    error_code=ClientErrorCode.TASK_ACCESS_DENIED,
+                    error_code=ClientErrorCode.TASK_UNAVAILABLE,
                 )
             task_created = True
 

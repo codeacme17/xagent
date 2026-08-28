@@ -303,7 +303,7 @@ async def test_chat_without_an_actor_uses_the_authentication_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_non_owner_uses_the_access_denied_contract(db_session) -> None:
+async def test_chat_non_owner_uses_the_neutral_unavailable_contract(db_session) -> None:
     owner = _user(db_session, "chat-access-owner")
     stranger = _user(db_session, "chat-access-stranger")
     task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
@@ -325,16 +325,15 @@ async def test_chat_non_owner_uses_the_access_denied_contract(db_session) -> Non
         call.args[0] for call in ws_manager.send_personal_message.call_args_list
     ]
     assert payloads
-    assert all(payload["error_code"] == "task_access_denied" for payload in payloads)
+    assert all(payload["error_code"] == "task_unavailable" for payload in payloads)
     assert all(
-        payload["message"] == "You do not have access to this task."
-        for payload in payloads
+        payload["message"] == "Task is no longer available." for payload in payloads
     )
     assert f"Task {task.id} does not belong to you" not in repr(payloads)
 
 
 @pytest.mark.asyncio
-async def test_unserialized_chat_non_owner_keeps_the_access_contract(
+async def test_unserialized_chat_non_owner_keeps_the_neutral_contract(
     db_session,
 ) -> None:
     owner = _user(db_session, "direct-chat-access-owner")
@@ -358,10 +357,9 @@ async def test_unserialized_chat_non_owner_keeps_the_access_contract(
         call.args[0] for call in ws_manager.send_personal_message.call_args_list
     ]
     assert payloads
-    assert all(payload["error_code"] == "task_access_denied" for payload in payloads)
+    assert all(payload["error_code"] == "task_unavailable" for payload in payloads)
     assert all(
-        payload["message"] == "You do not have access to this task."
-        for payload in payloads
+        payload["message"] == "Task is no longer available." for payload in payloads
     )
 
 

@@ -277,6 +277,78 @@ async def test_missing_task_control_uses_stable_error_code(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "message_type", ["pause_task", "resume_task"], ids=["pause", "resume"]
+)
+async def test_non_owner_control_is_indistinguishable_from_missing_task(
+    _test_db: None,
+    message_type: str,
+) -> None:
+    """A signed-in user cannot use task controls as an existence oracle."""
+    from fastapi import WebSocketDisconnect
+
+    db = _direct_db_session()
+    try:
+        owner = User(username=f"oracle-owner-{message_type}", password_hash="hash")
+        intruder = User(
+            username=f"oracle-intruder-{message_type}", password_hash="hash"
+        )
+        db.add_all([owner, intruder])
+        db.commit()
+        task = Task(
+            user_id=int(owner.id),
+            title="Private task",
+            description="Must not be discoverable",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        foreign_task_id = int(task.id)
+        intruder_id = int(intruder.id)
+    finally:
+        db.close()
+
+    async def send_control(task_id: int) -> list[dict]:
+        websocket = MagicMock()
+        websocket.receive_text = AsyncMock(
+            side_effect=[json.dumps({"type": message_type}), WebSocketDisconnect()]
+        )
+        connection_manager = MagicMock(
+            connect=AsyncMock(),
+            disconnect=MagicMock(),
+            send_personal_message=AsyncMock(),
+            broadcast_to_task=AsyncMock(),
+        )
+        with (
+            patch.object(websocket_api, "manager", connection_manager),
+            patch.object(
+                websocket_api,
+                "get_authenticated_user",
+                AsyncMock(return_value=SimpleNamespace(id=intruder_id, is_admin=False)),
+            ),
+        ):
+            await websocket_api.websocket_chat_endpoint(websocket, task_id, None)
+        return [
+            call.args[0]
+            for call in connection_manager.send_personal_message.await_args_list
+        ]
+
+    missing_payloads = await send_control(foreign_task_id + 424242)
+    foreign_payloads = await send_control(foreign_task_id)
+
+    expected = [
+        {
+            "type": "error",
+            "message": "Task is no longer available.",
+            "error_code": "task_unavailable",
+        }
+    ]
+    assert missing_payloads == foreign_payloads == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("handler_name", "extra_message_data"),
     ENQUEUE_FAILURE_HANDLERS,
     ids=[name for name, _ in ENQUEUE_FAILURE_HANDLERS],
@@ -603,12 +675,12 @@ async def test_builder_chat_redacts_through_its_own_socket_sink(
 @pytest.mark.parametrize(
     "handler_name", ["handle_pause_task", "handle_resume_task"], ids=["pause", "resume"]
 )
-async def test_permission_rejection_uses_stable_error_code(
+async def test_permission_rejection_uses_neutral_unavailable_code(
     _test_db: None,
     monkeypatch: pytest.MonkeyPatch,
     handler_name: str,
 ) -> None:
-    """Pause and resume preserve the same coded denial contract as chat."""
+    """Pause and resume do not reveal that another user's task exists."""
     db = _direct_db_session()
     try:
         owner = User(username=f"owner-{handler_name}", password_hash="hash")
@@ -643,8 +715,8 @@ async def test_permission_rejection_uses_stable_error_code(
     payloads = _client_payloads(connection_manager)
     assert payloads, "the handler must refuse the intruder out loud"
     assert any(
-        payload.get("message") == "You do not have access to this task."
-        and payload.get("error_code") == "task_access_denied"
+        payload.get("message") == "Task is no longer available."
+        and payload.get("error_code") == "task_unavailable"
         for payload in payloads
     ), payloads
 
