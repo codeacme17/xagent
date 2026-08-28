@@ -124,7 +124,6 @@ def downgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     if TABLE in inspector.get_table_names():
         op.drop_table(TABLE)
-    inspector = sa.inspect(op.get_bind())
     if COMMAND_TABLE in inspector.get_table_names():
         command_columns = {
             column["name"] for column in inspector.get_columns(COMMAND_TABLE)

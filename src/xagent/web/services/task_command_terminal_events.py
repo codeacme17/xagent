@@ -40,6 +40,25 @@ class TerminalTaskEventDraft:
 
 
 _DRAFT_ATTRIBUTE = "_xagent_terminal_task_event_draft"
+_CANCEL_COMMAND_KIND = "cancel"
+_EXTERNAL_COMMAND_SCOPE = "external"
+
+
+def _is_external_cancel(command: TaskExecutionCommand) -> bool:
+    """Match the normalized durable shape used by the WebSocket classifier.
+
+    ``TaskCommandKind`` lives in the transport module that imports this one,
+    so importing that enum here would create a cycle. The producer stores the
+    enum value, and WebSocket ingress accepts the same exact external scope;
+    keeping both checks strict prevents malformed payload values from gaining
+    the anonymous-audience disclosure policy.
+    """
+
+    return (
+        str(command.kind) == _CANCEL_COMMAND_KIND
+        and isinstance(command.payload, dict)
+        and command.payload.get("scope") == _EXTERNAL_COMMAND_SCOPE
+    )
 
 
 def bind_terminal_event_draft(
@@ -80,6 +99,7 @@ def stage_terminal_event(
         db.query(TaskExecutionCommand, Task)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(TaskExecutionCommand.id == command_db_id)
+        .populate_existing()
         .one_or_none()
     )
     if snapshot is None:
@@ -135,7 +155,11 @@ def stage_terminal_event(
         outcome=draft.outcome.value,
         message_code=(draft.message_code.value if draft.message_code else None),
         resend_safe=bool(draft.resend_safe),
-        include_command_identity=bool(draft.include_command_identity),
+        include_command_identity=bool(
+            draft.include_command_identity
+            and command.actor_user_id is not None
+            and not _is_external_cancel(command)
+        ),
     )
     db.add(event)
     db.flush()

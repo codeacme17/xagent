@@ -35,13 +35,13 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
-from .task_lease_service import get_runner_id
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
     TerminalTaskEventOutcome,
     stage_terminal_event,
     terminal_event_draft_for_error,
 )
+from .task_lease_service import get_runner_id
 
 logger = logging.getLogger(__name__)
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-from threading import Barrier, Event as ThreadEvent
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
+from threading import Event as ThreadEvent
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +36,7 @@ from xagent.web.services.task_command_transport import (
     claim_task_command,
     enqueue_task_command,
     fail_task_command,
+    finish_task_command,
     retry_failed_task_command,
 )
 
@@ -95,7 +97,7 @@ def _create_running_task(db) -> tuple[User, Task]:
         run_id="run-1",
         state_version=3,
         runner_id="worker-a",
-        lease_expires_at=datetime.utcnow() + timedelta(minutes=1),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
     )
     db.add(task)
     db.commit()
@@ -168,6 +170,178 @@ def test_terminal_event_uses_the_command_acceptance_snapshot(db_session) -> None
     assert command.target_state_version == 3
     assert event.task_run_id == "run-1"
     assert event.task_state_version == 3
+
+
+def test_terminal_event_refreshes_identity_mapped_command_after_bulk_update(
+    db_session,
+) -> None:
+    user, task = _create_running_task(db_session)
+    claimed = _claim_command(db_session, user, task, "identity-mapped-command")
+    command = db_session.get(TaskExecutionCommand, claimed.id)
+    assert command is not None
+    assert command.status == "processing"
+
+    updated = (
+        db_session.query(TaskExecutionCommand)
+        .filter(TaskExecutionCommand.id == claimed.id)
+        .update(
+            {TaskExecutionCommand.status: "completed"},
+            synchronize_session=False,
+        )
+    )
+    assert updated == 1
+    assert command.status == "processing"
+
+    event = stage_terminal_event(db_session, command_db_id=claimed.id)
+
+    assert event.outcome == "completed"
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+def test_external_cancel_suppresses_command_identity_projection(
+    db_session,
+    outcome: str,
+) -> None:
+    user, task = _create_running_task(db_session)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id=f"external-{outcome}",
+        kind=TaskCommandKind.CANCEL,
+        payload={"type": "cancel_task", "scope": "external"},
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+    if outcome == "completed":
+        assert finish_task_command(
+            claimed.id,
+            "worker-a",
+            expected_attempt_count=claimed.attempt_count,
+        )
+    else:
+        assert fail_task_command(
+            claimed.id,
+            "worker-a",
+            "rejected",
+            force_terminal=True,
+            expected_attempt_count=claimed.attempt_count,
+        )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert event.include_command_identity is False
+    assert event.command_id == f"external-{outcome}"
+    assert event.command_kind == TaskCommandKind.CANCEL.value
+    assert event.actor_user_id == user.id
+    assert event.task_owner_user_id == user.id
+    assert event.task_run_id == "run-1"
+    assert event.task_state_version == 3
+    assert event.outcome_version == claimed.attempt_count
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "with_actor", "expected_identity"),
+    [
+        pytest.param(
+            TaskCommandKind.PAUSE,
+            {"scope": "external"},
+            True,
+            True,
+            id="external-scope-on-non-cancel",
+        ),
+        pytest.param(
+            TaskCommandKind.CANCEL,
+            {"type": "cancel_task"},
+            True,
+            True,
+            id="cancel-without-scope",
+        ),
+        pytest.param(
+            TaskCommandKind.CANCEL,
+            {"scope": ["external"]},
+            True,
+            True,
+            id="cancel-with-non-string-scope",
+        ),
+        pytest.param(
+            TaskCommandKind.PAUSE,
+            {"type": "pause_task"},
+            False,
+            False,
+            id="actorless-command",
+        ),
+    ],
+)
+def test_terminal_event_identity_matches_kind_scope_and_actor(
+    db_session,
+    kind: TaskCommandKind,
+    payload: dict,
+    with_actor: bool,
+    expected_identity: bool,
+) -> None:
+    user, task = _create_running_task(db_session)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id) if with_actor else None,
+        command_id=f"identity-axis-{uuid.uuid4().hex}",
+        kind=kind,
+        payload=payload,
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+    assert finish_task_command(
+        claimed.id,
+        "worker-a",
+        expected_attempt_count=claimed.attempt_count,
+    )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert event.include_command_identity is expected_identity
+
+
+def test_terminal_event_preserves_explicit_identity_suppression(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    claimed = _claim_command(db_session, user, task, "suppressed-command-identity")
+    assert fail_task_command(
+        claimed.id,
+        "worker-a",
+        "rejected",
+        force_terminal=True,
+        expected_attempt_count=claimed.attempt_count,
+        terminal_event=TerminalTaskEventDraft(
+            outcome=TerminalTaskEventOutcome.FAILED,
+            message_code=None,
+            resend_safe=False,
+            include_command_identity=False,
+        ),
+    )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert event.include_command_identity is False
 
 
 def test_one_concurrent_claim_winner_stages_one_terminal_event(db_session) -> None:
