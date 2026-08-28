@@ -176,6 +176,17 @@ from ..services.task_command_transport import (
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
+from ..services.task_command_terminal_events import (
+    TerminalTaskEvent,
+    TerminalTaskEventDraft,
+    TerminalTaskEventLoopRegistry,
+    TerminalTaskEventMessageCode,
+    TerminalTaskEventPrincipal,
+    TerminalTaskEventSubscription,
+    bind_terminal_event_draft,
+    resolve_terminal_task_event_cursor,
+    terminal_task_event_payload,
+)
 from ..services.task_execution_controller import (
     StaleTaskRunError,
     StaleTaskStateVersionError,
@@ -4754,6 +4765,7 @@ _VERSIONED_TASK_EVENT_TYPES = {
     "agent_error",
     "error",
     "task_completed",
+    "task_command_outcome",
     "task_error",
     "task_pause_requested",
     "task_paused",
@@ -5095,6 +5107,86 @@ class ConnectionManager:
 
 # Global connection manager
 manager = ConnectionManager()
+
+_terminal_task_event_registry = TerminalTaskEventLoopRegistry()
+
+
+async def _send_terminal_task_event(
+    websocket: WebSocket,
+    event: TerminalTaskEvent,
+) -> None:
+    """Send the immutable event snapshot without current-task relabeling."""
+
+    await send_websocket_text(
+        websocket,
+        json.dumps(terminal_task_event_payload(event)),
+        is_active=lambda: manager.is_connection_registered(
+            websocket,
+            event.task_id,
+        ),
+    )
+
+
+async def attach_terminal_task_events(
+    websocket: WebSocket,
+    *,
+    task_id: int,
+    principal: User | WebSocketPrincipal,
+    after_event_id: int | None,
+) -> TerminalTaskEventSubscription:
+    """Attach an authorized socket to this worker's durable event tailer."""
+
+    resolved_after_event_id = (
+        after_event_id
+        if isinstance(after_event_id, int) and not isinstance(after_event_id, bool)
+        else None
+    )
+
+    async def send(event: TerminalTaskEvent) -> None:
+        if manager.is_connection_registered(websocket, task_id):
+            await _send_terminal_task_event(websocket, event)
+
+    return await _terminal_task_event_registry.attach(
+        connection=websocket,
+        principal=TerminalTaskEventPrincipal(
+            user_id=int(principal.id),
+            is_admin=bool(getattr(principal, "is_admin", False)),
+        ),
+        task_id=task_id,
+        sink=send,
+        after_event_id=resolved_after_event_id,
+    )
+
+
+async def resolve_initial_terminal_task_event_cursor(
+    *,
+    task_id: int,
+    principal: User | WebSocketPrincipal,
+    after_event_id: int | None,
+    allow_missing_task: bool = False,
+) -> int | None:
+    """Fix the event baseline before initial status/history awaits."""
+
+    resolved_after_event_id = (
+        after_event_id
+        if isinstance(after_event_id, int) and not isinstance(after_event_id, bool)
+        else None
+    )
+    return await resolve_terminal_task_event_cursor(
+        principal=TerminalTaskEventPrincipal(
+            user_id=int(principal.id),
+            is_admin=bool(getattr(principal, "is_admin", False)),
+        ),
+        task_id=task_id,
+        after_event_id=resolved_after_event_id,
+        allow_missing_task=allow_missing_task,
+    )
+
+
+async def detach_terminal_task_events(websocket: WebSocket) -> None:
+    """Detach the current durable-event subscription for one local socket."""
+
+    await _terminal_task_event_registry.detach(websocket)
 
 
 async def handle_file_upload_for_task(
@@ -6378,6 +6470,12 @@ async def _handle_chat_message_unserialized(
             if preparation.task_created:
                 old_task_id = preparation.requested_task_id
                 manager.move_connection(websocket, task_id)
+                await attach_terminal_task_events(
+                    websocket,
+                    task_id=task_id,
+                    principal=user,
+                    after_event_id=0,
+                )
                 await manager.send_personal_message(
                     {
                         "type": "task_id_updated",
@@ -8119,6 +8217,11 @@ async def websocket_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
     token: Optional[str] = Query(None, description="Authentication token"),
+    terminal_event_after: Optional[int] = Query(
+        None,
+        ge=0,
+        description="Last terminal task-command event cursor received",
+    ),
 ) -> None:
     """WebSocket unified endpoint - handle chat, execution status, and DAG intervention"""
     # Verify user identity
@@ -8138,10 +8241,22 @@ async def websocket_chat_endpoint(
     # Initialised here, not in the loop, because the initial status request runs
     # before the first message is ever parsed.
     dispatching = "websocket initial status request"
-
     try:
+        terminal_event_cursor = await resolve_initial_terminal_task_event_cursor(
+            task_id=task_id,
+            principal=user,
+            after_event_id=terminal_event_after,
+            allow_missing_task=True,
+        )
         # Send initial state
         await handle_status_request(websocket, task_id, user)
+        if terminal_event_cursor is not None:
+            await attach_terminal_task_events(
+                websocket,
+                task_id=task_id,
+                principal=user,
+                after_event_id=terminal_event_cursor,
+            )
 
         while True:
             # Receive client message
@@ -8208,6 +8323,7 @@ async def websocket_chat_endpoint(
         raise
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)
 
 
 async def handle_intervention(
@@ -9403,54 +9519,48 @@ def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
     return None
 
 
-async def _broadcast_terminal_command_error(
+def _is_external_cancel(command: ClaimedTaskCommand) -> bool:
+    """Whether this command is a stop issued by a task's external audience."""
+
+    return (
+        command.kind == TaskCommandKind.CANCEL
+        and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+    )
+
+
+async def _terminal_command_event_draft(
     command: ClaimedTaskCommand,
     error: BaseException,
-) -> None:
-    scope = _command_scope(command)
-    # Two things separate an external-scope cancel from every other command
-    # that exhausts its budget, and both come from who reads the frame. The
-    # wording has to be true about the turn, which takes reading the task.
-    # And ``command_kind``/``command_id`` are operator handles: an anonymous
-    # visitor cannot act on them and should not be shown the durable command
-    # identity of a task they do not own. Two payload literals rather than
-    # one built and trimmed: the client-safe guard only inspects dict
-    # literals passed straight to the sink, and a payload assembled in a
-    # variable would drop this site out of its view entirely.
-    if is_external_cancel_command(kind=command.kind.value, scope=scope):
-        task_status = await _load_terminal_command_task_status(command.task_id)
-        await manager.broadcast_to_task(
-            {
-                "type": "agent_error",
-                "message": client_safe_task_command_failure(
-                    command.kind,
-                    error,
-                    scope=scope,
-                    task_status=task_status,
-                ),
-                "task_id": command.task_id,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
-            command.task_id,
-        )
-        return
-    await manager.broadcast_to_task(
-        {
-            "type": "agent_error",
-            # A blessed constructor rather than an f-string at the call
-            # site: the guard cannot see inside an interpolation. The kind
-            # also travels as a structured field for consumers that want it.
-            "message": client_safe_task_command_failure(
-                command.kind,
-                error,
-                scope=scope,
+) -> TerminalTaskEventDraft:
+    """Build safe presentation metadata; disposition code persists it."""
+
+    if _is_external_cancel(command):
+        try:
+            task_status = await _load_terminal_command_task_status(command.task_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not classify external terminal command outcome; "
+                "using conservative client message task_id=%s error_type=%s",
+                command.task_id,
+                type(exc).__name__,
+            )
+            task_status = None
+        return TerminalTaskEventDraft(
+            message_code=(
+                TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+                if task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
             ),
-            "command_kind": command.kind.value,
-            "task_id": command.task_id,
-            "command_id": command.command_id,
-            "timestamp": datetime.now(timezone.utc).timestamp(),
-        },
-        command.task_id,
+            resend_safe=False,
+            include_command_identity=False,
+        )
+    return TerminalTaskEventDraft(
+        message_code=(
+            TerminalTaskEventMessageCode.TASK_COMMAND_DEFERRED
+            if isinstance(error, TaskCommandDeferred)
+            else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
+        ),
+        resend_safe=False,
     )
 
 
@@ -9464,7 +9574,10 @@ async def execute_durable_task_command(
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
             _command_origins.discard_command(command.command_id, command.task_id)
-            await _broadcast_terminal_command_error(command, exc)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
         # A deferral that will retry keeps its origin entry.
         raise
     except TaskCommandRejected:
@@ -9475,7 +9588,10 @@ async def execute_durable_task_command(
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
             _command_origins.discard_command(command.command_id, command.task_id)
-            await _broadcast_terminal_command_error(command, exc)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
         raise
     _command_origins.discard_command(command.command_id, command.task_id)
     return result
@@ -10071,6 +10187,7 @@ async def websocket_build_preview_endpoint(
                     )
             elif message_type == "clear_context":
                 manager.unregister_connection(websocket)
+                await detach_terminal_task_events(websocket)
                 websocket.state.preview_task_id = None
                 await send_websocket_text(
                     websocket,
@@ -10103,6 +10220,7 @@ async def websocket_build_preview_endpoint(
         logger.error(f"Unexpected error in build preview WebSocket: {e}")
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)
 
 
 async def handle_build_preview_execution(
@@ -10189,6 +10307,14 @@ async def handle_build_preview_execution(
         manager.register_connection(websocket, preview_task_id)
     else:
         preview_task_id = int(str(preview_task_id))
+
+    if not _terminal_task_event_registry.has_subscription(websocket):
+        await attach_terminal_task_events(
+            websocket,
+            task_id=preview_task_id,
+            principal=cast(WebSocketPrincipal, user),
+            after_event_id=0,
+        )
 
     await handle_chat_message(
         websocket,
