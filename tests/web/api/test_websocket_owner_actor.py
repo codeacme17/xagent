@@ -1736,6 +1736,98 @@ async def test_durable_failure_keeps_detail_sender_only(
 
 
 @pytest.mark.asyncio
+async def test_attachment_bind_race_keeps_specific_failure_on_origin_lane(
+    db_session,
+    tmp_path,
+) -> None:
+    """A post-prepare bind loss must not disclose sender state to subscribers."""
+
+    owner = _user(db_session, "bind-race-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "bind-race-runner"
+    task.run_id = "bind-race-run"
+    file_path = tmp_path / "bind-race.txt"
+    file_path.write_text("raced attachment")
+    db_session.add(
+        UploadedFile(
+            file_id="bind-race-file",
+            user_id=int(owner.id),
+            task_id=int(task.id),
+            filename="bind-race.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=file_path.stat().st_size,
+        )
+    )
+    db_session.commit()
+
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        async def send_text(self, payload: str) -> None:
+            import json
+
+            self.messages.append(json.loads(payload))
+
+    origin = RecordingSocket()
+    subscriber = RecordingSocket()
+    connection_manager = websocket_api.ConnectionManager()
+    connection_manager.register_connection(origin, int(task.id))  # type: ignore[arg-type]
+    connection_manager.register_connection(subscriber, int(task.id))  # type: ignore[arg-type]
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    bg_manager = MagicMock()
+    bg_manager.reserve_resume.return_value = True
+    bg_manager.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch("xagent.web.api.websocket.manager", connection_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+        patch(
+            "xagent.web.api.websocket.bind_turn_files_no_commit",
+            return_value=["bind-race-file"],
+        ),
+    ):
+        await _handle_chat_message_unserialized(
+            origin,  # type: ignore[arg-type]
+            int(task.id),
+            {
+                "message": "Use my attachment",
+                "client_message_id": "bind-race-turn",
+                "user": SimpleNamespace(id=int(owner.id), is_admin=False),
+                "files": [
+                    {
+                        "file_id": "bind-race-file",
+                        "name": "bind-race.txt",
+                    }
+                ],
+            },
+        )
+
+    assert any(
+        event.get("type") == "message_rejected"
+        and event.get("error_code") == "message_attachment_unavailable"
+        for event in origin.messages
+    )
+    subscriber_failures = [
+        event
+        for event in subscriber.messages
+        if event.get("type") in {"error", "agent_error", "task_error"}
+    ]
+    assert subscriber_failures
+    assert all(
+        event.get("error_code") == "task_execution_failed"
+        and event.get("message") == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        for event in subscriber_failures
+    )
+
+
+@pytest.mark.asyncio
 async def test_resume_registration_failure_keeps_injected_delivery_pending(
     db_session,
 ) -> None:
@@ -4496,11 +4588,12 @@ async def test_a_dispatch_fault_is_labelled_with_the_message_that_failed(
     db_session.close()
 
     websocket = MagicMock()
+    websocket.accept = AsyncMock()
     websocket.receive_text = AsyncMock(
         side_effect=[json.dumps({"type": "resume_task"}), WebSocketDisconnect()]
     )
     ws_manager = MagicMock(
-        connect=AsyncMock(),
+        register_connection=MagicMock(),
         disconnect=MagicMock(),
         send_personal_message=AsyncMock(),
         broadcast_to_task=AsyncMock(),

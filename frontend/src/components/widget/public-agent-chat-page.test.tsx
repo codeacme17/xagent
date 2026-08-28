@@ -168,6 +168,7 @@ async function expectWidgetAuthFailure(detail: string) {
 function expectPublicProviderToken() {
   expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.provider).toMatchObject({ token: "public-access-token" })
+  expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
   expect(app.provider?.transport?.capabilities).toEqual({
     agentCards: "disabled",
     voice: "disabled",
@@ -624,6 +625,7 @@ describe("PublicAgentChatPage", () => {
       access_token: "public-access-token",
     })
     expect(app.provider).toMatchObject({ token: "public-access-token" })
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.buildWebSocketUrl?.({
       baseUrl: "wss://api.example",
       taskId: 42,

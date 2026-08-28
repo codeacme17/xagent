@@ -606,6 +606,7 @@ export function PublicAgentChatPage({
   const fileAccess = usePublicFileAccessPolicy(publicAccessToken)
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       agentCards: "disabled",
       voice: "disabled",

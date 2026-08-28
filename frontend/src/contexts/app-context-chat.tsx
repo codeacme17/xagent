@@ -902,10 +902,14 @@ const getWebSocketErrorCodeField = (message: WebSocketMessage): {
   return { present: false, value: undefined }
 }
 
-const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+const getWebSocketErrorMessage = (
+  message: WebSocketMessage,
+  trustLegacyErrorProse: boolean,
+): string => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
   if (getWebSocketErrorCodeField(message).present) return "Unknown error"
+  if (!trustLegacyErrorProse) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
 }
 
@@ -1844,6 +1848,12 @@ export interface AppProviderTransportCapabilities {
 }
 
 export interface AppProviderTransportConfig {
+  /**
+   * Whether no-code error frames may render server prose during a temporary
+   * old-backend/new-frontend deployment skew. Public and external-credential
+   * transports must opt out; the authenticated page keeps its legacy default.
+   */
+  legacyErrorProse?: "trusted" | "untrusted"
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   /**
    * Owns every file URL and request made below this provider. Public
@@ -1991,6 +2001,7 @@ export function AppProvider({
     }
   }, [])
   const sessionTransport = transport?.session
+  const trustLegacyErrorProse = transport?.legacyErrorProse !== "untrusted"
   const filesDisabled = !resolveTransportCapability(
     sessionTransport,
     sessionTransport?.files,
@@ -5601,7 +5612,7 @@ export function AppProvider({
         const agentErrorCode = getWebSocketErrorCode(message)
         const agentErrorMessage = agentErrorCode
           ? t(clientErrorTranslationKey(agentErrorCode))
-          : getWebSocketErrorMessage(message)
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -5648,7 +5659,7 @@ export function AppProvider({
         const websocketErrorCode = getWebSocketErrorCode(message)
         const websocketErrorMessage = websocketErrorCode
           ? t(clientErrorTranslationKey(websocketErrorCode))
-          : getWebSocketErrorMessage(message)
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
@@ -5694,7 +5705,7 @@ export function AppProvider({
         }
         break
     }
-  }, [])
+  }, [trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,

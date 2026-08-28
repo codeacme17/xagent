@@ -227,6 +227,7 @@ from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    send_websocket_authentication_infrastructure_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -7077,6 +7078,22 @@ async def _handle_chat_message_unserialized(
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
+            if (
+                isinstance(e, ClientVisibleError)
+                and e.error_code == ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
+            ):
+                # Preparation verified the attachment before the later atomic
+                # bind lost its race.  The specific state belongs only to the
+                # verified origin; task subscribers receive the same neutral
+                # execution failure as every other sender-specific durable
+                # attachment fault.
+                log_client_facing_failure(
+                    e,
+                    "Attachment bind race in agent execution: %s",
+                )
+                if not await answer_durable_turn_failure(e.error_code):
+                    return
+                return
             error_code = (
                 e.error_code
                 if isinstance(e, ClientVisibleError)
@@ -8157,6 +8174,24 @@ _DISPATCH_OPERATIONS = {
 _UNKNOWN_DISPATCH_OPERATION = "websocket unknown message type"
 
 
+def _private_websocket_task_access_sync(
+    *,
+    task_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+) -> Literal["authorized", "missing", "foreign"]:
+    """Classify private task access before a socket joins its live audience."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
+        if owner_id is None:
+            return "missing"
+        if actor_is_admin or int(owner_id) == actor_user_id:
+            return "authorized"
+        return "foreign"
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -8173,7 +8208,32 @@ async def websocket_chat_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Accept before closing an access denial so the fixed close reason survives
+    # the WebSocket handshake.  Do not register until ownership has been
+    # checked: task broadcasts are an owner-scoped private audience.
+    await websocket.accept()
+    try:
+        access = await run_db_io_cancellation_safe(
+            lambda: _private_websocket_task_access_sync(
+                task_id=task_id,
+                actor_user_id=int(user.id),
+                actor_is_admin=bool(user.is_admin),
+            )
+        )
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
+        return
+    if access == "foreign":
+        await websocket.close(
+            code=4003,
+            reason=client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
+        )
+        return
+    if access == "authorized":
+        manager.register_connection(websocket, task_id)
+    # A missing id deliberately stays accepted but unregistered.  The legacy
+    # first-chat recovery path creates a replacement task, then
+    # ``move_connection`` registers this already-accepted socket on that id.
 
     # Which message the loop is currently applying, for the fault arms below:
     # they guard the whole dispatch, so a fixed label would report a resume or

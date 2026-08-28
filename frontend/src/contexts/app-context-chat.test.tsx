@@ -3157,6 +3157,118 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
   })
 
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("hides absent-code $eventType prose at the untrusted $location boundary", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    const secret = "provider=openai path=/srv/private token=secret"
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: { type: eventType, message: secret },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            message: secret,
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain("Unknown error")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(secret)
+  })
+
+  it("preserves absent-code legacy prose for the authenticated default transport", async () => {
+    render(
+      <AppProvider token="authenticated-token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          type: "agent_error",
+          message: "Legacy actionable authenticated error",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Legacy actionable authenticated error",
+      )
+    })
+  })
+
+  it.each(
+    (["error", "agent_error", "task_error"] as const).flatMap((eventType) => [
+      { eventType, location: "nested" as const },
+      { eventType, location: "root" as const },
+    ]),
+  )("localizes recognized $location codes for untrusted $eventType events", async ({ eventType, location }) => {
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{ legacyErrorProse: "untrusted" }}
+      >
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.(location === "nested"
+        ? {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            data: {
+              type: eventType,
+              error_code: "task_execution_failed",
+              message: "provider token=secret",
+            },
+          }
+        : {
+            type: eventType,
+            timestamp: "2026-05-27T05:00:05Z",
+            error_code: "task_execution_failed",
+            message: "provider token=secret",
+          } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "clientErrors.taskExecutionFailed",
+      )
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("token=secret")
+  })
+
   it("stops processing when a task waits for user input", async () => {
     render(
       <AppProvider token="token">

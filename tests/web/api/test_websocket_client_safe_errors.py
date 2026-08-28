@@ -279,11 +279,11 @@ async def test_missing_task_control_uses_stable_error_code(
 @pytest.mark.parametrize(
     "message_type", ["pause_task", "resume_task"], ids=["pause", "resume"]
 )
-async def test_non_owner_control_is_indistinguishable_from_missing_task(
+async def test_private_endpoint_closes_foreign_task_before_control_dispatch(
     _test_db: None,
     message_type: str,
 ) -> None:
-    """A signed-in user cannot use task controls as an existence oracle."""
+    """Foreign sockets never join or dispatch; missing ids retain recovery."""
     from fastapi import WebSocketDisconnect
 
     db = _direct_db_session()
@@ -309,13 +309,18 @@ async def test_non_owner_control_is_indistinguishable_from_missing_task(
     finally:
         db.close()
 
-    async def send_control(task_id: int) -> list[dict]:
+    async def send_control(task_id: int) -> tuple[list[dict], list[tuple[int, str]]]:
         websocket = MagicMock()
+        websocket.accept = AsyncMock()
+        closed: list[tuple[int, str]] = []
+        websocket.close = AsyncMock(
+            side_effect=lambda *, code, reason: closed.append((code, reason))
+        )
         websocket.receive_text = AsyncMock(
             side_effect=[json.dumps({"type": message_type}), WebSocketDisconnect()]
         )
         connection_manager = MagicMock(
-            connect=AsyncMock(),
+            register_connection=MagicMock(),
             disconnect=MagicMock(),
             send_personal_message=AsyncMock(),
             broadcast_to_task=AsyncMock(),
@@ -329,13 +334,16 @@ async def test_non_owner_control_is_indistinguishable_from_missing_task(
             ),
         ):
             await websocket_api.websocket_chat_endpoint(websocket, task_id, None)
-        return [
-            call.args[0]
-            for call in connection_manager.send_personal_message.await_args_list
-        ]
+        return (
+            [
+                call.args[0]
+                for call in connection_manager.send_personal_message.await_args_list
+            ],
+            closed,
+        )
 
-    missing_payloads = await send_control(foreign_task_id + 424242)
-    foreign_payloads = await send_control(foreign_task_id)
+    missing_payloads, missing_closes = await send_control(foreign_task_id + 424242)
+    foreign_payloads, foreign_closes = await send_control(foreign_task_id)
 
     expected = [
         {
@@ -344,7 +352,10 @@ async def test_non_owner_control_is_indistinguishable_from_missing_task(
             "error_code": "task_unavailable",
         }
     ]
-    assert missing_payloads == foreign_payloads == expected
+    assert missing_payloads == expected
+    assert missing_closes == []
+    assert foreign_payloads == []
+    assert foreign_closes == [(4003, "Task is no longer available.")]
 
 
 @pytest.mark.asyncio
