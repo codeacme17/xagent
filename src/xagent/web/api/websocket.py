@@ -7146,55 +7146,15 @@ async def _handle_chat_message_unserialized(
             ):
                 return
         except RuntimeError as e:
-            # RuntimeError is incidental server detail. Both the initiator and
-            # task subscribers get stable codes with fixed safe fallbacks.
-            message = client_safe_error_message(e)
+            # RuntimeError is incidental server detail. Reuse the same
+            # audience split as the durable-failure arms above: the initiator
+            # gets the message-processing code while task subscribers get the
+            # neutral task-failure code.
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
-            if not await finish_delivery_failure(
-                message,
-                error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+            if not await answer_durable_turn_failure(
+                ClientErrorCode.MESSAGE_PROCESSING_FAILED
             ):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    CLIENT_SAFE_TASK_FAILURE,
-                    error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
-                )
-                await manager.broadcast_to_task(
-                    {
-                        **error_payload,
-                        "timestamp": timestamp,
-                    },
-                    authorized_task_id,
-                )
-                # Only the durable path needs this: there the rejection ack is
-                # suppressed, so the coded fallback bubble is its only answer.
-                if suppress_delivery_ack:
-                    await manager.send_personal_message(
-                        {
-                            "type": "error",
-                            "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
-                            "message": client_error_message(
-                                ClientErrorCode.MESSAGE_PROCESSING_FAILED
-                            ),
-                            "timestamp": timestamp,
-                        },
-                        websocket,
-                    )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
-                        "message": client_error_message(
-                            ClientErrorCode.MESSAGE_PROCESSING_FAILED
-                        ),
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except Exception as e:
             # Other unknown errors, re-raise
             # The branch that withholds the detail logs it, rather than

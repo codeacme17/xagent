@@ -183,17 +183,16 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
 
     # These are deliberate exact baselines. If a producer is added or removed,
     # inspect the changed site and bump the corresponding count in this test.
-    assert result.producers == 30, (
-        f"expected exactly 30 producers, matched {result.producers}; "
+    assert result.producers == 29, (
+        f"expected exactly 29 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
-    # This branch raised the common-base census from 53 to 54 with one coded
-    # error payload. #1658 then removed ``_resync_client_to_running_task``'s
-    # stale-client ``error`` frame in favour of the control-only
-    # ``task_resumed`` shape, bringing the combined census back to 53. The
-    # producer count above is unchanged, so both movements stay explicit.
-    assert result.error_payloads == 53, (
-        f"expected exactly 53 error payloads, matched {result.error_payloads}; "
+    # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
+    # frame in favour of the control-only ``task_resumed`` shape. The inner
+    # RuntimeError arm now also reuses ``answer_durable_turn_failure`` instead
+    # of spelling out three error payloads locally, bringing the census to 50.
+    assert result.error_payloads == 50, (
+        f"expected exactly 50 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
