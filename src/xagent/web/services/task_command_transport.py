@@ -36,6 +36,12 @@ from .db_runtime import (
     run_db_io_cancellation_safe,
 )
 from .task_lease_service import get_runner_id
+from .task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    TerminalTaskEventOutcome,
+    stage_terminal_event,
+    terminal_event_draft_for_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +312,7 @@ def stage_task_command(
     # window across everything it did in between, so existence is re-checked
     # here, by query, before inserting a command that references the row.
     snapshot = db.execute(
-        select(Task.status, Task.runner_id, Task.run_id).where(
+        select(Task.status, Task.runner_id, Task.run_id, Task.state_version).where(
             Task.id == resolved_task_id
         )
     ).one_or_none()
@@ -348,6 +354,7 @@ def stage_task_command(
         kind=kind.value,
         payload=payload,
         target_run_id=snapshot.run_id,
+        target_state_version=int(snapshot.state_version or 0),
         target_runner_id=active_runner_id,
         status=COMMAND_PENDING,
     )
@@ -755,6 +762,8 @@ def finish_task_command(
             },
             synchronize_session=False,
         )
+        if updated == 1:
+            stage_terminal_event(db, command_db_id=command_db_id)
         db.commit()
         return updated == 1
 
@@ -767,6 +776,7 @@ def fail_task_command(
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -823,6 +833,12 @@ def fail_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -837,6 +853,7 @@ def defer_task_command(
     reason: str,
     *,
     expected_attempt_count: int | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
@@ -896,6 +913,12 @@ def defer_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -1080,6 +1103,7 @@ async def dispatch_one_task_command(
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
+        terminal_event = terminal_event_draft_for_error(exc)
 
         def persist_deferral() -> bool:
             return defer_task_command(
@@ -1087,6 +1111,7 @@ async def dispatch_one_task_command(
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
+                terminal_event=terminal_event,
             )
 
         disposition_name = "defer_task_command"
@@ -1105,6 +1130,11 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
+                terminal_event=TerminalTaskEventDraft(
+                    outcome=TerminalTaskEventOutcome.FAILED,
+                    message_code=None,
+                    resend_safe=False,
+                ),
             )
 
         disposition_name = "fail_task_command"
@@ -1134,6 +1164,7 @@ async def dispatch_one_task_command(
                 command.attempt_count,
             )
             error = str(exc)
+            terminal_event = terminal_event_draft_for_error(exc)
 
             def persist_failure() -> bool:
                 return fail_task_command(
@@ -1141,6 +1172,7 @@ async def dispatch_one_task_command(
                     runner_id,
                     error,
                     expected_attempt_count=command.attempt_count,
+                    terminal_event=terminal_event,
                 )
 
             disposition_name = "fail_task_command"
