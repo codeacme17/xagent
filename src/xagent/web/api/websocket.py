@@ -4558,7 +4558,7 @@ class SharedWebSocketTracer(TraceHandler):
             if self.is_preview:
                 stream_event["is_preview"] = True
 
-            await self.ws.send_text(json.dumps(stream_event))
+            await send_websocket_text(self.ws, json.dumps(stream_event))
 
         except (RuntimeError, ConnectionError) as e:
             error_msg = str(e)
@@ -9564,6 +9564,7 @@ async def websocket_builder_chat_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
     active_chat_task: asyncio.Task[None] | None = None
 
@@ -9590,9 +9591,12 @@ async def websocket_builder_chat_endpoint(
     except Exception as e:
         logger.error(f"Unexpected error in builder chat WebSocket: {e}")
     finally:
-        if active_chat_task is not None:
-            await cancel_and_drain_async_task(active_chat_task)
-        websocket.state.chat_task = None
+        retire_websocket_writer(websocket)
+        try:
+            if active_chat_task is not None:
+                await cancel_and_drain_async_task(active_chat_task)
+        finally:
+            websocket.state.chat_task = None
 
 
 async def handle_builder_chat(
@@ -9734,7 +9738,8 @@ clarification questions as plain assistant text.
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     create_stream_event(
                         _agent_outbound_event_type(payload),
@@ -9753,17 +9758,18 @@ clarification questions as plain assistant text.
                         },
                         event_id=payload.get("event_id"),
                     )
-                )
+                ),
             )
 
         llm = runtime_inputs.llm
         compact_llm = runtime_inputs.compact_llm
 
         if not llm:
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     {"type": "error", "message": "No LLM configured for builder chat"}
-                )
+                ),
             )
             return
 
@@ -9982,7 +9988,8 @@ clarification questions as plain assistant text.
                         "chat_response"
                     )
 
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "task_completed",
@@ -9991,15 +9998,16 @@ clarification questions as plain assistant text.
                             "success": result.get("success", True),
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
-        await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+        await send_websocket_text(
+            websocket,
+            json.dumps({"type": "error", "message": client_safe_error_message(e)}),
         )
 
 
@@ -10019,6 +10027,7 @@ async def websocket_build_preview_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Build preview WebSocket connection established for user {user.id}")
 
     try:
@@ -10041,13 +10050,14 @@ async def websocket_build_preview_endpoint(
                         {"type": "pause_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to pause",
                             }
-                        )
+                        ),
                     )
             elif message_type == "resume":
                 task_id = getattr(websocket.state, "preview_task_id", None)
@@ -10058,28 +10068,31 @@ async def websocket_build_preview_endpoint(
                         {"type": "resume_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to resume",
                             }
-                        )
+                        ),
                     )
             elif message_type == "clear_context":
                 manager.unregister_connection(websocket)
                 websocket.state.preview_task_id = None
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "context_cleared",
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
                 logger.info(f"Cleared build preview context for user {user.id}")
             else:
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "error",
@@ -10087,7 +10100,7 @@ async def websocket_build_preview_endpoint(
                             # "Unknown message type" site above.
                             "message": "Unknown message type",
                         }
-                    )
+                    ),
                 )
 
     except WebSocketDisconnect:
@@ -10112,13 +10125,14 @@ async def handle_build_preview_execution(
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
     if not user_message and not files_data:
-        await websocket.send_text(
+        await send_websocket_text(
+            websocket,
             json.dumps(
                 {
                     "type": "error",
                     "message": "Message or files are required for preview",
                 }
-            )
+            ),
         )
         return
 
