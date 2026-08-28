@@ -37,7 +37,6 @@ from .db_runtime import (
 )
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
-    TerminalTaskEventOutcome,
     stage_terminal_event,
     terminal_event_draft_for_error,
 )
@@ -1131,7 +1130,6 @@ async def dispatch_one_task_command(
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
                 terminal_event=TerminalTaskEventDraft(
-                    outcome=TerminalTaskEventOutcome.FAILED,
                     message_code=None,
                     resend_safe=False,
                 ),

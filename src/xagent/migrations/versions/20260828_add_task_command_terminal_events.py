@@ -19,9 +19,32 @@ depends_on: Union[str, Sequence[str], None] = None
 TABLE = "task_command_terminal_events"
 COMMAND_TABLE = "task_execution_commands"
 TARGET_STATE_VERSION = "target_state_version"
+POSTGRES_VISIBLE_TABLE_SCHEMA_SQL = sa.text(
+    """
+    SELECT ns.nspname
+    FROM pg_catalog.pg_class AS cls
+    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = cls.relnamespace
+    WHERE cls.oid = pg_catalog.to_regclass(:table_name)
+    """
+)
 
 
-def _create_terminal_event_table() -> None:
+def _target_schema() -> str | None:
+    """Resolve the schema containing the visible command table."""
+
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        resolved = bind.execute(
+            POSTGRES_VISIBLE_TABLE_SCHEMA_SQL,
+            {"table_name": COMMAND_TABLE},
+        ).scalar()
+        if resolved:
+            return str(resolved)
+    schema = op.get_context().version_table_schema
+    return str(schema) if schema else None
+
+
+def _create_terminal_event_table(schema: str | None) -> None:
     op.create_table(
         TABLE,
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -81,11 +104,13 @@ def _create_terminal_event_table() -> None:
             "outcome_version",
             name="uq_task_command_terminal_outcome_version",
         ),
+        schema=schema,
     )
     op.create_index(
         "ix_task_command_terminal_events_task_cursor",
         TABLE,
         ["task_id", "id"],
+        schema=schema,
     )
 
 
@@ -96,23 +121,25 @@ def upgrade() -> None:
             COMMAND_TABLE,
             sa.Column(TARGET_STATE_VERSION, sa.Integer(), nullable=True),
         )
-        _create_terminal_event_table()
+        _create_terminal_event_table(None)
         return
 
+    schema = _target_schema()
     inspector = sa.inspect(op.get_bind())
-    tables = set(inspector.get_table_names())
+    tables = set(inspector.get_table_names(schema=schema))
     if not {"tasks", "users", COMMAND_TABLE}.issubset(tables):
         return
     command_columns = {
-        column["name"] for column in inspector.get_columns(COMMAND_TABLE)
+        column["name"] for column in inspector.get_columns(COMMAND_TABLE, schema=schema)
     }
     if TARGET_STATE_VERSION not in command_columns:
         op.add_column(
             COMMAND_TABLE,
             sa.Column(TARGET_STATE_VERSION, sa.Integer(), nullable=True),
+            schema=schema,
         )
     if TABLE not in tables:
-        _create_terminal_event_table()
+        _create_terminal_event_table(schema)
 
 
 def downgrade() -> None:
@@ -121,12 +148,15 @@ def downgrade() -> None:
         op.drop_column(COMMAND_TABLE, TARGET_STATE_VERSION)
         return
 
+    schema = _target_schema()
     inspector = sa.inspect(op.get_bind())
-    if TABLE in inspector.get_table_names():
-        op.drop_table(TABLE)
-    if COMMAND_TABLE in inspector.get_table_names():
+    tables = set(inspector.get_table_names(schema=schema))
+    if TABLE in tables:
+        op.drop_table(TABLE, schema=schema)
+    if COMMAND_TABLE in tables:
         command_columns = {
-            column["name"] for column in inspector.get_columns(COMMAND_TABLE)
+            column["name"]
+            for column in inspector.get_columns(COMMAND_TABLE, schema=schema)
         }
         if TARGET_STATE_VERSION in command_columns:
-            op.drop_column(COMMAND_TABLE, TARGET_STATE_VERSION)
+            op.drop_column(COMMAND_TABLE, TARGET_STATE_VERSION, schema=schema)

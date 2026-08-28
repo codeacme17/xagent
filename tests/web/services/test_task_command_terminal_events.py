@@ -10,7 +10,7 @@ from threading import Event as ThreadEvent
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event as sa_event
 from sqlalchemy.engine import make_url
 from sqlalchemy.schema import CreateSchema, DropSchema
 
@@ -28,7 +28,6 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as task_command_transport_module
 from xagent.web.services.task_command_terminal_events import (
     TerminalTaskEventDraft,
-    TerminalTaskEventOutcome,
     stage_terminal_event,
 )
 from xagent.web.services.task_command_transport import (
@@ -276,7 +275,7 @@ def test_external_cancel_suppresses_command_identity_projection(
             TaskCommandKind.PAUSE,
             {"type": "pause_task"},
             False,
-            False,
+            True,
             id="actorless-command",
         ),
     ],
@@ -328,7 +327,6 @@ def test_terminal_event_preserves_explicit_identity_suppression(db_session) -> N
         force_terminal=True,
         expected_attempt_count=claimed.attempt_count,
         terminal_event=TerminalTaskEventDraft(
-            outcome=TerminalTaskEventOutcome.FAILED,
             message_code=None,
             resend_safe=False,
             include_command_identity=False,
@@ -342,6 +340,7 @@ def test_terminal_event_preserves_explicit_identity_suppression(db_session) -> N
         .one()
     )
     assert event.include_command_identity is False
+    assert event.outcome == "failed"
 
 
 def test_one_concurrent_claim_winner_stages_one_terminal_event(db_session) -> None:
@@ -510,7 +509,20 @@ def test_retry_appends_one_new_outcome_version_and_restaging_is_idempotent(
         expected_attempt_count=second_claim.attempt_count,
     )
 
-    restaged = stage_terminal_event(db_session, command_db_id=second_claim.id)
+    marker_username = "caller-write-survives-terminal-event-conflict"
+    db_session.add(User(username=marker_username, password_hash="hash", is_admin=False))
+    db_session.flush()
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, *_args) -> None:
+        statements.append(statement)
+
+    engine = get_engine()
+    sa_event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        restaged = stage_terminal_event(db_session, command_db_id=second_claim.id)
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record_statement)
     db_session.commit()
     db_session.expire_all()
     events = (
@@ -519,11 +531,14 @@ def test_retry_appends_one_new_outcome_version_and_restaging_is_idempotent(
         .order_by(TaskCommandTerminalEvent.outcome_version)
         .all()
     )
+    assert any("SAVEPOINT" in statement.upper() for statement in statements)
+    assert any("ROLLBACK TO SAVEPOINT" in statement.upper() for statement in statements)
     assert [event.outcome_version for event in events] == [1, 2]
     assert restaged.id == events[1].id
+    assert db_session.query(User).filter(User.username == marker_username).one()
 
 
-def test_terminal_event_outcome_must_match_command_disposition(db_session) -> None:
+def test_terminal_event_draft_uses_the_command_disposition_outcome(db_session) -> None:
     user, task = _create_running_task(db_session)
     claimed = _claim_command(
         db_session,
@@ -538,15 +553,16 @@ def test_terminal_event_outcome_must_match_command_disposition(db_session) -> No
         "internal detail",
         force_terminal=True,
         expected_attempt_count=claimed.attempt_count,
+        terminal_event=TerminalTaskEventDraft(
+            message_code=None,
+            resend_safe=False,
+        ),
     )
 
-    with pytest.raises(ValueError, match="must match"):
-        stage_terminal_event(
-            db_session,
-            command_db_id=claimed.id,
-            draft=TerminalTaskEventDraft(
-                outcome=TerminalTaskEventOutcome.COMPLETED,
-                message_code=None,
-                resend_safe=False,
-            ),
-        )
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert event.outcome == "failed"

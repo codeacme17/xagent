@@ -6,6 +6,7 @@ import enum
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
@@ -22,18 +23,10 @@ class TerminalTaskEventMessageCode(str, enum.Enum):
     EXTERNAL_TURN_INTERRUPTED = "external_turn_interrupted"
 
 
-class TerminalTaskEventOutcome(str, enum.Enum):
-    """Terminal command dispositions that may be projected to a client."""
-
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
 @dataclass(frozen=True)
 class TerminalTaskEventDraft:
     """Client-safe terminal outcome staged by a command disposition."""
 
-    outcome: TerminalTaskEventOutcome
     message_code: TerminalTaskEventMessageCode | None
     resend_safe: bool
     include_command_identity: bool = True
@@ -44,21 +37,15 @@ _CANCEL_COMMAND_KIND = "cancel"
 _EXTERNAL_COMMAND_SCOPE = "external"
 
 
-def _is_external_cancel(command: TaskExecutionCommand) -> bool:
-    """Match the normalized durable shape used by the WebSocket classifier.
+def is_external_cancel_command(*, kind: str, scope: object) -> bool:
+    """Return whether strict command kind/scope values name an external cancel.
 
-    ``TaskCommandKind`` lives in the transport module that imports this one,
-    so importing that enum here would create a cycle. The producer stores the
-    enum value, and WebSocket ingress accepts the same exact external scope;
-    keeping both checks strict prevents malformed payload values from gaining
-    the anonymous-audience disclosure policy.
+    The helper accepts normalized primitives so durable ORM rows and live
+    command snapshots can share one disclosure-policy classifier without
+    importing each other's modules.
     """
 
-    return (
-        str(command.kind) == _CANCEL_COMMAND_KIND
-        and isinstance(command.payload, dict)
-        and command.payload.get("scope") == _EXTERNAL_COMMAND_SCOPE
-    )
+    return kind == _CANCEL_COMMAND_KIND and scope == _EXTERNAL_COMMAND_SCOPE
 
 
 def bind_terminal_event_draft(
@@ -93,6 +80,10 @@ def stage_terminal_event(
     exclusively from the immutable command-acceptance snapshot; reading the
     task's current run or state version here could associate an old command
     outcome with a newer interaction.
+
+    The insert runs in a savepoint so a concurrent natural-key winner can be
+    adopted without poisoning the caller's transaction. Other integrity
+    failures still propagate after the savepoint has been rolled back.
     """
 
     snapshot = (
@@ -110,30 +101,16 @@ def stage_terminal_event(
             f"Task command {command_db_id} is not terminal: {command.status}"
         )
     outcome_version = int(command.attempt_count or 0)
+    outcome = str(command.status)
     if draft is None:
         failed = command.status == "failed"
         draft = TerminalTaskEventDraft(
-            outcome=TerminalTaskEventOutcome(str(command.status)),
             message_code=(
                 TerminalTaskEventMessageCode.TASK_COMMAND_FAILED if failed else None
             ),
             resend_safe=False,
         )
-    if draft.outcome.value != command.status:
-        raise ValueError(
-            "Terminal event outcome must match the command disposition: "
-            f"{draft.outcome.value!r} != {command.status!r}"
-        )
-    existing = (
-        db.query(TaskCommandTerminalEvent)
-        .filter(
-            TaskCommandTerminalEvent.task_command_id == command_db_id,
-            TaskCommandTerminalEvent.outcome_version == outcome_version,
-        )
-        .one_or_none()
-    )
-    if existing is not None:
-        return existing
+    scope = command.payload.get("scope") if isinstance(command.payload, dict) else None
 
     event = TaskCommandTerminalEvent(
         event_id=str(uuid.uuid4()),
@@ -152,15 +129,28 @@ def stage_terminal_event(
         ),
         task_owner_user_id=int(task.user_id),
         outcome_version=outcome_version,
-        outcome=draft.outcome.value,
+        outcome=outcome,
         message_code=(draft.message_code.value if draft.message_code else None),
         resend_safe=bool(draft.resend_safe),
         include_command_identity=bool(
             draft.include_command_identity
-            and command.actor_user_id is not None
-            and not _is_external_cancel(command)
+            and not is_external_cancel_command(kind=str(command.kind), scope=scope)
         ),
     )
-    db.add(event)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(event)
+            db.flush()
+    except IntegrityError:
+        existing = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(
+                TaskCommandTerminalEvent.task_command_id == command_db_id,
+                TaskCommandTerminalEvent.outcome_version == outcome_version,
+            )
+            .one_or_none()
+        )
+        if existing is None:
+            raise
+        return existing
     return event
