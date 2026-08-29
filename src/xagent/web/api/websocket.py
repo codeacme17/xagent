@@ -149,6 +149,7 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from ..services.task_command_terminal_events import is_external_cancel_command
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -165,7 +166,6 @@ from ..services.task_command_transport import (
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
-from ..services.task_command_terminal_events import is_external_cancel_command
 from ..services.task_execution_controller import (
     StaleTaskRunError,
     StaleTaskStateVersionError,
