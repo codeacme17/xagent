@@ -924,10 +924,10 @@ async def test_ws_append_rejection_surfaces_workforce_code() -> None:
                 raise AssertionError("agent_error broadcast did not arrive in time")
 
         assert errors[0]["message"] == (
-            "This workforce conversation can no longer accept messages; "
-            "please start a new conversation."
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce."
         )
-        assert errors[0]["error_code"] == "workforce_unavailable"
+        assert errors[0]["error_code"] == "workforce_archived"
         assert "busy" not in errors[0]["message"]
     finally:
         db.close()
