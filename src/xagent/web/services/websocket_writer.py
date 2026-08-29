@@ -81,7 +81,18 @@ class _ConnectionTextWriter:
             try:
                 await write
             except asyncio.CancelledError:
-                if self.retired and write.cancelled():
+                # ``retire`` cancels the in-flight write so a disconnected
+                # connection stops holding the socket, and reporting that as a
+                # retirement is what lets the caller tell it apart from its own
+                # cancellation. Those two can land in the same tick, and then
+                # the caller's cancellation wins: converting it here would
+                # finish a cancelled task with a plain exception, so
+                # ``await``ing it would raise ``WebSocketWriterRetiredError``
+                # instead of ``CancelledError`` and ``Task.cancelled()`` would
+                # report ``False`` for a task that really was cancelled.
+                caller = asyncio.current_task()
+                caller_cancelled = caller is not None and caller.cancelling() > 0
+                if self.retired and write.cancelled() and not caller_cancelled:
                     raise WebSocketWriterRetiredError(
                         "WebSocket connection generation is retired"
                     ) from None

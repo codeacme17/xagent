@@ -155,6 +155,24 @@ async def test_retirement_rejects_queued_writes_and_same_socket_reactivation() -
 
 
 @pytest.mark.asyncio
+async def test_retirement_does_not_swallow_the_callers_own_cancellation() -> None:
+    websocket = ControlledWebSocket()
+    sender = asyncio.create_task(send_websocket_text(websocket, "in-flight"))
+    await websocket.entered.wait()
+
+    # Retirement cancels the in-flight write, and the caller is cancelled in
+    # the same tick. The caller's own cancellation wins: reporting the
+    # retirement instead would finish a cancelled task with a plain exception.
+    retire_websocket_writer(websocket)
+    sender.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+    assert sender.cancelled()
+    assert websocket.completed == []
+
+
+@pytest.mark.asyncio
 async def test_manager_unregister_keeps_the_physical_socket_writer_usable() -> None:
     websocket = ControlledWebSocket()
     websocket.release.set()
