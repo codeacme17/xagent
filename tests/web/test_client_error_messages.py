@@ -56,6 +56,10 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "This workforce conversation can no longer accept messages; "
             "please start a new conversation."
         ),
+        "workforce_archived": (
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce."
+        ),
         "message_attachment_corrupt": (
             "A stored file for this message failed its integrity check "
             "and must be re-uploaded."

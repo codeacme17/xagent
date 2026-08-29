@@ -29,6 +29,7 @@ class ClientErrorCode(StrEnum):
     TASK_UNAVAILABLE = "task_unavailable"
     TASK_BUSY = "task_busy"
     WORKFORCE_UNAVAILABLE = "workforce_unavailable"
+    WORKFORCE_ARCHIVED = "workforce_archived"
     MESSAGE_ATTACHMENT_CORRUPT = "message_attachment_corrupt"
     MESSAGE_ATTACHMENT_UNAVAILABLE = "message_attachment_unavailable"
     TASK_CHECKPOINT_UNREADABLE = "task_checkpoint_unreadable"
@@ -70,6 +71,10 @@ def client_error_message(code: ClientErrorCode) -> str:
         ClientErrorCode.WORKFORCE_UNAVAILABLE: (
             "This workforce conversation can no longer accept messages; "
             "please start a new conversation."
+        ),
+        ClientErrorCode.WORKFORCE_ARCHIVED: (
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce."
         ),
         ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT: (
             "A stored file for this message failed its integrity check "

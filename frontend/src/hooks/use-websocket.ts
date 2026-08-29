@@ -1335,17 +1335,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 },
               )
             }
-            const normalizedFiles = data.files
-              .filter((file): file is { file_id: string; filename?: string; file_size?: number; mime_type?: string } => (
-                isJsonRecord(file) && typeof file.file_id === 'string'
-              ))
-              .map(file => ({
-                  file_id: file.file_id,
-                  name: typeof file.filename === 'string' ? file.filename : '',
-                  size: typeof file.file_size === 'number' ? file.file_size : 0,
-                  type: typeof file.mime_type === 'string' ? file.mime_type : '',
-              }))
-            if (normalizedFiles.length !== filesToUpload.length) {
+            const normalizedFileIds = normalizeUploadFileIds(
+              data.files.map(file => isJsonRecord(file) ? file.file_id : undefined),
+              filesToUpload.length,
+            )
+            if (!normalizedFileIds) {
               const uploadError = classifyUploadError(response, parsed)
               throw deliveryError(
                 uploadError.message,
@@ -1353,7 +1347,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 { userFacing: true, errorCode: uploadError.errorCode },
               )
             }
-            return normalizedFiles
+            return data.files.map((file, index) => {
+              const metadata = isJsonRecord(file) ? file : {}
+              return {
+                file_id: normalizedFileIds[index],
+                name: typeof metadata.filename === 'string' ? metadata.filename : '',
+                size: typeof metadata.file_size === 'number' ? metadata.file_size : 0,
+                type: typeof metadata.mime_type === 'string' ? metadata.mime_type : '',
+              }
+            })
           })()
           uploadedFiles = await Promise.race([uploadRequest, claim.cancellation])
         }

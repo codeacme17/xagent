@@ -20,6 +20,7 @@ describe("client error wire contract", () => {
     ["task_unavailable", "clientErrors.taskUnavailable", "Task is no longer available."],
     ["task_busy", "clientErrors.taskBusy", "Task is currently busy; please wait for the previous turn to finish before sending another message."],
     ["workforce_unavailable", "clientErrors.workforceUnavailable", "This workforce conversation can no longer accept messages; please start a new conversation."],
+    ["workforce_archived", "clientErrors.workforceArchived", "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce."],
     ["message_attachment_corrupt", "clientErrors.messageAttachmentCorrupt", "A stored file for this message failed its integrity check and must be re-uploaded."],
     ["message_attachment_unavailable", "clientErrors.messageAttachmentUnavailable", "A stored file for this message could not be read. Please try again."],
     ["task_checkpoint_unreadable", "clientErrors.taskCheckpointUnreadable", "The task's saved progress could not be read."],

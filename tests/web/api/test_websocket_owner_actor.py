@@ -1073,7 +1073,46 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
 
 
 @pytest.mark.asyncio
-async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
+@pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_message"),
+    [
+        (
+            "actor_task_reuse_unsupported",
+            "message_continuation_unsupported",
+            "Task does not support message continuation.",
+        ),
+        (
+            "workforce_archived",
+            "workforce_archived",
+            "This workforce has been archived. Unarchive and publish it before "
+            "starting a new conversation, or select an active workforce.",
+        ),
+        (
+            "workforce_config_changed",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+        (
+            "workforce_run_not_found",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+        (
+            "workforce_run_not_active",
+            "workforce_unavailable",
+            "This workforce conversation can no longer accept messages; "
+            "please start a new conversation.",
+        ),
+    ],
+)
+async def test_chat_turn_rejection_payload_is_loaded_off_loop(
+    db_session,
+    reason: str,
+    expected_code: str,
+    expected_message: str,
+) -> None:
     from xagent.web.services.task_orchestrator import TaskTurnError
 
     owner = _user(db_session, "busy-payload-owner")
@@ -1101,7 +1140,7 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
-            side_effect=TaskTurnError("workforce_archived"),
+            side_effect=TaskTurnError(reason),
         ),
         patch(
             "xagent.web.api.websocket._read_task_error_payload_isolated",
@@ -1125,19 +1164,16 @@ async def test_chat_busy_error_payload_is_loaded_off_loop(db_session) -> None:
 
     assert len(payload_threads) == 1
     assert payload_threads[0] != event_loop_thread
-    assert payload_codes == ["workforce_unavailable"]
-    assert payload_messages == [
-        "This workforce conversation can no longer accept messages; "
-        "please start a new conversation."
-    ]
+    assert payload_codes == [expected_code]
+    assert payload_messages == [expected_message]
     broadcast = ws_manager.broadcast_to_task.await_args.args[0]
-    assert broadcast["error_code"] == "workforce_unavailable"
+    assert broadcast["error_code"] == expected_code
     rejected = [
         call.args[0]
         for call in ws_manager.send_personal_message.call_args_list
         if call.args[0].get("type") == "message_rejected"
     ]
-    assert rejected[0]["error_code"] == "workforce_unavailable"
+    assert rejected[0]["error_code"] == expected_code
 
 
 @pytest.mark.asyncio

@@ -285,7 +285,7 @@ _TURN_REJECTION_CODES = {
     "actor_task_reuse_unsupported": (
         ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
     ),
-    "workforce_archived": ClientErrorCode.WORKFORCE_UNAVAILABLE,
+    "workforce_archived": ClientErrorCode.WORKFORCE_ARCHIVED,
     "workforce_config_changed": ClientErrorCode.WORKFORCE_UNAVAILABLE,
     "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
     "workforce_run_not_active": ClientErrorCode.WORKFORCE_UNAVAILABLE,

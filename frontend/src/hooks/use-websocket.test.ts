@@ -3033,6 +3033,48 @@ describe("useWebSocket normalized connections", () => {
     fetchMock.mockRestore()
   })
 
+  it("rejects a malformed oversized upload result before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: true,
+        files: [
+          { file_id: 123, filename: "bad.txt" },
+          { file_id: "file-2", filename: "second.txt" },
+          { file_id: "file-3", filename: "extra.txt" },
+        ],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const outcome = result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["one"], "first.txt"),
+        new File(["two"], "second.txt"),
+      ],
+    ).then(
+      () => null,
+      error => error,
+    )
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    await expect(outcome).resolves.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
   it("rejects an incomplete custom upload result before sending chat", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
