@@ -99,12 +99,6 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
-from ..services.websocket_writer import (
-    activate_websocket_writer,
-    fanout_websocket_text,
-    retire_websocket_writer,
-    send_websocket_text,
-)
 from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
@@ -159,7 +153,18 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from ..services.task_command_terminal_events import is_external_cancel_command
+from ..services.task_command_terminal_events import (
+    TerminalTaskEvent,
+    TerminalTaskEventDraft,
+    TerminalTaskEventLoopRegistry,
+    TerminalTaskEventMessageCode,
+    TerminalTaskEventPrincipal,
+    TerminalTaskEventSubscription,
+    bind_terminal_event_draft,
+    is_external_cancel_command,
+    resolve_terminal_task_event_cursor,
+    terminal_task_event_payload,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -175,17 +180,6 @@ from ..services.task_command_transport import (
     enqueue_task_command,
     task_has_live_foreign_runner,
     task_has_live_runner,
-)
-from ..services.task_command_terminal_events import (
-    TerminalTaskEvent,
-    TerminalTaskEventDraft,
-    TerminalTaskEventLoopRegistry,
-    TerminalTaskEventMessageCode,
-    TerminalTaskEventPrincipal,
-    TerminalTaskEventSubscription,
-    bind_terminal_event_draft,
-    resolve_terminal_task_event_cursor,
-    terminal_task_event_payload,
 )
 from ..services.task_execution_controller import (
     StaleTaskRunError,
@@ -230,6 +224,12 @@ from ..services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,
     stage_uploaded_file_from_local_path,
+)
+from ..services.websocket_writer import (
+    activate_websocket_writer,
+    fanout_websocket_text,
+    retire_websocket_writer,
+    send_websocket_text,
 )
 from ..services.workforce_runtime import (
     sync_workforce_run_status,
@@ -4224,6 +4224,7 @@ class BackgroundTaskManager:
         # a newer run as an idempotent success.
         self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
+        self._resume_owner_started_at: dict[int, float] = {}
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -4236,6 +4237,7 @@ class BackgroundTaskManager:
             or self.resume_tasks
             or self._resume_run_ids
             or self._resume_reservations
+            or self._resume_owner_started_at
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4309,7 +4311,16 @@ class BackgroundTaskManager:
         if existing is not None:
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
         return None
+
+    def resume_holder_age_seconds(self, task_id: int) -> float | None:
+        """Return the local resume-slot holder's monotonic age, if known."""
+
+        started_at = self._resume_owner_started_at.get(task_id)
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
 
     def try_reserve_resume(
         self,
@@ -4328,6 +4339,7 @@ class BackgroundTaskManager:
         if existing_state is not None:
             return existing_state
         self._resume_reservations.add(task_id)
+        self._resume_owner_started_at[task_id] = time.monotonic()
         return ResumeReservationOutcome.RESERVED
 
     def reserve_resume(self, task_id: int) -> bool:
@@ -4355,6 +4367,7 @@ class BackgroundTaskManager:
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
@@ -4363,6 +4376,7 @@ class BackgroundTaskManager:
         if self._shutting_down:
             return
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4399,6 +4413,7 @@ class BackgroundTaskManager:
         if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(
@@ -4414,6 +4429,12 @@ class BackgroundTaskManager:
             )
             if task is not None
         }
+        if not self._shutting_down:
+            # A cancel can race the await between reservation and coordinator
+            # registration. Clear that pre-registration owner even when there
+            # is no asyncio task to cancel yet.
+            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
             return BackgroundTaskCancelOutcome(requested=False)
 
@@ -4443,7 +4464,6 @@ class BackgroundTaskManager:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
-            self._resume_reservations.discard(task_id)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -4475,6 +4495,7 @@ class BackgroundTaskManager:
                 self.resume_tasks.clear()
                 self._resume_run_ids.clear()
                 self._resume_reservations.clear()
+                self._resume_owner_started_at.clear()
 
 
 # Global background task manager
@@ -6569,7 +6590,46 @@ async def _handle_chat_message_unserialized(
             if task_uses_live_control and supports_live_control:
                 logger.info(f"Using agent message control for task {task_id}")
                 assert agent_service is not None
-                if not background_task_manager.reserve_resume(task_id):
+                reservation = background_task_manager.try_reserve_resume(
+                    task_id,
+                    expected_run_id=task_run_id,
+                )
+                if reservation is not ResumeReservationOutcome.RESERVED:
+                    if suppress_delivery_ack:
+                        # Durable commands own their retry budget. All three
+                        # occupied states can clear without this attempt doing
+                        # anything: a reservation can register or release, a
+                        # coordinator can finish, and shutdown is retained as
+                        # a defensive state even though normal shutdown stops
+                        # the dispatcher before setting the manager flag.
+                        holder_age_seconds = (
+                            background_task_manager.resume_holder_age_seconds(task_id)
+                        )
+                        holder_age_text = (
+                            f"{holder_age_seconds:.3f}"
+                            if holder_age_seconds is not None
+                            else "unknown"
+                        )
+                        logger.info(
+                            "Deferring message %s for task %s: resume slot "
+                            "unavailable (%s), holder_age_seconds=%s",
+                            turn_id,
+                            task_id,
+                            reservation.value,
+                            holder_age_text,
+                        )
+                        message_data["_durable_command_defer"] = turn_id
+                        message_data["_durable_command_defer_reason"] = (
+                            f"Message {turn_id} is waiting for the live-control "
+                            f"resume slot ({reservation.value})"
+                        )
+                        if recovered_delivery is not None:
+                            # A prior attempt claimed the durable delivery and
+                            # may have injected it. Task/run-local occupancy is
+                            # not evidence that this command owns the live
+                            # coordinator after a worker handoff.
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                        return
                     await finish_delivery(
                         False,
                         "A previous guidance message is still being applied. "
@@ -9350,6 +9410,21 @@ async def _execute_durable_task_command(
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_durable_command_defer") == command.command_id:
+            # This marker is mutually exclusive with commit-outcome-unknown:
+            # the handler returns immediately after recording contention.
+            raise TaskCommandDeferred(
+                str(message_data["_durable_command_defer_reason"]),
+                resend_safe=(
+                    # Every settled contention increments defer_count once.
+                    # Equality proves there is no extra expired/failed claim
+                    # whose worker might still resume and inject after this
+                    # attempt observed no delivery row.
+                    command.attempt_count == command.defer_count + 1
+                    and message_data.get("_durable_command_defer_unsafe")
+                    != command.command_id
+                ),
+            )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
@@ -9560,7 +9635,9 @@ async def _terminal_command_event_draft(
             if isinstance(error, TaskCommandDeferred)
             else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
         ),
-        resend_safe=False,
+        resend_safe=(
+            error.resend_safe if isinstance(error, TaskCommandDeferred) else False
+        ),
     )
 
 
