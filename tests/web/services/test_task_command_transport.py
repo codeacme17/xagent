@@ -34,6 +34,7 @@ from xagent.web.models.database import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as task_command_transport_module
 from xagent.web.services.task_command_transport import (
@@ -372,6 +373,12 @@ def test_stale_attempt_cannot_mutate_reclaimed_command(db_session) -> None:
     assert row.status == "processing"
     assert row.claimed_by == "runner-a"
     assert row.attempt_count == second.attempt_count
+    assert (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+        .count()
+        == 0
+    )
 
 
 def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
@@ -876,6 +883,13 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
     assert row.defer_count == MAX_COMMAND_DEFERS
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == message.command_id)
+        .one()
+    )
+    assert event.outcome == COMMAND_FAILED
+    assert event.outcome_version == row.attempt_count
 
     cancel_claim = claim_task_command(db_session)
     assert cancel_claim is not None
