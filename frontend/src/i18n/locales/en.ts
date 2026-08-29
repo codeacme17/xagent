@@ -539,6 +539,8 @@ Build when you need.`,
   widgetChat: {
     title: "AI Assistant",
     newConversation: "New conversation",
+    close: "Close",
+    moreOptions: "More options",
     status: {
       initializing: "Initializing...",
       connecting: "Connecting...",

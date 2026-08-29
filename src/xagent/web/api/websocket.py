@@ -152,6 +152,10 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from ..services.mcp_runtime import (
+    MCPBuiltinOAuthActorPolicy,
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -198,6 +202,7 @@ from ..services.task_lease_service import (
 )
 from ..services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    mcp_runtime_authorization_policy_required,
     task_extension_bindings_from_agent_config,
 )
 from ..services.uploaded_file_store import (
@@ -275,9 +280,11 @@ def _waiting_or_paused_event_fields(status: TaskStatus) -> tuple[str, str]:
     return "task_paused", "Task paused"
 
 
-# Non-transient workforce reasons must not fall back to retryable busy
-# guidance. They share one honest client action: start a new conversation.
+# Non-transient turn rejections must not fall back to retryable busy guidance.
 _TURN_REJECTION_CODES = {
+    "actor_task_reuse_unsupported": (
+        ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
+    ),
     "workforce_archived": ClientErrorCode.WORKFORCE_UNAVAILABLE,
     "workforce_config_changed": ClientErrorCode.WORKFORCE_UNAVAILABLE,
     "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
@@ -2621,6 +2628,7 @@ async def execute_task_background(
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
@@ -2695,6 +2703,7 @@ async def execute_task_background(
                 connector_runtime_turn_id=context_dict.get("turn_id")
                 if isinstance(context_dict.get("turn_id"), str)
                 else None,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                 resolved_execution_scope=execution_scope,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
@@ -5447,7 +5456,11 @@ async def handle_chat_message(
             command_id=_client_message_id(message_data.get("client_message_id")),
             allow_missing_task=True,
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
         error_code = (
@@ -5548,6 +5561,10 @@ def _enqueue_websocket_task_command_sync(
             raise ClientVisiblePermissionError(
                 f"Access denied: Task {task_id} does not belong to you",
                 error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
+        if mcp_runtime_authorization_policy_required(task.agent_config):
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} is actor-marked; generic task commands are unsupported"
             )
         if kind == TaskCommandKind.MESSAGE:
             from ..services.chat_history_service import (
@@ -7424,15 +7441,21 @@ async def handle_execute_task(
         # ordering while the scheduled coroutine owns all runtime DB work.
         await background_task
 
-    except (ValueError, KeyError, TypeError) as e:
-        # Data validation and format error
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as e:
+        # Data validation and actor-policy errors are client-safe only when
+        # explicitly marked with a stable code.
         error_code = (
             e.error_code
             if isinstance(e, ClientVisibleError)
             else ClientErrorCode.MESSAGE_PROCESSING_FAILED
         )
         message = client_error_message(error_code)
-        log_client_facing_failure(e, "Data validation error in task execution: %s")
+        log_client_facing_failure(e, "Task execution rejected: %s")
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -8380,7 +8403,11 @@ async def handle_pause_task(
             kind=TaskCommandKind.PAUSE,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Pause command rejected for task %s: %s", task_id
         )
@@ -8663,7 +8690,11 @@ async def handle_resume_task(
             kind=TaskCommandKind.RESUME,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Resume command rejected for task %s: %s", task_id
         )
