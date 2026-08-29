@@ -99,12 +99,6 @@ from ..services.chat_history_service import (
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
-from ..services.websocket_writer import (
-    activate_websocket_writer,
-    fanout_websocket_text,
-    retire_websocket_writer,
-    send_websocket_text,
-)
 from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
@@ -218,6 +212,13 @@ from ..services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,
     stage_uploaded_file_from_local_path,
+)
+from ..services.websocket_writer import (
+    WebSocketWriterRetiredError,
+    activate_websocket_writer,
+    fanout_websocket_text,
+    retire_websocket_writer,
+    send_websocket_text,
 )
 from ..services.workforce_runtime import (
     sync_workforce_run_status,
@@ -5054,13 +5055,18 @@ class ConnectionManager:
         await send_websocket_text(websocket, json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        connections = self.connections_for_task(task_id)
-        if not connections:
+        if not self.connections_for_task(task_id):
             return
         versioned_message = await _with_current_task_control_state(
             message,
             fallback_task_id=task_id,
         )
+        # Enrichment awaits a task-control snapshot, which is long enough for a
+        # client to finish its handshake and register. Take the membership
+        # snapshot that decides delivery after that await, not before it.
+        connections = self.connections_for_task(task_id)
+        if not connections:
+            return
         failures = await fanout_websocket_text(
             connections,
             json.dumps(versioned_message),
@@ -5071,6 +5077,12 @@ class ConnectionManager:
         )
         unexpected: Exception | None = None
         for connection, error in failures:
+            if isinstance(error, WebSocketWriterRetiredError):
+                # The connection was retired while its frame waited its turn,
+                # so its own teardown is already running. That is the ordered
+                # writer's equivalent of the membership recheck skipping a
+                # departed connection, not a transport failure worth a warning.
+                continue
             if isinstance(
                 error,
                 (

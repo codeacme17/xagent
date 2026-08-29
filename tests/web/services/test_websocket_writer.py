@@ -144,14 +144,20 @@ async def test_retirement_rejects_queued_writes_and_same_socket_reactivation() -
     with pytest.raises(WebSocketWriterRetiredError):
         await asyncio.wait_for(first, timeout=1)
 
-    with pytest.raises(WebSocketWriterRetiredError):
-        activate_websocket_writer(websocket)
     replacement = ControlledWebSocket()
     replacement.release.set()
     await send_websocket_text(replacement, "replacement")
     assert websocket.completed == []
     assert websocket.active_sends == 0
     assert replacement.completed == ["replacement"]
+
+    # Retirement rejects the generation, not the socket object: a live socket
+    # can be registered again (a task delete retires every socket on the task
+    # before closing them), and the new generation writes normally.
+    activate_websocket_writer(websocket)
+    websocket.release.set()
+    assert await send_websocket_text(websocket, "next generation")
+    assert websocket.completed == ["next generation"]
 
 
 @pytest.mark.asyncio
@@ -186,6 +192,24 @@ async def test_manager_unregister_keeps_the_physical_socket_writer_usable() -> N
     assert manager.connections_for_task(42) == []
     assert manager.connections_for_task(43) == [websocket]
     assert [json.loads(frame)["type"] for frame in websocket.completed] == ["preview"]
+
+
+@pytest.mark.asyncio
+async def test_manager_re_registers_a_disconnected_socket_without_raising() -> None:
+    websocket = ControlledWebSocket()
+    websocket.release.set()
+    manager = ConnectionManager()
+    manager.register_connection(websocket, task_id=42)
+    manager.disconnect(websocket)
+
+    # ``detach_task_connections`` retires every socket on a deleted task and
+    # closes them from a separate task, so a message arriving in that window
+    # re-registers a retired-but-open socket. Registration must stay total.
+    manager.register_connection(websocket, task_id=43)
+    await manager.send_personal_message({"type": "resumed"}, websocket)
+
+    assert manager.connections_for_task(43) == [websocket]
+    assert [json.loads(frame)["type"] for frame in websocket.completed] == ["resumed"]
 
 
 @pytest.mark.asyncio

@@ -136,14 +136,18 @@ def _current_writer(
 
 
 def activate_websocket_writer(websocket: WebSocketTextSink) -> None:
-    """Create a writer for a newly accepted or reactivated connection."""
+    """Create a writer for a newly accepted or reactivated connection.
+
+    Retirement scopes a *generation*, not the socket object. Writes already
+    queued on a retired writer stay rejected, because they hold that writer,
+    but installing a fresh one here keeps ``register_connection`` total: a
+    task delete retires every socket on the task and closes them from a
+    separate task, so a message arriving in that window re-registers a socket
+    that is retired and still open.
+    """
 
     writer = _current_writer(websocket)
-    if writer is not None:
-        if writer.retired:
-            raise WebSocketWriterRetiredError(
-                "A retired WebSocket object cannot be reactivated"
-            )
+    if writer is not None and not writer.retired:
         return
     setattr(
         _writer_owner(websocket),
