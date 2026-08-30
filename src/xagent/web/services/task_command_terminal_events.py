@@ -127,6 +127,9 @@ def stage_terminal_event(
         actor_user_id=(
             int(command.actor_user_id) if command.actor_user_id is not None else None
         ),
+        actor_subject=(
+            str(command.actor_subject) if command.actor_subject is not None else None
+        ),
         task_owner_user_id=int(task.user_id),
         outcome_version=outcome_version,
         outcome=outcome,

@@ -226,6 +226,46 @@ def test_enqueue_is_committed_and_idempotent(db_session) -> None:
     assert db_session.query(TaskExecutionCommand).count() == 1
 
 
+def test_reused_actor_id_does_not_match_a_legacy_command(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    actor_id = int(user.id)
+    task_id = int(task.id)
+    legacy = TaskExecutionCommand(
+        task_id=task_id,
+        actor_user_id=actor_id,
+        actor_subject=f"legacy-user-id:{actor_id}",
+        command_id="legacy-actor-idempotency",
+        kind=TaskCommandKind.PAUSE.value,
+        payload={"type": "pause_task"},
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    assert user.actor_subject != legacy.actor_subject
+
+    duplicate = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=actor_id,
+        command_id=legacy.command_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    classification = classify_task_command_conflict(
+        db_session,
+        task_id=task_id,
+        command_id=legacy.command_id,
+        actor_user_id=actor_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    assert duplicate.created is False
+    assert duplicate.payload_matches is False
+    assert classification.kind is TaskCommandConflictKind.RACED_DUPLICATE
+    assert classification.raced is not None
+    assert classification.raced.payload_matches is False
+
+
 def test_live_run_command_stays_with_owner_until_task_lease_expires(
     db_session,
 ) -> None:
