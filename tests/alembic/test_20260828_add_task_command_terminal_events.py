@@ -76,7 +76,18 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
             {"revision": DOWN_REVISION},
         )
-        connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+        connection.execute(
+            text("CREATE TABLE users (id INTEGER PRIMARY KEY, created_at DATETIME)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, created_at) VALUES "
+                "(7, '2026-08-01 00:00:00'), "
+                "(8, NULL), "
+                "(9, '2026-08-01 00:00:00'), "
+                "(10, '2026-08-02 00:00:00')"
+            )
+        )
         connection.execute(
             text(
                 "CREATE TABLE tasks ("
@@ -87,13 +98,20 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             text(
                 "CREATE TABLE task_execution_commands ("
                 "id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, "
-                "target_run_id VARCHAR(64))"
+                "target_run_id VARCHAR(64), actor_user_id INTEGER, "
+                "created_at DATETIME)"
             )
         )
         connection.execute(
             text(
                 "INSERT INTO task_execution_commands "
-                "(id, task_id, target_run_id) VALUES (1, 1, 'legacy-run')"
+                "(id, task_id, target_run_id, actor_user_id, created_at) "
+                "VALUES "
+                "(1, 1, 'legacy-run', 7, '2026-08-01 00:00:00'), "
+                "(2, 1, 'legacy-run', 8, '2026-08-01 00:00:00'), "
+                "(3, 1, 'legacy-run', 9, NULL), "
+                "(4, 1, 'legacy-run', 10, '2026-08-01 00:00:00'), "
+                "(5, 1, 'legacy-run', 11, '2026-08-01 00:00:00')"
             )
         )
         config.attributes["connection"] = connection
@@ -115,6 +133,7 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             "command_id",
             "command_kind",
             "actor_user_id",
+            "actor_subject",
             "task_owner_user_id",
             "task_owner_subject",
             "outcome_version",
@@ -150,12 +169,42 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             for column in inspect(connection).get_columns("task_execution_commands")
         }
         assert "target_state_version" in command_columns
+        assert "actor_subject" in command_columns
         legacy_version = connection.execute(
             text(
                 "SELECT target_state_version FROM task_execution_commands WHERE id = 1"
             )
         ).scalar_one()
         assert legacy_version is None
+        actor_subject = connection.execute(
+            text("SELECT actor_subject FROM task_execution_commands WHERE id = 1")
+        ).scalar_one()
+        user_subject = connection.execute(
+            text("SELECT actor_subject FROM users WHERE id = 7")
+        ).scalar_one()
+        assert len(user_subject) == 32
+        assert actor_subject == user_subject
+        ambiguous_subjects = dict(
+            connection.execute(
+                text(
+                    "SELECT id, actor_subject FROM task_execution_commands "
+                    "WHERE id != 1 ORDER BY id"
+                )
+            ).all()
+        )
+        assert ambiguous_subjects == {
+            2: "legacy-user-id:8",
+            3: "legacy-user-id:9",
+            4: "legacy-user-id:10",
+            5: "legacy-user-id:11",
+        }
+        user_columns = {
+            column["name"] for column in inspect(connection).get_columns("users")
+        }
+        assert "actor_subject" in user_columns
+        assert {
+            index["name"] for index in inspect(connection).get_indexes("users")
+        } == {"ix_users_actor_subject"}
 
         command.downgrade(config, DOWN_REVISION)
         assert (
@@ -166,6 +215,10 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             for column in inspect(connection).get_columns("task_execution_commands")
         }
         assert "target_state_version" not in command_columns
+        assert "actor_subject" not in command_columns
+        assert "actor_subject" not in {
+            column["name"] for column in inspect(connection).get_columns("users")
+        }
 
 
 def test_upgrade_skips_without_command_table() -> None:
@@ -211,12 +264,20 @@ def test_offline_upgrade_emits_terminal_event_schema(dialect_name: str) -> None:
         sql = _offline_sql(migration, dialect_name, "upgrade")
 
     assert "ALTER TABLE task_execution_commands ADD COLUMN target_state_version" in sql
+    assert "ALTER TABLE users ADD COLUMN actor_subject" in sql
+    assert "UPDATE users SET actor_subject=" in sql
+    assert "ALTER TABLE task_execution_commands ADD COLUMN actor_subject" in sql
+    assert "UPDATE task_execution_commands SET actor_subject=" in sql
     assert f"CREATE TABLE {TABLE}" in sql
     for name in UNIQUE_CONSTRAINT_NAMES:
         assert f"CONSTRAINT {name} UNIQUE" in sql
     assert sql.count("FOREIGN KEY(") == len(EXPECTED_FOREIGN_KEYS)
-    assert sql.count("ON DELETE CASCADE") == 3
-    assert sql.count("ON DELETE SET NULL") == 1
+    assert sql.count("ON DELETE CASCADE") == sum(
+        ondelete == "CASCADE" for _, _, ondelete in EXPECTED_FOREIGN_KEYS
+    )
+    assert sql.count("ON DELETE SET NULL") == sum(
+        ondelete == "SET NULL" for _, _, ondelete in EXPECTED_FOREIGN_KEYS
+    )
     for name in NON_NULL_COLUMNS - {"id"}:
         assert re.search(rf"^\s*{re.escape(name)}\s+.*NOT NULL", sql, re.MULTILINE)
     for name in ("resend_safe", "include_command_identity", "created_at"):
@@ -244,6 +305,8 @@ def test_offline_downgrade_emits_terminal_event_cleanup(dialect_name: str) -> No
         sql = _offline_sql(migration, dialect_name, "downgrade")
 
     assert "DROP TABLE task_command_terminal_events" in sql
+    assert "ALTER TABLE task_execution_commands DROP COLUMN actor_subject" in sql
+    assert "ALTER TABLE users DROP COLUMN actor_subject" in sql
     assert "ALTER TABLE task_execution_commands DROP COLUMN target_state_version" in sql
     assert "%(" not in sql
 
@@ -258,7 +321,18 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
     engine = postgresql_engine_factory("upgrade")
 
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+        connection.execute(
+            text(
+                "CREATE TABLE users ("
+                "id INTEGER PRIMARY KEY, created_at TIMESTAMP WITH TIME ZONE)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, created_at) "
+                "VALUES (7, '2026-08-01 00:00:00+00')"
+            )
+        )
         connection.execute(
             text(
                 "CREATE TABLE tasks ("
@@ -269,13 +343,15 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
             text(
                 "CREATE TABLE task_execution_commands ("
                 "id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, "
-                "target_run_id VARCHAR(64))"
+                "target_run_id VARCHAR(64), actor_user_id INTEGER, "
+                "created_at TIMESTAMP WITH TIME ZONE)"
             )
         )
         connection.execute(
             text(
                 "INSERT INTO task_execution_commands "
-                "(id, task_id, target_run_id) VALUES (1, 1, 'legacy-run')"
+                "(id, task_id, target_run_id, actor_user_id, created_at) "
+                "VALUES (1, 1, 'legacy-run', 7, '2026-08-01 00:00:00+00')"
             )
         )
         connection.execute(text("CREATE SCHEMA app"))
@@ -285,8 +361,15 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
             )
         connection.execute(
             text(
+                "INSERT INTO app.users (id, created_at) "
+                "VALUES (11, '2026-08-01 00:00:00+00')"
+            )
+        )
+        connection.execute(
+            text(
                 "INSERT INTO app.task_execution_commands "
-                "(id, task_id, target_run_id) VALUES (1, 1, 'legacy-run')"
+                "(id, task_id, target_run_id, actor_user_id, created_at) "
+                "VALUES (1, 1, 'legacy-run', 11, '2026-08-01 00:00:00+00')"
             )
         )
         connection.execute(
@@ -314,9 +397,27 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
             )
         ).scalar_one()
         assert legacy_version is None
+        actor_subject = connection.execute(
+            text("SELECT actor_subject FROM task_execution_commands WHERE id = 1")
+        ).scalar_one()
+        app_user_subject = connection.execute(
+            text("SELECT actor_subject FROM app.users WHERE id = 11")
+        ).scalar_one()
+        assert len(app_user_subject) == 32
+        assert actor_subject == app_user_subject
+        assert "actor_subject" not in {
+            column["name"]
+            for column in inspector.get_columns(
+                "task_execution_commands", schema="public"
+            )
+        }
 
         with Operations.context(context):
             migration.downgrade()
         assert "task_command_terminal_events" not in sa.inspect(
             connection
         ).get_table_names(schema="app")
+        assert "actor_subject" not in {
+            column["name"]
+            for column in inspector.get_columns("task_execution_commands", schema="app")
+        }

@@ -15,6 +15,7 @@ import enum
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -29,6 +30,7 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
+from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
     is_database_pool_timeout,
@@ -226,6 +228,7 @@ def _matches_existing(
     command: TaskExecutionCommand,
     *,
     actor_user_id: int | None,
+    actor_subject: str | None,
     kind: TaskCommandKind,
     payload: dict[str, Any],
 ) -> bool:
@@ -233,11 +236,45 @@ def _matches_existing(
         command.payload if isinstance(command.payload, dict) else {}
     )
     stored_actor_user_id = getattr(command, "actor_user_id", None)
+    stored_actor_subject = getattr(command, "actor_subject", None)
+    actors_match = (
+        stored_actor_user_id is None and stored_actor_subject is None
+        if actor_user_id is None
+        else actor_subject is not None and stored_actor_subject == actor_subject
+    )
     return (
-        stored_actor_user_id == actor_user_id
+        actors_match
         and str(command.kind) == kind.value
         and _canonical_payload(stored_payload) == _canonical_payload(payload)
     )
+
+
+def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    if actor_user_id is None:
+        return None
+    stored_subject = db.execute(
+        select(User.actor_subject).where(User.id == actor_user_id)
+    ).scalar_one_or_none()
+    return str(stored_subject) if stored_subject is not None else None
+
+
+def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    stored_subject = _load_actor_subject(db, actor_user_id)
+    if actor_user_id is None or stored_subject is not None:
+        return stored_subject
+    candidate_subject = str(uuid.uuid4())
+    (
+        db.query(User)
+        .filter(
+            User.id == actor_user_id,
+            User.actor_subject.is_(None),
+        )
+        .update(
+            {User.actor_subject: candidate_subject},
+            synchronize_session=False,
+        )
+    )
+    return _load_actor_subject(db, actor_user_id)
 
 
 def stage_task_command(
@@ -265,10 +302,12 @@ def stage_task_command(
        is not served from the identity map, so it observes a caller's own
        uncommitted CAS-style update to the same row instead of a stale cached
        instance.
-    4. Check for an existing command with this (task_id, command_id) before
+    4. Resolve the actor's stable internal subject in this transaction, so
+       idempotency never treats a reused integer user id as the same actor.
+    5. Check for an existing command with this (task_id, command_id) before
        adding a new row, so a repeated call is idempotent without relying on
        the unique constraint to reject it.
-    5. Add and flush the new row last, so any remaining IntegrityError is
+    6. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself.
 
     Caller obligations:
@@ -312,6 +351,7 @@ def stage_task_command(
     if snapshot is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
+    actor_subject = _resolve_actor_subject(db, actor_user_id)
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
@@ -324,6 +364,7 @@ def stage_task_command(
         matches = _matches_existing(
             existing,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )
@@ -343,6 +384,7 @@ def stage_task_command(
     command = TaskExecutionCommand(
         task_id=resolved_task_id,
         actor_user_id=actor_user_id,
+        actor_subject=actor_subject,
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
@@ -415,9 +457,11 @@ def classify_task_command_conflict(
         .one_or_none()
     )
     if raced is not None:
+        actor_subject = _load_actor_subject(db, actor_user_id)
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )

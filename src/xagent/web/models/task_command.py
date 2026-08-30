@@ -38,6 +38,9 @@ class TaskExecutionCommand(Base):  # type: ignore
         nullable=True,
         index=True,
     )
+    # Immutable acceptance-time pseudonym. ``actor_user_id`` remains the live
+    # relational join and may be NULLed when the account is deleted.
+    actor_subject = Column(String(64), nullable=True)
     command_id = Column(String(64), nullable=False)
     kind = Column(String(32), nullable=False)
     payload = Column(JSON, nullable=False)

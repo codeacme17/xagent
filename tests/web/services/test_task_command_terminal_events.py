@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.admin_users import delete_user
 from xagent.web.models.database import (
     Base,
     get_db,
@@ -419,6 +421,8 @@ def test_terminal_event_identity_matches_kind_scope_and_actor(
         .one()
     )
     assert event.include_command_identity is expected_identity
+    assert event.actor_user_id == (int(user.id) if with_actor else None)
+    assert (event.actor_subject is not None) is with_actor
 
 
 def test_terminal_event_preserves_explicit_identity_suppression(db_session) -> None:
@@ -970,7 +974,6 @@ def test_concurrent_first_commands_share_one_actor_subject(db_session) -> None:
     assert len(set(subjects)) == 1
 
 
-@pytest.mark.asyncio
 async def test_cancellation_after_commit_survives_a_fresh_database_session(
     db_session,
 ) -> None:
