@@ -292,6 +292,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -374,6 +375,74 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("preserves absent-code rejection prose for a trusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "trusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "trusted-legacy-rejection",
+        message: "Legacy actionable authenticated rejection",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Legacy actionable authenticated rejection",
+      disposition: "rejected",
+      userFacing: true,
+      errorCode: null,
+    })
+  })
+
+  it("hides absent-code rejection prose for an untrusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "untrusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "untrusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "untrusted-legacy-rejection",
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: null,
+    })
+  })
+
   it("keeps a rejection without a backend reason marked as not user facing", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -410,6 +479,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -450,6 +520,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -519,6 +590,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -634,6 +706,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const socket = MockWebSocket.instances[0]

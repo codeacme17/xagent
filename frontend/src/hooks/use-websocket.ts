@@ -271,6 +271,7 @@ export interface UseWebSocketOptions {
   uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
+  legacyErrorProse?: "trusted" | "untrusted"
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
   onConnectionFailure?: (failure: WebSocketConnectionFailure) => void
   onSessionConnectionClose?: (
@@ -301,6 +302,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     uploadFiles,
     connection: connectionOption,
     deliveryGeneration = 0,
+    legacyErrorProse = "untrusted",
     onConnectionClose,
     onConnectionFailure,
     onSessionConnectionClose,
@@ -379,6 +381,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const mountedRef = useRef(false)
   const tokenRef = useRef(token !== undefined ? token : authToken)
   const pendingDeliveriesRef = useRef(new Map<string, PendingDelivery>())
+  const legacyErrorProseRef = useRef(legacyErrorProse)
   const preparationsRef = useRef(new Map<string, MessagePreparationClaim>())
   // Keyed by the logical client_message_id, not by physical send. The durable
   // transport compares the whole payload, so a same-id retry that re-resolved
@@ -665,6 +668,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     taskIdRef.current = taskId
     deliveryIdentityRef.current = nextIdentity
     deliveryGenerationRef.current = deliveryGeneration
+    legacyErrorProseRef.current = legacyErrorProse
     callbacksRef.current = {
       onConnectionClose,
       onConnectionFailure,
@@ -959,11 +963,22 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               } else {
                 const hasErrorCode = Object.prototype.hasOwnProperty.call(data, "error_code")
                 const errorCode = readClientErrorCode(data.error_code)
+                const hasLegacyRejectionMessage = (
+                  typeof data.message === "string"
+                  && data.message.trim() !== ""
+                )
+                const trustLegacyRejectionMessage = (
+                  !hasErrorCode
+                  && legacyErrorProseRef.current === "trusted"
+                  && hasLegacyRejectionMessage
+                )
                 const rejectionMessage = errorCode
                   ? clientErrorFallback(errorCode)
                   : hasErrorCode
                     ? "Message was rejected."
-                    : data.message || "Message was rejected."
+                    : trustLegacyRejectionMessage
+                      ? data.message
+                      : "Message was rejected."
                 pending.reject(deliveryError(
                   rejectionMessage,
                   data.rejection_outcome === "not_accepted"
@@ -971,7 +986,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     : "outcome_unknown",
                   {
                     retryWithNewId: data.retry_with_new_id === true,
-                    userFacing: errorCode !== null,
+                    userFacing: errorCode !== null || trustLegacyRejectionMessage,
                     errorCode,
                   },
                 ))

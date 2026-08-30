@@ -2358,6 +2358,7 @@ export function AppProvider({
       sessionTransport === undefined
         ? undefined
         : deliveryGeneration,
+    legacyErrorProse: trustLegacyErrorProse ? "trusted" : "untrusted",
     onSessionConnectionClose: sessionTransport?.onConnectionClose,
     onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {

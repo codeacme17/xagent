@@ -31,6 +31,7 @@ const webSocketOptions = vi.hoisted(() => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -51,6 +52,7 @@ const webSocketOptions = vi.hoisted(() => ({
   },
   all: [] as Array<{
     onMessage?: (message: TestWebSocketMessage) => void
+    legacyErrorProse?: "trusted" | "untrusted"
     token?: string
   }>,
 }))
@@ -93,6 +95,7 @@ vi.mock("@/hooks/use-websocket", () => ({
       credentialOwner: { kind: "external" }
     } | null
     deliveryGeneration?: number
+    legacyErrorProse?: "trusted" | "untrusted"
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
       recoverable: boolean
@@ -3174,6 +3177,7 @@ describe("AppProvider websocket message routing", () => {
 
     const onMessage = webSocketOptions.current?.onMessage
     expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("untrusted")
     const secret = "provider=openai path=/srv/private token=secret"
 
     act(() => {
@@ -3205,6 +3209,7 @@ describe("AppProvider websocket message routing", () => {
 
     const onMessage = webSocketOptions.current?.onMessage
     expect(onMessage).toBeDefined()
+    expect(webSocketOptions.current?.legacyErrorProse).toBe("trusted")
 
     act(() => {
       onMessage?.({
