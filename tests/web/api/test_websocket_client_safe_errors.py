@@ -2672,7 +2672,7 @@ async def test_origin_entry_dies_with_its_command_or_socket(
         "retrying deferral keeps the origin"
     )
     exhausted = _pause_command(command_id="pause:cleanup")
-    exhausted.defer_count = websocket_api.MAX_COMMAND_DEFERS
+    exhausted.defer_count = websocket_api.max_command_defers()
     with pytest.raises(websocket_api.TaskCommandDeferred):
         await websocket_api.execute_durable_task_command(exhausted)
     assert not origins.has(command.command_id, command.task_id)

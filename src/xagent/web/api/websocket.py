@@ -163,11 +163,11 @@ from ..services.task_command_terminal_events import (
     TerminalTaskEventMessageCode,
     bind_terminal_event_draft,
     is_external_cancel_command,
+    terminal_event_draft_for_error,
 )
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
-    MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
     EnqueuedTaskCommand,
@@ -177,6 +177,7 @@ from ..services.task_command_transport import (
     TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    max_command_defers,
     task_has_live_foreign_runner,
     task_has_live_runner,
 )
@@ -9794,7 +9795,7 @@ async def execute_durable_task_command(
     try:
         result = await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
-        if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+        if command.defer_count + 1 >= max_command_defers():
             _command_origins.discard_command(command.command_id, command.task_id)
             bind_terminal_event_draft(
                 exc,
@@ -9803,10 +9804,32 @@ async def execute_durable_task_command(
             await _broadcast_terminal_command_error(command, exc)
         # A deferral that will retry keeps its origin entry.
         raise
-    except TaskCommandRejected:
+    except TaskCommandRejected as exc:
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
         _command_origins.discard_command(command.command_id, command.task_id)
+        if (
+            command.kind == TaskCommandKind.MESSAGE
+            and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
+        ):
+            # The one command whose handler has no channel of its own: the
+            # external audience's answer travels through the seam executor,
+            # which reports outcomes only as these exceptions. Without a
+            # broadcast, a deferred answer that is later terminally rejected
+            # (revoked principal, stale request, spent id, quota) vanishes
+            # silently — the task stays parked and nobody is told
+            # (xorbitsai/xagent-saas#952 B2). First-party rejections keep
+            # their handler-owned notifications and are deliberately not
+            # re-broadcast here. An executor-bound presentation draft is
+            # preserved; the standard one is derived only when none was
+            # bound, so the persisted terminal event is classified either
+            # way.
+            if terminal_event_draft_for_error(exc) is None:
+                bind_terminal_event_draft(
+                    exc,
+                    await _terminal_command_event_draft(command, exc),
+                )
+            await _broadcast_terminal_command_error(command, exc)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:

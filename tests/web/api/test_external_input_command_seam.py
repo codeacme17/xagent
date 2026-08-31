@@ -31,13 +31,13 @@ from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
     COMMAND_PENDING,
-    MAX_COMMAND_DEFERS,
     ClaimedTaskCommand,
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
     dispatch_one_task_command,
     enqueue_task_command,
+    max_command_defers,
 )
 from xagent.web.services.task_execution_controller import TaskControlState
 
@@ -483,12 +483,12 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         )
         assert enqueued.created
         # Spend all but the last unit of the defer budget so the next
-        # deferral is the terminal one -- MAX_COMMAND_DEFERS real round
+        # deferral is the terminal one -- max_command_defers() real round
         # trips would prove nothing more about the disposition under test.
         db.query(TaskExecutionCommand).filter(
             TaskExecutionCommand.command_id == "ext-input-exhausted"
         ).update(
-            {TaskExecutionCommand.defer_count: MAX_COMMAND_DEFERS - 1},
+            {TaskExecutionCommand.defer_count: max_command_defers() - 1},
             synchronize_session=False,
         )
         db.commit()
@@ -516,6 +516,96 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         assert event.outcome == "failed"
         assert event.message_code == "task_command_deferred"
         assert event.resend_safe is True
+        assert event.include_command_identity is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_external_input_broadcasts_and_keeps_the_bound_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal rejection must surface, and the executor's draft must win.
+
+    The seam executor is the one MESSAGE handler with no notification
+    channel of its own: without the broadcast, a deferred answer that is
+    later terminally rejected vanishes silently while the task stays parked
+    (xorbitsai/xagent-saas#952 B2). And the rejection disposition must
+    persist the draft the executor bound -- hardcoding a neutral one
+    silently discarded its identity-withholding (#952 M3) -- proven here
+    through the real dispatch path, not by reading back the attribute.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from xagent.web.services.task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        TerminalTaskEventMessageCode,
+        bind_terminal_event_draft,
+    )
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(command: ClaimedTaskCommand) -> dict[str, Any]:
+        rejection = TaskCommandRejected(
+            "the continuation was refused", reason="continuation_refused"
+        )
+        bind_terminal_event_draft(
+            rejection,
+            TerminalTaskEventDraft(
+                message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+                resend_safe=False,
+                include_command_identity=False,
+            ),
+        )
+        raise rejection
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-rejected",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-rejected")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.message_code == "task_command_failed"
         assert event.include_command_identity is False
     finally:
         db.close()
