@@ -357,6 +357,7 @@ def stage_task_command(
             Task.run_id,
             Task.state_version,
             Task.user_id,
+            User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
         .select_from(Task)
@@ -375,6 +376,17 @@ def stage_task_command(
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
     actor_subject = _resolve_actor_subject(db, actor_user_id)
+    task_owner_subject = (
+        str(snapshot.task_owner_subject)
+        if snapshot.task_owner_subject is not None
+        else None
+    )
+    if snapshot.task_owner_row_id is not None and task_owner_subject is None:
+        task_owner_subject = (
+            actor_subject
+            if actor_user_id == int(snapshot.user_id)
+            else _resolve_actor_subject(db, int(snapshot.user_id))
+        )
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
@@ -409,11 +421,7 @@ def stage_task_command(
         actor_user_id=actor_user_id,
         actor_subject=actor_subject,
         task_owner_user_id=int(snapshot.user_id),
-        task_owner_subject=(
-            str(snapshot.task_owner_subject)
-            if snapshot.task_owner_subject is not None
-            else None
-        ),
+        task_owner_subject=task_owner_subject,
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
