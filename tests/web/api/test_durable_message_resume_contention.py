@@ -270,6 +270,13 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         assert stored.status == COMMAND_PENDING
         assert stored.failure_count == 0
         assert stored.defer_count == 1
+        # A defer that still has budget must not stage a terminal event.
+        assert (
+            db_session.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+            .count()
+            == 0
+        )
         assert "holder_age_seconds=" in caplog.text
         assert "holder_age_seconds=unknown" not in caplog.text
 
@@ -300,6 +307,9 @@ async def test_dispatcher_reclaims_and_applies_message_after_contention_clears(
         # worker A notices claim loss. The missing delivery row is not durable
         # proof that worker A cannot resume and inject after this read.
         (True, False, False),
+        # A recovered delivery row alone must force unsafe even when the
+        # claim arithmetic is clean: this pins the marker term in isolation.
+        (False, True, False),
         (True, True, False),
     ],
 )

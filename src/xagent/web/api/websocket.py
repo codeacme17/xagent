@@ -4467,6 +4467,7 @@ class BackgroundTaskManager:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -9469,6 +9470,13 @@ async def _execute_durable_task_command(
                     # Equality proves there is no extra expired/failed claim
                     # whose worker might still resume and inject after this
                     # attempt observed no delivery row.
+                    #
+                    # The equality couples two write sites: claiming is the
+                    # only writer of attempt_count and defer_task_command the
+                    # only writer of defer_count. retry_failed_task_command
+                    # resets defer_count but not attempt_count, so an
+                    # operator-retried command can never prove safety again
+                    # (the safe direction for a duplicate-send decision).
                     command.attempt_count == command.defer_count + 1
                     and message_data.get("_durable_command_defer_unsafe")
                     != command.command_id
