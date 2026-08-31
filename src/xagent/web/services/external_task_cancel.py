@@ -42,16 +42,13 @@ from .chat_history_service import (
     persist_assistant_message_no_commit,
 )
 from .db_runtime import run_db_io_cancellation_safe
+from .task_command_contract import EXTERNAL_COMMAND_SCOPE as EXTERNAL_COMMAND_SCOPE
 from .task_command_transport import TaskCommandRejected
 from .task_execution_controller import TaskControlState
 
 logger = logging.getLogger(__name__)
 
 EXTERNAL_TASK_SOURCE = "external"
-
-# Command payload scope that routes a CANCEL command to this core. A command
-# without it keeps the A2A execution path it has always had.
-EXTERNAL_COMMAND_SCOPE = "external"
 
 _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
 

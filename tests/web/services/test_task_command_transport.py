@@ -740,6 +740,42 @@ async def test_stale_run_rejection_reason_is_persisted(db_session) -> None:
     assert stored.result == {"rejection_reason": "stale_run"}
 
 
+@pytest.mark.asyncio
+async def test_unsupported_cancel_scope_persists_a_generic_redacted_failure(
+    db_session,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="unsupported-cancel-scope",
+        kind=TaskCommandKind.CANCEL,
+        payload={
+            "agent_id": 1,
+            "target_state_version": int(task.state_version),
+            "scope": None,
+        },
+    )
+
+    assert await dispatch_one_task_command(
+        execute_durable_task_command,
+        command_db_id=enqueued.command_id,
+    )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+        .one()
+    )
+    assert event.message_code == "task_command_failed"
+    assert event.include_command_identity is False
+
+
 def test_later_command_cannot_overtake_unfinished_command(db_session) -> None:
     user, task = _create_running_task(db_session)
     first = enqueue_task_command(

@@ -15,6 +15,7 @@ from sqlalchemy import event as sa_event
 from sqlalchemy.engine import make_url
 from sqlalchemy.schema import CreateSchema, DropSchema
 
+from xagent.web.api import websocket as websocket_api
 from xagent.web.models.database import (
     Base,
     get_db,
@@ -248,6 +249,95 @@ def test_external_cancel_suppresses_command_identity_projection(
     assert event.outcome_version == claimed.attempt_count
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_identity", "expected_message_code"),
+    [
+        pytest.param(
+            {"type": "cancel_task"},
+            True,
+            websocket_api.TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+            id="legacy-missing-scope",
+        ),
+        pytest.param(
+            {"scope": "external"},
+            False,
+            websocket_api.TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+            id="external",
+        ),
+        pytest.param(
+            {"scope": "unknown"},
+            False,
+            websocket_api.TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+            id="unknown-string",
+        ),
+        pytest.param(
+            {"scope": None},
+            False,
+            websocket_api.TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+            id="none",
+        ),
+        pytest.param(
+            {"scope": {}},
+            False,
+            websocket_api.TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+            id="dict",
+        ),
+        pytest.param(
+            {"scope": []},
+            False,
+            websocket_api.TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+            id="list",
+        ),
+    ],
+)
+async def test_live_and_durable_cancel_audiences_share_disclosure_policy(
+    db_session,
+    payload: dict[str, object],
+    expected_identity: bool,
+    expected_message_code: websocket_api.TerminalTaskEventMessageCode,
+) -> None:
+    user, task = _create_running_task(db_session)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id=f"audience-{uuid.uuid4().hex}",
+        kind=TaskCommandKind.CANCEL,
+        payload=payload,
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+
+    draft = await websocket_api._terminal_command_event_draft(
+        claimed,
+        RuntimeError("internal detail"),
+    )
+    assert draft.include_command_identity is expected_identity
+    assert draft.message_code is expected_message_code
+    assert fail_task_command(
+        claimed.id,
+        "worker-a",
+        "internal detail",
+        force_terminal=True,
+        expected_attempt_count=claimed.attempt_count,
+        terminal_event=draft,
+    )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert event.include_command_identity is expected_identity
+    assert event.message_code == expected_message_code.value
+
+
 @pytest.mark.parametrize(
     ("kind", "payload", "with_actor", "expected_identity"),
     [
@@ -269,8 +359,8 @@ def test_external_cancel_suppresses_command_identity_projection(
             TaskCommandKind.CANCEL,
             {"scope": ["external"]},
             True,
-            True,
-            id="cancel-with-non-string-scope",
+            False,
+            id="cancel-with-unsupported-scope",
         ),
         pytest.param(
             TaskCommandKind.PAUSE,

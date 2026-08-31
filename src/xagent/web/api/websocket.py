@@ -118,7 +118,6 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.external_task_cancel import (
-    EXTERNAL_COMMAND_SCOPE,
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
 )
@@ -159,7 +158,10 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from ..services.task_command_terminal_events import is_external_cancel_command
+from ..services.task_command_contract import (
+    TaskCommandAudience,
+    classify_task_command_audience,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -455,7 +457,7 @@ def client_safe_task_command_failure(
     kind: TaskCommandKind,
     error: BaseException,
     *,
-    scope: str | None = None,
+    payload: object = None,
     task_status: TaskStatus | None = None,
 ) -> str:
     """Terminal command failure: server-owned kind prefix + redacted detail.
@@ -473,7 +475,7 @@ def client_safe_task_command_failure(
     running would be false, and the visitor would keep waiting on a turn
     nobody stopped.
     """
-    if is_external_cancel_command(kind=kind.value, scope=scope):
+    if classify_task_command_audience(kind, payload) is TaskCommandAudience.EXTERNAL:
         return external_cancel_exhausted_message(task_status)
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
@@ -9423,33 +9425,18 @@ async def _execute_durable_task_command(
                         "state-version target",
                         reason="stale_run",
                     )
-                # The A2A execution core loads its target as an A2A task, so
-                # a cancel for any other task source needs its own core. The
-                # scope names which one, and the absence of the key is itself
-                # a value: it is the only shape this command had before the
-                # external core existed, so it stays on the A2A path. Any
-                # other value names a core that does not exist here, and
-                # silently running the A2A one against it would cancel
-                # nothing while reporting success.
-                if "scope" not in message_data:
-                    scope_value = EXTERNAL_COMMAND_SCOPE_ABSENT
-                else:
-                    scope_value = message_data["scope"]
-                # Identity and equality checks rather than set membership:
-                # an unhashable payload value (a dict or list) must land in
-                # the same terminal rejection, not raise ``TypeError`` into
-                # the retry path.
-                if (
-                    scope_value is not EXTERNAL_COMMAND_SCOPE_ABSENT
-                    and scope_value != EXTERNAL_COMMAND_SCOPE
-                ):
+                audience = classify_task_command_audience(
+                    command.kind,
+                    message_data,
+                )
+                if audience is TaskCommandAudience.UNSUPPORTED:
                     raise TaskCommandRejected(
                         f"Cancel command {command.command_id} names task scope "
-                        f"{scope_value!r}, which has no execution core",
+                        f"{message_data.get('scope')!r}, which has no execution core",
                         reason="unsupported_scope",
                     )
                 async with task_execution_controller.command(command.task_id):
-                    if scope_value == EXTERNAL_COMMAND_SCOPE:
+                    if audience is TaskCommandAudience.EXTERNAL:
                         await cancel_external_task_unserialized(
                             task_id=command.task_id,
                             agent_id=agent_id,
@@ -9483,19 +9470,6 @@ async def _execute_durable_task_command(
     return result
 
 
-# "no scope key at all" needs a value the scope check can compare against
-# and no payload can ever carry. A JSON payload cannot hold this object, so
-# a producer cannot forge the pre-external shape by writing a string.
-EXTERNAL_COMMAND_SCOPE_ABSENT = object()
-
-
-def _command_scope(command: ClaimedTaskCommand) -> str | None:
-    """The scope a command payload names, or ``None`` when it names none."""
-
-    scope = command.payload.get("scope")
-    return scope if isinstance(scope, str) else None
-
-
 def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
     """The turn a command names, or ``None`` when it names none usably.
 
@@ -9519,22 +9493,14 @@ def _command_turn_id(task_id: int, message_data: dict[str, Any]) -> str | None:
     return None
 
 
-def _is_external_cancel(command: ClaimedTaskCommand) -> bool:
-    """Whether this command is a stop issued by a task's external audience."""
-
-    return (
-        command.kind == TaskCommandKind.CANCEL
-        and _command_scope(command) == EXTERNAL_COMMAND_SCOPE
-    )
-
-
 async def _terminal_command_event_draft(
     command: ClaimedTaskCommand,
     error: BaseException,
 ) -> TerminalTaskEventDraft:
     """Build safe presentation metadata; disposition code persists it."""
 
-    if _is_external_cancel(command):
+    audience = classify_task_command_audience(command.kind, command.payload)
+    if audience is TaskCommandAudience.EXTERNAL:
         try:
             task_status = await _load_terminal_command_task_status(command.task_id)
         except Exception as exc:
@@ -9561,6 +9527,7 @@ async def _terminal_command_event_draft(
             else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
         ),
         resend_safe=False,
+        include_command_identity=audience is TaskCommandAudience.INTERNAL,
     )
 
 
@@ -9580,9 +9547,18 @@ async def execute_durable_task_command(
             )
         # A deferral that will retry keeps its origin entry.
         raise
-    except TaskCommandRejected:
+    except TaskCommandRejected as exc:
         # Rejections come from handlers that already expose their durable
-        # domain-level outcome. The dispatcher makes them terminal immediately.
+        # domain-level outcome. An unsupported audience is instead a malformed
+        # transport contract, so it still needs a generic, identity-free event.
+        if (
+            classify_task_command_audience(command.kind, command.payload)
+            is TaskCommandAudience.UNSUPPORTED
+        ):
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
         _command_origins.discard_command(command.command_id, command.task_id)
         raise
     except Exception as exc:

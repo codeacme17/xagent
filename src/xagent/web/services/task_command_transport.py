@@ -35,6 +35,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .task_command_contract import TaskCommandKind
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
     stage_terminal_event,
@@ -55,13 +56,6 @@ MAX_COMMAND_FAILURES = 5
 MAX_COMMAND_DEFERS = 60
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
-
-
-class TaskCommandKind(str, enum.Enum):
-    MESSAGE = "message"
-    PAUSE = "pause"
-    RESUME = "resume"
-    CANCEL = "cancel"
 
 
 class TaskCommandTaskMissing(ValueError):
@@ -1117,6 +1111,7 @@ async def dispatch_one_task_command(
         disposition_operation = persist_deferral
     except TaskCommandRejected as exc:
         error = str(exc)
+        terminal_event = terminal_event_draft_for_error(exc)
         rejection_result = (
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
@@ -1129,9 +1124,13 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
-                terminal_event=TerminalTaskEventDraft(
-                    message_code=None,
-                    resend_safe=False,
+                terminal_event=(
+                    terminal_event
+                    if terminal_event is not None
+                    else TerminalTaskEventDraft(
+                        message_code=None,
+                        resend_safe=False,
+                    )
                 ),
             )
 

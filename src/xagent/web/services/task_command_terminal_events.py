@@ -26,6 +26,10 @@ from ..models.task_command import TaskExecutionCommand
 from ..models.task_command_terminal_event import TaskCommandTerminalEvent
 from ..utils.db_timezone import format_datetime_for_api
 from .db_runtime import await_task_settlement, run_db_io_cancellation_safe
+from .task_command_contract import (
+    TaskCommandAudience,
+    classify_task_command_audience,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,19 +85,6 @@ class TerminalTaskEvent:
 
 TerminalTaskEventSink = Callable[[TerminalTaskEvent], Awaitable[None]]
 _DRAFT_ATTRIBUTE = "_xagent_terminal_task_event_draft"
-_CANCEL_COMMAND_KIND = "cancel"
-_EXTERNAL_COMMAND_SCOPE = "external"
-
-
-def is_external_cancel_command(*, kind: str, scope: object) -> bool:
-    """Return whether strict command kind/scope values name an external cancel.
-
-    The helper accepts normalized primitives so durable ORM rows and live
-    command snapshots can share one disclosure-policy classifier without
-    importing each other's modules.
-    """
-
-    return kind == _CANCEL_COMMAND_KIND and scope == _EXTERNAL_COMMAND_SCOPE
 
 
 class TerminalTaskEventAccessDenied(PermissionError):
@@ -162,7 +153,7 @@ def stage_terminal_event(
             ),
             resend_safe=False,
         )
-    scope = command.payload.get("scope") if isinstance(command.payload, dict) else None
+    audience = classify_task_command_audience(str(command.kind), command.payload)
 
     event = TaskCommandTerminalEvent(
         event_id=str(uuid.uuid4()),
@@ -185,8 +176,7 @@ def stage_terminal_event(
         message_code=(draft.message_code.value if draft.message_code else None),
         resend_safe=bool(draft.resend_safe),
         include_command_identity=bool(
-            draft.include_command_identity
-            and not is_external_cancel_command(kind=str(command.kind), scope=scope)
+            draft.include_command_identity and audience is TaskCommandAudience.INTERNAL
         ),
     )
     try:
