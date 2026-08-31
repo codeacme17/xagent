@@ -135,16 +135,15 @@ def stage_terminal_event(
     """
 
     snapshot = (
-        db.query(TaskExecutionCommand, Task, User.actor_subject)
+        db.query(TaskExecutionCommand, Task)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
-        .outerjoin(User, User.id == Task.user_id)
         .filter(TaskExecutionCommand.id == command_db_id)
         .populate_existing()
         .one_or_none()
     )
     if snapshot is None:
         raise ValueError(f"Task command {command_db_id} does not exist")
-    command, task, task_owner_subject = snapshot
+    command, task = snapshot
     if command.status not in {"completed", "failed"}:
         raise ValueError(
             f"Task command {command_db_id} is not terminal: {command.status}"
@@ -179,9 +178,15 @@ def stage_terminal_event(
         actor_subject=(
             str(command.actor_subject) if command.actor_subject is not None else None
         ),
-        task_owner_user_id=int(task.user_id),
+        task_owner_user_id=(
+            int(command.task_owner_user_id)
+            if command.task_owner_user_id is not None
+            else int(task.user_id)
+        ),
         task_owner_subject=(
-            str(task_owner_subject) if task_owner_subject is not None else None
+            str(command.task_owner_subject)
+            if command.task_owner_subject is not None
+            else None
         ),
         outcome_version=outcome_version,
         outcome=outcome,

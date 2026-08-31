@@ -134,28 +134,26 @@ def _claim_command(
 
 
 def test_terminal_event_uses_the_command_acceptance_snapshot(db_session) -> None:
-    _, task = _create_running_task(db_session)
-    current_owner = User(
-        username="terminal-event-current-owner",
-        password_hash="hash",
-        is_admin=False,
-        created_at=datetime.now(timezone.utc) + timedelta(days=1),
-    )
-    db_session.add(current_owner)
-    db_session.commit()
-    task.user_id = int(current_owner.id)
-    db_session.commit()
-    owner_subject = current_owner.actor_subject
-    assert owner_subject is not None
+    accepted_owner, task = _create_running_task(db_session)
+    accepted_owner_subject = accepted_owner.actor_subject
+    assert accepted_owner_subject is not None
     enqueued = enqueue_task_command(
         db_session,
         task_id=int(task.id),
-        actor_user_id=int(current_owner.id),
+        actor_user_id=int(accepted_owner.id),
         command_id="stale-run-outcome",
         kind=TaskCommandKind.PAUSE,
         payload={"type": "pause_task"},
     )
 
+    current_owner = User(
+        username="terminal-event-reassigned-owner",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(current_owner)
+    db_session.flush()
+    task.user_id = int(current_owner.id)
     task.run_id = "run-2"
     task.state_version = 9
     db_session.commit()
@@ -183,9 +181,12 @@ def test_terminal_event_uses_the_command_acceptance_snapshot(db_session) -> None
     assert command is not None
     assert command.target_run_id == "run-1"
     assert command.target_state_version == 3
+    assert command.task_owner_user_id == int(accepted_owner.id)
+    assert command.task_owner_subject == accepted_owner_subject
     assert event.task_run_id == "run-1"
     assert event.task_state_version == 3
-    assert event.task_owner_subject == owner_subject
+    assert event.task_owner_user_id == int(accepted_owner.id)
+    assert event.task_owner_subject == accepted_owner_subject
 
 
 def test_terminal_event_refreshes_identity_mapped_command_after_bulk_update(
@@ -773,6 +774,8 @@ def test_legacy_orphan_task_owner_does_not_block_terminal_disposition(
     db_session.add(actor)
     db_session.commit()
     owner_id = int(owner.id)
+    owner_subject = owner.actor_subject
+    assert owner_subject is not None
     enqueued = enqueue_task_command(
         db_session,
         task_id=int(task.id),
@@ -818,7 +821,7 @@ def test_legacy_orphan_task_owner_does_not_block_terminal_disposition(
         assert command is not None
         assert command.status == "failed"
         assert event.task_owner_user_id == owner_id
-        assert event.task_owner_subject is None
+        assert event.task_owner_subject == owner_subject
 
 
 @pytest.mark.asyncio
