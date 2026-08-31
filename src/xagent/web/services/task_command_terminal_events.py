@@ -24,6 +24,7 @@ from ..models.database import get_session_local
 from ..models.task import Task
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_command_terminal_event import TaskCommandTerminalEvent
+from ..models.user import User
 from ..utils.db_timezone import format_datetime_for_api
 from .db_runtime import await_task_settlement, run_db_io_cancellation_safe
 from .task_command_contract import (
@@ -126,19 +127,23 @@ def stage_terminal_event(
 
     The insert runs in a savepoint so a concurrent natural-key winner can be
     adopted without poisoning the caller's transaction. Other integrity
-    failures still propagate after the savepoint has been rolled back.
+    failures still propagate after the savepoint has been rolled back. On
+    SQLite, the caller must execute the terminal-disposition DML in this
+    transaction before entering this helper so the SAVEPOINT does not become
+    pysqlite's first write-adjacent statement.
     """
 
     snapshot = (
-        db.query(TaskExecutionCommand, Task)
+        db.query(TaskExecutionCommand, Task, User.actor_subject)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
+        .outerjoin(User, User.id == Task.user_id)
         .filter(TaskExecutionCommand.id == command_db_id)
         .populate_existing()
         .one_or_none()
     )
     if snapshot is None:
         raise ValueError(f"Task command {command_db_id} does not exist")
-    command, task = snapshot
+    command, task, task_owner_subject = snapshot
     if command.status not in {"completed", "failed"}:
         raise ValueError(
             f"Task command {command_db_id} is not terminal: {command.status}"
@@ -171,6 +176,9 @@ def stage_terminal_event(
             int(command.actor_user_id) if command.actor_user_id is not None else None
         ),
         task_owner_user_id=int(task.user_id),
+        task_owner_subject=(
+            str(task_owner_subject) if task_owner_subject is not None else None
+        ),
         outcome_version=outcome_version,
         outcome=outcome,
         message_code=(draft.message_code.value if draft.message_code else None),

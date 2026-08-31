@@ -132,11 +132,23 @@ def _claim_command(
 
 
 def test_terminal_event_uses_the_command_acceptance_snapshot(db_session) -> None:
-    user, task = _create_running_task(db_session)
+    _, task = _create_running_task(db_session)
+    current_owner = User(
+        username="terminal-event-current-owner",
+        password_hash="hash",
+        is_admin=False,
+        created_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    db_session.add(current_owner)
+    db_session.commit()
+    task.user_id = int(current_owner.id)
+    db_session.commit()
+    owner_subject = current_owner.actor_subject
+    assert owner_subject is not None
     enqueued = enqueue_task_command(
         db_session,
         task_id=int(task.id),
-        actor_user_id=int(user.id),
+        actor_user_id=int(current_owner.id),
         command_id="stale-run-outcome",
         kind=TaskCommandKind.PAUSE,
         payload={"type": "pause_task"},
@@ -171,6 +183,7 @@ def test_terminal_event_uses_the_command_acceptance_snapshot(db_session) -> None
     assert command.target_state_version == 3
     assert event.task_run_id == "run-1"
     assert event.task_state_version == 3
+    assert event.task_owner_subject == owner_subject
 
 
 def test_terminal_event_refreshes_identity_mapped_command_after_bulk_update(
@@ -521,6 +534,440 @@ def test_terminal_disposition_rolls_back_when_event_staging_fails(db_session) ->
         .count()
     )
     assert event_count == 0
+
+    db_session.rollback()
+    assert fail_task_command(
+        claimed.id,
+        "worker-a",
+        "retry after event write recovery",
+        force_terminal=True,
+        expected_attempt_count=claimed.attempt_count,
+    )
+
+    db_session.expire_all()
+    recovered = db_session.get(TaskExecutionCommand, claimed.id)
+    assert recovered is not None
+    assert recovered.status == "failed"
+    events = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .all()
+    )
+    assert len(events) == 1
+
+
+def test_live_legacy_actor_replays_command_after_upgrade(db_session) -> None:
+    if get_engine().dialect.name != "sqlite":
+        pytest.skip("full parent-schema replay setup is SQLite-specific")
+
+    actor, task = _create_running_task(db_session)
+    actor_id = int(actor.id)
+    task_id = int(task.id)
+    first = enqueue_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=actor_id,
+        command_id="live-legacy-actor-replay",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    database_path = get_engine().url.database
+    assert database_path is not None
+    db_session.close()
+    get_engine().dispose()
+    legacy = sqlite3.connect(database_path)
+    try:
+        legacy.execute("DROP TABLE task_command_terminal_events")
+        legacy.execute("ALTER TABLE task_execution_commands DROP COLUMN actor_subject")
+        legacy.execute("DROP INDEX ix_users_actor_subject")
+        legacy.execute("ALTER TABLE users DROP COLUMN actor_subject")
+        legacy.execute(
+            "ALTER TABLE task_execution_commands DROP COLUMN target_state_version"
+        )
+        legacy.execute(
+            "UPDATE alembic_version SET version_num = ?",
+            ("20260821_actor_oauth_flow_states",),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    init_db(db_url=f"sqlite:///{database_path}")
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as check:
+        replay = enqueue_task_command(
+            check,
+            task_id=task_id,
+            actor_user_id=actor_id,
+            command_id="live-legacy-actor-replay",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+        assert replay.command_id == first.command_id
+        assert replay.created is False
+        assert replay.payload_matches is True
+
+
+@pytest.mark.parametrize(
+    "replacement_before_upgrade",
+    [False, True],
+    ids=["orphan-remains", "actor-id-reused"],
+)
+def test_legacy_orphan_actor_does_not_block_terminal_disposition(
+    db_session,
+    replacement_before_upgrade: bool,
+) -> None:
+    if get_engine().dialect.name != "sqlite":
+        pytest.skip("legacy orphan preservation is SQLite-specific")
+
+    owner, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    actor = User(
+        username="terminal-event-admin-actor",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+    actor_id = int(actor.id)
+    first = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=actor_id,
+        command_id="legacy-orphan-actor",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    second = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id="after-legacy-orphan-actor",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=first.command_id,
+    )
+    assert claimed is not None
+
+    database_path = get_engine().url.database
+    assert database_path is not None
+    db_session.close()
+    get_engine().dispose()
+    legacy = sqlite3.connect(database_path)
+    try:
+        assert legacy.execute("PRAGMA foreign_keys").fetchone() == (0,)
+        legacy.execute("DROP TABLE task_command_terminal_events")
+        legacy.execute("ALTER TABLE task_execution_commands DROP COLUMN actor_subject")
+        legacy.execute("DROP INDEX ix_users_actor_subject")
+        legacy.execute("ALTER TABLE users DROP COLUMN actor_subject")
+        legacy.execute(
+            "ALTER TABLE task_execution_commands DROP COLUMN target_state_version"
+        )
+        legacy.execute("DELETE FROM users WHERE id = ?", (actor_id,))
+        if replacement_before_upgrade:
+            legacy.execute(
+                "INSERT INTO users "
+                "(id, username, password_hash, is_admin, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    actor_id,
+                    "terminal-event-replacement",
+                    "hash",
+                    1,
+                    "9999-12-31 23:59:59",
+                ),
+            )
+        legacy.execute(
+            "UPDATE alembic_version SET version_num = ?",
+            ("20260821_actor_oauth_flow_states",),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    init_db(db_url=f"sqlite:///{database_path}")
+    assert fail_task_command(
+        claimed.id,
+        "worker-a",
+        "executor failed",
+        force_terminal=True,
+        expected_attempt_count=claimed.attempt_count,
+    )
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as check:
+        command = check.get(TaskExecutionCommand, claimed.id)
+        assert command is not None
+        assert command.status == "failed"
+        assert command.failure_count == 1
+        event = (
+            check.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+            .one()
+        )
+        assert event.actor_user_id == actor_id
+        assert event.actor_subject == f"legacy-user-id:{actor_id}"
+        replacement = check.get(User, actor_id)
+        if replacement_before_upgrade:
+            assert replacement is not None
+            assert replacement.actor_subject is not None
+            assert replacement.actor_subject != event.actor_subject
+            replay = enqueue_task_command(
+                check,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id="legacy-orphan-actor",
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+            assert replay.created is False
+            assert replay.payload_matches is False
+            replacement_command = enqueue_task_command(
+                check,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id="replacement-actor-command",
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+            replacement_row = check.get(
+                TaskExecutionCommand,
+                replacement_command.command_id,
+            )
+            assert replacement_row is not None
+            assert replacement_row.actor_subject == replacement.actor_subject
+        else:
+            assert replacement is None
+        assert (
+            claim_task_command(
+                check,
+                runner_id="worker-a",
+                command_db_id=second.command_id,
+            )
+            is not None
+        )
+
+
+def test_legacy_orphan_task_owner_does_not_block_terminal_disposition(
+    db_session,
+) -> None:
+    if get_engine().dialect.name != "sqlite":
+        pytest.skip("legacy orphan preservation is SQLite-specific")
+
+    owner, task = _create_running_task(db_session)
+    actor = User(
+        username="terminal-event-owner-orphan-actor",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+    owner_id = int(owner.id)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(actor.id),
+        command_id="legacy-orphan-task-owner",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+
+    database_path = get_engine().url.database
+    assert database_path is not None
+    db_session.close()
+    get_engine().dispose()
+    legacy = sqlite3.connect(database_path)
+    try:
+        assert legacy.execute("PRAGMA foreign_keys").fetchone() == (0,)
+        legacy.execute("DELETE FROM users WHERE id = ?", (owner_id,))
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    assert fail_task_command(
+        claimed.id,
+        "worker-a",
+        "executor failed",
+        force_terminal=True,
+        expected_attempt_count=claimed.attempt_count,
+    )
+    SessionLocal = get_session_local()
+    with SessionLocal() as check:
+        command = check.get(TaskExecutionCommand, claimed.id)
+        event = (
+            check.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+            .one()
+        )
+        assert command is not None
+        assert command.status == "failed"
+        assert event.task_owner_user_id == owner_id
+        assert event.task_owner_subject is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delete_before_staging",
+    [True, False],
+    ids=["actor-deleted-before-staging", "actor-deleted-after-staging"],
+)
+async def test_actor_snapshot_survives_supported_user_deletion(
+    db_session,
+    delete_before_staging: bool,
+) -> None:
+    owner, task = _create_running_task(db_session)
+    deleting_admin = User(
+        username="terminal-event-deleting-admin",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db_session.add(deleting_admin)
+    db_session.flush()
+    actor = User(
+        username="terminal-event-cross-user-actor",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+    actor_id = int(actor.id)
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=actor_id,
+        command_id=f"actor-snapshot-{delete_before_staging}",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    accepted = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert accepted is not None
+    actor_subject = str(accepted.actor_subject)
+    assert actor_subject
+    same_actor_command = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=actor_id,
+        command_id=f"actor-snapshot-same-subject-{delete_before_staging}",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+    )
+    same_actor = db_session.get(TaskExecutionCommand, same_actor_command.command_id)
+    assert same_actor is not None
+    assert same_actor.actor_subject == actor_subject
+
+    if delete_before_staging:
+        assert await delete_user(actor_id, deleting_admin, db_session) == {
+            "message": "User deleted successfully"
+        }
+    claimed = claim_task_command(
+        db_session,
+        runner_id="worker-a",
+        command_db_id=enqueued.command_id,
+    )
+    assert claimed is not None
+    assert finish_task_command(
+        claimed.id,
+        "worker-a",
+        expected_attempt_count=claimed.attempt_count,
+    )
+    if not delete_before_staging:
+        assert await delete_user(actor_id, deleting_admin, db_session) == {
+            "message": "User deleted successfully"
+        }
+    if actor in db_session:
+        db_session.expunge(actor)
+    replacement = User(
+        username="terminal-event-replacement-actor",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db_session.add(replacement)
+    db_session.commit()
+    if get_engine().dialect.name == "sqlite":
+        assert int(replacement.id) == actor_id
+    assert replacement.actor_subject != actor_subject
+
+    db_session.expire_all()
+    command = db_session.get(TaskExecutionCommand, claimed.id)
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == claimed.id)
+        .one()
+    )
+    assert command is not None
+    assert command.actor_user_id is None
+    assert command.actor_subject == actor_subject
+    assert event.actor_user_id == (None if delete_before_staging else actor_id)
+    assert event.actor_subject == actor_subject
+    assert db_session.get(Task, task.id) is not None
+    assert db_session.get(User, owner.id) is not None
+
+
+def test_concurrent_first_commands_share_one_actor_subject(db_session) -> None:
+    actor, first_task = _create_running_task(db_session)
+    actor_id = int(actor.id)
+    second_task = Task(
+        user_id=actor.id,
+        title="Concurrent terminal task events",
+        description="Concurrent terminal task events",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        run_id="run-2",
+        state_version=3,
+        runner_id="worker-b",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    db_session.add(second_task)
+    db_session.commit()
+    db_session.query(User).filter(User.id == actor_id).update(
+        {User.actor_subject: None},
+        synchronize_session=False,
+    )
+    db_session.commit()
+
+    barrier = Barrier(2)
+    SessionLocal = get_session_local()
+
+    def accept(task_id: int, command_id: str) -> str:
+        with SessionLocal() as session:
+            barrier.wait()
+            enqueued = enqueue_task_command(
+                session,
+                task_id=task_id,
+                actor_user_id=actor_id,
+                command_id=command_id,
+                kind=TaskCommandKind.PAUSE,
+                payload={"type": "pause_task"},
+            )
+            command = session.get(TaskExecutionCommand, enqueued.command_id)
+            assert command is not None
+            assert command.actor_subject is not None
+            return str(command.actor_subject)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        subjects = list(
+            pool.map(
+                lambda item: accept(*item),
+                [
+                    (int(first_task.id), "concurrent-actor-subject-a"),
+                    (int(second_task.id), "concurrent-actor-subject-b"),
+                ],
+            )
+        )
+
+    assert len(set(subjects)) == 1
 
 
 @pytest.mark.asyncio
