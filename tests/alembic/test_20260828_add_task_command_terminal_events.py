@@ -170,6 +170,8 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
         }
         assert "target_state_version" in command_columns
         assert "actor_subject" in command_columns
+        assert "task_owner_user_id" in command_columns
+        assert "task_owner_subject" in command_columns
         legacy_version = connection.execute(
             text(
                 "SELECT target_state_version FROM task_execution_commands WHERE id = 1"
@@ -184,6 +186,13 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
         ).scalar_one()
         assert len(user_subject) == 32
         assert actor_subject == user_subject
+        legacy_owner_snapshot = connection.execute(
+            text(
+                "SELECT task_owner_user_id, task_owner_subject "
+                "FROM task_execution_commands WHERE id = 1"
+            )
+        ).one()
+        assert legacy_owner_snapshot == (None, None)
         ambiguous_subjects = dict(
             connection.execute(
                 text(
@@ -216,6 +225,8 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
         }
         assert "target_state_version" not in command_columns
         assert "actor_subject" not in command_columns
+        assert "task_owner_user_id" not in command_columns
+        assert "task_owner_subject" not in command_columns
         assert "actor_subject" not in {
             column["name"] for column in inspect(connection).get_columns("users")
         }
@@ -267,6 +278,8 @@ def test_offline_upgrade_emits_terminal_event_schema(dialect_name: str) -> None:
     assert "ALTER TABLE users ADD COLUMN actor_subject" in sql
     assert "UPDATE users SET actor_subject=" in sql
     assert "ALTER TABLE task_execution_commands ADD COLUMN actor_subject" in sql
+    assert "ALTER TABLE task_execution_commands ADD COLUMN task_owner_user_id" in sql
+    assert "ALTER TABLE task_execution_commands ADD COLUMN task_owner_subject" in sql
     assert "UPDATE task_execution_commands SET actor_subject=" in sql
     assert f"CREATE TABLE {TABLE}" in sql
     for name in UNIQUE_CONSTRAINT_NAMES:
@@ -306,6 +319,8 @@ def test_offline_downgrade_emits_terminal_event_cleanup(dialect_name: str) -> No
 
     assert "DROP TABLE task_command_terminal_events" in sql
     assert "ALTER TABLE task_execution_commands DROP COLUMN actor_subject" in sql
+    assert "ALTER TABLE task_execution_commands DROP COLUMN task_owner_user_id" in sql
+    assert "ALTER TABLE task_execution_commands DROP COLUMN task_owner_subject" in sql
     assert "ALTER TABLE users DROP COLUMN actor_subject" in sql
     assert "ALTER TABLE task_execution_commands DROP COLUMN target_state_version" in sql
     assert "%(" not in sql
@@ -405,6 +420,12 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
         ).scalar_one()
         assert len(app_user_subject) == 32
         assert actor_subject == app_user_subject
+        app_command_columns = {
+            column["name"]
+            for column in inspector.get_columns("task_execution_commands", schema="app")
+        }
+        assert "task_owner_user_id" in app_command_columns
+        assert "task_owner_subject" in app_command_columns
         assert "actor_subject" not in {
             column["name"]
             for column in inspector.get_columns(
@@ -418,6 +439,14 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
             connection
         ).get_table_names(schema="app")
         assert "actor_subject" not in {
+            column["name"]
+            for column in inspector.get_columns("task_execution_commands", schema="app")
+        }
+        assert "task_owner_user_id" not in {
+            column["name"]
+            for column in inspector.get_columns("task_execution_commands", schema="app")
+        }
+        assert "task_owner_subject" not in {
             column["name"]
             for column in inspector.get_columns("task_execution_commands", schema="app")
         }

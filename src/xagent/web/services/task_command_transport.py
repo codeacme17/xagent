@@ -308,8 +308,9 @@ def stage_task_command(
        is not served from the identity map, so it observes a caller's own
        uncommitted CAS-style update to the same row instead of a stale cached
        instance.
-    4. Resolve the actor's stable internal subject in this transaction, so
-       idempotency never treats a reused integer user id as the same actor.
+    4. Resolve the actor and task owner's stable internal subjects in this
+       transaction, so idempotency and terminal delivery never treat a reused
+       integer user id as the same identity.
     5. Check for an existing command with this (task_id, command_id) before
        adding a new row, so a repeated call is idempotent without relying on
        the unique constraint to reject it.
@@ -350,9 +351,25 @@ def stage_task_command(
     # window across everything it did in between, so existence is re-checked
     # here, by query, before inserting a command that references the row.
     snapshot = db.execute(
-        select(Task.status, Task.runner_id, Task.run_id, Task.state_version).where(
-            Task.id == resolved_task_id
+        select(
+            Task.status,
+            Task.runner_id,
+            Task.run_id,
+            Task.state_version,
+            Task.user_id,
+            User.actor_subject.label("task_owner_subject"),
         )
+        .select_from(Task)
+        .outerjoin(
+            User,
+            and_(
+                User.id == Task.user_id,
+                User.created_at.is_not(None),
+                Task.created_at.is_not(None),
+                User.created_at <= Task.created_at,
+            ),
+        )
+        .where(Task.id == resolved_task_id)
     ).one_or_none()
     if snapshot is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
@@ -391,6 +408,12 @@ def stage_task_command(
         task_id=resolved_task_id,
         actor_user_id=actor_user_id,
         actor_subject=actor_subject,
+        task_owner_user_id=int(snapshot.user_id),
+        task_owner_subject=(
+            str(snapshot.task_owner_subject)
+            if snapshot.task_owner_subject is not None
+            else None
+        ),
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,

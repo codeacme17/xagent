@@ -22,6 +22,8 @@ USER_TABLE = "users"
 TARGET_STATE_VERSION = "target_state_version"
 ACTOR_SUBJECT = "actor_subject"
 ACTOR_SUBJECT_INDEX = "ix_users_actor_subject"
+COMMAND_TASK_OWNER_USER_ID = "task_owner_user_id"
+COMMAND_TASK_OWNER_SUBJECT = "task_owner_subject"
 POSTGRES_VISIBLE_TABLE_SCHEMA_SQL = sa.text(
     """
     SELECT ns.nspname
@@ -191,6 +193,14 @@ def upgrade() -> None:
             COMMAND_TABLE,
             sa.Column(ACTOR_SUBJECT, sa.String(64), nullable=True),
         )
+        op.add_column(
+            COMMAND_TABLE,
+            sa.Column(COMMAND_TASK_OWNER_USER_ID, sa.Integer(), nullable=True),
+        )
+        op.add_column(
+            COMMAND_TABLE,
+            sa.Column(COMMAND_TASK_OWNER_SUBJECT, sa.String(64), nullable=True),
+        )
         _backfill_actor_subjects(None)
         op.create_index(
             ACTOR_SUBJECT_INDEX,
@@ -231,6 +241,18 @@ def upgrade() -> None:
             schema=schema,
         )
         command_columns.add(ACTOR_SUBJECT)
+    if COMMAND_TASK_OWNER_USER_ID not in command_columns:
+        op.add_column(
+            COMMAND_TABLE,
+            sa.Column(COMMAND_TASK_OWNER_USER_ID, sa.Integer(), nullable=True),
+            schema=schema,
+        )
+    if COMMAND_TASK_OWNER_SUBJECT not in command_columns:
+        op.add_column(
+            COMMAND_TABLE,
+            sa.Column(COMMAND_TASK_OWNER_SUBJECT, sa.String(64), nullable=True),
+            schema=schema,
+        )
     if "actor_user_id" in command_columns:
         _backfill_actor_subjects(schema)
     user_indexes = {
@@ -251,6 +273,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     if op.get_context().as_sql:
         op.drop_table(TABLE)
+        op.drop_column(COMMAND_TABLE, COMMAND_TASK_OWNER_SUBJECT)
+        op.drop_column(COMMAND_TABLE, COMMAND_TASK_OWNER_USER_ID)
         op.drop_column(COMMAND_TABLE, ACTOR_SUBJECT)
         op.drop_column(COMMAND_TABLE, TARGET_STATE_VERSION)
         op.drop_index(ACTOR_SUBJECT_INDEX, table_name=USER_TABLE)
@@ -269,6 +293,10 @@ def downgrade() -> None:
         }
         if TARGET_STATE_VERSION in command_columns:
             op.drop_column(COMMAND_TABLE, TARGET_STATE_VERSION, schema=schema)
+        if COMMAND_TASK_OWNER_SUBJECT in command_columns:
+            op.drop_column(COMMAND_TABLE, COMMAND_TASK_OWNER_SUBJECT, schema=schema)
+        if COMMAND_TASK_OWNER_USER_ID in command_columns:
+            op.drop_column(COMMAND_TABLE, COMMAND_TASK_OWNER_USER_ID, schema=schema)
         if ACTOR_SUBJECT in command_columns:
             op.drop_column(COMMAND_TABLE, ACTOR_SUBJECT, schema=schema)
     if USER_TABLE in tables:
