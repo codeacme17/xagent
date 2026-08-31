@@ -961,6 +961,7 @@ def test_concurrent_first_commands_share_one_actor_subject(db_session) -> None:
             command = session.get(TaskExecutionCommand, enqueued.command_id)
             assert command is not None
             assert command.actor_subject is not None
+            assert command.task_owner_subject == command.actor_subject
             return str(command.actor_subject)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
