@@ -123,6 +123,43 @@ async def test_fresh_worker_hub_replays_another_workers_committed_event(
 
 
 @pytest.mark.asyncio
+async def test_attached_owner_receives_first_event_after_subject_self_heal(
+    terminal_event_db_session,
+) -> None:
+    db_session = terminal_event_db_session
+    owner, task = _create_running_task(db_session)
+    owner_id = int(owner.id)
+    db_session.query(User).filter(User.id == owner_id).update(
+        {User.actor_subject: None},
+        synchronize_session=False,
+    )
+    db_session.commit()
+
+    received = []
+    ready = asyncio.Event()
+
+    async def receive(event) -> None:
+        received.append(event)
+        ready.set()
+
+    hub = TerminalTaskEventHub(poll_interval_seconds=0.01)
+    subscription = await hub.attach_terminal_events(
+        principal=TerminalTaskEventPrincipal(user_id=owner_id, is_admin=False),
+        task_id=int(task.id),
+        sink=receive,
+        after_event_id=0,
+    )
+    try:
+        _fail_command(db_session, owner, task, "first-self-healed-owner-event")
+        await asyncio.wait_for(ready.wait(), timeout=1)
+    finally:
+        await subscription.close()
+        await hub.close()
+
+    assert [event.command_id for event in received] == ["first-self-healed-owner-event"]
+
+
+@pytest.mark.asyncio
 async def test_failed_sink_retries_in_order_without_reclaiming_command(
     terminal_event_db_session,
 ) -> None:
@@ -635,6 +672,36 @@ def test_external_projection_omits_command_identity() -> None:
     assert "command_id" not in payload
     assert "command_kind" not in payload
     assert "external-command-secret" not in repr(payload)
+
+
+def test_identity_suppressed_failure_message_omits_command_kind() -> None:
+    event = TerminalTaskEvent(
+        cursor=19,
+        event_id="00000000-0000-0000-0000-000000000003",
+        task_id=9,
+        task_run_id="run-9",
+        task_state_version=3,
+        command_id="unsupported-command-secret",
+        command_kind="cancel",
+        actor_user_id=1,
+        task_owner_user_id=1,
+        task_owner_subject="owner-subject",
+        outcome_version=1,
+        outcome="failed",
+        message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
+        resend_safe=False,
+        include_command_identity=False,
+        created_at=datetime.utcnow(),
+    )
+
+    payload = terminal_task_event_payload(event)
+
+    assert payload["type"] == "agent_error"
+    assert payload["message"] == "Task command failed: Task execution failed."
+    assert "command_id" not in payload
+    assert "command_kind" not in payload
+    assert "unsupported-command-secret" not in repr(payload)
+    assert "cancel" not in repr(payload)
 
 
 class _BlockedTerminalEventWebSocket:

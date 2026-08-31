@@ -395,6 +395,8 @@ def render_terminal_task_event_message(event: TerminalTaskEvent) -> str | None:
         return "Stopping this response didn't go through — please try again."
     if code == TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED:
         return "This response was interrupted."
+    if not event.include_command_identity:
+        return "Task command failed: Task execution failed."
     kind = (
         event.command_kind
         if event.command_kind
@@ -452,6 +454,7 @@ class _Subscriber:
     task_id: int
     sink: TerminalTaskEventSink
     cursor: int
+    principal_user_id: int
     task_owner_subject: str | None
     principal_is_admin: bool
 
@@ -518,6 +521,7 @@ class TerminalTaskEventHub:
                 task_id=task_id,
                 sink=sink,
                 cursor=authorized.cursor,
+                principal_user_id=principal.user_id,
                 task_owner_subject=authorized.task_owner_subject,
                 principal_is_admin=principal.is_admin,
             )
@@ -623,6 +627,37 @@ class TerminalTaskEventHub:
     ) -> None:
         try:
             for event in events:
+                if (
+                    not subscriber.principal_is_admin
+                    and subscriber.task_owner_subject is None
+                    and event.task_owner_subject is not None
+                ):
+                    try:
+                        refreshed = (
+                            await _resolve_authorized_terminal_task_event_cursor(
+                                principal=TerminalTaskEventPrincipal(
+                                    user_id=subscriber.principal_user_id,
+                                    is_admin=False,
+                                ),
+                                task_id=subscriber.task_id,
+                                after_event_id=subscriber.cursor,
+                            )
+                        )
+                    except TerminalTaskEventAccessDenied:
+                        refreshed = None
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "Terminal task event authorization refresh failed; "
+                            "retrying event_id=%s task_id=%s",
+                            event.event_id,
+                            event.task_id,
+                            exc_info=True,
+                        )
+                        return
+                    if refreshed is not None:
+                        subscriber.task_owner_subject = refreshed.task_owner_subject
                 authorized = subscriber.principal_is_admin or (
                     subscriber.task_owner_subject is not None
                     and event.task_owner_subject is not None
