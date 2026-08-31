@@ -438,6 +438,7 @@ def test_postgresql_upgrade_targets_visible_schema_and_preserves_legacy_version(
         assert "task_command_terminal_events" not in sa.inspect(
             connection
         ).get_table_names(schema="app")
+        inspector = sa.inspect(connection)
         assert "actor_subject" not in {
             column["name"]
             for column in inspector.get_columns("task_execution_commands", schema="app")
