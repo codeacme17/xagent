@@ -76,6 +76,7 @@ class TerminalTaskEvent:
     command_kind: str
     actor_user_id: int | None
     task_owner_user_id: int
+    task_owner_subject: str | None
     outcome_version: int
     outcome: str
     message_code: TerminalTaskEventMessageCode | None
@@ -209,22 +210,34 @@ def stage_terminal_event(
     return event
 
 
+@dataclass(frozen=True)
+class _AuthorizedTerminalTaskEventCursor:
+    cursor: int
+    task_owner_subject: str | None
+
+
 def _authorize_and_resolve_cursor(
     principal: TerminalTaskEventPrincipal,
     task_id: int,
     after_event_id: int | None,
     *,
     allow_missing_task: bool = False,
-) -> int | None:
+) -> _AuthorizedTerminalTaskEventCursor | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
-        if owner_id is None:
+        owner = (
+            db.query(Task.user_id, User.actor_subject)
+            .outerjoin(User, User.id == Task.user_id)
+            .filter(Task.id == task_id)
+            .one_or_none()
+        )
+        if owner is None:
             if allow_missing_task:
                 return None
             raise TerminalTaskEventAccessDenied(
                 f"Task {task_id} is not available to this principal"
             )
+        owner_id, owner_subject = owner
         if not principal.is_admin and int(owner_id) != principal.user_id:
             raise TerminalTaskEventAccessDenied(
                 f"Task {task_id} is not available to this principal"
@@ -232,15 +245,39 @@ def _authorize_and_resolve_cursor(
         if after_event_id is not None:
             if after_event_id < 0:
                 raise ValueError("after_event_id must be non-negative")
-            return min(after_event_id, MAX_TERMINAL_EVENT_CURSOR)
-        latest = (
-            db.query(TaskCommandTerminalEvent.id)
-            .filter(TaskCommandTerminalEvent.task_id == task_id)
-            .order_by(TaskCommandTerminalEvent.id.desc())
-            .limit(1)
-            .scalar()
+            cursor = min(after_event_id, MAX_TERMINAL_EVENT_CURSOR)
+        else:
+            latest = (
+                db.query(TaskCommandTerminalEvent.id)
+                .filter(TaskCommandTerminalEvent.task_id == task_id)
+                .order_by(TaskCommandTerminalEvent.id.desc())
+                .limit(1)
+                .scalar()
+            )
+            cursor = int(latest or 0)
+        return _AuthorizedTerminalTaskEventCursor(
+            cursor=cursor,
+            task_owner_subject=(
+                str(owner_subject) if owner_subject is not None else None
+            ),
         )
-        return int(latest or 0)
+
+
+async def _resolve_authorized_terminal_task_event_cursor(
+    *,
+    principal: TerminalTaskEventPrincipal,
+    task_id: int,
+    after_event_id: int | None,
+    allow_missing_task: bool = False,
+) -> _AuthorizedTerminalTaskEventCursor | None:
+    return await run_db_io_cancellation_safe(
+        lambda: _authorize_and_resolve_cursor(
+            principal,
+            task_id,
+            after_event_id,
+            allow_missing_task=allow_missing_task,
+        )
+    )
 
 
 async def resolve_terminal_task_event_cursor(
@@ -252,14 +289,13 @@ async def resolve_terminal_task_event_cursor(
 ) -> int | None:
     """Authorize a task and fix the replay baseline before other awaits."""
 
-    return await run_db_io_cancellation_safe(
-        lambda: _authorize_and_resolve_cursor(
-            principal,
-            task_id,
-            after_event_id,
-            allow_missing_task=allow_missing_task,
-        )
+    authorized = await _resolve_authorized_terminal_task_event_cursor(
+        principal=principal,
+        task_id=task_id,
+        after_event_id=after_event_id,
+        allow_missing_task=allow_missing_task,
     )
+    return authorized.cursor if authorized is not None else None
 
 
 def _decode_message_code(
@@ -325,6 +361,11 @@ def _load_events(after_cursor_by_task: dict[int, int]) -> list[TerminalTaskEvent
                     int(row.actor_user_id) if row.actor_user_id is not None else None
                 ),
                 task_owner_user_id=int(row.task_owner_user_id),
+                task_owner_subject=(
+                    str(row.task_owner_subject)
+                    if row.task_owner_subject is not None
+                    else None
+                ),
                 outcome_version=int(row.outcome_version),
                 outcome=str(row.outcome),
                 message_code=_decode_message_code(
@@ -406,7 +447,7 @@ class _Subscriber:
     task_id: int
     sink: TerminalTaskEventSink
     cursor: int
-    principal_user_id: int
+    task_owner_subject: str | None
     principal_is_admin: bool
 
 
@@ -457,12 +498,12 @@ class TerminalTaskEventHub:
     ) -> TerminalTaskEventSubscription:
         """Authorize and attach a local sink, optionally replaying after a cursor."""
 
-        cursor = await resolve_terminal_task_event_cursor(
+        authorized = await _resolve_authorized_terminal_task_event_cursor(
             principal=principal,
             task_id=task_id,
             after_event_id=after_event_id,
         )
-        assert cursor is not None
+        assert authorized is not None
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Terminal task event hub is closed")
@@ -471,8 +512,8 @@ class TerminalTaskEventHub:
             self._subscribers[subscription_id] = _Subscriber(
                 task_id=task_id,
                 sink=sink,
-                cursor=cursor,
-                principal_user_id=principal.user_id,
+                cursor=authorized.cursor,
+                task_owner_subject=authorized.task_owner_subject,
                 principal_is_admin=principal.is_admin,
             )
             if self._poller is None or self._poller.done():
@@ -577,9 +618,10 @@ class TerminalTaskEventHub:
     ) -> None:
         try:
             for event in events:
-                authorized = (
-                    subscriber.principal_is_admin
-                    or subscriber.principal_user_id == event.task_owner_user_id
+                authorized = subscriber.principal_is_admin or (
+                    subscriber.task_owner_subject is not None
+                    and event.task_owner_subject is not None
+                    and subscriber.task_owner_subject == event.task_owner_subject
                 )
                 while authorized:
                     try:

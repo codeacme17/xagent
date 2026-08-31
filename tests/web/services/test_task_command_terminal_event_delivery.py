@@ -214,6 +214,8 @@ async def test_blocked_low_cursor_cannot_pin_healthy_sink_before_page_boundary(
     user, task = _create_running_task(db_session)
     task_id = int(task.id)
     owner_id = int(user.id)
+    owner_subject = user.actor_subject
+    assert owner_subject is not None
     created_at = datetime.utcnow()
     events = [
         TerminalTaskEvent(
@@ -226,6 +228,7 @@ async def test_blocked_low_cursor_cannot_pin_healthy_sink_before_page_boundary(
             command_kind="pause",
             actor_user_id=owner_id,
             task_owner_user_id=owner_id,
+            task_owner_subject=str(owner_subject),
             outcome_version=1,
             outcome="failed",
             message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
@@ -434,7 +437,12 @@ async def test_new_owner_cannot_receive_prior_owners_event(
 ) -> None:
     db_session = terminal_event_db_session
     original_owner, task = _create_running_task(db_session)
-    _fail_command(db_session, original_owner, task, "old-owner-command")
+    old_command = _fail_command(db_session, original_owner, task, "old-owner-command")
+    old_event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == old_command.id)
+        .one()
+    )
     new_owner = User(
         username="terminal-event-new-owner",
         password_hash="hash",
@@ -445,10 +453,37 @@ async def test_new_owner_cannot_receive_prior_owners_event(
     task.user_id = int(new_owner.id)
     db_session.commit()
     _fail_command(db_session, new_owner, task, "new-owner-command")
+    assert old_event.task_owner_subject != new_owner.actor_subject
+
+    # Numeric ids are historical hints, not authorization evidence. Simulate
+    # an ambiguous/reused id while retaining the stable original-owner subject.
+    old_event.task_owner_user_id = int(new_owner.id)
+    db_session.commit()
 
     received = await _replay_one(int(new_owner.id), int(task.id))
 
     assert [event.command_id for event in received] == ["new-owner-command"]
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_receive_event_with_ambiguous_owner_subject(
+    terminal_event_db_session,
+) -> None:
+    db_session = terminal_event_db_session
+    owner, task = _create_running_task(db_session)
+    command = _fail_command(db_session, owner, task, "ambiguous-owner-command")
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == command.id)
+        .one()
+    )
+    event.task_owner_subject = None
+    db_session.commit()
+    _fail_command(db_session, owner, task, "stable-owner-command")
+
+    received = await _replay_one(int(owner.id), int(task.id))
+
+    assert [item.command_id for item in received] == ["stable-owner-command"]
 
 
 @pytest.mark.asyncio
@@ -557,6 +592,7 @@ def test_legacy_unknown_version_cannot_project_as_current_interaction() -> None:
         command_kind="cancel",
         actor_user_id=1,
         task_owner_user_id=1,
+        task_owner_subject="owner-subject",
         outcome_version=1,
         outcome="failed",
         message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
@@ -584,6 +620,7 @@ def test_external_projection_omits_command_identity() -> None:
         command_kind="cancel",
         actor_user_id=None,
         task_owner_user_id=1,
+        task_owner_subject="owner-subject",
         outcome_version=1,
         outcome="failed",
         message_code=TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
@@ -644,6 +681,7 @@ async def test_terminal_send_preserves_immutable_event_correlation(
         command_kind="pause",
         actor_user_id=1,
         task_owner_user_id=1,
+        task_owner_subject="owner-subject",
         outcome_version=1,
         outcome="failed",
         message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
@@ -689,6 +727,7 @@ async def test_queued_terminal_event_rechecks_task_membership_before_send() -> N
         command_kind="pause",
         actor_user_id=1,
         task_owner_user_id=1,
+        task_owner_subject="owner-subject",
         outcome_version=1,
         outcome="failed",
         message_code=TerminalTaskEventMessageCode.TASK_COMMAND_FAILED,
