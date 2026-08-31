@@ -45,12 +45,13 @@ class TaskCommandTerminalEvent(Base):  # type: ignore
     task_state_version = Column(Integer, nullable=True)
     command_id = Column(String(64), nullable=False)
     command_kind = Column(String(32), nullable=False)
-    # Historical numeric hints and the stable opaque actor subject are
-    # deliberately not relational joins. Numeric ids never drive identity or
-    # authorization because SQLite may reuse them after account deletion.
+    # Historical numeric hints and stable opaque subjects are deliberately not
+    # relational joins. Numeric ids never drive identity or authorization
+    # because SQLite may reuse them after account deletion.
     actor_user_id = Column(Integer, nullable=True)
     actor_subject = Column(String(64), nullable=True)
     task_owner_user_id = Column(Integer, nullable=False)
+    task_owner_subject = Column(String(64), nullable=True)
     outcome_version = Column(Integer, nullable=False)
     outcome = Column(String(32), nullable=False)
     message_code = Column(String(64), nullable=True)

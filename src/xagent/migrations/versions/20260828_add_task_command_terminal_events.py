@@ -71,6 +71,7 @@ def _create_terminal_event_table(schema: str | None) -> None:
         sa.Column("actor_user_id", sa.Integer(), nullable=True),
         sa.Column(ACTOR_SUBJECT, sa.String(64), nullable=True),
         sa.Column("task_owner_user_id", sa.Integer(), nullable=False),
+        sa.Column("task_owner_subject", sa.String(64), nullable=True),
         sa.Column("outcome_version", sa.Integer(), nullable=False),
         sa.Column("outcome", sa.String(32), nullable=False),
         sa.Column("message_code", sa.String(64), nullable=True),

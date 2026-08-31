@@ -135,6 +135,7 @@ def test_upgrade_adds_terminal_task_command_event_log() -> None:
             "actor_user_id",
             "actor_subject",
             "task_owner_user_id",
+            "task_owner_subject",
             "outcome_version",
             "outcome",
             "message_code",
