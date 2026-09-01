@@ -58,10 +58,10 @@ MAX_COMMAND_DEFERS = 60
 
 
 def max_command_defers() -> int:
-    """The defer budget, coupled to the configured task lease TTL.
+    """The defer budget, a TTL-coupled heuristic rather than a guarantee.
 
-    A deferral's canonical wait is a task lease another holder has not
-    released yet, and a lease on a non-RUNNING row cannot be refreshed, so
+    A deferral's shortest canonical wait is a task lease another holder has
+    not released yet: on a non-RUNNING row the lease cannot be refreshed, so
     it clears within one TTL. The budget (spent roughly once per second —
     ``defer_task_command`` re-arms the claim one second out) must outlast
     that with real margin: a fixed 60 was silently smaller than any raised
@@ -71,9 +71,15 @@ def max_command_defers() -> int:
     every setting; the historical constant stays as the floor so short-TTL
     deployments keep their existing patience. Read per call, not cached:
     the TTL is env-driven and tests vary it.
+
+    This mitigates rather than closes the exhaustion: a RUNNING row's lease
+    is heartbeat-refreshed for the whole turn, so a command deferring behind
+    a turn longer than the budget still fails terminally. The structural
+    fix — patience as a wall-clock deadline against the command's
+    ``created_at`` instead of a defer count — is #1995.
     """
 
-    return max(MAX_COMMAND_DEFERS, int(get_task_lease_ttl_seconds()) * 2)
+    return max(MAX_COMMAND_DEFERS, get_task_lease_ttl_seconds() * 2)
 
 
 DISPATCHER_IDLE_SECONDS = 0.5

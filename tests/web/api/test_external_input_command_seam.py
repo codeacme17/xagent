@@ -22,6 +22,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.services.external_task_input import (
+    EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
     execute_external_task_input_command,
     register_external_task_input_executor,
     registered_external_task_input_executor,
@@ -449,7 +450,9 @@ async def test_deferred_external_input_spends_the_defer_budget_not_failures() ->
 
 
 @pytest.mark.asyncio
-async def test_exhausted_external_deferral_withholds_command_identity() -> None:
+async def test_exhausted_external_deferral_withholds_command_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An external audience never sees durable command identity.
 
     The terminal rebind in ``execute_durable_task_command`` runs *after* the
@@ -457,8 +460,13 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
     ``_terminal_command_event_draft`` itself: an exhausted external-scope
     deferral must persist ``include_command_identity=False`` (same policy as
     the external cancel) while still carrying the exception's own
-    ``resend_safe`` evidence.
+    ``resend_safe`` evidence. The live ``agent_error`` frame follows the
+    same rule: identity withheld and a purpose-built terminal sentence,
+    pinned here because the exhausted-deferral path broadcasts through the
+    same chokepoint.
     """
+
+    from unittest.mock import AsyncMock, MagicMock
 
     agent_id, owner_user_id = _create_agent()
     task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
@@ -470,6 +478,10 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         )
 
     register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock()
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
 
     db = _direct_db_session()
     try:
@@ -499,6 +511,15 @@ async def test_exhausted_external_deferral_withholds_command_identity() -> None:
         websocket_api.execute_durable_task_command
     )
     assert processed is True
+
+    payloads = [
+        call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
+    ]
+    assert [payload["type"] for payload in payloads] == ["agent_error"]
+    (exhausted_payload,) = payloads
+    assert exhausted_payload["message"] == EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+    assert "command_id" not in exhausted_payload
+    assert "command_kind" not in exhausted_payload
 
     db = _direct_db_session()
     try:
@@ -590,6 +611,15 @@ async def test_rejected_external_input_broadcasts_and_keeps_the_bound_draft(
         call.args[0] for call in broadcast_manager.broadcast_to_task.await_args_list
     ]
     assert [payload["type"] for payload in payloads] == ["agent_error"]
+
+    (rejection_payload,) = payloads
+    # The live frame mirrors the persisted-event disclosure rule: the
+    # external audience never sees durable command identity, and the generic
+    # fallback's "Please try again." would be false for the non-retryable
+    # rejections this broadcast exists to surface.
+    assert rejection_payload["message"] == EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+    assert "command_id" not in rejection_payload
+    assert "command_kind" not in rejection_payload
 
     db = _direct_db_session()
     try:

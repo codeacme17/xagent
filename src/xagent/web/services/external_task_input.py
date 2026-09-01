@@ -28,6 +28,15 @@ from typing import Any, Awaitable, Callable
 
 from .task_command_transport import ClaimedTaskCommand, TaskCommandRejected
 
+# Broadcast, never stored -- the same single-consumer rule as the external
+# cancel sentences in external_task_cancel.py. Every terminal outcome of an
+# external-scope MESSAGE ends the same way for its audience: the answer was
+# not applied to the turn. The sentence instructs neither retry nor
+# abandonment, because either instruction would sometimes be false --
+# resubmitting the identical answer reopens a spent budget, while a revoked
+# principal or a stale request makes any retry futile.
+EXTERNAL_INPUT_NOT_APPLIED_MESSAGE = "This answer was not applied to the task."
+
 ExternalTaskInputExecutor = Callable[
     [ClaimedTaskCommand], Awaitable[dict[str, Any] | None]
 ]

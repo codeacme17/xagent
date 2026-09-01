@@ -120,7 +120,10 @@ from ..services.external_task_cancel import (
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
 )
-from ..services.external_task_input import execute_external_task_input_command
+from ..services.external_task_input import (
+    EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
+    execute_external_task_input_command,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -451,9 +454,18 @@ def client_safe_task_command_failure(
     status in. Saying the response was interrupted when the task is still
     running would be false, and the visitor would keep waiting on a turn
     nobody stopped.
+
+    An external-scope MESSAGE gets the same courtesy for the opposite
+    reason: the generic fallback ends in "Please try again.", which is
+    false for the non-retryable rejections this broadcast exists to
+    surface (revoked principal, stale request, spent id). Its sentence
+    asserts only the refusal and needs no task status, so the caller does
+    not read the task for it.
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
+    if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
+        return EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -9700,7 +9712,7 @@ async def _broadcast_terminal_command_error(
     # wording has to be true about the turn, which takes reading the task.
     # And ``command_kind``/``command_id`` are operator handles: an anonymous
     # visitor cannot act on them and should not be shown the durable command
-    # identity of a task they do not own. Two payload literals rather than
+    # identity of a task they do not own. Three payload literals rather than
     # one built and trimmed: the client-safe guard only inspects dict
     # literals passed straight to the sink, and a payload assembled in a
     # variable would drop this site out of its view entirely.
@@ -9714,6 +9726,29 @@ async def _broadcast_terminal_command_error(
                     error,
                     scope=scope,
                     task_status=task_status,
+                ),
+                "task_id": command.task_id,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            command.task_id,
+        )
+        return
+    if scope == EXTERNAL_COMMAND_SCOPE:
+        # Every other external-scope command mirrors the persisted-event
+        # rule (``include_command_identity=scope != EXTERNAL_COMMAND_SCOPE``):
+        # the live frame must not disclose what the durable record withholds,
+        # because an embedding application's stream projection may forward
+        # ``agent_error`` frames verbatim to the anonymous audience. No task
+        # status read either -- the wording asserts nothing about the turn,
+        # and this branch runs inside exception handlers where an unguarded
+        # database read would escape the disposition that is being reported.
+        await manager.broadcast_to_task(
+            {
+                "type": "agent_error",
+                "message": client_safe_task_command_failure(
+                    command.kind,
+                    error,
+                    scope=scope,
                 ),
                 "task_id": command.task_id,
                 "timestamp": datetime.now(timezone.utc).timestamp(),

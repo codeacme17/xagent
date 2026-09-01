@@ -198,8 +198,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # frame in favour of the control-only ``task_resumed`` shape. The inner
     # RuntimeError arm now also reuses ``answer_durable_turn_failure`` instead
     # of spelling out three error payloads locally, bringing the census to 50.
-    assert result.error_payloads == 50, (
-        f"expected exactly 50 error payloads, matched {result.error_payloads}; "
+    # ``_broadcast_terminal_command_error`` gained a third payload literal for
+    # external-scope non-cancel commands, mirroring the persisted-event
+    # identity rule for the live frame too, bringing the census to 51.
+    assert result.error_payloads == 51, (
+        f"expected exactly 51 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
