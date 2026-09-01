@@ -67,6 +67,7 @@ def external_input_terminal_message(error: BaseException) -> str:
         return EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
     return EXTERNAL_INPUT_UNCONFIRMED_MESSAGE
 
+
 ExternalTaskInputExecutor = Callable[
     [ClaimedTaskCommand], Awaitable[dict[str, Any] | None]
 ]
