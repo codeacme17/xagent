@@ -2904,7 +2904,9 @@ def test_enqueue_notifies_only_after_commit(db_session, monkeypatch) -> None:
     assert order == ["commit", "notify"]
 
 
-def test_defer_budget_is_coupled_to_the_lease_ttl(monkeypatch):
+def test_defer_budget_is_coupled_to_the_lease_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The defer budget must outlast the configured lease TTL with margin.
 
     A deferral's canonical wait is an unreleased task lease, which clears
@@ -2913,11 +2915,17 @@ def test_defer_budget_is_coupled_to_the_lease_ttl(monkeypatch):
     failure for an already-accepted command (xorbitsai/xagent-saas#952 B3).
     """
 
-    from xagent.web.services.task_command_transport import max_command_defers
-
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "300")
     assert max_command_defers() == 600
 
     # The historical constant stays as the floor for short TTLs.
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "10")
     assert max_command_defers() == MAX_COMMAND_DEFERS
+
+    # The default (no env var) doubles the historical constant.
+    monkeypatch.delenv("XAGENT_TASK_LEASE_TTL_SECONDS", raising=False)
+    assert max_command_defers() == 120
+
+    # An invalid value falls back to the default TTL, not the floor.
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "not-a-number")
+    assert max_command_defers() == 120

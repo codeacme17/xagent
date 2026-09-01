@@ -54,6 +54,9 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
+# Since the budget was coupled to the lease TTL, this constant is the FLOOR
+# of the effective defer budget, not the budget itself — compare against
+# max_command_defers(), never against this constant directly.
 MAX_COMMAND_DEFERS = 60
 
 

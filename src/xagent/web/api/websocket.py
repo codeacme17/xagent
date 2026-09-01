@@ -467,6 +467,8 @@ def client_safe_task_command_failure(
         return external_cancel_exhausted_message(task_status)
     if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
         return external_input_terminal_message(error)
+    # kind.value in the text is safe only while every external-scope kind is
+    # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
@@ -9865,7 +9867,20 @@ async def execute_durable_task_command(
                     exc,
                     await _terminal_command_event_draft(command, exc),
                 )
-            await _broadcast_terminal_command_error(command, exc)
+            try:
+                await _broadcast_terminal_command_error(command, exc)
+            except Exception:
+                # The rejection is already classified and its draft is
+                # bound; a failed notification must not supersede the
+                # terminal rejection into a retried failure (the finalize
+                # broadcast in external_task_cancel.py keeps the same rule).
+                # Exception, never BaseException: cancellation propagates.
+                logger.warning(
+                    "task %s external input rejection is terminal but its "
+                    "broadcast failed",
+                    command.task_id,
+                    exc_info=True,
+                )
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:

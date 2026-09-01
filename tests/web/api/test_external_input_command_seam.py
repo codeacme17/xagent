@@ -929,3 +929,91 @@ async def test_rejected_external_input_without_a_bound_draft_gets_the_fallback(
         assert event.include_command_identity is False
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_rejection_broadcast_failure_does_not_supersede_the_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed broadcast must not turn a terminal rejection into a retry.
+
+    ``broadcast_to_task`` re-raises non-connection errors (its control-state
+    snapshot read can fail), and an exception escaping the rejection arm
+    would supersede ``TaskCommandRejected``: the dispatcher's generic
+    disposition would then spend the failure budget on a command whose
+    outcome is already durably decided, and the executor-bound draft would
+    be lost with it. The broadcast is fire-and-forget for the disposition:
+    one dispatch must leave the command terminally failed with the bound
+    draft persisted.
+    """
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from xagent.web.services.task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        bind_terminal_event_draft,
+    )
+
+    agent_id, owner_user_id = _create_agent()
+    task_id = _create_waiting_task(agent_id=agent_id, owner_user_id=owner_user_id)
+
+    async def executor(_command: ClaimedTaskCommand) -> dict[str, Any]:
+        rejection = TaskCommandRejected(
+            "the continuation was refused", reason="continuation_refused"
+        )
+        bind_terminal_event_draft(
+            rejection,
+            TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=False,
+            ),
+        )
+        raise rejection
+
+    register_external_task_input_executor(executor)
+
+    broadcast_manager = MagicMock()
+    broadcast_manager.broadcast_to_task = AsyncMock(
+        side_effect=Exception("the control-state snapshot read failed")
+    )
+    monkeypatch.setattr(websocket_api, "manager", broadcast_manager)
+
+    db = _direct_db_session()
+    try:
+        enqueued = enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id="ext-input-broadcast-broke",
+            kind=TaskCommandKind.MESSAGE,
+            payload={"scope": "external", "message": "the answer"},
+        )
+        assert enqueued.created
+    finally:
+        db.close()
+
+    processed = await dispatch_one_task_command(
+        websocket_api.execute_durable_task_command
+    )
+    assert processed is True
+    broadcast_manager.broadcast_to_task.assert_awaited()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.command_id == "ext-input-broadcast-broke")
+            .one()
+        )
+        assert row.status == COMMAND_FAILED
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter(TaskCommandTerminalEvent.task_command_id == int(row.id))
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.message_code is None
+        assert event.include_command_identity is False
+    finally:
+        db.close()
