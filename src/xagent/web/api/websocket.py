@@ -121,8 +121,8 @@ from ..services.external_task_cancel import (
     external_cancel_exhausted_message,
 )
 from ..services.external_task_input import (
-    EXTERNAL_INPUT_NOT_APPLIED_MESSAGE,
     execute_external_task_input_command,
+    external_input_terminal_message,
 )
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
@@ -458,14 +458,15 @@ def client_safe_task_command_failure(
     An external-scope MESSAGE gets the same courtesy for the opposite
     reason: the generic fallback ends in "Please try again.", which is
     false for the non-retryable rejections this broadcast exists to
-    surface (revoked principal, stale request, spent id). Its sentence
-    asserts only the refusal and needs no task status, so the caller does
-    not read the task for it.
+    surface (revoked principal, stale request, spent id). Its wording is
+    picked by what the terminal exception proves -- non-application is
+    asserted only when it is established, uncertainty otherwise -- and
+    needs no task status, so the caller does not read the task for it.
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
-        return EXTERNAL_INPUT_NOT_APPLIED_MESSAGE
+        return external_input_terminal_message(error)
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
 
