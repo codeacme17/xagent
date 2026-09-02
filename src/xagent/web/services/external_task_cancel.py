@@ -14,10 +14,12 @@ surface needs.
   - The wait for the running coroutine is longer than the A2A one, because
     the external turn's finalize races the settlement that the cancelled
     coroutine is about to perform. See ``EXTERNAL_CANCEL_WAIT_SECONDS``.
-  - Every expected failure leaves as ``TaskCommandRejected``. A rejected
-    command is terminal without a client-visible error frame, which is the
-    outcome an anonymous visitor should get for a stop that no longer has a
-    target.
+  - Every expected failure leaves as ``TaskCommandRejected``. Whether the
+    visitor hears about it is the dispatcher's per-reason policy
+    (``EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS``): a stale target
+    broadcasts, because the stop press it answers gets no other signal,
+    while a stop that no longer has a target at all stays terminal without
+    a client-visible error frame.
   - The finalize commits more than the terminal row: the interruption
     transcript line the visitor reads and the stopped turn's delivery row
     are staged in the same transaction, and the shared task cache is
@@ -90,6 +92,26 @@ EXTERNAL_CANCEL_ERROR_MESSAGE = "Stopped by the visitor."
 EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE = (
     "Stopping this response didn't go through — please try again."
 )
+
+# ``TaskCommandRejected`` reasons the durable dispatcher answers with a live
+# ``agent_error`` broadcast when an external-scope CANCEL lands on them
+# (#2009). Membership is decided per reason, never as a blanket:
+#
+# - ``stale_run`` broadcasts. It is the one rejection the real producer's
+#   stop press can reach — the target's run/version moved between the
+#   producer's read and the dispatch — and nothing else answers that press.
+#   The broadcast wording is read from the task's current status
+#   (``external_cancel_exhausted_message``), so it stays true for a live
+#   successor ("didn't go through — please try again") and for a target
+#   that settled on its own ("This response was interrupted.").
+# - ``task_not_found`` stays silent. The status read has no row to consult,
+#   and the fallback wording would invite retrying a stop against a task
+#   that no longer exists.
+# - ``unsupported_scope`` is structurally absent: it is raised only for a
+#   payload whose scope is not ``external``, and the dispatcher's gate
+#   classifies external cancels by that same scope, so no membership here
+#   could ever make it broadcast.
+EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS = frozenset({"stale_run"})
 
 
 def external_cancel_exhausted_message(task_status: TaskStatus | None) -> str:
