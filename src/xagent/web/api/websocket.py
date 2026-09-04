@@ -165,6 +165,7 @@ from ..services.task_command_terminal_events import (
     TerminalTaskEventDraft,
     TerminalTaskEventMessageCode,
     bind_terminal_event_draft,
+    first_party_message_terminal_text,
     is_external_cancel_command,
     terminal_event_draft_for_error,
 )
@@ -462,11 +463,24 @@ def client_safe_task_command_failure(
     picked by what the terminal exception proves -- non-application is
     asserted only when it is established, uncertainty otherwise -- and
     needs no task status, so the caller does not read the task for it.
+
+    A first-party MESSAGE drops the prefix for the same proof rule: its
+    sender is deciding whether to resend a durably accepted reply, so the
+    sentence comes from the bound terminal-event draft instead of the
+    exception text (#1500).
     """
     if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     if scope == EXTERNAL_COMMAND_SCOPE and kind == TaskCommandKind.MESSAGE:
         return external_input_terminal_message(error)
+    if kind == TaskCommandKind.MESSAGE:
+        # A first-party MESSAGE follows the external rule above rather than
+        # the generic fallback: restating the deferral's last wait condition
+        # under a "failed" prefix tells the sender nothing about whether the
+        # accepted reply was applied (#1500). The sentence is derived from
+        # the bound terminal-event draft, so it asserts non-application only
+        # when the persisted outcome proves it.
+        return first_party_message_terminal_text(terminal_event_draft_for_error(error))
     # kind.value in the text is safe only while every external-scope kind is
     # handled above; a new external-scope kind needs its own branch first.
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
@@ -9759,6 +9773,16 @@ async def _broadcast_terminal_command_error(
             command.task_id,
         )
         return
+    # ``outcome``/``resend_safe``/``message_code`` expose the persisted
+    # terminal disposition structurally (#1500), so the sender can decide
+    # whether resending the command is safe without parsing ``message``.
+    # The field names match the durable terminal-event projection (#1904).
+    # Values come from the draft the dispatcher binds before broadcasting;
+    # a missing draft degrades to the unsafe/unknown reading. Only this
+    # identity-bearing frame carries them: the two external frames above
+    # deliberately expose nothing the anonymous audience cannot act on,
+    # and a retry decision needs the ``command_id`` they withhold.
+    draft = terminal_event_draft_for_error(error)
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
@@ -9769,6 +9793,13 @@ async def _broadcast_terminal_command_error(
                 command.kind,
                 error,
                 scope=scope,
+            ),
+            "outcome": "failed",
+            "resend_safe": draft is not None and bool(draft.resend_safe),
+            "message_code": (
+                draft.message_code.value
+                if draft is not None and draft.message_code is not None
+                else None
             ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
