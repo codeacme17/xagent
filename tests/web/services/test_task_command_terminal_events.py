@@ -30,7 +30,11 @@ from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEve
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as task_command_transport_module
 from xagent.web.services.task_command_terminal_events import (
+    FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE,
+    FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE,
     TerminalTaskEventDraft,
+    TerminalTaskEventMessageCode,
+    first_party_message_terminal_text,
     stage_terminal_event,
 )
 from xagent.web.services.task_command_transport import (
@@ -1025,13 +1029,6 @@ def test_terminal_event_draft_uses_the_command_disposition_outcome(db_session) -
 
 
 def test_first_party_message_wording_asserts_non_application_only_on_proof() -> None:
-    from xagent.web.services.task_command_terminal_events import (
-        FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE,
-        FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE,
-        TerminalTaskEventMessageCode,
-        first_party_message_terminal_text,
-    )
-
     proven = TerminalTaskEventDraft(
         message_code=TerminalTaskEventMessageCode.TASK_COMMAND_DEFERRED,
         resend_safe=True,
@@ -1052,11 +1049,6 @@ def test_first_party_message_wording_asserts_non_application_only_on_proof() -> 
 
 
 def test_first_party_message_wording_treats_a_missing_draft_as_unknown() -> None:
-    from xagent.web.services.task_command_terminal_events import (
-        FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE,
-        first_party_message_terminal_text,
-    )
-
     assert (
         first_party_message_terminal_text(None)
         == FIRST_PARTY_MESSAGE_UNCONFIRMED_MESSAGE
