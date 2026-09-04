@@ -9722,6 +9722,13 @@ async def _broadcast_terminal_command_error(
     # variable would drop this site out of its view entirely.
     if is_external_cancel_command(kind=command.kind.value, scope=scope):
         task_status = await _load_terminal_command_task_status(command.task_id)
+        if task_status is TaskStatus.COMPLETED:
+            # Every wording this branch can pick asserts the turn did not
+            # finish cleanly, which is false here - the run completed and
+            # its own completion frame already answered the audience. The
+            # persisted terminal-event draft keeps its audit classification;
+            # nothing renders it to a client.
+            return
         await manager.broadcast_to_task(
             {
                 "type": "agent_error",

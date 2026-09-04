@@ -100,10 +100,19 @@ EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE = (
 # - ``stale_run`` broadcasts. It is the one rejection the real producer's
 #   stop press can reach — the target's run/version moved between the
 #   producer's read and the dispatch — and nothing else answers that press.
-#   The broadcast wording is read from the task's current status
-#   (``external_cancel_exhausted_message``), so it stays true for a live
-#   successor ("didn't go through — please try again") and for a target
-#   that settled on its own ("This response was interrupted.").
+#   Its producers are this module's own checks above plus three sites in
+#   ``websocket.py``'s dispatcher: the common pre-dispatch target-run-id
+#   comparison (ahead of either execution core), the CANCEL payload's
+#   state-version validation, and the ``StaleTaskRunError`` wrap around the
+#   cancel cores. Every one of them rides this same gate — it matches on
+#   the reason, not the raise site. The broadcast wording is read
+#   from the task's current status (``external_cancel_exhausted_message``),
+#   so it stays true for a live successor ("didn't go through — please try
+#   again") and for a target that settled on its own ("This response was
+#   interrupted."). A target that is ``COMPLETED`` is the one exception: the
+#   broadcast site suppresses the live frame there, because the task's own
+#   completion frame already answered the visitor and "interrupted" would
+#   be false for a run that finished.
 # - ``task_not_found`` stays silent. The status read has no row to consult,
 #   and the fallback wording would invite retrying a stop against a task
 #   that no longer exists.
@@ -188,8 +197,11 @@ def _is_settled_external_cancel_target(
     the visitor's stop had landed. A tuple that matches with any other text
     falls through to ``_assert_external_cancel_target``, which rejects it as
     ``stale_run`` (the version has moved, or the task is already terminal),
-    writing nothing and broadcasting nothing; that run's own settlement owns
-    its transcript and its event.
+    writing nothing itself; that run's own settlement owns its transcript
+    and its event. The dispatcher still broadcasts that rejection for the
+    reasons in ``EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS``, except when
+    the target completed - there the live frame is suppressed because the
+    completion frame already answered the visitor.
     """
 
     return (
