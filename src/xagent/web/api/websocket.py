@@ -9776,12 +9776,23 @@ async def _broadcast_terminal_command_error(
     # ``outcome``/``resend_safe``/``message_code`` expose the persisted
     # terminal disposition structurally (#1500), so the sender can decide
     # whether resending the command is safe without parsing ``message``.
-    # The field names match the durable terminal-event projection (#1904).
+    # The field names match the durable terminal-event projection (#1904),
+    # including its two disambiguators: ``task_run_id`` (the acceptance
+    # snapshot's run) and ``outcome_version`` (the attempt count, which the
+    # terminal CAS write pins to this same value), because an operator retry
+    # can send one ``command_id`` through a terminal broadcast twice.
     # Values come from the draft the dispatcher binds before broadcasting;
     # a missing draft degrades to the unsafe/unknown reading. Only this
     # identity-bearing frame carries them: the two external frames above
     # deliberately expose nothing the anonymous audience cannot act on,
     # and a retry decision needs the ``command_id`` they withhold.
+    #
+    # ``resend_safe`` is a proof of non-application, not a retryability
+    # rating: the only producer of ``True`` is the MESSAGE contention
+    # deferral. PAUSE/RESUME/CANCEL terminals therefore always carry
+    # ``False`` even though those commands are idempotent by design -- a
+    # consumer deciding whether to offer a retry for them must reason from
+    # ``command_kind``, never from this flag.
     draft = terminal_event_draft_for_error(error)
     await manager.broadcast_to_task(
         {
@@ -9795,15 +9806,15 @@ async def _broadcast_terminal_command_error(
                 scope=scope,
             ),
             "outcome": "failed",
-            "resend_safe": draft is not None and bool(draft.resend_safe),
+            "resend_safe": bool(draft and draft.resend_safe),
             "message_code": (
-                draft.message_code.value
-                if draft is not None and draft.message_code is not None
-                else None
+                draft.message_code.value if draft and draft.message_code else None
             ),
             "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
+            "task_run_id": command.target_run_id,
+            "outcome_version": int(command.attempt_count or 0),
             "timestamp": datetime.now(timezone.utc).timestamp(),
         },
         command.task_id,

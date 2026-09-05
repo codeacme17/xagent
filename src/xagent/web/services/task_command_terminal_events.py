@@ -67,12 +67,19 @@ def terminal_event_draft_for_error(
 
 
 # Wording for a first-party MESSAGE command that reached a terminal
-# disposition after the sender's reply was durably accepted. The split
-# mirrors ``external_task_input.external_input_terminal_message``: the
-# categorical "not applied" sentence is reserved for outcomes whose draft
-# proves non-application, and every other terminal gets the sentence that
-# asserts only uncertainty, because a worker may have injected the message
-# before crashing and the reclaiming attempt cannot know.
+# disposition after the sender's reply was durably accepted. The sentence
+# pair matches ``external_task_input.external_input_terminal_message``, but
+# the proof rule is narrower, not a mirror: the external helper also treats
+# ``TaskCommandRejected`` as proven non-application, while this one reads
+# only ``draft.resend_safe`` -- which stays ``False`` for rejections --
+# because first-party MESSAGE rejections keep their handler-owned
+# notification and never reach this broadcast. Whoever wires that broadcast
+# up later must widen the proof rule here, or a provably-unapplied
+# rejection would be reported as unconfirmed. The categorical "not applied"
+# sentence is reserved for outcomes whose draft proves non-application, and
+# every other terminal gets the sentence that asserts only uncertainty,
+# because a worker may have injected the message before crashing and the
+# reclaiming attempt cannot know.
 FIRST_PARTY_MESSAGE_NOT_APPLIED_MESSAGE = (
     "This message was not applied to the task. It is safe to send it again."
 )
