@@ -21,7 +21,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
-import { cn } from "@/lib/utils"
+import { cn, firstNonEmptyString } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -154,28 +154,19 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
 // The waiting round's identity. Prefers the id the task-state handler
 // already extracted (request_id, falling back to the ask frame's event_id -
 // see the app context's task_waiting_for_user case); when the status frame
-// carried none, falls back to the same ask trace events the prompt and
-// interactions fall back to, so all three stay sourced from one ask.
+// carried none, falls back to the replayed waiting result the prompt and
+// interactions also fall back to, so all three stay sourced from one ask.
 type WaitingRoundTraceEvent = {
-  event_id?: unknown
   event_type?: unknown
   data?: {
-    request_id?: unknown
-    event_id?: unknown
-    expect_response?: unknown
     result?: {
       status?: unknown
       request_id?: unknown
-      event_id?: unknown
+      clarification_draft?: {
+        event_id?: unknown
+      }
     }
   }
-}
-
-const firstRoundId = (...candidates: unknown[]): string | undefined => {
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate) return candidate
-  }
-  return undefined
 }
 
 const findWaitingRequestId = (
@@ -192,25 +183,24 @@ const findWaitingRequestId = (
     return currentTask.waitingRequestId
   }
 
-  // Only data-level ids count: a trace row's top-level event_id can be a
-  // client-minted placeholder (react_task_end rows get generateMessageId
-  // ids), and adopting one would name a round no message ever carried,
-  // leaving no instance active. And the scan STOPS at the most recent ask
-  // whether or not it carries an id - reaching past it could return an
-  // older round's id for the current question. An id-less newest ask
-  // returns undefined so the prompt-text match below stays in charge.
+  // Only react_task_end rows reach state.traceEvents for a waiting result
+  // (a live ask's agent_message lands in the transcript instead, already
+  // carrying its interactionRequestId), and the round identity on such a
+  // row lives at result.clarification_draft.event_id. A row's top-level
+  // event_id never counts: it is a client-minted placeholder, and adopting
+  // one would name a round no message ever carried. The scan STOPS at the
+  // most recent waiting result whether or not it yields an id - reaching
+  // past it could return an older round's id - and an id-less newest result
+  // returns undefined so the prompt-text match stays in charge.
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
-    if (event.event_type === "agent_message" && event.data?.expect_response === true) {
-      return firstRoundId(event.data?.request_id, event.data?.event_id)
-    }
     if (
       event.event_type === "react_task_end"
       && event.data?.result?.status === "waiting_for_user"
     ) {
-      return firstRoundId(
+      return firstNonEmptyString(
         event.data?.result?.request_id,
-        event.data?.result?.event_id,
+        event.data?.result?.clarification_draft?.event_id,
       )
     }
   }
@@ -560,11 +550,15 @@ export function TaskConversationPanel({
       return null
     }
 
-    // When the waiting round has an identity, match by it exactly: the
+    // When the waiting round has an identity, prefer matching by it: the
     // prompt-text fallback below can pick a message whose text merely equals
     // the question while the round actually lives on a different item,
     // leaving TWO instances active at once (the timeline one and the
-    // virtual one) with independently diverging state.
+    // virtual one) with independently diverging state. A FAILED id-match
+    // falls through rather than short-circuiting: replayed history rows
+    // carry no interactionRequestId, and with the ask sitting as the last
+    // assistant message the virtual bubble is suppressed too - returning
+    // null here would leave zero active reply instances for a waiting task.
     if (waitingRoundId) {
       for (let i = messageItems.length - 1; i >= 0; i--) {
         const item = messageItems[i]
@@ -572,7 +566,6 @@ export function TaskConversationPanel({
           return item.id
         }
       }
-      return null
     }
 
     if (waitingPrompt) {
@@ -585,6 +578,14 @@ export function TaskConversationPanel({
       }
     }
 
+    // The bare newest-interactions fallback is for rounds with NO identity
+    // at all. Under a known round id whose item and text both failed to
+    // match, it could only pick an OLDER round's form (a dropped ask frame
+    // for the current round), misbinding the reply - the virtual bubble
+    // showing the current question is the right instance there.
+    if (waitingRoundId) {
+      return null
+    }
     for (let i = messageItems.length - 1; i >= 0; i--) {
       const item = messageItems[i]
       if (item.role === "assistant" && item.interactions && item.interactions.length > 0) {
@@ -960,7 +961,10 @@ export function TaskConversationPanel({
               currentInteractionRequestId={
                 state.currentTask?.status === "waiting_for_user" &&
                 state.currentTask.id === String(state.taskId)
-                  ? state.currentTask.waitingRequestId
+                  // The same round identity the form path uses - including
+                  // the ask-trace fallback - so a free-text reply after a
+                  // reload still binds to the round.
+                  ? waitingRoundId
                   : undefined
               }
               isLoading={

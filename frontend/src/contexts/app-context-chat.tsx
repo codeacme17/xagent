@@ -354,7 +354,7 @@ import {
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
-import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
+import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview, firstNonEmptyString } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
@@ -1609,8 +1609,19 @@ function projectAppState(state: AppState, action: AppAction): AppState {
             : undefined,
           waitingRequestId: isWaitingForUser
             ? action.payload.waitingRequestId ?? (
-              action.payload.waitingQuestion === undefined
-              && action.payload.waitingInteractions === undefined
+              // An id-less payload keeps the known id when it asserts
+              // nothing new - and also when it re-asserts the SAME question
+              // text: reload/reconnect reassertion frames re-send the
+              // unchanged question with no id, and wiping the id there
+              // severs the open round's correlation. An id-less payload
+              // carrying a DIFFERENT question (or fresh interactions
+              // without one) is a legacy-backend new round and must not
+              // inherit the previous round's id.
+              (action.payload.waitingQuestion === undefined
+                && action.payload.waitingInteractions === undefined)
+              || (action.payload.waitingQuestion !== undefined
+                && action.payload.waitingQuestion
+                  === state.currentTask.waitingQuestion)
                 ? state.currentTask.waitingRequestId
                 : undefined
             )
@@ -2870,9 +2881,10 @@ export function AppProvider({
     // sends exactly once. Dropping the whole frame silences that notice
     // forever, so error frames fall through with their control tuple
     // neutralized (this flag suppresses every status side effect below)
-    // instead of being swallowed. This extends the same reasoning
-    // ``canAcceptTaskControlVersion`` already applies to UNversioned error
-    // frames ("error frames remain informational") to versioned ones.
+    // instead of being swallowed. Weaker than the guard's UNversioned-error
+    // rule, deliberately: an unversioned error frame has no version to lose
+    // and passes whole, control tuple included; a stale VERSIONED one lost
+    // the version argument and keeps only its notice.
     let staleControlErrorFrame = false
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
       if (
@@ -3218,10 +3230,10 @@ export function AppProvider({
             // preferred field so a backend that later adopts the explicit
             // name wins over the fallback - but only with a non-empty
             // string; anything else falls through to the next candidate.
-            const interactionRequestId = [
+            const interactionRequestId = firstNonEmptyString(
               eventData.request_id,
               eventData.event_id,
-            ].find((id): id is string => typeof id === "string" && id !== "")
+            )
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -5711,12 +5723,12 @@ export function AppProvider({
         // actually mints and forwards on ask frames today. First non-empty
         // string wins: nullish coalescing alone would let an empty or
         // non-string ``request_id`` block the ``event_id`` fallback.
-        const waitingRequestId = [
+        const waitingRequestId = firstNonEmptyString(
           waitingRoot.request_id,
           waitingData.request_id,
           waitingRoot.event_id,
           waitingData.event_id,
-        ].find((id): id is string => typeof id === "string" && id !== "")
+        )
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {

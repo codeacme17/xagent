@@ -602,10 +602,10 @@ describe("TaskConversationPanel", () => {
     expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
   })
 
-  it("adopts the ask frame's event_id as the waiting round id when no request_id exists", () => {
-    // No backend emits request_id today; the stable per-ask identity on the
-    // wire is event_id. The trace fallback must surface it so the round is
-    // identified even when the status frame carried nothing.
+  it("adopts the replayed waiting result's clarification event_id as the round id", () => {
+    // No backend emits request_id today, and replayed history rows carry no
+    // interactionRequestId; after a reload the round identity lives at the
+    // replayed react_task_end's result.clarification_draft.event_id.
     appState.messages = [{
       id: "user-1",
       role: "user",
@@ -614,14 +614,15 @@ describe("TaskConversationPanel", () => {
     }]
     appState.traceEvents = [
       {
-        event_type: "agent_message",
+        event_id: "react-task-end-1757200000000-abc12",
+        event_type: "react_task_end",
         timestamp: 1000,
         data: {
-          expect_response: true,
-          message: "Which region should I use?",
-          event_id: "evt-round-1",
-          metadata: {
+          result: {
+            status: "waiting_for_user",
+            message: "Which region should I use?",
             interactions: [{ type: "text_input", field: "region", label: "Region" }],
+            clarification_draft: { event_id: "evt-round-1" },
           },
         },
       },
@@ -643,6 +644,138 @@ describe("TaskConversationPanel", () => {
     )
     expect(activeWait).toBeDefined()
     expect(activeWait).toHaveAttribute("data-request-id", "evt-round-1")
+  })
+
+  it("stops the round-id scan at the newest waiting result", () => {
+    // Reaching past an id-less newest result would return an OLDER round's
+    // id for the current question; the scan must stop and leave the round
+    // id-less so the prompt-text match stays in charge.
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Working on it",
+      timestamp: 3000,
+    }]
+    appState.traceEvents = [
+      {
+        event_type: "react_task_end",
+        timestamp: 1000,
+        data: {
+          result: {
+            status: "waiting_for_user",
+            message: "Old question",
+            clarification_draft: { event_id: "evt-old-round" },
+          },
+        },
+      },
+      {
+        event_type: "react_task_end",
+        timestamp: 2000,
+        data: {
+          result: {
+            status: "waiting_for_user",
+            message: "Which city?",
+          },
+        },
+      },
+    ]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which city?",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const activeWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-active") === "true",
+    )
+    expect(activeWait).toBeDefined()
+    expect(activeWait).toHaveAttribute("data-request-id", "")
+  })
+
+  it("prefers the virtual bubble over an older round's form when the round id and text both miss", () => {
+    // Round 2's status frame arrived (new id, new question) but its ask row
+    // never landed. The only interactive timeline item belongs to round 1;
+    // activating it would misbind the reply. The virtual bubble carrying
+    // the current question is the correct instance.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "round-1",
+      },
+      {
+        id: "u1",
+        role: "user",
+        content: "City: Beijing",
+        timestamp: 2000,
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which hotel?",
+      waitingRequestId: "round-2",
+      waitingInteractions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    expect(active[0]).toHaveAttribute("data-request-id", "round-2")
+    expect(active[0]).toHaveTextContent("Which hotel?")
+  })
+
+  it("falls back to the text match when no timeline item carries the round id", () => {
+    // Replayed history rows carry no interactionRequestId. With the ask as
+    // the last assistant message (virtual bubble suppressed), a failed
+    // id-match that short-circuited instead of falling through would leave
+    // ZERO active reply instances for a waiting task.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        // No interactionRequestId - the replayed row never carried one.
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which city?",
+      waitingRequestId: "round-1",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    expect(active[0]).toHaveTextContent("Which city?")
   })
 
   it("keeps at most one instance active for a waiting round", () => {
