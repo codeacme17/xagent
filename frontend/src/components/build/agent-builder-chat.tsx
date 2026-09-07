@@ -529,7 +529,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       return false
     }
     return true
-  }, [messages, isLoading, token, agentConfig, onUpdateConfig])
+  }, [messages, isLoading, token, agentConfig, onUpdateConfig, t, toolCategories, branding.appName])
 
   const handleStop = () => {
     if (wsRef.current) {
