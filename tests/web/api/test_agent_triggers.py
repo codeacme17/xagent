@@ -564,6 +564,18 @@ def test_finish_trigger_run_after_task_finalizes_terminal_run(
     start = _fire_test_run(headers)
     _set_task_status(start.task_id, terminal, error_message=expected_error)
 
+    # Seed a stale error so the assertions below prove the finalizer
+    # overwrites error_message in both directions (clears it on COMPLETED,
+    # replaces it on FAILED) instead of passing against the NULL default.
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        run.error_message = "stale-error-from-previous-attempt"
+        db.add(run)
+        db.commit()
+    finally:
+        db.close()
+
     _finish_trigger_run_after_task(start)
 
     db = _direct_db_session()

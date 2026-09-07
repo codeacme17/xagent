@@ -1859,11 +1859,12 @@ def _finish_trigger_run_after_task(start: _PreparedTriggerStart) -> None:
             setattr(run, "error_message", task.error_message)
         else:
             # The task is not terminal yet (pending/running/paused/
-            # waiting_for_user). Leave the run untouched; a later
-            # sync_trigger_run_status call finalizes it -- finish_turn on
-            # the task's terminal transition, or lease recovery, which
-            # deliberately fails runs of PAUSED crash-recovered tasks.
-            # Stamping finished_at here would strand the run as "running"
+            # waiting_for_user). Leave the run untouched. If the task later
+            # terminates (or lease recovery reclaims a crashed RUNNING
+            # lease), sync_trigger_run_status finalizes the run; a task
+            # parked at PAUSED/WAITING_FOR_USER that never resumes leaves
+            # the run at "running" indefinitely (#2177). Stamping
+            # finished_at here would instead strand the run as "running"
             # with a finish timestamp, because this finalizer only runs
             # once.
             return
