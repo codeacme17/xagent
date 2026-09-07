@@ -1,6 +1,7 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
@@ -103,7 +104,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     traceEvents,
   }: {
     content?: React.ReactNode
-    onSendInteraction?: (text: string, files?: File[]) => Promise<void> | void
+    onSendInteraction?: ClarificationOnSend
     processStatus?: string
     traceEvents?: unknown[]
   }) => {
@@ -133,7 +134,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
             try {
               await onSendInteraction("upload this", [
                 new File(["data"], "data.txt", { type: "text/plain" }),
-              ])
+              ], {}, { clientMessageId: "test-attempt" })
               setStatus("resolved")
             } catch (error) {
               // Surface the declared delivery contract (#1485): the form

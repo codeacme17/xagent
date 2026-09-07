@@ -194,6 +194,21 @@ export function ClarificationForm({
       setIsSubmitted(false)
       setIsOpen(true)
       setSendFailure(null)
+      // A re-activation is a new clarification round (the backend never
+      // populates request_id, so the requestId reset above cannot be relied
+      // on, and the live turn path reuses this instance). Round 1's delivery
+      // identity must not leak into round 2: the server ACKs a resolved
+      // client_message_id without re-enqueueing, which would silently
+      // swallow round 2's answer (#2175 review). The trade: a transient
+      // active flap inside one round (an inferred-running dispatch racing a
+      // re-broadcast wait) burns a legitimately kept identity, regressing
+      // that resubmit to the old mint-fresh behavior - bounded server-side
+      // by the guidance_in_progress claim check. The draft is deliberately
+      // kept: wiping formState on such a flap would cost the visitor their
+      // answer, and with the ref cleared even an identical draft mints a
+      // fresh id, so keeping it cannot re-open the swallow.
+      submitAttemptRef.current = null
+      skipAttemptRef.current = null
     }
   }, [active])
 

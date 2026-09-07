@@ -1,4 +1,4 @@
-import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
+import type { MessageDeliveryDisposition, MessageDeliveryError } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
 import { readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 
@@ -39,16 +39,17 @@ export type ClarificationOnSend = (
 ) => Promise<void> | void
 
 /**
- * The discriminated failure a send path rejects with — the same shape
- * use-websocket's MessageDeliveryError carries, declared here so an `onSend`
- * provider can construct it without depending on the websocket hook.
+ * The discriminated failure a send path rejects with — its shape is derived
+ * from use-websocket's MessageDeliveryError (a type-only import, so this
+ * still has no runtime dependency on the websocket hook). Deriving via Pick
+ * means renaming or removing one of these four fields on the class fails
+ * type-check here; it does not notice fields *added* to the class, and the
+ * readers below stay deliberately structural (they take `unknown`).
  */
-export type ClarificationSendFailure = Error & {
-  disposition: MessageDeliveryDisposition
-  userFacing: boolean
-  errorCode: ClientErrorCode | null
-  retryWithNewId: boolean
-}
+export type ClarificationSendFailure = Error & Pick<
+  MessageDeliveryError,
+  "disposition" | "userFacing" | "errorCode" | "retryWithNewId"
+>
 
 export interface ClarificationSendFailureOptions {
   /** Whether `message` is the sender-actionable reason, safe to display. */

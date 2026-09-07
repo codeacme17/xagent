@@ -66,6 +66,7 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 import { ClarificationForm } from "./clarification-form"
+import { clarificationSendFailure } from "./clarification-delivery"
 
 // Every describe in this file gets the identity translate back, so a locale
 // swapped by one test cannot leak into a suite added below it.
@@ -695,6 +696,29 @@ describe("ClarificationForm delivery failures", () => {
 
     expect(screen.queryByRole("alert")).toBeNull()
   })
+
+  it("never shows the builder's internal diagnostic to the visitor", async () => {
+    // The builder path rejects with the factory's product and userFacing
+    // unset - exactly what agent-builder-chat throws. The raw string is a
+    // developer diagnostic, not visitor copy.
+    const onSend = vi.fn().mockRejectedValue(
+      clarificationSendFailure("Failed to send interaction", "not_sent"),
+    )
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    // Positive anchor first: the alert must carry the localized copy, so the
+    // negative assertion below cannot pass vacuously on an unrelated alert.
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.sendError")
+    expect(alert).not.toHaveTextContent("Failed to send interaction")
+  })
 })
 
 describe("ClarificationForm interaction identity", () => {
@@ -927,6 +951,31 @@ describe("ClarificationForm delivery identity", () => {
     typeAndSubmit()
     await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
     rerender(form("inputreq_r2"))
+    typeAndSubmit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(second).not.toBe(first)
+  })
+
+  it("mints a fresh clientMessageId when the form is re-activated for a new round", async () => {
+    // Round 1's answer can land server-side while the client sees
+    // outcome_unknown (ref kept for the retry). The backend never populates
+    // request_id, so when round 2 re-activates this same instance the only
+    // signal is the active flip - without clearing the attempt there, a
+    // same-text round-2 answer would reuse round 1's resolved id, which the
+    // server ACKs without re-enqueueing: the answer is silently swallowed.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+      .mockResolvedValueOnce(undefined)
+    const { rerender } = render(<ClarificationForm interactions={interactions} active />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+
+    rerender(<ClarificationForm interactions={interactions} active={false} />)
+    rerender(<ClarificationForm interactions={interactions} active />)
+
     typeAndSubmit()
     await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
 
