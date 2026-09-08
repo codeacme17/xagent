@@ -7,18 +7,39 @@ structured envelope carrying the prior result instead.
 
 Scope is deliberately narrow:
 
-* Same turn only, enforced by turn_id equality on the ledger records: a
-  resume or injected user message continues the execution — and its
-  checkpointed ledger — under a fresh turn_id, so the guard holds across an
-  intra-turn resume but never across turns; creating two identical records
-  in different turns stays possible.
+* Same turn only, enforced by turn_id equality on the ledger records. The
+  runner stamps a fresh turn_id on every user message (initial and
+  injected), and the pattern re-reads it at each pattern start, so a resume
+  that continues the execution — and its checkpointed ledger — under a new
+  user message compares unequal and executes, while an intra-turn resume
+  keeps suppressing the replay. A call with no turn_id (an embedding that
+  drives the pattern directly without stamping turns) is never guarded:
+  suppression must not outlive a turn, so an unknowable turn fails open.
 * Identical execution arguments only, compared via the ledger's canonical
   args hash.
-* Only tools that *explicitly* declare themselves as writes. An MCP tool
-  whose wire annotations classify as destructive, or an internal tool marked
-  ``non_idempotent = True``. Undeclared and read-only hints are exempt: an
-  unannotated MCP tool may be a legitimate identical-args poll loop, and
-  suppressing it would hand the model stale data.
+* Only tools that *explicitly* declare a non-idempotent write:
+
+  - an MCP tool whose wire annotations classify as a non-idempotent write
+    (``classify_non_idempotent_write`` in the MCP adapter: an exact
+    ``idempotentHint: false``, or an exact ``destructiveHint: true`` with no
+    idempotency promise, never a read-only tool), carried here as
+    ``ToolMetadata.mcp_non_idempotent_write``; or
+  - an internal tool that sets ``non_idempotent = True`` on itself, carried
+    as ``ToolMetadata.non_idempotent``.
+
+  Undeclared tools are exempt: an unannotated MCP tool may be a legitimate
+  identical-args poll loop, and suppressing it would hand the model stale
+  data. Deduplication therefore fails OPEN — the mirror image of a
+  confirmation-style consumer, for which ``MCPWriteHint``'s docstring
+  prescribes treating everything except an explicit read-only claim as a
+  write.
+
+Enrollment is read from ``tool.metadata`` rather than the concrete tool
+object: wrappers such as the sandbox tool wrapper forward only
+``.metadata``, so a declaration read off the adapter directly would vanish
+for every sandboxed MCP server. A bare ``non_idempotent = True`` attribute
+on the tool object is honored as well for tools that do not build their
+metadata through ``AbstractBaseTool``.
 """
 
 from __future__ import annotations
@@ -31,38 +52,27 @@ from typing import Any
 # of a suppression.
 DUPLICATE_WRITE_SUPPRESSED_KEY = "duplicate_write_suppressed"
 
-# Mirrors ``MCPWriteHint.DESTRUCTIVE.value`` without importing the MCP
-# adapter: this module sits under ``core.agent`` and duck-types the hint the
-# same way the common tool contract does (``_write_hint_value`` in
-# ``tools.adapters.vibe.base``). A pin test keeps the string aligned with
-# the enum.
-DESTRUCTIVE_WRITE_HINT_VALUE = "destructive"
-
 
 def tool_requires_duplicate_write_guard(tool: Any) -> bool:
     """Whether ``tool`` explicitly declares itself a non-idempotent write.
 
-    True for exactly two declarations, both opt-in:
-
-    * ``tool.non_idempotent is True`` — an internal tool's own marker.
-      ``is True`` so a truthy non-boolean never enrolls a tool by accident.
-    * an MCP write hint whose value is ``destructive`` — the only
-      classification produced from an explicit ``destructiveHint: true`` on
-      the wire (see ``classify_write_hint``). UNDECLARED must stay exempt
-      here even though confirmation gating treats it as a write: the safe
-      direction inverts for deduplication, where suppressing an unannotated
-      poll loop would silently serve stale results.
+    True for exactly three opt-in declarations — the tool object's own
+    ``non_idempotent is True`` marker, the same marker carried on its
+    metadata, or an MCP wire declaration carried as
+    ``metadata.mcp_non_idempotent_write is True``. ``is True`` throughout so
+    a truthy non-boolean never enrolls a tool by accident; everything
+    undeclared stays exempt (see the module docstring for why deduplication
+    fails open).
     """
     if getattr(tool, "non_idempotent", None) is True:
         return True
 
-    hint = getattr(tool, "write_hint", None)
-    if hint is None:
+    metadata = getattr(tool, "metadata", None)
+    if metadata is None:
         return False
-    value = getattr(hint, "value", None)
-    if not isinstance(value, str):
-        return False
-    return value == DESTRUCTIVE_WRITE_HINT_VALUE
+    if getattr(metadata, "non_idempotent", None) is True:
+        return True
+    return getattr(metadata, "mcp_non_idempotent_write", None) is True
 
 
 def build_suppression_envelope(

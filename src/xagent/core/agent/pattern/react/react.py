@@ -62,10 +62,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, cast
 
-from ....context_ref import (
-    split_tool_result_context_references,
-    split_tool_result_supersedes_scope,
-)
+from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
@@ -3641,13 +3638,14 @@ class ReActPattern(AgentPattern):
         computed from the same post-transform ``tool_call`` that
         ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
         calls compare equal exactly when their executions would be identical.
-        The turn_id equality is what makes the guard strictly per-turn:
-        ``resume``/``inject_user_message`` continue this execution — and its
-        checkpointed ledger — under a fresh turn_id, so an explicit repeat
-        requested in a later turn always executes, while an intra-turn resume
-        keeps suppressing the replay. Where the embedding provides no turn
-        tracking, both sides are None and the scope degrades to the pattern
-        execution, which is a single turn in those embeddings.
+        The turn_id equality is what makes the guard strictly per-turn: the
+        runner stamps a fresh turn_id on every user message (initial and
+        injected), and ``active_turn_id`` is re-resolved from the latest user
+        message at each pattern start — so an explicit repeat requested in a
+        later turn always executes, while an intra-turn resume of the
+        checkpointed ledger keeps suppressing the replay. A call with no
+        stamped turn_id is never guarded: without a turn to scope to,
+        suppression could outlive a turn, so an unknowable turn fails open.
 
         Serial execution makes the check-then-record window safe for guarded
         tools: they are non-idempotent by declaration, so
@@ -3663,9 +3661,12 @@ class ReActPattern(AgentPattern):
         if not tool_requires_duplicate_write_guard(tool):
             return None
 
+        turn_id = self._tool_call_turn_id(tool_call)
+        if turn_id is None:
+            return None
+
         tool_name = str(tool_call["name"])
         args_hash = self._args_hash(self._tool_call_args_dict(tool_call))
-        turn_id = self._tool_call_turn_id(tool_call)
         # The caller runs this scan before recording anything for the current
         # call, so every ledger entry — including one under this call's own
         # id, which a provider may have reused — belongs to an earlier call.
@@ -3679,21 +3680,26 @@ class ReActPattern(AgentPattern):
             if isinstance(record.result, dict) and record.result.get(
                 DUPLICATE_WRITE_SUPPRESSED_KEY
             ):
-                # A prior suppression envelope; keep scanning so the model
-                # always gets the genuine execution's result attached.
+                # A prior suppression envelope: keep scanning so the model
+                # always gets the genuine execution's result attached. An
+                # envelope CAN precede its genuine record here — load_state
+                # rebuilds the ledger in the checkpoint's stored order, and
+                # _reorder_ledger_for_batch re-appends a batch's records at
+                # the tail, moving a genuine record behind an envelope when a
+                # provider reused its id inside a concurrent batch.
                 continue
             # The ledger stores the raw execution return, which may still
-            # carry reserved transport keys (_xagent_context_refs /
-            # _xagent_supersedes_scope). add_tool_result only splits those at
-            # the top level, so strip them here or they reach the model as
-            # noise nested inside the envelope.
-            prior_result, _ = split_tool_result_context_references(record.result)
-            try:
-                prior_result, _ = split_tool_result_supersedes_scope(prior_result)
-            except ValueError:
-                # An invalid nested scope value never blocks suppression; the
-                # original call already delivered its observation.
-                pass
+            # carry reserved transport keys. add_tool_result only splits
+            # those at the top level, so drop them here — unconditionally,
+            # not via the split helpers, whose scope validation could raise —
+            # or they reach the model as noise nested inside the envelope.
+            prior_result = record.result
+            if isinstance(prior_result, dict):
+                prior_result = {
+                    key: value
+                    for key, value in prior_result.items()
+                    if key not in (CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY)
+                }
             return build_suppression_envelope(
                 tool_name=tool_name,
                 prior_tool_call_id=record.tool_call_id,

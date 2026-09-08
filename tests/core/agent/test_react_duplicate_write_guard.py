@@ -3,11 +3,17 @@
 Covers xorbitsai/xagent#2217: a write-category tool call whose (tool,
 arguments) pair already succeeded earlier in the same turn must not execute
 again; the model receives a structured suppression envelope carrying the
-prior result instead. Only tools that explicitly declare themselves as
-writes are guarded — an MCP tool whose wire annotations classify as
-DESTRUCTIVE, or an internal tool marked ``non_idempotent = True``. Tools
-with an undeclared or read-only hint are exempt, so legitimate repeated
-reads (status polling with identical args) keep executing.
+prior result instead.
+
+Enrollment is explicit-only and read off ``tool.metadata`` (wrappers such as
+the sandbox tool wrapper forward only ``.metadata``): an MCP wire
+declaration carried as ``metadata.mcp_non_idempotent_write`` (classified by
+``classify_non_idempotent_write`` — covered by the wire-level tests in
+``tests/core/tools/adapters/vibe/test_mcp_adapter.py``), or an internal
+tool's ``non_idempotent = True`` marker. Undeclared tools stay exempt, so
+legitimate repeated reads (status polling with identical args) keep
+executing. The guard is strictly per-turn: it only fires for calls stamped
+with a turn_id, and only against records from the same turn.
 """
 
 from __future__ import annotations
@@ -20,12 +26,13 @@ from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, ReActPattern
 from xagent.core.agent.pattern.react.duplicate_write_guard import (
-    DESTRUCTIVE_WRITE_HINT_VALUE,
     DUPLICATE_WRITE_SUPPRESSED_KEY,
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
-from xagent.core.tools.adapters.vibe.mcp_adapter import MCPWriteHint
+
+TURN_1 = {"turn_id": "turn-1"}
+TURN_2 = {"turn_id": "turn-2"}
 
 
 class CreateRecordArgs(BaseModel):
@@ -44,24 +51,26 @@ class FakeLLM:
 
 
 class FakeWriteTool:
-    """A create-style tool whose declared write hint is configurable."""
+    """A create-style tool whose metadata declaration is configurable."""
 
     def __init__(
         self,
         *,
-        write_hint: Any = MCPWriteHint.DESTRUCTIVE,
+        mcp_non_idempotent_write: Any = True,
         fail_first: bool = False,
         name: str = "create_record",
+        concurrency_safe: bool = False,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._fail_first = fail_first
-        if write_hint is not None:
-            self.write_hint = write_hint
 
         class Metadata:
             description = "Create a record in the external system."
+            non_idempotent = False
 
         Metadata.name = name
+        Metadata.mcp_non_idempotent_write = mcp_non_idempotent_write
+        Metadata.concurrency_safe = concurrency_safe
         self.metadata = Metadata()
 
     def args_type(self) -> type[BaseModel]:
@@ -80,7 +89,7 @@ class FakeNonIdempotentInternalTool(FakeWriteTool):
     non_idempotent = True
 
     def __init__(self) -> None:
-        super().__init__(write_hint=None, name="submit_form")
+        super().__init__(mcp_non_idempotent_write=None, name="submit_form")
 
 
 def _tool_call_response(name: str, args: dict[str, Any], call_id: str) -> dict:
@@ -96,12 +105,20 @@ def _tool_call_response(name: str, args: dict[str, Any], call_id: str) -> dict:
     }
 
 
-def _pattern() -> ReActPattern:
-    return ReActPattern(
-        max_iterations=8,
-        repeated_tool_decision_after_consecutive_tool_calls=None,
-        repeated_tool_decision_after_consecutive_work_tool_calls=None,
-    )
+def _pattern(**overrides: Any) -> ReActPattern:
+    kwargs: dict[str, Any] = {
+        "max_iterations": 8,
+        "repeated_tool_decision_after_consecutive_tool_calls": None,
+        "repeated_tool_decision_after_consecutive_work_tool_calls": None,
+    }
+    kwargs.update(overrides)
+    return ReActPattern(**kwargs)
+
+
+def _turn_context(message: str = "Create the record") -> ExecutionContext:
+    context = ExecutionContext()
+    context.add_user_message(message, metadata=dict(TURN_1))
+    return context
 
 
 def _run_twice_llm(
@@ -127,36 +144,49 @@ def _tool_results(context: ExecutionContext) -> list[Any]:
 
 
 # ---------------------------------------------------------------------------
-# Classification
+# Enrollment
 # ---------------------------------------------------------------------------
 
 
-def test_destructive_hint_value_pins_the_mcp_enum() -> None:
-    # The guard module duck-types the hint instead of importing the MCP
-    # adapter; this pin keeps the string aligned with the enum it mirrors.
-    assert DESTRUCTIVE_WRITE_HINT_VALUE == MCPWriteHint.DESTRUCTIVE.value
-
-
-def test_only_explicit_writes_require_the_guard() -> None:
+def test_only_explicit_declarations_require_the_guard() -> None:
     assert tool_requires_duplicate_write_guard(
-        FakeWriteTool(write_hint=MCPWriteHint.DESTRUCTIVE)
+        FakeWriteTool(mcp_non_idempotent_write=True)
     )
     assert tool_requires_duplicate_write_guard(FakeNonIdempotentInternalTool())
-    # UNDECLARED and READ_ONLY are exempt by user decision on #2217: an
-    # unannotated MCP tool may be a legitimate identical-args poll loop.
+    # Undeclared MCP tools (None) and explicitly-idempotent ones (False) are
+    # exempt: an unannotated tool may be a legitimate identical-args poll
+    # loop, and deduplication fails open.
     assert not tool_requires_duplicate_write_guard(
-        FakeWriteTool(write_hint=MCPWriteHint.UNDECLARED)
+        FakeWriteTool(mcp_non_idempotent_write=None)
     )
     assert not tool_requires_duplicate_write_guard(
-        FakeWriteTool(write_hint=MCPWriteHint.READ_ONLY)
+        FakeWriteTool(mcp_non_idempotent_write=False)
     )
-    assert not tool_requires_duplicate_write_guard(FakeWriteTool(write_hint=None))
 
 
-def test_non_boolean_non_idempotent_marker_does_not_guard() -> None:
-    tool = FakeWriteTool(write_hint=None)
+def test_metadata_level_internal_marker_enrolls() -> None:
+    # AbstractBaseTool.metadata carries the tool's non_idempotent marker, and
+    # wrappers forward metadata — the guard must honor it there too.
+    tool = FakeWriteTool(mcp_non_idempotent_write=None)
+    tool.metadata.non_idempotent = True
+    assert tool_requires_duplicate_write_guard(tool)
+
+
+def test_non_boolean_marker_on_the_tool_does_not_enroll() -> None:
+    # A tool author writing a truthy non-boolean must not be enrolled by
+    # accident. Only the tool-object attribute is checked here: the metadata
+    # fields are typed on a pydantic model, which coerces a truthy value to
+    # True before the guard ever sees it, so there is no such shape to pin.
+    tool = FakeWriteTool(mcp_non_idempotent_write=None)
     tool.non_idempotent = "yes"  # type: ignore[attr-defined]
     assert not tool_requires_duplicate_write_guard(tool)
+
+
+def test_tool_without_metadata_is_exempt() -> None:
+    class Bare:
+        pass
+
+    assert not tool_requires_duplicate_write_guard(Bare())
 
 
 # ---------------------------------------------------------------------------
@@ -165,12 +195,11 @@ def test_non_boolean_non_idempotent_marker_does_not_guard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_destructive_call_is_suppressed() -> None:
+async def test_duplicate_write_is_suppressed() -> None:
     args = {"title": "invoice", "amount": 7}
     llm = _run_twice_llm("create_record", args, dict(args))
     tool = FakeWriteTool()
-    context = ExecutionContext()
-    context.add_user_message("Create the invoice record")
+    context = _turn_context("Create the invoice record")
 
     result = await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -222,8 +251,7 @@ async def test_key_order_does_not_defeat_the_guard() -> None:
         ]
     )
     tool = FakeWriteTool()
-    context = ExecutionContext()
-    context.add_user_message("Create the record")
+    context = _turn_context()
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -238,8 +266,7 @@ async def test_different_args_both_execute() -> None:
         {"title": "invoice", "amount": 8},
     )
     tool = FakeWriteTool()
-    context = ExecutionContext()
-    context.add_user_message("Create both records")
+    context = _turn_context("Create both records")
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -248,16 +275,15 @@ async def test_different_args_both_execute() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "write_hint",
-    [MCPWriteHint.UNDECLARED, MCPWriteHint.READ_ONLY, None],
-    ids=["undeclared", "read_only", "no_hint"],
+    "declaration",
+    [None, False],
+    ids=["undeclared", "explicitly_idempotent"],
 )
-async def test_unguarded_tools_repeat_identical_calls(write_hint: Any) -> None:
+async def test_unenrolled_tools_repeat_identical_calls(declaration: Any) -> None:
     args = {"title": "status-poll"}
     llm = _run_twice_llm("create_record", args, dict(args))
-    tool = FakeWriteTool(write_hint=write_hint)
-    context = ExecutionContext()
-    context.add_user_message("Poll twice")
+    tool = FakeWriteTool(mcp_non_idempotent_write=declaration)
+    context = _turn_context("Poll twice")
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -269,8 +295,7 @@ async def test_failed_first_write_is_retried() -> None:
     args = {"title": "invoice"}
     llm = _run_twice_llm("create_record", args, dict(args))
     tool = FakeWriteTool(fail_first=True)
-    context = ExecutionContext()
-    context.add_user_message("Create the record")
+    context = _turn_context()
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -283,8 +308,7 @@ async def test_non_idempotent_internal_tool_is_guarded() -> None:
     args = {"title": "form"}
     llm = _run_twice_llm("submit_form", args, dict(args))
     tool = FakeNonIdempotentInternalTool()
-    context = ExecutionContext()
-    context.add_user_message("Submit the form")
+    context = _turn_context("Submit the form")
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -309,8 +333,7 @@ async def test_provider_id_reuse_does_not_defeat_the_guard() -> None:
         ]
     )
     tool = FakeWriteTool()
-    context = ExecutionContext()
-    context.add_user_message("Create the record")
+    context = _turn_context()
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -335,8 +358,7 @@ async def test_third_call_attaches_the_original_result() -> None:
         ]
     )
     tool = FakeWriteTool()
-    context = ExecutionContext()
-    context.add_user_message("Create the record")
+    context = _turn_context()
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
@@ -350,46 +372,44 @@ async def test_third_call_attaches_the_original_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_guard_survives_checkpoint_state_round_trip() -> None:
-    args = {"title": "invoice"}
-    first_llm = FakeLLM(
+async def test_unknown_tool_bypasses_the_guard_gracefully() -> None:
+    # A call naming a tool that is not mounted must not trip the guard's
+    # lookup; it flows to the normal not-found error path.
+    llm = FakeLLM(
         responses=[
-            _tool_call_response("create_record", args, "call_1"),
-            {"content": "Created.", "done": True},
-        ]
-    )
-    first_tool = FakeWriteTool()
-    first_context = ExecutionContext()
-    first_context.add_user_message("Create the record")
-    first_pattern = _pattern()
-    await first_pattern.run(context=first_context, tools=[first_tool], llm=first_llm)
-    assert len(first_tool.calls) == 1
-
-    # Ledger state survives a checkpoint round-trip. Without turn tracking
-    # (no turn_id metadata anywhere, as in embeddings that never stamp one)
-    # the guard scope degrades to the pattern execution, so the restored
-    # ledger keeps suppressing the identical write. The stamped-turn variants
-    # of this scenario are covered by the two tests below.
-    resumed_pattern = _pattern()
-    resumed_pattern.load_state(json.loads(json.dumps(first_pattern.get_state())))
-    resumed_llm = FakeLLM(
-        responses=[
-            _tool_call_response("create_record", dict(args), "call_2"),
+            _tool_call_response("missing_tool", {"title": "x"}, "call_1"),
             {"content": "Done.", "done": True},
         ]
     )
-    resumed_tool = FakeWriteTool()
-    resumed_context = ExecutionContext()
-    resumed_context.add_user_message("Create the record")
+    tool = FakeWriteTool()
+    context = _turn_context("Use a missing tool")
 
-    await resumed_pattern.run(
-        context=resumed_context, tools=[resumed_tool], llm=resumed_llm
-    )
+    result = await _pattern().run(context=context, tools=[tool], llm=llm)
 
-    assert resumed_tool.calls == []
-    envelope = _tool_results(resumed_context)[0]
-    assert envelope[DUPLICATE_WRITE_SUPPRESSED_KEY] is True
-    assert envelope["suppressed_duplicate_of"] == "call_1"
+    assert result["success"] is True
+    assert tool.calls == []
+    first_result = _tool_results(context)[0]
+    assert first_result.get("success") is False
+
+
+# ---------------------------------------------------------------------------
+# Turn scoping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unstamped_turns_are_never_guarded() -> None:
+    # Fail-closed on turn identity: without a stamped turn_id the guard
+    # cannot bound suppression to one turn, so it does not fire at all.
+    args = {"title": "invoice"}
+    llm = _run_twice_llm("create_record", args, dict(args))
+    tool = FakeWriteTool()
+    context = ExecutionContext()
+    context.add_user_message("Create the record")  # no turn metadata
+
+    await _pattern().run(context=context, tools=[tool], llm=llm)
+
+    assert len(tool.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -402,8 +422,7 @@ async def test_intra_turn_resume_suppresses_under_the_same_turn_id() -> None:
         ]
     )
     first_tool = FakeWriteTool()
-    first_context = ExecutionContext()
-    first_context.add_user_message("Create the record", metadata={"turn_id": "turn-1"})
+    first_context = _turn_context()
     first_pattern = _pattern()
     await first_pattern.run(context=first_context, tools=[first_tool], llm=first_llm)
     assert len(first_tool.calls) == 1
@@ -417,30 +436,30 @@ async def test_intra_turn_resume_suppresses_under_the_same_turn_id() -> None:
         ]
     )
     resumed_tool = FakeWriteTool()
-    resumed_context = ExecutionContext()
-    resumed_context.add_user_message(
-        "Create the record", metadata={"turn_id": "turn-1"}
-    )
+    resumed_context = _turn_context()
 
     await resumed_pattern.run(
         context=resumed_context, tools=[resumed_tool], llm=resumed_llm
     )
 
     assert resumed_tool.calls == []
+    envelope = _tool_results(resumed_context)[0]
+    assert envelope[DUPLICATE_WRITE_SUPPRESSED_KEY] is True
+    assert envelope["suppressed_duplicate_of"] == "call_1"
 
 
 @pytest.mark.asyncio
 async def test_identical_write_in_a_later_turn_executes() -> None:
     # The guard must be strictly per-turn (#2217): an explicit user request
     # in a later turn of the same execution repeats the identical write.
-    # resume/inject_user_message continue the execution with the ledger
-    # restored but a fresh turn_id on the new user message.
+    # The runner stamps a fresh turn_id on every user message; the pattern
+    # re-resolves it at each pattern start.
     args = {"title": "invoice"}
     pattern = _pattern()
     tool = FakeWriteTool()
     context = ExecutionContext()
 
-    context.add_user_message("Create the record", metadata={"turn_id": "turn-1"})
+    context.add_user_message("Create the record", metadata=dict(TURN_1))
     first_llm = FakeLLM(
         responses=[
             _tool_call_response("create_record", args, "call_1"),
@@ -451,7 +470,7 @@ async def test_identical_write_in_a_later_turn_executes() -> None:
     assert len(tool.calls) == 1
 
     context.add_user_message(
-        "Create the exact same record again", metadata={"turn_id": "turn-2"}
+        "Create the exact same record again", metadata=dict(TURN_2)
     )
     second_llm = FakeLLM(
         responses=[
@@ -460,6 +479,162 @@ async def test_identical_write_in_a_later_turn_executes() -> None:
         ]
     )
     await pattern.run(context=context, tools=[tool], llm=second_llm)
+
+    assert len(tool.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pre_upgrade_checkpoint_records_never_match_a_stamped_turn() -> None:
+    # Checkpoints written before ToolCallRecord.turn_id existed restore with
+    # turn_id=None; against a stamped turn they must fail the equality check
+    # and err toward executing.
+    args = {"title": "invoice"}
+    seed_pattern = _pattern()
+    seed_llm = FakeLLM(
+        responses=[
+            _tool_call_response("create_record", args, "call_1"),
+            {"content": "Created.", "done": True},
+        ]
+    )
+    seed_tool = FakeWriteTool()
+    await seed_pattern.run(context=_turn_context(), tools=[seed_tool], llm=seed_llm)
+
+    state = json.loads(json.dumps(seed_pattern.get_state()))
+    for record in state["tool_ledger"].values():
+        record.pop("turn_id", None)  # simulate the pre-upgrade shape
+
+    resumed_pattern = _pattern()
+    resumed_pattern.load_state(state)
+    resumed_tool = FakeWriteTool()
+    resumed_llm = FakeLLM(
+        responses=[
+            _tool_call_response("create_record", dict(args), "call_2"),
+            {"content": "Done.", "done": True},
+        ]
+    )
+
+    await resumed_pattern.run(
+        context=_turn_context(), tools=[resumed_tool], llm=resumed_llm
+    )
+
+    assert len(resumed_tool.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ledger-order and concurrency edges
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_envelope_first_ledger_order_still_attaches_the_genuine_result() -> None:
+    # load_state rebuilds the ledger in the checkpoint's stored order, so an
+    # envelope record can precede its genuine record. The scan must skip the
+    # envelope and attach the genuine execution's result.
+    genuine_result = {"success": True, "record_id": "rec-1"}
+    envelope_record = {
+        "tool_call_id": "call_2",
+        "tool_name": "create_record",
+        "args": {"title": "invoice", "amount": 0},
+        "args_hash": "",
+        "status": "completed",
+        "result": build_suppression_envelope(
+            tool_name="create_record",
+            prior_tool_call_id="call_1",
+            prior_result=genuine_result,
+        ),
+        "error": None,
+        "turn_id": "turn-1",
+    }
+    genuine_record = {
+        "tool_call_id": "call_1",
+        "tool_name": "create_record",
+        "args": {"title": "invoice", "amount": 0},
+        "args_hash": "",
+        "status": "completed",
+        "result": genuine_result,
+        "error": None,
+        "turn_id": "turn-1",
+    }
+
+    seed_pattern = _pattern()
+    seed_llm = FakeLLM(
+        responses=[
+            _tool_call_response(
+                "create_record", {"title": "invoice", "amount": 0}, "call_1"
+            ),
+            {"content": "Created.", "done": True},
+        ]
+    )
+    await seed_pattern.run(
+        context=_turn_context(), tools=[FakeWriteTool()], llm=seed_llm
+    )
+    state = json.loads(json.dumps(seed_pattern.get_state()))
+    real_hash = state["tool_ledger"]["call_1"]["args_hash"]
+    envelope_record["args_hash"] = real_hash
+    genuine_record["args_hash"] = real_hash
+    state["tool_ledger"] = {"call_2": envelope_record, "call_1": genuine_record}
+
+    pattern = _pattern()
+    pattern.load_state(state)
+    tool = FakeWriteTool()
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response(
+                "create_record", {"title": "invoice", "amount": 0}, "call_3"
+            ),
+            {"content": "Done.", "done": True},
+        ]
+    )
+    context = _turn_context()
+
+    await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert tool.calls == []
+    envelope = _tool_results(context)[0]
+    assert envelope["suppressed_duplicate_of"] == "call_1"
+    assert envelope["result"] == genuine_result
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_writes_are_a_disclosed_boundary() -> None:
+    # Documents the disclosed check-then-record window: when an operator
+    # marks a non-idempotent tool concurrency_safe (contradicting that
+    # flag's idempotency meaning), two identical calls in one concurrent
+    # batch are invisible to each other (neither is "completed" during the
+    # other's scan) and both execute. If this test ever fails because only
+    # one call ran, the window was closed — update the guard's docstring and
+    # the PR-facing disclosure.
+    args = {"title": "invoice"}
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "create_record",
+                            "arguments": json.dumps(args),
+                        },
+                    },
+                    {
+                        "id": "call_2",
+                        "function": {
+                            "name": "create_record",
+                            "arguments": json.dumps(args),
+                        },
+                    },
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    tool = FakeWriteTool(concurrency_safe=True)
+    context = _turn_context()
+    pattern = _pattern(tool_parallel_enabled=True, tool_max_concurrency=2)
+
+    await pattern.run(context=context, tools=[tool], llm=llm)
 
     assert len(tool.calls) == 2
 
@@ -473,6 +648,12 @@ async def test_identical_write_in_a_later_turn_executes() -> None:
 async def test_envelope_strips_reserved_transport_keys() -> None:
     # The ledger stores the raw execution return; reserved transport keys
     # must not reach the model nested inside the suppression envelope.
+    #
+    # Only a *valid* scope is exercised, deliberately: a value the scope
+    # parser rejects cannot reach this code at all, because the genuine
+    # call's own add_tool_result raises ValueError on the same value
+    # (context_ref.py) and nothing on the ReAct loop's backfill path catches
+    # it, so the turn ends before any duplicate can be issued.
     args = {"title": "invoice"}
 
     class ReservedKeysTool(FakeWriteTool):
@@ -487,8 +668,7 @@ async def test_envelope_strips_reserved_transport_keys() -> None:
 
     llm = _run_twice_llm("create_record", args, dict(args))
     tool = ReservedKeysTool()
-    context = ExecutionContext()
-    context.add_user_message("Create the record")
+    context = _turn_context()
 
     await _pattern().run(context=context, tools=[tool], llm=llm)
 
