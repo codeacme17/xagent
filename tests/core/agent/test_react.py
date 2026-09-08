@@ -5400,8 +5400,43 @@ def _ask_then_stale_final_answer_llm() -> FakeLLM:
     )
 
 
-async def _park_on_question_with_stale_sibling() -> dict[str, Any]:
-    """Run one turn that parks on ask_user_question with a bundled sibling.
+def _send_message_then_stale_final_answer_llm() -> FakeLLM:
+    """One response bundling send_message(expect_response) with a stale
+    final_answer."""
+
+    return FakeLLM(
+        responses=[
+            {
+                "content": "Choose A or B",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Choose A or B",'
+                                '"message_type":"question",'
+                                '"expect_response":true}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_stale_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Choose A or B"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+
+async def _park_on_question_with_stale_sibling(
+    llm: FakeLLM | None = None,
+) -> dict[str, Any]:
+    """Run one turn that parks on a control tool with a bundled sibling.
 
     Returns the ``waiting_for_user`` checkpoint payload the runtime persisted
     at pause time -- the exact state a production resume restores.
@@ -5415,7 +5450,7 @@ async def _park_on_question_with_stale_sibling() -> dict[str, Any]:
     first = await pattern.run(
         context=context,
         tools=[],
-        llm=_ask_then_stale_final_answer_llm(),
+        llm=llm or _ask_then_stale_final_answer_llm(),
         runtime=runtime,
     )
 
@@ -5494,11 +5529,38 @@ async def test_react_resume_from_waiting_checkpoint_replans_instead_of_replaying
     assert resumed["response"] == "You chose B."
 
 
+@pytest.mark.asyncio
+async def test_react_send_message_waiting_checkpoint_resume_replans() -> None:
+    """send_message(expect_response=True) parks through the same control
+    branch as ask_user_question; its persisted waiting checkpoint must carry
+    an empty plan and resume by replanning, not by replaying the stale
+    sibling (#2216)."""
+
+    checkpoint = await _park_on_question_with_stale_sibling(
+        llm=_send_message_then_stale_final_answer_llm()
+    )
+
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("B")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["success"] is True
+    assert len(resumed_llm.calls) == 1
+    assert resumed["response"] == "You chose B."
+
+
 def _legacy_waiting_state_and_context(
-    stale_pending: dict[str, Any],
+    *stale_pendings: dict[str, Any],
 ) -> tuple[dict[str, Any], ExecutionContext]:
     """Build the state a pre-fix waiting_for_user checkpoint persisted: the
-    parked question plus the batch's unexecuted sibling still pending."""
+    parked question plus the batch's unexecuted siblings still pending."""
 
     context = ExecutionContext()
     context.add_user_message("Ask, then answer")
@@ -5513,14 +5575,17 @@ def _legacy_waiting_state_and_context(
                     "arguments": '{"message": "Choose A or B", "interactions": []}',
                 },
             },
-            {
-                "id": stale_pending["id"],
-                "type": "function",
-                "function": {
-                    "name": stale_pending["name"],
-                    "arguments": json.dumps(stale_pending["args"]),
-                },
-            },
+            *(
+                {
+                    "id": stale_pending["id"],
+                    "type": "function",
+                    "function": {
+                        "name": stale_pending["name"],
+                        "arguments": json.dumps(stale_pending["args"]),
+                    },
+                }
+                for stale_pending in stale_pendings
+            ),
         ],
     )
     context.add_tool_result(
@@ -5545,64 +5610,68 @@ def _legacy_waiting_state_and_context(
             "task_text": "Ask, then answer",
             "message_count": len(context.messages),
         },
-        "pending_tool_calls": [stale_pending],
+        "pending_tool_calls": list(stale_pendings),
     }
     return state, context
 
 
+_STALE_FINAL_ANSWER = {
+    "id": "call_stale_final",
+    "name": "final_answer",
+    "args": {"answer": "Choose A or B"},
+}
+_STALE_WORK_TOOL = {
+    "id": "call_stale_calc",
+    "name": "calculator",
+    "args": {"expression": "5+5"},
+}
+
+
 @pytest.mark.asyncio
-async def test_react_resume_waiting_cancels_stale_final_answer_from_legacy_checkpoint() -> (
-    None
-):
+@pytest.mark.parametrize(
+    "stale_pendings",
+    [
+        pytest.param([_STALE_FINAL_ANSWER], id="stale-final-answer"),
+        pytest.param([_STALE_WORK_TOOL], id="stale-work-tool"),
+        pytest.param(
+            [_STALE_FINAL_ANSWER, _STALE_WORK_TOOL],
+            id="stale-final-answer-and-work-tool",
+        ),
+    ],
+)
+async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint(
+    stale_pendings: list[dict[str, Any]],
+) -> None:
     """Checkpoints written before the discard-order fix still carry the parked
-    batch's siblings; the waiting-resume path must cancel them, not replay."""
+    batch's siblings; the waiting-resume path must cancel them all -- never
+    finalize off a stale final_answer, never execute a stale work tool -- and
+    the healed state must re-persist with an empty plan."""
 
-    state, context = _legacy_waiting_state_and_context(
-        {
-            "id": "call_stale_final",
-            "name": "final_answer",
-            "args": {"answer": "Choose A or B"},
-        }
-    )
-    context.add_user_message("B")
-    pattern = ReActPattern(max_iterations=3)
-    pattern.load_state(state)
-    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
-
-    resumed = await pattern.run(context=context, tools=[], llm=resumed_llm)
-
-    assert resumed["success"] is True
-    assert len(resumed_llm.calls) == 1
-    assert resumed["response"] == "You chose B."
-    assert pattern.tool_ledger["call_stale_final"].status == "cancelled"
-
-
-@pytest.mark.asyncio
-async def test_react_resume_waiting_cancels_stale_work_tool_from_legacy_checkpoint() -> (
-    None
-):
-    """A stale work-tool sibling restored from a legacy checkpoint must not
-    execute on resume -- the resumed turn replans from the user's answer."""
-
-    state, context = _legacy_waiting_state_and_context(
-        {
-            "id": "call_stale_calc",
-            "name": "calculator",
-            "args": {"expression": "5+5"},
-        }
-    )
+    state, context = _legacy_waiting_state_and_context(*stale_pendings)
     context.add_user_message("B")
     pattern = ReActPattern(max_iterations=3)
     pattern.load_state(state)
     tool = FakeTool()
     resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+    runtime = PatternRuntime()
 
-    resumed = await pattern.run(context=context, tools=[tool], llm=resumed_llm)
+    resumed = await pattern.run(
+        context=context, tools=[tool], llm=resumed_llm, runtime=runtime
+    )
 
     assert resumed["success"] is True
-    assert tool.calls == []
+    assert resumed["response"] == "You chose B."
     assert len(resumed_llm.calls) == 1
-    assert pattern.tool_ledger["call_stale_calc"].status == "cancelled"
+    assert tool.calls == []
+    for stale_pending in stale_pendings:
+        assert pattern.tool_ledger[stale_pending["id"]].status == "cancelled"
+    resume_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "tool_interaction_response_received"
+    ]
+    assert resume_checkpoints
+    assert resume_checkpoints[-1]["pattern_state"]["pending_tool_calls"] == []
 
 
 @pytest.mark.asyncio
