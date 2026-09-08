@@ -602,102 +602,6 @@ describe("TaskConversationPanel", () => {
     expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
   })
 
-  it("adopts the replayed waiting result's clarification event_id as the round id", () => {
-    // No backend emits request_id today, and replayed history rows carry no
-    // interactionRequestId; after a reload the round identity lives at the
-    // replayed react_task_end's result.clarification_draft.event_id.
-    appState.messages = [{
-      id: "user-1",
-      role: "user",
-      content: "Start the question",
-      timestamp: 2000,
-    }]
-    appState.traceEvents = [
-      {
-        event_id: "react-task-end-1757200000000-abc12",
-        event_type: "react_task_end",
-        timestamp: 1000,
-        data: {
-          result: {
-            status: "waiting_for_user",
-            message: "Which region should I use?",
-            interactions: [{ type: "text_input", field: "region", label: "Region" }],
-            clarification_draft: { event_id: "evt-round-1" },
-          },
-        },
-      },
-    ]
-    appState.currentTask = {
-      id: "42",
-      title: "Preview",
-      description: "Preview",
-      status: "waiting_for_user",
-      createdAt: "2026-01-01T00:00:00Z",
-      updatedAt: "2026-01-01T00:00:00Z",
-      waitingQuestion: "Which region should I use?",
-    }
-
-    render(<TaskConversationPanel mode="embedded-preview" />)
-
-    const activeWait = screen.getAllByTestId("chat-message").find(
-      (message) => message.getAttribute("data-active") === "true",
-    )
-    expect(activeWait).toBeDefined()
-    expect(activeWait).toHaveAttribute("data-request-id", "evt-round-1")
-  })
-
-  it("stops the round-id scan at the newest waiting result", () => {
-    // Reaching past an id-less newest result would return an OLDER round's
-    // id for the current question; the scan must stop and leave the round
-    // id-less so the prompt-text match stays in charge.
-    appState.messages = [{
-      id: "user-1",
-      role: "user",
-      content: "Working on it",
-      timestamp: 3000,
-    }]
-    appState.traceEvents = [
-      {
-        event_type: "react_task_end",
-        timestamp: 1000,
-        data: {
-          result: {
-            status: "waiting_for_user",
-            message: "Old question",
-            clarification_draft: { event_id: "evt-old-round" },
-          },
-        },
-      },
-      {
-        event_type: "react_task_end",
-        timestamp: 2000,
-        data: {
-          result: {
-            status: "waiting_for_user",
-            message: "Which city?",
-          },
-        },
-      },
-    ]
-    appState.currentTask = {
-      id: "42",
-      title: "Preview",
-      description: "Preview",
-      status: "waiting_for_user",
-      createdAt: "2026-01-01T00:00:00Z",
-      updatedAt: "2026-01-01T00:00:00Z",
-      waitingQuestion: "Which city?",
-    }
-
-    render(<TaskConversationPanel mode="embedded-preview" />)
-
-    const activeWait = screen.getAllByTestId("chat-message").find(
-      (message) => message.getAttribute("data-active") === "true",
-    )
-    expect(activeWait).toBeDefined()
-    expect(activeWait).toHaveAttribute("data-request-id", "")
-  })
-
   it("prefers the virtual bubble over an older round's form when the round id and text both miss", () => {
     // Round 2's status frame arrived (new id, new question) but its ask row
     // never landed. The only interactive timeline item belongs to round 1;
@@ -824,20 +728,18 @@ describe("TaskConversationPanel", () => {
     expect(active[0]).toHaveTextContent("Which city?")
   })
 
-  it("never adopts a client-minted trace id as the round id", () => {
-    // react_task_end rows in state get generateMessageId placeholders as
-    // their top-level event_id; adopting one would name a round no message
-    // carries, deactivating every instance. With no data-level id on the
-    // newest ask, the prompt-text match stays in charge and activates the
-    // persisted bubble.
+  it("gives the active id-less replayed row the resolved round id", () => {
+    // A replayed chat-history row carries no interactionRequestId. When the
+    // text fallback elects it as the active instance, it must submit with
+    // the round id the waiting frame delivered - not id-less.
     appState.messages = [
       {
         id: "q1",
         role: "assistant",
-        content: "Choose a region",
+        content: "Which city?",
         timestamp: 1000,
         isResult: true,
-        interactions: [{ type: "text_input", field: "region", label: "Region" }],
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
       },
       {
         id: "u1",
@@ -846,19 +748,7 @@ describe("TaskConversationPanel", () => {
         timestamp: 2000,
       },
     ]
-    appState.traceEvents = [
-      {
-        event_id: "react-task-end-1757200000000-abc12",
-        event_type: "react_task_end",
-        timestamp: 1500,
-        data: {
-          result: {
-            status: "waiting_for_user",
-            message: "Choose a region",
-          },
-        },
-      },
-    ]
+    appState.traceEvents = []
     appState.currentTask = {
       id: "42",
       title: "Preview",
@@ -866,7 +756,8 @@ describe("TaskConversationPanel", () => {
       status: "waiting_for_user",
       createdAt: "2026-01-01T00:00:00Z",
       updatedAt: "2026-01-01T00:00:00Z",
-      waitingQuestion: "Choose a region",
+      waitingQuestion: "Which city?",
+      waitingRequestId: "evt-round-1",
     }
 
     render(<TaskConversationPanel mode="embedded-preview" />)
@@ -874,8 +765,61 @@ describe("TaskConversationPanel", () => {
     const active = screen.getAllByTestId("chat-message")
       .filter((node) => node.getAttribute("data-active") === "true")
     expect(active).toHaveLength(1)
-    expect(active[0]).toHaveTextContent("Choose a region")
-    expect(active[0]).toHaveAttribute("data-request-id", "")
+    expect(active[0]).toHaveTextContent("Which city?")
+    expect(active[0]).toHaveAttribute("data-request-id", "evt-round-1")
+  })
+
+  it("never text-elects a lookalike row that carries a different round id", () => {
+    // Same question text asked in an earlier round: that row provably
+    // belongs to the other round and must not be elected over the id-less
+    // current row.
+    // The lookalike carrying the OLD round id is deliberately the NEWEST
+    // text-matching row: the reverse scan reaches it first, so only the
+    // skip guard (not election order) keeps it from being elected.
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: 2000,
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "evt-old-round",
+      },
+      {
+        id: "u1",
+        role: "user",
+        content: "Working on it",
+        timestamp: 3000,
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which city?",
+      waitingRequestId: "evt-round-2",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const active = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-active") === "true")
+    expect(active).toHaveLength(1)
+    // The id-less newest row is elected and speaks with the current round id.
+    expect(active[0]).toHaveAttribute("data-request-id", "evt-round-2")
   })
 
   it("activates the round-id match rather than a same-text lookalike", () => {

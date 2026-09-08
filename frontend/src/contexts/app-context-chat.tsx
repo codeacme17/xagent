@@ -890,6 +890,15 @@ const taskFromTaskInfoData = (
   runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
   waitingQuestion: taskData.waiting_question as string | undefined,
   waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+  // The waiting round's identity, emitted on waiting task_info frames
+  // (live, resume, and replay) so a reply binds to the exact ask (#1500).
+  // Key present only when the frame carries one: an explicit undefined
+  // would let SET_CURRENT_TASK's merge wipe an id the waiting handler
+  // already holds when an id-less task_info (a backend predating the
+  // emission) arrives mid-round.
+  ...(firstNonEmptyString(taskData.request_id) !== undefined
+    ? { waitingRequestId: firstNonEmptyString(taskData.request_id) }
+    : {}),
   runId: taskData.run_id as string | null | undefined,
   stateVersion: parseInteger(taskData.state_version),
   controlState: taskData.control_state as TaskControlState | undefined,

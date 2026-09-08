@@ -6722,6 +6722,151 @@ describe("clarification round identity (#1500)", () => {
     })
   })
 
+  it("adopts the live ask's event_id onto the transcript message", async () => {
+    // The one adoption site production always exercises: a live ask arrives
+    // as an agent_message trace event whose data.event_id is the round id,
+    // and the transcript message it produces must carry it as
+    // interactionRequestId.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "trace-row-1",
+          event_type: "agent_message",
+          data: {
+            message: "Which region should I use?",
+            expect_response: true,
+            event_id: "evt-live-ask",
+            metadata: {
+              interactions: [
+                { type: "text_input", field: "region", label: "Region" },
+              ],
+            },
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string; interactionRequestId?: string }>
+      const ask = messages.find(
+        (m) => m.content === "Which region should I use?"
+      )
+      expect(ask?.interactionRequestId).toBe("evt-live-ask")
+    })
+  })
+
+  it("keeps a held round id when an id-less waiting task_info arrives", async () => {
+    // A backend predating the emission sends waiting task_info frames with
+    // no request_id; SET_CURRENT_TASK's merge must not wipe the id the
+    // waiting handler already extracted for the open round.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        task: { id: 1, status: "waiting_for_user" },
+        message: "Which region should I use?",
+        event_id: "evt-live-round",
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "evt-live-round"
+      )
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "task-info-row-2",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Task",
+            description: "Task",
+            status: "waiting_for_user",
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe(
+        "waiting_for_user"
+      )
+    })
+    expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+      "evt-live-round"
+    )
+  })
+
+  it("adopts the waiting task_info frame's request_id as the round id", async () => {
+    // The replay/live waiting task_info now carries request_id; the task
+    // shaping must surface it as waitingRequestId.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "task-info-row",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Task",
+            description: "Task",
+            status: "waiting_for_user",
+            request_id: "evt-info-round",
+          },
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe(
+        "evt-info-round"
+      )
+    })
+  })
+
   it("falls back to event_id when request_id is an empty string", async () => {
     // Nullish coalescing alone would let an empty request_id block the
     // event_id fallback and leave the round id-less.

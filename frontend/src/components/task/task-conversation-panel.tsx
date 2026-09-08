@@ -21,7 +21,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
-import { cn, firstNonEmptyString } from "@/lib/utils"
+import { cn } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -149,63 +149,6 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   }
 
   return null
-}
-
-// The waiting round's identity. Prefers the id the task-state handler
-// already extracted (request_id, falling back to the ask frame's event_id -
-// see the app context's task_waiting_for_user case); when the status frame
-// carried none, falls back to the replayed waiting result the prompt and
-// interactions also fall back to, so all three stay sourced from one ask.
-type WaitingRoundTraceEvent = {
-  event_type?: unknown
-  data?: {
-    result?: {
-      status?: unknown
-      request_id?: unknown
-      clarification_draft?: {
-        event_id?: unknown
-      }
-    }
-  }
-}
-
-const findWaitingRequestId = (
-  currentTask: { status?: unknown; waitingRequestId?: unknown } | null | undefined,
-  traceEvents: WaitingRoundTraceEvent[],
-): string | undefined => {
-  if (currentTask?.status !== "waiting_for_user") {
-    return undefined
-  }
-  if (
-    typeof currentTask.waitingRequestId === "string"
-    && currentTask.waitingRequestId
-  ) {
-    return currentTask.waitingRequestId
-  }
-
-  // Only react_task_end rows reach state.traceEvents for a waiting result
-  // (a live ask's agent_message lands in the transcript instead, already
-  // carrying its interactionRequestId), and the round identity on such a
-  // row lives at result.clarification_draft.event_id. A row's top-level
-  // event_id never counts: it is a client-minted placeholder, and adopting
-  // one would name a round no message ever carried. The scan STOPS at the
-  // most recent waiting result whether or not it yields an id - reaching
-  // past it could return an older round's id - and an id-less newest result
-  // returns undefined so the prompt-text match stays in charge.
-  for (let i = traceEvents.length - 1; i >= 0; i--) {
-    const event = traceEvents[i]
-    if (
-      event.event_type === "react_task_end"
-      && event.data?.result?.status === "waiting_for_user"
-    ) {
-      return firstNonEmptyString(
-        event.data?.result?.request_id,
-        event.data?.result?.clarification_draft?.event_id,
-      )
-    }
-  }
-
-  return undefined
 }
 
 const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
@@ -537,13 +480,14 @@ export function TaskConversationPanel({
     () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
     [managerTraceEvents, state.currentTask]
   )
-  const waitingRoundId = useMemo(
-    () => findWaitingRequestId(
-      state.currentTask,
-      managerTraceEvents as WaitingRoundTraceEvent[],
-    ),
-    [managerTraceEvents, state.currentTask]
-  )
+  // The waiting round's identity, delivered on the task-state frames
+  // themselves (live/resume waiting task_info, replay task_info, replay
+  // reassertion) - no client-side reconstruction. Undefined only for
+  // backends predating the emission, where rounds stay unidentified.
+  const waitingRoundId =
+    state.currentTask?.status === "waiting_for_user"
+      ? state.currentTask.waitingRequestId
+      : undefined
 
   const activeWaitingMessageId = useMemo(() => {
     if (state.currentTask?.status !== "waiting_for_user") {
@@ -572,6 +516,16 @@ export function TaskConversationPanel({
       const normalizedPrompt = waitingPrompt.trim()
       for (let i = messageItems.length - 1; i >= 0; i--) {
         const item = messageItems[i]
+        // A row that carries its OWN round id different from the current
+        // round is a lookalike from an earlier ask - electing it would
+        // misbind the reply. Only id-less rows may be text-elected.
+        if (
+          waitingRoundId
+          && item.interactionRequestId
+          && item.interactionRequestId !== waitingRoundId
+        ) {
+          continue
+        }
         if (item.role === "assistant" && typeof item.content === "string" && item.content.trim() === normalizedPrompt) {
           return item.id
         }
@@ -878,7 +832,16 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
-                        interactionRequestId={item.interactionRequestId}
+                        // The active waiting item speaks for the current
+                        // round: when a replayed row carries no id of its
+                        // own, the resolved round id keeps its reply - and
+                        // the retry gate - bound to the ask instead of
+                        // submitting id-less.
+                        interactionRequestId={
+                          item.id === activeWaitingMessageId
+                            ? item.interactionRequestId ?? waitingRoundId
+                            : item.interactionRequestId
+                        }
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
