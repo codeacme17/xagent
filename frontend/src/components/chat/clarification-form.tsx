@@ -83,12 +83,13 @@ export function ClarificationForm({
   onSend,
 }: ClarificationFormProps) {
   // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
-  let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
+  let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined, isConnected: boolean | undefined;
   try {
     const appCtx = useApp();
     sendMessage = appCtx.sendMessage;
     dispatch = appCtx.dispatch;
     contextFilesDisabled = appCtx.filesDisabled;
+    isConnected = appCtx.isConnected;
   } catch {
     // We might not be in the app context (e.g., agent builder chat)
   }
@@ -123,39 +124,36 @@ export function ClarificationForm({
   const [formState, setFormState] = useState<Record<string, any>>({})
   const previousRequestIdRef = useRef(requestId)
   const latestRequestIdRef = useRef(requestId)
-  // One delivery identity per unresolved submission, handed to both send
-  // paths: an unchanged resubmit presents the same clientMessageId (so a
-  // dedup-capable consumer can recognize the retry), while a changed draft,
-  // a delivered send, or a `retryWithNewId` failure mints a fresh one. Same
-  // semantics as ChatInput's delivery attempt. Submit and the connect-apps
-  // skip are independent submissions a mixed interaction list renders side
-  // by side, so each keeps its own slot - a skip between two submits of the
-  // same draft must not burn the submit's identity.
+  // One delivery identity per unresolved TEXT-ONLY submission: an unchanged
+  // resubmit presents the same clientMessageId (so a dedup-capable consumer
+  // can recognize the retry), while a changed draft, a delivered send, a
+  // `retryWithNewId` failure, a new round, or a reconnect mints a fresh one
+  // (ChatInput keeps only the first three of those rules - this form also
+  // has round/connection resets because its rounds share one instance).
+  // File-bearing answers never reuse an identity (see handleSubmit), and the
+  // connect-apps skip deliberately keeps no identity of its own (see
+  // handleSkipConnectApps) - a mixed interaction list renders it beside
+  // Submit, and a skip that shared this slot could burn the submit's
+  // unresolved identity out from under it.
   type DeliveryAttempt = { key: string } & ClarificationSendAttempt
   const submitAttemptRef = useRef<DeliveryAttempt | null>(null)
-  const skipAttemptRef = useRef<DeliveryAttempt | null>(null)
+  const wasDisconnectedRef = useRef(false)
 
-  const resolveDeliveryAttempt = (
-    ref: React.MutableRefObject<DeliveryAttempt | null>,
-    deliveryKey: string,
-  ): string => {
-    const previous = ref.current
+  const resolveDeliveryAttempt = (deliveryKey: string): string => {
+    const previous = submitAttemptRef.current
     const clientMessageId = previous?.key === deliveryKey
       ? previous.clientMessageId
       : generateClientMessageId()
-    ref.current = { key: deliveryKey, clientMessageId }
+    submitAttemptRef.current = { key: deliveryKey, clientMessageId }
     return clientMessageId
   }
 
-  // Clears only the attempt this send owns: a concurrent send of the same
-  // kind (e.g. a double-clicked skip) may have replaced the slot with its
-  // own attempt, which must survive this send's resolution.
-  const settleDeliveryAttempt = (
-    ref: React.MutableRefObject<DeliveryAttempt | null>,
-    clientMessageId: string,
-  ) => {
-    if (ref.current?.clientMessageId === clientMessageId) {
-      ref.current = null
+  // Clears only the attempt this send owns: a concurrent send (e.g. a
+  // double-clicked submit) may have replaced the slot with its own attempt,
+  // which must survive this send's resolution.
+  const settleDeliveryAttempt = (clientMessageId: string) => {
+    if (submitAttemptRef.current?.clientMessageId === clientMessageId) {
+      submitAttemptRef.current = null
     }
   }
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -183,7 +181,6 @@ export function ClarificationForm({
     // A new request is a new question; its answer must never present the
     // previous round's unresolved delivery identity.
     submitAttemptRef.current = null
-    skipAttemptRef.current = null
   }, [active, isConnectAppsOnly, requestId])
 
   useEffect(() => {
@@ -208,9 +205,27 @@ export function ClarificationForm({
       // answer, and with the ref cleared even an identical draft mints a
       // fresh id, so keeping it cannot re-open the swallow.
       submitAttemptRef.current = null
-      skipAttemptRef.current = null
     }
   }, [active])
+
+  // A reconnect can land waiting_for_user -> waiting_for_user across two
+  // DISTINCT rounds (the backend never mints a per-round request_id - see
+  // #2251 - and a missed broadcast means `active` never flips), so the
+  // active-flip proxy above misses that boundary. The connection edge is the
+  // remaining observable signal: any identity kept across a disconnect gap
+  // may belong to a previous round, and dropping it only regresses that one
+  // resubmit to minting a fresh id. Strictly false -> true: the builder path
+  // has no app context (isConnected stays undefined) and must not clear.
+  useEffect(() => {
+    if (isConnected === false) {
+      wasDisconnectedRef.current = true
+      return
+    }
+    if (isConnected === true && wasDisconnectedRef.current) {
+      wasDisconnectedRef.current = false
+      submitAttemptRef.current = null
+    }
+  }, [isConnected])
 
   const normalizedInteractions = useMemo(() => {
     const seenFields = new Set<string>()
@@ -386,11 +401,24 @@ export function ClarificationForm({
     const outboundFiles = filesDisabled ? [] : files
     const finalMessage = textMessage || (outboundFiles.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
 
-    const clientMessageId = resolveDeliveryAttempt(submitAttemptRef, JSON.stringify([
-      submittedRequestId ?? null,
-      finalMessage,
-      outboundFiles.map((file) => [file.name, file.size, file.lastModified]),
-    ]))
+    let clientMessageId: string
+    if (outboundFiles.length > 0) {
+      // File answers never reuse an identity: this path re-uploads the raw
+      // File[] on every attempt, minting fresh file_ids, and the server's
+      // same-id payload match compares attachments BY file_id - a reused id
+      // with "new" files is rejected as MESSAGE_ID_CONFLICT (#2175 round 3).
+      // Until uploads are tagged back with their file_id (ChatInput-style),
+      // a fresh id per attempt restores the exact pre-#2175 behavior here.
+      submitAttemptRef.current = null
+      clientMessageId = generateClientMessageId()
+    } else {
+      // Text-only by construction (the file branch above never stores an
+      // attempt), so the key needs no file component.
+      clientMessageId = resolveDeliveryAttempt(JSON.stringify([
+        submittedRequestId ?? null,
+        finalMessage,
+      ]))
+    }
 
     try {
       setIsSubmitting(true)
@@ -402,7 +430,7 @@ export function ClarificationForm({
         await sendMessage(finalMessage, { force: true, metadata, clientMessageId }, outboundFiles)
       }
       // Delivered: the identity is spent whether or not this render is stale.
-      settleDeliveryAttempt(submitAttemptRef, clientMessageId)
+      settleDeliveryAttempt(clientMessageId)
 
       if (latestRequestIdRef.current !== submittedRequestId) return
       setIsSubmitted(true)
@@ -412,7 +440,7 @@ export function ClarificationForm({
       }
     } catch (error) {
       if (readSendRetryWithNewId(error)) {
-        settleDeliveryAttempt(submitAttemptRef, clientMessageId)
+        settleDeliveryAttempt(clientMessageId)
       }
       if (latestRequestIdRef.current !== submittedRequestId) return
       console.error("Failed to send clarification response", error)
@@ -426,9 +454,10 @@ export function ClarificationForm({
       // The toast is a snapshot - it keeps whatever language was active when
       // it fired. The alert below is not, and re-resolves on every render.
       // The draft is preserved and Submit stays enabled in every case, so the
-      // copy may only warn, never promise: an unchanged resubmit re-presents
-      // the same delivery identity, but only the internal path is known to
-      // dedup on it - an onSend provider may still answer the question twice.
+      // copy may only warn, never promise: an unchanged text-only resubmit
+      // re-presents the same delivery identity, but a file answer mints a
+      // fresh one each attempt, and only the internal path is known to dedup
+      // - an onSend provider may still answer the question twice.
       const hintKey = sendHintKey(disposition)
       const hint = hintKey ? t(hintKey) : null
       const errorMessage = errorCode
@@ -452,26 +481,18 @@ export function ClarificationForm({
   const handleSkipConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.skip")
     const metadata: ClarificationSendMetadata = requestId ? { request_id: requestId } : {}
-    // A skip is a delivery attempt like any other. The button unmounts on
-    // its first click, so the reuse only covers a double-click racing ahead
-    // of that re-render - but a skip must never clobber the submit slot's
-    // unresolved identity, which is why it gets its own.
-    const clientMessageId = resolveDeliveryAttempt(skipAttemptRef, JSON.stringify([
-      "connect_apps_skip",
-      requestId ?? null,
-      message,
-    ]))
+    // A skip mints a fresh identity per click: the button unmounts on its
+    // first click (skipped never resets), so identity reuse is unreachable,
+    // and by not touching the submit slot at all a skip can never burn an
+    // unresolved submit attempt (#2175 round 3).
+    const clientMessageId = generateClientMessageId()
     try {
       if (onSend) {
         await onSend(message, [], metadata, { clientMessageId })
       } else if (sendMessage) {
         await sendMessage(message, { force: true, metadata, clientMessageId }, [])
       }
-      settleDeliveryAttempt(skipAttemptRef, clientMessageId)
     } catch (error) {
-      if (readSendRetryWithNewId(error)) {
-        settleDeliveryAttempt(skipAttemptRef, clientMessageId)
-      }
       console.error("Failed to send connect-apps skip response", error)
       toast.error(t("chatPage.clarification.sendError"))
     }

@@ -15,6 +15,7 @@ import { resolveTranslation } from "@/i18n/translations"
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
   filesDisabled: false,
+  isConnected: true,
   providerAvailable: true,
   sendMessage: vi.fn(),
 }))
@@ -78,6 +79,7 @@ describe("ClarificationForm Session file capability", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.isConnected = true
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
@@ -279,6 +281,7 @@ describe("ClarificationForm connect_apps interaction", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.isConnected = true
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
@@ -443,6 +446,7 @@ describe("ClarificationForm delivery failures", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.isConnected = true
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
@@ -788,6 +792,7 @@ describe("ClarificationForm delivery identity", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.isConnected = true
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
@@ -939,9 +944,11 @@ describe("ClarificationForm delivery identity", () => {
     expect(skipIds[0]).not.toBe(submitIds[0])
   })
 
-  it("scopes the delivery attempt to the rendered request", async () => {
-    // A new clarification round is a new question; its answer must never
-    // reuse the identity of the previous round's unresolved attempt.
+  it("scopes the delivery key to the rendered request", async () => {
+    // The delivery key embeds the requestId, so a new clarification round's
+    // resolveDeliveryAttempt lookup already misses the previous round's
+    // unresolved attempt - the layout-effect ref clear above is belt-and-
+    // braces on top of that.
     appContextMock.sendMessage.mockRejectedValue(deliveryFailure("outcome_unknown"))
     const form = (requestId: string) => (
       <ClarificationForm interactions={interactions} requestId={requestId} />
@@ -982,12 +989,73 @@ describe("ClarificationForm delivery identity", () => {
     const [first, second] = sentClientMessageIds()
     expect(second).not.toBe(first)
   })
+
+  it("mints a fresh clientMessageId for a file-bearing answer on every attempt", async () => {
+    // Files are re-uploaded raw (the File[] itself, not a reference) on every
+    // attempt, minting fresh file_ids server-side; a reused clientMessageId
+    // with "new" attachments trips the server's same-id payload match and is
+    // rejected as MESSAGE_ID_CONFLICT (#2175 round 3) - so a file-bearing
+    // answer must never reuse an identity, unlike a text-only resubmit.
+    appContextMock.sendMessage
+      .mockRejectedValueOnce(deliveryFailure("outcome_unknown"))
+      .mockResolvedValueOnce(undefined)
+    const fileInteractions = [
+      { type: "file_upload" as const, field: "evidence", label: "Evidence" },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={fileInteractions} filesDisabled={false} />,
+    )
+
+    const file = new File(["report"], "report.txt", { type: "text/plain" })
+    fireEvent.change(
+      container.querySelector<HTMLInputElement>('input[type="file"]')!,
+      { target: { files: [file] } },
+    )
+    submit()
+    await screen.findByRole("alert")
+    submit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(first).toEqual(expect.any(String))
+    expect(second).toEqual(expect.any(String))
+    expect(second).not.toBe(first)
+
+    const filesSent = appContextMock.sendMessage.mock.calls.map((call) => call[2])
+    expect(filesSent[0]).toHaveLength(1)
+    expect(filesSent[1]).toHaveLength(1)
+  })
+
+  it("clears the delivery attempt when the connection returns after a disconnect", async () => {
+    // A reconnect can land waiting_for_user -> waiting_for_user across two
+    // distinct rounds (the backend never mints a per-round request_id - see
+    // #2251 - and a missed broadcast means `active` never flips), so the
+    // active-flip proxy above misses that boundary. The connection edge is
+    // the remaining observable signal for it.
+    appContextMock.sendMessage.mockRejectedValue(deliveryFailure("outcome_unknown"))
+    const { rerender } = render(<ClarificationForm interactions={interactions} />)
+
+    typeAndSubmit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(1))
+
+    appContextMock.isConnected = false
+    rerender(<ClarificationForm interactions={interactions} />)
+    appContextMock.isConnected = true
+    rerender(<ClarificationForm interactions={interactions} />)
+
+    typeAndSubmit()
+    await waitFor(() => expect(appContextMock.sendMessage).toHaveBeenCalledTimes(2))
+
+    const [first, second] = sentClientMessageIds()
+    expect(second).not.toBe(first)
+  })
 })
 
 describe("ClarificationForm blank option filtering", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.isConnected = true
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()

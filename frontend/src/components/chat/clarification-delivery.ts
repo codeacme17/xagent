@@ -70,6 +70,9 @@ export const clarificationSendFailure = (
   retryWithNewId: options.retryWithNewId ?? false,
 })
 
+const asRecord = (error: unknown): Record<string, unknown> | null =>
+  typeof error === "object" && error !== null ? error as Record<string, unknown> : null
+
 /**
  * Delivery failures carry whether the turn definitely never reached the agent.
  * Plain errors (local validation, unexpected throws) carry nothing, and are
@@ -77,10 +80,7 @@ export const clarificationSendFailure = (
  * turn that may have landed is worse than saying nothing.
  */
 export const readSendDisposition = (error: unknown): MessageDeliveryDisposition | null => {
-  if (typeof error !== "object" || error === null || !("disposition" in error)) {
-    return null
-  }
-  const disposition = (error as { disposition: unknown }).disposition
+  const disposition = asRecord(error)?.disposition
   return disposition === "not_sent"
     || disposition === "rejected"
     || disposition === "outcome_unknown"
@@ -94,9 +94,7 @@ export const readSendDisposition = (error: unknown): MessageDeliveryDisposition 
  * unchanged resubmit stays recognizable as a retry.
  */
 export const readSendRetryWithNewId = (error: unknown): boolean =>
-  typeof error === "object"
-  && error !== null
-  && (error as { retryWithNewId?: unknown }).retryWithNewId === true
+  asRecord(error)?.retryWithNewId === true
 
 /**
  * Only the reasons the sender can act on — the backend's rejection text — are
@@ -106,21 +104,14 @@ export const readSendRetryWithNewId = (error: unknown): boolean =>
  * way — `userFacing` still has to be set.
  */
 export const readSendReason = (error: unknown): string => {
-  if (
-    typeof error !== "object"
-    || error === null
-    || (error as { userFacing?: unknown }).userFacing !== true
-  ) {
-    return ""
-  }
-  const message = (error as { message?: unknown }).message
+  const record = asRecord(error)
+  if (record?.userFacing !== true) return ""
+  const message = record.message
   return typeof message === "string" ? message.trim() : ""
 }
 
-export const readSendErrorCode = (error: unknown): ClientErrorCode | null => {
-  if (typeof error !== "object" || error === null) return null
-  return readClientErrorCode((error as { errorCode?: unknown }).errorCode)
-}
+export const readSendErrorCode = (error: unknown): ClientErrorCode | null =>
+  readClientErrorCode(asRecord(error)?.errorCode)
 
 /**
  * The hint that belongs with a disposition, as a key rather than a translated

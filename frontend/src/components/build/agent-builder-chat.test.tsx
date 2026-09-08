@@ -128,6 +128,9 @@ vi.mock("@/components/chat/ChatMessage", () => ({
         data-process-status={processStatus || ""}
         data-trace-count={traceEvents?.length ?? 0}
       >
+        {/* Rendered so the rollback tests can tell the surviving row apart
+            from the optimistic bubbles it is supposed to have removed. */}
+        <div>{content}</div>
         <button
           type="button"
           onClick={async () => {
@@ -294,6 +297,9 @@ describe("AgentBuilderChat", () => {
     // optimistic bubbles (user + assistant placeholder) are rolled back,
     // leaving only the initial greeting.
     expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
+      "builds.configForm.chat.initialMessage"
+    )
   })
 
   it("rolls back both optimistic bubbles when the connection setup throws", async () => {
@@ -318,6 +324,9 @@ describe("AgentBuilderChat", () => {
       expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
     })
     expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
+      "builds.configForm.chat.initialMessage"
+    )
   })
 
   it.each([
