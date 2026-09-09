@@ -51,23 +51,21 @@ export type ClarificationSendFailure = Error & Pick<
   "disposition" | "userFacing" | "errorCode" | "retryWithNewId"
 >
 
-export interface ClarificationSendFailureOptions {
-  /** Whether `message` is the sender-actionable reason, safe to display. */
-  userFacing?: boolean
-  errorCode?: ClientErrorCode | null
-  /** The attempt's identity is burned; a retry must mint a new one. */
-  retryWithNewId?: boolean
-}
-
-export const clarificationSendFailure = (
+/**
+ * Every caller so far wants the same defaults: non-user-facing (the message
+ * is a developer diagnostic), no error code, and keep the delivery identity.
+ * Should a provider ever need different values, the type above declares all
+ * four fields, so they can be set on the returned error - or this can grow
+ * an options argument again at that point.
+ */
+export const createClarificationSendFailure = (
   message: string,
   disposition: MessageDeliveryDisposition,
-  options: ClarificationSendFailureOptions = {},
 ): ClarificationSendFailure => Object.assign(new Error(message), {
   disposition,
-  userFacing: options.userFacing ?? false,
-  errorCode: options.errorCode ?? null,
-  retryWithNewId: options.retryWithNewId ?? false,
+  userFacing: false,
+  errorCode: null,
+  retryWithNewId: false,
 })
 
 const asRecord = (error: unknown): Record<string, unknown> | null =>

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { MessageDeliveryError } from "@/hooks/use-websocket"
 import {
-  clarificationSendFailure,
+  createClarificationSendFailure,
   readSendDisposition,
   readSendErrorCode,
   readSendReason,
@@ -25,7 +25,7 @@ describe("clarification-delivery readers", () => {
   })
 
   it("the factory's product satisfies the same readers", () => {
-    const failure = clarificationSendFailure("Failed to send interaction", "not_sent")
+    const failure = createClarificationSendFailure("Failed to send interaction", "not_sent")
 
     expect(readSendDisposition(failure)).toBe("not_sent")
     expect(readSendRetryWithNewId(failure)).toBe(false)

@@ -67,7 +67,7 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 import { ClarificationForm } from "./clarification-form"
-import { clarificationSendFailure } from "./clarification-delivery"
+import { createClarificationSendFailure } from "./clarification-delivery"
 
 // Every describe in this file gets the identity translate back, so a locale
 // swapped by one test cannot leak into a suite added below it.
@@ -706,7 +706,7 @@ describe("ClarificationForm delivery failures", () => {
     // unset - exactly what agent-builder-chat throws. The raw string is a
     // developer diagnostic, not visitor copy.
     const onSend = vi.fn().mockRejectedValue(
-      clarificationSendFailure("Failed to send interaction", "not_sent"),
+      createClarificationSendFailure("Failed to send interaction", "not_sent"),
     )
 
     await submitAnswer(onSend)
@@ -796,6 +796,11 @@ describe("ClarificationForm delivery identity", () => {
     appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
+    // Reset what the "keeps the submit attempt alive across an interleaved
+    // connect-apps skip" test below mutates, so a later test in this
+    // describe never inherits its Gmail app.
+    mcpAppsMock.apps = []
+    mcpAppsMock.refresh.mockReset().mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -896,6 +901,25 @@ describe("ClarificationForm delivery identity", () => {
     const attempts = onSend.mock.calls.map((call) => call[3])
     expect(attempts[0]).toEqual({ clientMessageId: expect.any(String) })
     expect(attempts[1]).toEqual(attempts[0])
+  })
+
+  it("mints a fresh clientMessageId via the injected onSend path when the failure demands a new id", async () => {
+    // Mirrors "mints a fresh clientMessageId when the failure demands a new
+    // id" above, but through the injected onSend provider - retryWithNewId
+    // must reset the identity regardless of which send path rejected.
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(deliveryFailure("rejected", { retryWithNewId: true }))
+      .mockResolvedValueOnce(undefined)
+    render(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    typeAndSubmit()
+    await screen.findByRole("alert")
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    const ids = onSend.mock.calls.map((call) => call[3]?.clientMessageId)
+    expect(ids[1]).toEqual(expect.any(String))
+    expect(ids[1]).not.toBe(ids[0])
   })
 
   it("keeps the submit attempt alive across an interleaved connect-apps skip", async () => {

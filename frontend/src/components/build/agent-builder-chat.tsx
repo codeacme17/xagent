@@ -16,13 +16,20 @@ import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import {
-  clarificationSendFailure,
+  createClarificationSendFailure,
+  readSendDisposition,
   type ClarificationSendMetadata,
 } from "@/components/chat/clarification-delivery"
 
 import { Interaction } from "@/contexts/app-context-chat"
 
 import { FileAttachment } from "@/components/file/file-attachment"
+
+// A refused/unreachable backend never throws from the WebSocket constructor -
+// it fails async via onerror/onclose, or never opens at all - so cap how long
+// a new connection is given to actually deliver the payload before the send
+// is failed outright.
+const WS_DELIVERY_TIMEOUT_MS = 15_000
 
 interface Message {
   role: "user" | "assistant" | "system"
@@ -123,10 +130,16 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const [isLoading, setIsLoading] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const mountedRef = useRef(true)
 
   // Clean up WebSocket on unmount
   useEffect(() => {
+    mountedRef.current = true
     return () => {
+      // Closing here fails an in-flight send, which is correct - but it is
+      // our own doing, so the failure must stay silent (see the catch in
+      // handleSendMessage).
+      mountedRef.current = false
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -272,17 +285,19 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
     try {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        // Reuse existing connection
-        sendPayload(wsRef.current)
+        // Reuse existing connection. send() still throws if the socket
+        // started closing since the readyState check; that is a delivery
+        // failure, not a setup failure, so it is typed like one.
+        try {
+          sendPayload(wsRef.current)
+        } catch {
+          throw createClarificationSendFailure("Connection send failed", "not_sent")
+        }
       } else {
         // Create new connection if none exists or it was closed
         const wsUrl = getApiUrl().replace(/^http/, "ws") + `/ws/build/chat?token=${token}`
         const ws = new WebSocket(wsUrl)
         wsRef.current = ws
-
-        ws.onopen = () => {
-          sendPayload(ws)
-        }
 
         ws.onmessage = (event) => {
           try {
@@ -506,25 +521,108 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           }
         }
 
-        ws.onerror = (error) => {
-          console.error("WebSocket error:", error)
-          setIsLoading(false)
-          toast.error(t("builds.configForm.chat.errorConnection", { appName: branding.appName }))
-        }
+        // Resolve/reject only once actual delivery is decided - not merely
+        // once the constructor has been called - so the caller (and
+        // ClarificationForm, through onSendInteraction) never sees success
+        // before sendPayload has actually run. ws.onerror/ws.onclose below
+        // are ALSO the long-lived handlers for the rest of this connection's
+        // life, so their pre-existing side effects (logging, isLoading,
+        // clearing wsRef) keep firing both before and after delivery; what
+        // the two flags gate is which of them settles this promise, and
+        // which one owns the error toast.
+        await new Promise<void>((resolve, reject) => {
+          // `settled` = this promise already has its outcome. `delivered` =
+          // the payload actually went out. They are NOT the same: a timeout
+          // settles without delivering, and closing a still-CONNECTING
+          // socket fails the connection, so the close below re-enters
+          // onerror with `settled` already true. Deciding the toast on
+          // `settled` would make that path toast here AND in the catch.
+          let settled = false
+          let delivered = false
+          const settle = (outcome: () => void) => {
+            if (settled) return
+            settled = true
+            clearTimeout(deliveryTimeout)
+            outcome()
+          }
 
-        ws.onclose = () => {
-          setIsLoading(false)
-          wsRef.current = null
-        }
+          const deliveryTimeout = setTimeout(() => {
+            settle(() => {
+              // Nothing was sent and the socket never opened or failed.
+              // Close it so a late handshake cannot deliver after the send
+              // has already been failed, and fail the send: holding the
+              // form in "submitting" indefinitely is worse than telling the
+              // visitor it did not go out.
+              ws.close()
+              reject(createClarificationSendFailure("Connection timed out", "not_sent"))
+            })
+          }, WS_DELIVERY_TIMEOUT_MS)
+
+          ws.onopen = () => {
+            try {
+              sendPayload(ws)
+              delivered = true
+              settle(resolve)
+            } catch {
+              // Typed like the other pre-delivery failures so the catch
+              // below picks connection copy, not setup copy.
+              settle(() => reject(
+                createClarificationSendFailure("Connection send failed", "not_sent"),
+              ))
+            }
+          }
+
+          ws.onerror = (error) => {
+            console.error("WebSocket error:", error)
+            setIsLoading(false)
+            settle(() => {
+              reject(createClarificationSendFailure("Connection failed", "not_sent"))
+            })
+            // Before delivery the catch below owns the message, so toasting
+            // here would double up. After delivery this handler is the only
+            // one left that can report the drop, exactly as it did
+            // unconditionally before this change.
+            if (delivered) {
+              toast.error(t("builds.configForm.chat.errorConnection", { appName: branding.appName }))
+            }
+          }
+
+          ws.onclose = () => {
+            setIsLoading(false)
+            // Only disown the socket this handler belongs to: a send that
+            // already failed and was retried has installed a newer socket
+            // in the ref, and this late close must not null that one out.
+            if (wsRef.current === ws) {
+              wsRef.current = null
+            }
+            settle(() => {
+              reject(createClarificationSendFailure("Connection closed before delivery", "not_sent"))
+            })
+          }
+        })
       }
     } catch (error) {
       console.error(error)
-      toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
+      // Unmounting closes the socket ourselves, which lands here as a
+      // delivery failure. There is no visitor left to tell, and the toast
+      // is global - it would surface on whatever page they navigated to.
+      if (!mountedRef.current) {
+        return false
+      }
+      // Every failure that got as far as attempting delivery gets exactly
+      // one toast here, and the copy has to match what actually happened: a
+      // delivery failure (readSendDisposition non-null - see
+      // clarification-delivery.ts) is a connection problem, while anything
+      // else is a genuine setup throw. This path also serves the plain chat
+      // input, which has no clarification alert of its own to fall back on.
+      toast.error(readSendDisposition(error) !== null
+        ? t("builds.configForm.chat.errorConnection", { appName: branding.appName })
+        : t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
       setIsLoading(false)
-      // Same rollback as the upload failure above: the WebSocket constructor
-      // threw before anything was sent, so both optimistic bubbles come back
-      // out - the "not sent" hint invites a resubmit that must not stack a
-      // duplicate answer over a blank placeholder.
+      // Same rollback as the upload failure above: nothing was sent, so both
+      // optimistic bubbles come back out - the "not sent" hint invites a
+      // resubmit that must not stack a duplicate answer over a blank
+      // placeholder.
       setMessages(prev => prev.slice(0, -2))
       return false
     }
@@ -567,12 +665,16 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                 // build websocket has no delivery dedup to hand it to.
                 const didSend = await handleSendMessage(text, files, meta)
                 if (!didSend) {
-                  // Every false return happens before anything is handed to
-                  // the websocket (empty input, upload failure, connection
-                  // setup throw), so "not_sent" is accurate: the visitor can
-                  // resubmit safely. handleSendMessage already toasted the
-                  // actionable reason, so this stays non-user-facing.
-                  throw clarificationSendFailure(
+                  // Every false return means the payload never went out -
+                  // empty input, a send already in flight, upload failure,
+                  // setup throw, or a new connection that failed, closed,
+                  // or timed out before sendPayload ran - so "not_sent" is
+                  // accurate and the visitor can resubmit safely. Every one
+                  // of those that attempted delivery has already toasted its
+                  // own reason (the in-flight guard stays quiet on purpose:
+                  // the first send is still running), so this carries no
+                  // user-facing text of its own.
+                  throw createClarificationSendFailure(
                     "Failed to send interaction",
                     "not_sent",
                   )

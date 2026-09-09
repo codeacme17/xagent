@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 
@@ -180,6 +180,7 @@ import { AgentBuilderChat, type AgentConfig } from "./agent-builder-chat"
 class MockWebSocket {
   static OPEN = 1
   static CONNECTING = 0
+  static CLOSED = 3
   static instances: MockWebSocket[] = []
 
   readyState = MockWebSocket.CONNECTING
@@ -198,13 +199,21 @@ class MockWebSocket {
   }
 
   close() {
-    this.readyState = 3
+    this.readyState = MockWebSocket.CLOSED
     this.onclose?.()
   }
 
   open() {
     this.readyState = MockWebSocket.OPEN
     this.onopen?.()
+  }
+
+  /** Async connection failure (refused / dropped) - the constructor never
+   * throws for this, so the only signal is onerror followed by onclose. */
+  fail() {
+    this.readyState = MockWebSocket.CLOSED
+    this.onerror?.(new Event("error"))
+    this.onclose?.()
   }
 }
 
@@ -327,6 +336,135 @@ describe("AgentBuilderChat", () => {
     expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
       "builds.configForm.chat.initialMessage"
     )
+    expect(MockWebSocket.instances.flatMap((ws) => ws.sentMessages)).toEqual([])
+  })
+
+  it("reports not_sent when the connection fails before the payload is sent", async () => {
+    // Against a refused/unreachable backend the WebSocket constructor does
+    // NOT throw - the failure only surfaces later via onerror/onclose - so
+    // this exercises the async-failure path the constructor-throw test above
+    // cannot reach.
+    apiRequestMock.mockResolvedValueOnce(
+      successfulUploadResponse([{ file_id: "file-1", filename: "data.txt" }])
+    )
+    renderBuilderChat()
+    fireEvent.click(await screen.findByText("send-file-interaction"))
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+
+    await act(async () => {
+      MockWebSocket.instances[0].fail()
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText("rejected:not_sent")).toBeInTheDocument()
+    })
+    // Nothing ever reached the wire, and the resubmit the "not sent" hint
+    // invites must not find a stranded answer bubble or blank placeholder.
+    expect(MockWebSocket.instances.flatMap((ws) => ws.sentMessages)).toEqual([])
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
+      "builds.configForm.chat.initialMessage"
+    )
+    // Surfaced exactly once, with connection copy rather than the
+    // setup-throw copy.
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock.mock.calls[0][0]).toBe(
+      "builds.configForm.chat.errorConnection:Xagent"
+    )
+  })
+
+  it("tells the plain chat input a failed send never went out", async () => {
+    // The chat input has no clarification alert to fall back on, so this
+    // path must never fail silently - it is the one the delivery-failure
+    // toast routing exists for.
+    renderBuilderChat()
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+
+    await act(async () => {
+      MockWebSocket.instances[0].fail()
+    })
+
+    await waitFor(() => {
+      expect(toastErrorMock.mock.calls[0]?.[0]).toBe(
+        "builds.configForm.chat.errorConnection:Xagent"
+      )
+    })
+    expect(MockWebSocket.instances.flatMap((ws) => ws.sentMessages)).toEqual([])
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(1)
+  })
+
+  it("stays quiet when unmounting closes an in-flight connection", async () => {
+    // The unmount cleanup closes the socket, which fails the in-flight send
+    // - but that failure is our own doing and the toast is global, so it
+    // would otherwise surface on whatever page the visitor moved to.
+    const { unmount } = renderBuilderChat()
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+
+    await act(async () => {
+      unmount()
+    })
+
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("does not resolve the interaction until the payload is actually sent", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      successfulUploadResponse([{ file_id: "file-1", filename: "data.txt" }])
+    )
+    renderBuilderChat()
+    fireEvent.click(await screen.findByText("send-file-interaction"))
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+    // The connection is open-pending: the interaction must stay unresolved
+    // until sendPayload has actually run inside onopen. Every ChatMessage in
+    // this mock renders its own idle/resolved/rejected span regardless of
+    // whether it was the one clicked, so assert none has moved past "idle"
+    // rather than assuming a single match.
+    expect(screen.queryByText("resolved")).not.toBeInTheDocument()
+    expect(screen.queryByText(/^rejected:/)).not.toBeInTheDocument()
+    expect(screen.getAllByText("idle").length).toBeGreaterThan(0)
+
+    await act(async () => {
+      MockWebSocket.instances[0].open()
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText("resolved")).toBeInTheDocument()
+    })
+  })
+
+  it("returns false and sends nothing for a second send while the first is in flight", async () => {
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("send-chat-input"))
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    // isLoading is now true - a second send while the first is still in
+    // flight (the socket hasn't even opened yet) must return false and touch
+    // neither the message list nor the wire.
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(screen.getAllByTestId("chat-message")).toHaveLength(3)
+    expect(MockWebSocket.instances[0].sentMessages).toEqual([])
   })
 
   it.each([
