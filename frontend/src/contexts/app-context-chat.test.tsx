@@ -6672,10 +6672,12 @@ describe("clarification round identity (#1500)", () => {
     localStorage.clear()
   })
 
-  it("adopts the ask frame's event_id as the waiting round id", async () => {
-    // No backend emits request_id; the stable per-ask identity is event_id.
-    // request_id stays the preferred field so a backend that later adopts
-    // the explicit name wins over the fallback.
+  it("adopts the waiting frame's request_id as the round id", async () => {
+    // The waiting/reassert frames carry the round identity as request_id
+    // (backend #2232). They never emit event_id, so there is deliberately
+    // no event_id fallback on this handler - the ask frame's event_id is
+    // adopted in the agent_message trace reader instead. An empty-string
+    // request_id reads as no identity.
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -6693,14 +6695,14 @@ describe("clarification round identity (#1500)", () => {
         task_id: 1,
         task: { id: 1, status: "waiting_for_user" },
         message: "Which region should I use?",
-        event_id: "evt-round-1",
+        request_id: "req-round-1",
         interactions: [
           { type: "text", prompt: "Which region should I use?" },
         ],
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
-      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-1")
+      expect(screen.getByTestId("waiting-request-id").textContent).toBe("req-round-1")
     })
 
     act(() => {
@@ -6710,16 +6712,17 @@ describe("clarification round identity (#1500)", () => {
         task_id: 1,
         task: { id: 1, status: "waiting_for_user" },
         message: "Which hotel?",
-        request_id: "req-explicit",
-        event_id: "evt-round-2",
+        request_id: "",
+        event_id: "evt-never-adopted-here",
         interactions: [
           { type: "text", prompt: "Which hotel?" },
         ],
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
-      expect(screen.getByTestId("waiting-request-id").textContent).toBe("req-explicit")
+      expect(screen.getByTestId("messages").textContent).toContain("Which hotel?")
     })
+    expect(screen.getByTestId("waiting-request-id").textContent).toBe("")
   })
 
   it("adopts the live ask's event_id onto the transcript message", async () => {
@@ -6791,7 +6794,7 @@ describe("clarification round identity (#1500)", () => {
         task_id: 1,
         task: { id: 1, status: "waiting_for_user" },
         message: "Which region should I use?",
-        event_id: "evt-live-round",
+        request_id: "evt-live-round",
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
@@ -6867,35 +6870,6 @@ describe("clarification round identity (#1500)", () => {
     })
   })
 
-  it("falls back to event_id when request_id is an empty string", async () => {
-    // Nullish coalescing alone would let an empty request_id block the
-    // event_id fallback and leave the round id-less.
-    render(
-      <AppProvider token="token">
-        <SeedRunningTask />
-        <StateProbe />
-      </AppProvider>
-    )
-
-    const onMessage = webSocketOptions.current?.onMessage
-    expect(onMessage).toBeDefined()
-
-    act(() => {
-      onMessage?.({
-        type: "task_waiting_for_user",
-        timestamp: "2026-05-27T05:00:01Z",
-        task_id: 1,
-        task: { id: 1, status: "waiting_for_user" },
-        message: "Which region should I use?",
-        request_id: "",
-        event_id: "evt-round-3",
-      } as TestWebSocketMessage)
-    })
-    await waitFor(() => {
-      expect(screen.getByTestId("waiting-request-id").textContent).toBe("evt-round-3")
-    })
-  })
-
   it("keeps the round id across a same-question reassertion without an id", async () => {
     // Reload/reconnect reassertion frames re-send the unchanged question
     // with no id; wiping the id there severs the open round's correlation.
@@ -6916,7 +6890,7 @@ describe("clarification round identity (#1500)", () => {
         task_id: 1,
         task: { id: 1, status: "waiting_for_user" },
         message: "Which region should I use?",
-        event_id: "evt-round-1",
+        request_id: "evt-round-1",
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
@@ -6957,7 +6931,7 @@ describe("clarification round identity (#1500)", () => {
         task_id: 1,
         task: { id: 1, status: "waiting_for_user" },
         message: "Which region should I use?",
-        event_id: "evt-round-1",
+        request_id: "evt-round-1",
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
@@ -6975,6 +6949,58 @@ describe("clarification round identity (#1500)", () => {
     })
     await waitFor(() => {
       expect(screen.getByTestId("waiting-request-id").textContent).toBe("")
+    })
+  })
+
+  it("adds one bubble for a duplicated terminal command frame", async () => {
+    // A terminal agent_error carries a durable identity (command_id +
+    // outcome_version); a duplicated delivery of the SAME broadcast must
+    // not add a second bubble, while two DISTINCT commands failing with
+    // identical text must both stay visible (identity-keyed, never
+    // text-keyed).
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const terminalFrame = (commandId: string) => ({
+      type: "agent_error",
+      timestamp: "2026-05-27T05:00:02Z",
+      task_id: 1,
+      data: {
+        type: "agent_error",
+        message: "This message was not applied to the task.",
+        command_id: commandId,
+        command_kind: "message",
+        outcome: "failed",
+        outcome_version: 1,
+        resend_safe: true,
+      },
+    }) as TestWebSocketMessage
+
+    act(() => {
+      onMessage?.(terminalFrame("cmd-dup"))
+    })
+    act(() => {
+      onMessage?.(terminalFrame("cmd-dup"))
+    })
+    act(() => {
+      onMessage?.(terminalFrame("cmd-other"))
+    })
+
+    await waitFor(() => {
+      const messages = JSON.parse(
+        screen.getByTestId("messages").textContent || "[]"
+      ) as Array<{ content: string }>
+      const bubbles = messages.filter((m) =>
+        m.content.includes("This message was not applied to the task.")
+      )
+      expect(bubbles).toHaveLength(2)
     })
   })
 

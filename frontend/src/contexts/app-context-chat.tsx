@@ -5727,16 +5727,15 @@ export function AppProvider({
         const interactions = normalizeInteractions(
           waitingRoot.interactions ?? waitingData.interactions
         )
-        // ``request_id`` first (the explicit name, if a backend ever emits
-        // it), then ``event_id`` - the stable per-ask identity the runtime
-        // actually mints and forwards on ask frames today. First non-empty
-        // string wins: nullish coalescing alone would let an empty or
-        // non-string ``request_id`` block the ``event_id`` fallback.
+        // ``request_id`` only: the waiting/reassert frames' emitters carry
+        // the round identity under that explicit name (backend #2232) and
+        // never emit ``event_id`` - an event_id fallback here would be dead
+        // code testable only with hand-crafted frames. The ask frame's
+        // ``event_id`` is adopted where it genuinely lives, in the
+        // agent_message trace reader.
         const waitingRequestId = firstNonEmptyString(
           waitingRoot.request_id,
           waitingData.request_id,
-          waitingRoot.event_id,
-          waitingData.event_id,
         )
         dispatch({
           type: "UPDATE_TASK_STATUS",
@@ -5828,16 +5827,38 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: generateMessageId("msg"),
-            role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
-            timestamp: message.timestamp,
-            status: "failed",
-          },
-        })
+        const agentErrorData = asMessageRecord(message.data)
+        // A terminal command frame carries a durable identity
+        // (command_id, disambiguated by outcome_version): a duplicated
+        // delivery of the SAME terminal broadcast must not add a second
+        // bubble. Identity-keyed only - never text-keyed - so two distinct
+        // commands failing with identical redacted text both stay visible.
+        const agentErrorOccurrence =
+          typeof agentErrorData.command_id === "string"
+          && agentErrorData.command_id
+            ? `${agentErrorData.command_id}:${String(
+                agentErrorData.outcome_version ?? "",
+              )}`
+            : undefined
+        if (
+          agentErrorOccurrence === undefined
+          || !isDuplicateMessageForViewedTask(
+            agentErrorMessage || "",
+            "agent-error-command",
+            agentErrorOccurrence,
+          )
+        ) {
+          dispatch({
+            type: "ADD_MESSAGE",
+            payload: {
+              id: generateMessageId("msg"),
+              role: "assistant",
+              content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
+              timestamp: message.timestamp,
+              status: "failed",
+            },
+          })
+        }
         break
 
       case "error":

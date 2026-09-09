@@ -682,6 +682,32 @@ describe("TaskConversationPanel", () => {
     expect(active[0]).toHaveTextContent("Which city?")
   })
 
+  it("does not leak the previous task's round id during a task switch", () => {
+    // During a switch, currentTask can still describe task A while
+    // state.taskId already points at task B; the round id read is gated on
+    // the ids matching, like the sibling ChatInput wiring.
+    appState.taskId = 99
+    appState.messages = []
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Previous task",
+      description: "Previous task",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Old question?",
+      waitingRequestId: "round-of-task-42",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const leaked = screen.getAllByTestId("chat-message")
+      .filter((node) => node.getAttribute("data-request-id") === "round-of-task-42")
+    expect(leaked).toHaveLength(0)
+    appState.taskId = 42
+  })
+
   it("keeps at most one instance active for a waiting round", () => {
     // The two-instances window: the round's question is persisted on the
     // timeline AND an optimistic user message is the last item (so the

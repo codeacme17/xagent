@@ -21,7 +21,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
-import { cn } from "@/lib/utils"
+import { cn, firstNonEmptyString } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -484,8 +484,13 @@ export function TaskConversationPanel({
   // themselves (live/resume waiting task_info, replay task_info, replay
   // reassertion) - no client-side reconstruction. Undefined only for
   // backends predating the emission, where rounds stay unidentified.
+  // Gated on the task actually being the one on screen: during a task
+  // switch, currentTask can still describe the previous task while
+  // state.taskId already points at the new one (same guard as the
+  // ChatInput wiring below).
   const waitingRoundId =
     state.currentTask?.status === "waiting_for_user"
+    && state.currentTask.id === String(state.taskId)
       ? state.currentTask.waitingRequestId
       : undefined
 
@@ -839,7 +844,10 @@ export function TaskConversationPanel({
                         // submitting id-less.
                         interactionRequestId={
                           item.id === activeWaitingMessageId
-                            ? item.interactionRequestId ?? waitingRoundId
+                            ? firstNonEmptyString(
+                                item.interactionRequestId,
+                                waitingRoundId,
+                              )
                             : item.interactionRequestId
                         }
                         interactionsActive={item.id === activeWaitingMessageId}
