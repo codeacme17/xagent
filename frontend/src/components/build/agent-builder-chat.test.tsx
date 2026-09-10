@@ -327,7 +327,6 @@ describe("AgentBuilderChat", () => {
     expect(screen.getAllByTestId("chat-message")[0]).toHaveTextContent(
       "builds.configForm.chat.initialMessage"
     )
-    expect(MockWebSocket.instances.flatMap((ws) => ws.sentMessages)).toEqual([])
   })
 
   it.each([

@@ -49,6 +49,9 @@ export const createClarificationSendFailure = (
   message: string,
   disposition: MessageDeliveryDisposition,
 ): ClarificationSendFailure => Object.assign(new Error(message), {
+  // Named like MessageDeliveryError so a console.error of either one says
+  // which side of the contract produced it.
+  name: "ClarificationSendFailure",
   disposition,
   userFacing: false,
   errorCode: null,
