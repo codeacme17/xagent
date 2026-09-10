@@ -29,21 +29,21 @@ export type ClarificationOnSend = (
  * The discriminated failure a send path rejects with — its shape is derived
  * from use-websocket's MessageDeliveryError (a type-only import, so this
  * still has no runtime dependency on the websocket hook). Deriving via Pick
- * means renaming or removing one of these four fields on the class fails
+ * means renaming or removing one of these fields on the class fails
  * type-check here; it does not notice fields *added* to the class, and the
  * readers below stay deliberately structural (they take `unknown`).
  */
 export type ClarificationSendFailure = Error & Pick<
   MessageDeliveryError,
-  "disposition" | "userFacing" | "errorCode" | "retryWithNewId"
+  "disposition" | "userFacing" | "errorCode"
 >
 
 /**
  * Every caller so far wants the same defaults: non-user-facing (the message
- * is a developer diagnostic), no error code, and keep the delivery identity.
- * Should a provider ever need different values, the type above declares all
- * four fields, so they can be set on the returned error - or this can grow
- * an options argument again at that point.
+ * is a developer diagnostic) and no error code.
+ * Should a provider ever need different values, the type above declares
+ * them, so they can be set on the returned error - or this can grow an
+ * options argument again at that point.
  */
 export const createClarificationSendFailure = (
   message: string,
@@ -55,7 +55,6 @@ export const createClarificationSendFailure = (
   disposition,
   userFacing: false,
   errorCode: null,
-  retryWithNewId: false,
 })
 
 const asRecord = (error: unknown): Record<string, unknown> | null =>
