@@ -61,5 +61,7 @@ def downgrade() -> None:
         col["name"] for col in inspector.get_columns("task_chat_messages")
     }
     if "source_event_id" in existing_columns:
-        with op.batch_alter_table("task_chat_messages") as batch:
-            batch.drop_column("source_event_id")
+        # Plain drop_column, matching 20260522_add_turn_id_to_task_chat_messages.
+        # batch_alter_table would rebuild the table on SQLite, putting the named
+        # unique index uq_task_chat_messages_task_role_turn_id at risk.
+        op.drop_column("task_chat_messages", "source_event_id")

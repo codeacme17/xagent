@@ -20,24 +20,30 @@ The pairing is deliberately narrow. Only question rows and only
 other way round (row dropped, trace kept) by the caller's content check,
 because their trace events carry streaming identity this must not disturb.
 
-Not every question row can carry ``source_event_id``: the channel bots
-persist their own question rows through ``persist_assistant_message`` with no
-originating trace event to name (``channels/telegram/utils.py``), so those
-stay on the derivation path permanently. That is a coverage limit, not a
-correctness one -- the symmetry gate below refuses an ambiguous pairing
-rather than guessing one.
+Not every question row can carry ``source_event_id``. The channel finalizers
+write theirs through ``persist_assistant_message_no_commit``, which has no
+such parameter, reached from ``execution_result_projection.py`` via
+``managed_task_lease.py``; only the Slack, Telegram and Feishu bots consume
+that projection, so no ordinary web-chat turn takes this path. Those rows
+stay on the derivation path permanently, and because the same waiting
+question also goes through the shared outbound handler, a channel task ends
+up with two question rows for one trace -- the projection row can never pair,
+since the trace is already claimed. That is a pre-existing channel-only
+limit tracked separately, not something this pairing introduces; the
+symmetry gate below refuses an ambiguous pairing rather than guessing one.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 
 from ...core.agent.transcript import build_assistant_transcript_content
 from ..models.chat_message import TaskChatMessage
 from ..models.uploaded_file import UploadedFile
+from .chat_history_service import QUESTION_MESSAGE_TYPE, SUPERSEDED_MESSAGE_TYPE
 from .file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -49,9 +55,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ``question_superseded`` is the same row relabelled once a structured
+# ``SUPERSEDED_MESSAGE_TYPE`` is the same row relabelled once a structured
 # publication has taken over its answer slot; it replays identically.
-QUESTION_MESSAGE_TYPES = frozenset({"question", "question_superseded"})
+QUESTION_MESSAGE_TYPES = frozenset({QUESTION_MESSAGE_TYPE, SUPERSEDED_MESSAGE_TYPE})
 
 # Questions are emitted as ``agent_message``. ``ai_message`` is the final
 # answer channel and is out of scope by construction.
@@ -92,8 +98,8 @@ def _stripped_text(value: Any) -> str:
 
 def plan_assistant_question_replay(
     *,
-    rows: Iterable[ReplayQuestionRow],
-    traces: Iterable[ReplayTraceQuestion],
+    rows: Sequence[ReplayQuestionRow],
+    traces: Sequence[ReplayTraceQuestion],
     normalize_message: Optional[Callable[[str], str]] = None,
 ) -> AssistantQuestionReplayPlan:
     """Decide, for one snapshot, which trace event each question row replaces.
@@ -193,7 +199,7 @@ def load_transcript_replay(
     *,
     task_id: int,
     task_user_id: int,
-    trace_events: Iterable[Any],
+    trace_events: Sequence[Any],
     trace_data_by_event_id: Mapping[str, Any],
 ) -> TranscriptReplay:
     """Read a task's transcript rows and pair its questions with their traces.
@@ -236,8 +242,8 @@ def load_transcript_replay(
 
 def plan_snapshot_question_replay(
     *,
-    chat_messages: Iterable[Any],
-    trace_events: Iterable[Any],
+    chat_messages: Sequence[Any],
+    trace_events: Sequence[Any],
     trace_data_by_event_id: Mapping[str, Any],
     normalize_message: Optional[Callable[[str], str]] = None,
 ) -> AssistantQuestionReplayPlan:
@@ -292,7 +298,7 @@ def _derived_transcript_index(
     candidates: Sequence[ReplayTraceQuestion],
     claimed_event_ids: set[str],
     normalize_message: Optional[Callable[[str], str]],
-) -> Mapping[str, deque[str]]:
+) -> Mapping[str, list[str]]:
     """Index unclaimed trace events by the transcript text they would produce.
 
     This reproduces the exact transformation that wrote the row rather than
@@ -300,7 +306,7 @@ def _derived_transcript_index(
     ``build_assistant_transcript_content`` is deterministic.
     """
 
-    index: dict[str, deque[str]] = defaultdict(deque)
+    index: dict[str, list[str]] = defaultdict(list)
     for trace in candidates:
         if trace.event_id in claimed_event_ids:
             continue
@@ -313,7 +319,8 @@ def _derived_transcript_index(
                 # the way it did before the fix rather than mispairing it.
                 logger.warning(
                     "Could not normalize trace %s for question pairing; "
-                    "its transcript row may replay twice",
+                    "falling back to its raw text, which pairs only if the "
+                    "row was written before any reconciliation applied",
                     trace.event_id,
                     exc_info=True,
                 )
