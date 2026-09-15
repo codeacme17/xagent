@@ -70,6 +70,9 @@ DOWNSTREAM_RESUME_KWARGS: dict[str, Any] = {
 
 # Keywords #2318 removed. Listed so the removal stays a documented decision
 # rather than something a future reader has to reconstruct from git history.
+# A compat shim that re-accepts these exact names is a deliberate contract
+# change: relax ``test_removed_resume_kwargs_do_not_bind`` and update
+# ``EXPECTED_RESUME_PARAMETERS`` in the same commit as the shim.
 REMOVED_RESUME_KWARGS = ("delivery_websocket", "delivery_client_message_id")
 
 EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
