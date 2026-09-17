@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import logging
 import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, exists, select
+from sqlalchemy.orm import aliased
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
@@ -1062,7 +1064,15 @@ def test_registered_hook_classifies_external_tasks_in_counts_filters_and_detail(
             "widget_agent_id": int(task.agent_id),
         }
 
-    hooks.set_external_task_source_hook(_widget_session_predicate)
+    def _source_hook(_db: Any) -> list[tuple[Any, str]]:
+        return [
+            # Only the legacy row carries guest_id. If the hook ever ran against
+            # non-external rows this branch would relabel it Shareable Link.
+            (Task.agent_config["guest_id"].as_string().isnot(None), "shared_link"),
+            *_widget_session_predicate(_db),
+        ]
+
+    hooks.set_external_task_source_hook(_source_hook)
     hooks.set_external_task_context_hook(_context_hook)
 
     response = client.get("/api/conversation-logs", headers=headers)
@@ -1118,6 +1128,9 @@ def test_registered_hook_classifies_external_tasks_in_counts_filters_and_detail(
         f"/api/conversation-logs/{legacy_widget_task_id}", headers=headers
     )
     assert legacy_detail.status_code == 200, legacy_detail.text
+    # The detail path gates the hook in Python; without that gate the guest_id
+    # branch would relabel this row Shareable Link.
+    assert legacy_detail.json()["log"]["source"] == "widget"
     assert legacy_detail.json()["metadata"]["public_context"] == {
         "guest_id": "guest-legacy",
         "auth_mode": "widget",
@@ -1195,7 +1208,7 @@ def test_failing_source_hook_degrades_to_rest_api_default(
     assert detail.json()["metadata"]["public_context"] is None
 
 
-def test_source_hook_branches_apply_in_registration_order(
+def test_source_hook_branches_apply_in_returned_list_order(
     _reset_external_task_hooks: Any,
 ) -> None:
     hooks = _reset_external_task_hooks
@@ -1261,6 +1274,16 @@ def test_source_hook_branches_apply_in_registration_order(
             ],
             id="unhashable-ui-source",
         ),
+        # A bare cross-table comparison would cartesian-join the list query and
+        # make the detail query return several rows.
+        pytest.param([(Task.id == TriggerRun.task_id, "widget")], id="cross-table"),
+        # A VARCHAR expression. SQLite coerces it as a CASE condition (the
+        # marker value below starts with a digit so it coerces truthy);
+        # PostgreSQL rejects it at execute time.
+        pytest.param(
+            [(Task.agent_config["widget_session_id"].as_string(), "widget")],
+            id="non-boolean",
+        ),
     ],
 )
 def test_malformed_source_hook_entries_degrade_to_rest_api_default(
@@ -1276,8 +1299,19 @@ def test_malformed_source_hook_entries_degrade_to_rest_api_default(
         source="external",
         is_visible=False,
         agent_id=agent_id,
-        agent_config={"widget_session_id": "ws-4"},
+        agent_config={"widget_session_id": "7ws-4"},
     )
+    # Two linked rows: a cross-table predicate that slipped through would
+    # cartesian-join them, doubling the list and making the detail query
+    # return two rows.
+    for event_id in ("evt-a", "evt-b"):
+        _attach_trigger_run(
+            user_id=admin_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type="scheduled",
+            source_event_id=event_id,
+        )
 
     hooks.set_external_task_source_hook(lambda _db: malformed_branches)
 
@@ -1354,3 +1388,137 @@ def test_malformed_source_hook_entry_does_not_discard_valid_branches(
     detail = client.get(f"/api/conversation-logs/{widget_task_id}", headers=headers)
     assert detail.status_code == 200, detail.text
     assert detail.json()["log"]["source"] == "widget"
+
+
+@pytest.mark.parametrize(
+    "build_predicate",
+    [
+        pytest.param(
+            lambda: exists().where(TriggerRun.task_id == Task.id), id="exists"
+        ),
+        pytest.param(lambda: Task.id.in_(select(TriggerRun.task_id)), id="in-subquery"),
+    ],
+)
+def test_self_contained_cross_table_predicates_classify_external_tasks(
+    _reset_external_task_hooks: Any, build_predicate: Any
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Cross Table Agent")
+    linked_task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task with a linked row",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    # Stands in for the deployment's widget-session linkage table.
+    _attach_trigger_run(
+        user_id=admin_id,
+        agent_id=agent_id,
+        task_id=linked_task_id,
+        trigger_type="scheduled",
+        source_event_id="evt-linked",
+    )
+    unlinked_task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task without a linked row",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    hooks.set_external_task_source_hook(lambda _db: [(build_predicate(), "widget")])
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_counts"] == {
+        "all": 2,
+        "widget": 1,
+        "rest_api": 1,
+        "shared_link": 0,
+        "webhook": 0,
+    }
+    by_id = {item["task_id"]: item["source"] for item in body["logs"]}
+    assert by_id == {linked_task_id: "widget", unlinked_task_id: "rest_api"}
+
+    linked_detail = client.get(
+        f"/api/conversation-logs/{linked_task_id}", headers=headers
+    )
+    assert linked_detail.status_code == 200, linked_detail.text
+    assert linked_detail.json()["log"]["source"] == "widget"
+    unlinked_detail = client.get(
+        f"/api/conversation-logs/{unlinked_task_id}", headers=headers
+    )
+    assert unlinked_detail.status_code == 200, unlinked_detail.text
+    assert unlinked_detail.json()["log"]["source"] == "rest_api"
+
+
+def test_source_hook_returning_none_means_no_branches(
+    _reset_external_task_hooks: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="None Hook Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task behind a None-returning hook",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    hooks.set_external_task_source_hook(lambda _db: None)
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.conversation_logs"):
+        response = client.get("/api/conversation-logs", headers=headers)
+        detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["rest_api"] == 1
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "xagent.web.api.conversation_logs" and r.levelno >= logging.WARNING
+    ]
+
+
+def test_validator_rejects_non_boolean_and_cross_table_predicates(
+    _reset_external_task_hooks: Any,
+) -> None:
+    from xagent.web.api.conversation_logs import (
+        _validated_external_source_branches,
+    )
+
+    hooks = _reset_external_task_hooks
+    valid = Task.agent_config["widget_session_id"].as_string().isnot(None)
+    hooks.set_external_task_source_hook(
+        lambda _db: [
+            (Task.title, "widget"),
+            (Task.agent_config["widget_session_id"].as_string(), "widget"),
+            (Task.id == TriggerRun.task_id, "widget"),
+            (aliased(Task).source == "external", "widget"),
+            (exists().where(TriggerRun.task_id == Task.id), "shared_link"),
+            (Task.is_visible, "rest_api"),
+            (valid, "widget"),
+        ]
+    )
+
+    db = _direct_db_session()
+    try:
+        branches = _validated_external_source_branches(db)
+    finally:
+        db.close()
+
+    assert [ui_source for _, ui_source in branches] == [
+        "shared_link",
+        "rest_api",
+        "widget",
+    ]
+    # A bare boolean ORM column is accepted once unwrapped to its Column.
+    assert str(branches[1][0]) == "tasks.is_visible"
+    assert branches[2][0] is valid

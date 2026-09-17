@@ -23,23 +23,34 @@ if TYPE_CHECKING:
 
 EXTERNAL_TASK_SOURCE = "external"
 
-# Hook signature: (db: Session) -> Sequence[tuple[<SQL predicate>, ui_source]]
-# Each pair is a SQLAlchemy boolean expression over ``Task`` columns and the UI
-# source ("widget", "rest_api", "shared_link", "webhook") it selects. The
-# Conversation Logs query evaluates the pairs in order inside its
-# classification CASE, restricted to rows whose stored source is "external";
-# rows no predicate matches fall back to "rest_api". The hook is SQL-shaped so
-# per-source counts, channel filters and pagination stay in the database
-# instead of loading every task to classify it in Python. A predicate may
-# reference ``Task`` columns directly; anything in another table must be
-# reached through a self-contained subquery -- ``exists().where(Other.task_id
-# == Task.id)`` or ``Task.id.in_(subquery)`` -- because the consuming queries
-# join different tables and a bare cross-table comparison would multiply rows.
-# Entries that are not a ``(SQL expression, "widget" | "rest_api" |
-# "shared_link")`` pair (tuple or list) are skipped one at a time with a
-# warning, and a hook that raises is treated as unregistered. Application layers inject it via
-# set_external_task_source_hook().
-ExternalTaskSourceHook = Callable[[Session], Sequence[tuple[Any, str]]]
+# Hook signature:
+#     (db: Session) -> Sequence[tuple[<SQL predicate>, ui_source]] | None
+# Each pair is a boolean SQLAlchemy expression over ``Task`` columns and the UI
+# source ("widget", "rest_api" or "shared_link") it selects. The Conversation
+# Logs query evaluates the pairs in the order the returned list holds them
+# inside its classification CASE, restricted to rows whose stored source is
+# "external"; rows no predicate matches fall back to "rest_api". ``None`` means
+# "no branches". The hook is SQL-shaped so per-source counts, channel filters
+# and pagination stay in the database instead of loading every task to
+# classify it in Python. A predicate may reference ``Task`` columns directly;
+# anything in another table must be reached through a self-contained subquery
+# -- ``exists().where(Other.task_id == Task.id)`` or ``Task.id.in_(subquery)``
+# -- because the consuming queries join different tables and a bare
+# cross-table comparison would multiply rows. The consumer validates the
+# shape of each entry, not its semantics: a predicate that is not
+# boolean-typed (wrap SQL functions with ``type_=Boolean`` or
+# ``cast(..., Boolean)``), one that adds a FROM entry other than the ``tasks``
+# table (another table or a ``Task`` alias), or an entry that is not a
+# ``(predicate, ui_source)`` pair (tuple or list), is skipped one at a time
+# with a warning; a hook that raises is treated as unregistered.
+#
+# READ-ONLY CONTRACT: both hooks run inside a GET request on the caller-owned
+# ``db`` session. They may query through it but must not add, flush, commit,
+# roll back or close it.
+#
+# Application layers inject it via set_external_task_source_hook(). Only one
+# hook of each kind is held: a later set_* call replaces the earlier one.
+ExternalTaskSourceHook = Callable[[Session], Sequence[tuple[Any, str]] | None]
 _external_task_source_hook: ExternalTaskSourceHook | None = None
 
 # Hook signature: (db: Session, task: Task, ui_source: str) -> dict | None
@@ -47,8 +58,8 @@ _external_task_source_hook: ExternalTaskSourceHook | None = None
 # for example the widget session and end-user the task belongs to. ``None``
 # means "no deployment context"; external rows never fall back to the
 # agent_config-derived context of the legacy widget/share transports because
-# the session transport does not populate those keys. Application layers
-# inject it via set_external_task_context_hook().
+# the session transport does not populate those keys. Same read-only contract
+# as above. Application layers inject it via set_external_task_context_hook().
 ExternalTaskContextHook = Callable[[Session, "Task", str], dict[str, Any] | None]
 _external_task_context_hook: ExternalTaskContextHook | None = None
 
@@ -62,7 +73,8 @@ def external_task_source_branches(db: Session) -> list[tuple[Any, str]]:
     """Return the deployment's ``(predicate, ui_source)`` pairs, in order."""
     if _external_task_source_hook is None:
         return []
-    return list(_external_task_source_hook(db))
+    branches = _external_task_source_hook(db)
+    return [] if branches is None else list(branches)
 
 
 def set_external_task_context_hook(hook: ExternalTaskContextHook | None) -> None:

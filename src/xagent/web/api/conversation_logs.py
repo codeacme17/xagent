@@ -6,9 +6,10 @@ from datetime import timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, aliased, selectinload
 from sqlalchemy.sql import ColumnElement
+from sqlalchemy.types import Boolean
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
@@ -124,14 +125,15 @@ def _stored_source(task: Task) -> str:
 def _validated_external_source_branches(
     db: Session,
 ) -> list[tuple[ColumnElement[bool], str]]:
-    """Deployment ``(predicate, ui_source)`` pairs, validated in hook order.
+    """Deployment ``(predicate, ui_source)`` pairs, in the order the hook returns them.
 
     Two-tier fail-soft, matching the hook contract in
     ``services.conversation_log_sources``: a hook that raises is treated as
-    unregistered, and an entry that is not a ``(SQL predicate, known
-    ui_source)`` pair is skipped on its own so the deployment's other branches
-    still apply. Rows that only a skipped branch would have matched fall back
-    to the REST API default instead of the page going down.
+    unregistered, and an entry that is not a ``(boolean SQL predicate over
+    tasks, known ui_source)`` pair is skipped on its own so the
+    deployment's other branches still apply. Rows that only a skipped branch
+    would have matched fall back to the REST API default instead of the page
+    going down.
     """
     try:
         entries = external_task_source_branches(db)
@@ -140,29 +142,88 @@ def _validated_external_source_branches(
         return []
     branches: list[tuple[ColumnElement[bool], str]] = []
     for entry in entries:
-        if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+        try:
+            branch = _validated_source_branch(entry)
+        except Exception:
+            # Hook-supplied objects run their own code inside the checks
+            # (``__clause_element__``, SQL compilation); a failure there is a
+            # malformed entry, not a page outage.
             logger.warning(
-                "Ignoring malformed external task source branch %r: expected a "
-                "(predicate, ui_source) pair",
+                "Ignoring external task source branch %r: validation raised",
                 entry,
+                exc_info=True,
             )
             continue
-        predicate, ui_source = entry
-        if not isinstance(predicate, ColumnElement):
-            logger.warning(
-                "Ignoring external task source branch: predicate %r is not a "
-                "SQL expression",
-                predicate,
-            )
-            continue
-        if not isinstance(ui_source, str) or ui_source not in EXTERNAL_HOOK_UI_SOURCES:
-            logger.warning(
-                "Ignoring external task source branch with unsupported ui_source %r",
-                ui_source,
-            )
-            continue
-        branches.append((predicate, ui_source))
+        if branch is not None:
+            branches.append(branch)
     return branches
+
+
+def _validated_source_branch(entry: Any) -> tuple[ColumnElement[bool], str] | None:
+    """Return ``entry`` as a validated branch, or ``None`` after logging why not."""
+    if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+        logger.warning(
+            "Ignoring malformed external task source branch %r: expected a "
+            "(predicate, ui_source) pair",
+            entry,
+        )
+        return None
+    predicate, ui_source = entry
+    # ORM attributes such as ``Task.is_visible`` are InstrumentedAttribute
+    # proxies, not ColumnElements; unwrap them so bare columns are judged by
+    # their SQL type like any other expression.
+    clause_element = getattr(predicate, "__clause_element__", None)
+    if callable(clause_element):
+        predicate = clause_element()
+    if not isinstance(predicate, ColumnElement):
+        logger.warning(
+            "Ignoring external task source branch: predicate %r is not a "
+            "SQL expression",
+            predicate,
+        )
+        return None
+    if not isinstance(predicate.type, Boolean):
+        # SQLite coerces a non-boolean CASE condition; PostgreSQL raises
+        # "argument of CASE/WHEN must be type boolean" at execute time.
+        logger.warning(
+            "Ignoring external task source branch: predicate %s is not "
+            "boolean-typed (wrap functions with type_=Boolean or cast(Boolean))",
+            predicate,
+        )
+        return None
+    foreign_froms = _foreign_from_names(predicate)
+    if foreign_froms:
+        # A bare cross-table comparison (or a Task alias) adds that FROM entry
+        # to both the list query and the detail query and cartesian-joins
+        # them; other tables must be reached through exists() or in_(subquery).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s adds %s to "
+            "FROM; only the tasks table may appear",
+            predicate,
+            ", ".join(foreign_froms),
+        )
+        return None
+    if not isinstance(ui_source, str) or ui_source not in EXTERNAL_HOOK_UI_SOURCES:
+        logger.warning(
+            "Ignoring external task source branch with unsupported ui_source %r",
+            ui_source,
+        )
+        return None
+    return predicate, ui_source
+
+
+def _foreign_from_names(predicate: ColumnElement[bool]) -> list[str]:
+    """Names of FROM entries other than the ``tasks`` table that ``predicate`` adds.
+
+    Correlated ``exists()`` contributes no FROM entries and ``in_(subquery)``
+    contributes only ``tasks``; a bare ``Task.x == Other.y`` contributes both,
+    and an ``aliased(Task)`` contributes a second ``tasks`` alias.
+    """
+    return [
+        str(getattr(source, "description", None) or source)
+        for source in select(predicate).get_final_froms()
+        if source is not Task.__table__
+    ]
 
 
 def _external_ui_source_case(
