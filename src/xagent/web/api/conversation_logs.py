@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.sql import ColumnElement
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
@@ -17,6 +18,11 @@ from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.conversation_log_sources import (
+    EXTERNAL_TASK_SOURCE,
+    external_task_public_context,
+    external_task_source_branches,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -57,7 +63,19 @@ DIRECT_SOURCE_TO_UI_SOURCE = {
 TRIGGER_TYPE_TO_UI_SOURCE = {
     "webhook": SOURCE_WEBHOOK,
 }
-EXTERNAL_TASK_SOURCES = {*DIRECT_SOURCE_TO_UI_SOURCE, "trigger"}
+# ``external`` is stamped by the deployment layer's session transport and
+# covers both REST/SDK and widget-session tasks; the deployment classifies it
+# through ``services.conversation_log_sources`` and unclassified rows default
+# to REST API so they are never dropped from the page.
+EXTERNAL_DEFAULT_UI_SOURCE = SOURCE_REST_API
+# Webhook is excluded: its detail view expects a TriggerRun, which external
+# rows never have.
+EXTERNAL_HOOK_UI_SOURCES = {SOURCE_WIDGET, SOURCE_REST_API, SOURCE_SHARED_LINK}
+EXTERNAL_TASK_SOURCES = {
+    *DIRECT_SOURCE_TO_UI_SOURCE,
+    "trigger",
+    EXTERNAL_TASK_SOURCE,
+}
 
 
 def _status_value(task: Task) -> str:
@@ -99,8 +117,76 @@ def _ui_source_from_values(source: str, trigger_type: str | None) -> str | None:
     return None
 
 
+def _stored_source(task: Task) -> str:
+    return str(getattr(task, "source", "") or "")
+
+
+def _validated_external_source_branches(
+    db: Session,
+) -> list[tuple[ColumnElement[bool], str]]:
+    """Deployment ``(predicate, ui_source)`` pairs, validated in hook order.
+
+    A hook that raises, or an entry that is not a ``(SQL predicate,
+    known ui_source)`` pair, degrades to "no branch" so a broken deployment
+    classifier shows external rows under the REST API default instead of
+    taking the whole page down.
+    """
+    branches: list[tuple[ColumnElement[bool], str]] = []
+    try:
+        for entry in external_task_source_branches(db):
+            predicate, ui_source = entry
+            if not isinstance(predicate, ColumnElement):
+                logger.warning(
+                    "Ignoring external task source branch: predicate %r is not a "
+                    "SQL expression",
+                    predicate,
+                )
+                continue
+            if ui_source not in EXTERNAL_HOOK_UI_SOURCES:
+                logger.warning(
+                    "Ignoring external task source branch with unsupported "
+                    "ui_source %r",
+                    ui_source,
+                )
+                continue
+            branches.append((predicate, ui_source))
+    except Exception:
+        logger.exception("External task source hook failed; using default")
+        return []
+    return branches
+
+
+def _external_ui_source_case(
+    branches: Sequence[tuple[ColumnElement[bool], str]],
+) -> Any:
+    """Classification of a ``source="external"`` row; shared by list and detail.
+
+    Returns the plain default when no branch is registered: ``case()`` needs
+    at least one WHEN arm, and a bare bound parameter is what the existing
+    arms already use.
+    """
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    return case(*branches, else_=EXTERNAL_DEFAULT_UI_SOURCE)
+
+
+def _external_ui_source_for_task(db: Session, task: Task) -> str:
+    branches = _validated_external_source_branches(db)
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    ui_source = (
+        db.query(_external_ui_source_case(branches))
+        .select_from(Task)
+        .filter(Task.id == int(task.id))
+        .scalar()
+    )
+    return str(ui_source or EXTERNAL_DEFAULT_UI_SOURCE)
+
+
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
-    source = str(getattr(task, "source", "") or "")
+    source = _stored_source(task)
+    if source == EXTERNAL_TASK_SOURCE:
+        return _external_ui_source_for_task(db, task)
     return _ui_source_from_values(source, _trigger_type_for_task(db, task))
 
 
@@ -187,6 +273,10 @@ def _conversation_source_query(
             )
             for trigger_type_value, ui_source in TRIGGER_TYPE_TO_UI_SOURCE.items()
         ],
+        (
+            Task.source == EXTERNAL_TASK_SOURCE,
+            _external_ui_source_case(_validated_external_source_branches(db)),
+        ),
         else_=None,
     ).label("ui_source")
 
@@ -399,7 +489,17 @@ def _serialize_trigger_metadata(
     }
 
 
-def _serialize_public_context(task: Task, ui_source: str) -> dict[str, Any] | None:
+def _serialize_public_context(
+    db: Session, task: Task, ui_source: str
+) -> dict[str, Any] | None:
+    if _stored_source(task) == EXTERNAL_TASK_SOURCE:
+        # The session transport does not populate agent_config with widget or
+        # share details, so external rows carry only deployment-provided context.
+        try:
+            return external_task_public_context(db, task, ui_source)
+        except Exception:
+            logger.exception("External task context hook failed; omitting context")
+            return None
     config = _agent_config(task)
     if ui_source == SOURCE_WIDGET:
         return {
@@ -594,7 +694,7 @@ async def get_conversation_log_detail(
                 "description": task.description,
             },
             "trigger": _serialize_trigger_metadata(db, task),
-            "public_context": _serialize_public_context(task, ui_source),
+            "public_context": _serialize_public_context(db, task, ui_source),
         },
         "read_only": True,
     }

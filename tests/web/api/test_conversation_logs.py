@@ -14,6 +14,7 @@ from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
+from xagent.web.services import conversation_log_sources as external_source_hooks
 
 from .conftest import (
     _admin_headers,
@@ -943,3 +944,370 @@ def test_compaction_notice_sorts_between_messages_on_equal_timestamp() -> None:
         "compaction",
         "chat",
     ]
+
+
+@pytest.fixture(autouse=True)
+def _reset_external_task_hooks():
+    hooks = external_source_hooks
+    hooks.set_external_task_source_hook(None)
+    hooks.set_external_task_context_hook(None)
+    try:
+        yield hooks
+    finally:
+        hooks.set_external_task_source_hook(None)
+        hooks.set_external_task_context_hook(None)
+
+
+def _widget_session_predicate(_db: Any) -> list[tuple[Any, str]]:
+    return [
+        (
+            Task.agent_config["widget_session_id"].as_string().isnot(None),
+            "widget",
+        )
+    ]
+
+
+def test_unclassified_external_tasks_are_listed_under_rest_api() -> None:
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="External Agent")
+    external_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Session transport task",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    sdk_task_id = _create_task_row(
+        user_id=admin_id,
+        title="SDK task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert {item["task_id"] for item in body["logs"]} == {
+        external_task_id,
+        sdk_task_id,
+    }
+    assert body["source_counts"] == {
+        "all": 2,
+        "widget": 0,
+        "rest_api": 2,
+        "shared_link": 0,
+        "webhook": 0,
+    }
+    by_id = {item["task_id"]: item for item in body["logs"]}
+    assert by_id[external_task_id]["source"] == "rest_api"
+    assert by_id[external_task_id]["stored_source"] == "external"
+
+    filtered = client.get("/api/conversation-logs?source=widget", headers=headers)
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["logs"] == []
+
+    detail = client.get(f"/api/conversation-logs/{external_task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+    assert detail.json()["metadata"]["public_context"] is None
+
+
+def test_registered_hook_classifies_external_tasks_in_counts_filters_and_detail(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Session Widget Agent")
+    widget_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Widget session visitor",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-1"},
+    )
+    api_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Client application task",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    legacy_widget_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Legacy widget visitor",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+        # Carries the hook marker too: the hook must only ever see external
+        # rows, so the legacy row keeps its agent_config-derived context.
+        agent_config={"guest_id": "guest-legacy", "widget_session_id": "ws-legacy"},
+        channel_name="Web Widget",
+    )
+
+    context_calls: list[tuple[int, str]] = []
+
+    def _context_hook(_db: Any, task: Task, ui_source: str) -> dict[str, Any] | None:
+        context_calls.append((int(task.id), ui_source))
+        session_id = (task.agent_config or {}).get("widget_session_id")
+        if ui_source != "widget" or not session_id:
+            return None
+        return {
+            "auth_mode": "widget_session",
+            "channel_name": "Session Widget",
+            "widget_session_id": session_id,
+            "widget_agent_id": int(task.agent_id),
+        }
+
+    hooks.set_external_task_source_hook(_widget_session_predicate)
+    hooks.set_external_task_context_hook(_context_hook)
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_counts"] == {
+        "all": 3,
+        "widget": 2,
+        "rest_api": 1,
+        "shared_link": 0,
+        "webhook": 0,
+    }
+    by_id = {item["task_id"]: item for item in body["logs"]}
+    assert by_id[widget_task_id]["source"] == "widget"
+    assert by_id[widget_task_id]["source_label"] == "Widget"
+    assert by_id[api_task_id]["source"] == "rest_api"
+    assert by_id[legacy_widget_task_id]["source"] == "widget"
+
+    widget_filtered = client.get(
+        "/api/conversation-logs?source=widget", headers=headers
+    )
+    assert widget_filtered.status_code == 200, widget_filtered.text
+    assert {item["task_id"] for item in widget_filtered.json()["logs"]} == {
+        widget_task_id,
+        legacy_widget_task_id,
+    }
+    assert widget_filtered.json()["pagination"]["total"] == 2
+
+    rest_filtered = client.get(
+        "/api/conversation-logs?source=rest_api", headers=headers
+    )
+    assert rest_filtered.status_code == 200, rest_filtered.text
+    assert [item["task_id"] for item in rest_filtered.json()["logs"]] == [api_task_id]
+
+    widget_detail = client.get(
+        f"/api/conversation-logs/{widget_task_id}", headers=headers
+    )
+    assert widget_detail.status_code == 200, widget_detail.text
+    assert widget_detail.json()["log"]["source"] == "widget"
+    assert widget_detail.json()["metadata"]["public_context"] == {
+        "auth_mode": "widget_session",
+        "channel_name": "Session Widget",
+        "widget_session_id": "ws-1",
+        "widget_agent_id": agent_id,
+    }
+
+    api_detail = client.get(f"/api/conversation-logs/{api_task_id}", headers=headers)
+    assert api_detail.status_code == 200, api_detail.text
+    assert api_detail.json()["log"]["source"] == "rest_api"
+    assert api_detail.json()["metadata"]["public_context"] is None
+
+    legacy_detail = client.get(
+        f"/api/conversation-logs/{legacy_widget_task_id}", headers=headers
+    )
+    assert legacy_detail.status_code == 200, legacy_detail.text
+    assert legacy_detail.json()["metadata"]["public_context"] == {
+        "guest_id": "guest-legacy",
+        "auth_mode": "widget",
+        "channel_name": "Web Widget",
+        "widget_agent_id": None,
+    }
+    # The context hook only runs for external rows; legacy rows keep the
+    # agent_config-derived context.
+    assert {task_id for task_id, _ in context_calls} == {widget_task_id, api_task_id}
+
+
+def test_source_hook_branches_with_unknown_ui_source_are_ignored(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Unknown Source Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Mislabelled external task",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-2"},
+    )
+
+    hooks.set_external_task_source_hook(
+        lambda _db: [
+            (Task.agent_config["widget_session_id"].as_string().isnot(None), "slack")
+        ]
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["rest_api"] == 1
+    assert response.json()["source_counts"]["all"] == 1
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+
+
+def test_failing_source_hook_degrades_to_rest_api_default(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Broken Hook Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task behind a broken classifier",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    def _broken_source_hook(_db: Any) -> list[tuple[Any, str]]:
+        raise RuntimeError("deployment classifier is down")
+
+    def _broken_context_hook(_db: Any, _task: Task, _ui: str) -> dict[str, Any]:
+        raise RuntimeError("deployment context is down")
+
+    hooks.set_external_task_source_hook(_broken_source_hook)
+    hooks.set_external_task_context_hook(_broken_context_hook)
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["rest_api"] == 1
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+    assert detail.json()["metadata"]["public_context"] is None
+
+
+def test_source_hook_branches_apply_in_registration_order(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Ordered Hook Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Matches both predicates",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-3", "share_token": "tok"},
+    )
+
+    hooks.set_external_task_source_hook(
+        lambda _db: [
+            (Task.agent_config["share_token"].as_string().isnot(None), "shared_link"),
+            (Task.agent_config["widget_session_id"].as_string().isnot(None), "widget"),
+        ]
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["shared_link"] == 1
+    assert response.json()["source_counts"]["widget"] == 0
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "shared_link"
+
+
+@pytest.mark.parametrize(
+    "malformed_branches",
+    [
+        pytest.param(
+            [
+                (
+                    Task.agent_config["widget_session_id"].as_string().isnot(None),
+                    "widget",
+                    1,
+                )
+            ],
+            id="three-tuple",
+        ),
+        pytest.param(["widget"], id="bare-string-entry"),
+        pytest.param([("tasks.source = 'external'", "widget")], id="string-predicate"),
+        pytest.param(
+            [
+                (
+                    Task.agent_config["widget_session_id"].as_string().isnot(None),
+                    "webhook",
+                )
+            ],
+            id="webhook-not-allowed",
+        ),
+    ],
+)
+def test_malformed_source_hook_entries_degrade_to_rest_api_default(
+    _reset_external_task_hooks: Any, malformed_branches: list[Any]
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Malformed Hook Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task behind a malformed classifier",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-4"},
+    )
+
+    hooks.set_external_task_source_hook(lambda _db: malformed_branches)
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source_counts"] == {
+        "all": 1,
+        "widget": 0,
+        "rest_api": 1,
+        "shared_link": 0,
+        "webhook": 0,
+    }
+    assert [item["task_id"] for item in body["logs"]] == [task_id]
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+
+
+def test_external_widget_row_without_deployment_context_has_no_public_context(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Contextless Widget Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Widget session without context",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-5"},
+    )
+    hooks.set_external_task_source_hook(_widget_session_predicate)
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "widget"
+    # No agent_config-derived fallback: the session transport never sets those keys.
+    assert detail.json()["metadata"]["public_context"] is None
