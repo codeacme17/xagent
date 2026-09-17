@@ -126,33 +126,42 @@ def _validated_external_source_branches(
 ) -> list[tuple[ColumnElement[bool], str]]:
     """Deployment ``(predicate, ui_source)`` pairs, validated in hook order.
 
-    A hook that raises, or an entry that is not a ``(SQL predicate,
-    known ui_source)`` pair, degrades to "no branch" so a broken deployment
-    classifier shows external rows under the REST API default instead of
-    taking the whole page down.
+    Two-tier fail-soft, matching the hook contract in
+    ``services.conversation_log_sources``: a hook that raises is treated as
+    unregistered, and an entry that is not a ``(SQL predicate, known
+    ui_source)`` pair is skipped on its own so the deployment's other branches
+    still apply. Rows that only a skipped branch would have matched fall back
+    to the REST API default instead of the page going down.
     """
-    branches: list[tuple[ColumnElement[bool], str]] = []
     try:
-        for entry in external_task_source_branches(db):
-            predicate, ui_source = entry
-            if not isinstance(predicate, ColumnElement):
-                logger.warning(
-                    "Ignoring external task source branch: predicate %r is not a "
-                    "SQL expression",
-                    predicate,
-                )
-                continue
-            if ui_source not in EXTERNAL_HOOK_UI_SOURCES:
-                logger.warning(
-                    "Ignoring external task source branch with unsupported "
-                    "ui_source %r",
-                    ui_source,
-                )
-                continue
-            branches.append((predicate, ui_source))
+        entries = external_task_source_branches(db)
     except Exception:
         logger.exception("External task source hook failed; using default")
         return []
+    branches: list[tuple[ColumnElement[bool], str]] = []
+    for entry in entries:
+        if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+            logger.warning(
+                "Ignoring malformed external task source branch %r: expected a "
+                "(predicate, ui_source) pair",
+                entry,
+            )
+            continue
+        predicate, ui_source = entry
+        if not isinstance(predicate, ColumnElement):
+            logger.warning(
+                "Ignoring external task source branch: predicate %r is not a "
+                "SQL expression",
+                predicate,
+            )
+            continue
+        if not isinstance(ui_source, str) or ui_source not in EXTERNAL_HOOK_UI_SOURCES:
+            logger.warning(
+                "Ignoring external task source branch with unsupported ui_source %r",
+                ui_source,
+            )
+            continue
+        branches.append((predicate, ui_source))
     return branches
 
 

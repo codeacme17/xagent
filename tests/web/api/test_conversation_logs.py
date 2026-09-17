@@ -1252,6 +1252,15 @@ def test_source_hook_branches_apply_in_registration_order(
             ],
             id="webhook-not-allowed",
         ),
+        pytest.param(
+            [
+                (
+                    Task.agent_config["widget_session_id"].as_string().isnot(None),
+                    ["widget"],
+                )
+            ],
+            id="unhashable-ui-source",
+        ),
     ],
 )
 def test_malformed_source_hook_entries_degrade_to_rest_api_default(
@@ -1311,3 +1320,37 @@ def test_external_widget_row_without_deployment_context_has_no_public_context(
     assert detail.json()["log"]["source"] == "widget"
     # No agent_config-derived fallback: the session transport never sets those keys.
     assert detail.json()["metadata"]["public_context"] is None
+
+
+def test_malformed_source_hook_entry_does_not_discard_valid_branches(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Mixed Hook Agent")
+    widget_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Widget session next to a malformed entry",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"widget_session_id": "ws-6"},
+    )
+
+    hooks.set_external_task_source_hook(
+        lambda _db: [
+            "not-a-pair",
+            (Task.agent_config["widget_session_id"].as_string().isnot(None), "widget"),
+            (Task.agent_config["share_token"].as_string().isnot(None), "widget", 1),
+        ]
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["widget"] == 1
+    assert response.json()["source_counts"]["rest_api"] == 0
+
+    detail = client.get(f"/api/conversation-logs/{widget_task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "widget"

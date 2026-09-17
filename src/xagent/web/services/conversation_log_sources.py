@@ -36,8 +36,8 @@ EXTERNAL_TASK_SOURCE = "external"
 # == Task.id)`` or ``Task.id.in_(subquery)`` -- because the consuming queries
 # join different tables and a bare cross-table comparison would multiply rows.
 # Entries that are not a ``(SQL expression, "widget" | "rest_api" |
-# "shared_link")`` pair are skipped with a warning, and a hook that raises is
-# treated as unregistered. Application layers inject it via
+# "shared_link")`` pair (tuple or list) are skipped one at a time with a
+# warning, and a hook that raises is treated as unregistered. Application layers inject it via
 # set_external_task_source_hook().
 ExternalTaskSourceHook = Callable[[Session], Sequence[tuple[Any, str]]]
 _external_task_source_hook: ExternalTaskSourceHook | None = None
