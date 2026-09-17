@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import event, exists, select
-from sqlalchemy.orm import aliased
+from sqlalchemy import and_, column, event, exists, literal_column, select, text
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy.types import Boolean
 
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
@@ -17,6 +18,9 @@ from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 from xagent.web.services import conversation_log_sources as external_source_hooks
+from xagent.web.services.task_runtime import (
+    MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+)
 
 from .conftest import (
     _admin_headers,
@@ -1208,8 +1212,15 @@ def test_failing_source_hook_degrades_to_rest_api_default(
     assert detail.json()["metadata"]["public_context"] is None
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param("shared_link", "widget", id="alphabetical"),
+        pytest.param("widget", "shared_link", id="reversed"),
+    ],
+)
 def test_source_hook_branches_apply_in_returned_list_order(
-    _reset_external_task_hooks: Any,
+    _reset_external_task_hooks: Any, first: str, second: str
 ) -> None:
     hooks = _reset_external_task_hooks
     headers = _admin_headers()
@@ -1224,21 +1235,23 @@ def test_source_hook_branches_apply_in_returned_list_order(
         agent_config={"widget_session_id": "ws-3", "share_token": "tok"},
     )
 
+    # Both predicates match the row; the first listed pair must win
+    # regardless of how the ui_source strings sort.
     hooks.set_external_task_source_hook(
         lambda _db: [
-            (Task.agent_config["share_token"].as_string().isnot(None), "shared_link"),
-            (Task.agent_config["widget_session_id"].as_string().isnot(None), "widget"),
+            (Task.agent_config["share_token"].as_string().isnot(None), first),
+            (Task.agent_config["widget_session_id"].as_string().isnot(None), second),
         ]
     )
 
     response = client.get("/api/conversation-logs", headers=headers)
     assert response.status_code == 200, response.text
-    assert response.json()["source_counts"]["shared_link"] == 1
-    assert response.json()["source_counts"]["widget"] == 0
+    assert response.json()["source_counts"][first] == 1
+    assert response.json()["source_counts"][second] == 0
 
     detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
     assert detail.status_code == 200, detail.text
-    assert detail.json()["log"]["source"] == "shared_link"
+    assert detail.json()["log"]["source"] == first
 
 
 @pytest.mark.parametrize(
@@ -1277,6 +1290,26 @@ def test_source_hook_branches_apply_in_returned_list_order(
         # A bare cross-table comparison would cartesian-join the list query and
         # make the detail query return several rows.
         pytest.param([(Task.id == TriggerRun.task_id, "widget")], id="cross-table"),
+        # Raw SQL declares no FROM entry, so it slips past the FROM check and
+        # fails at execute time on every backend.
+        pytest.param(
+            [(literal_column("tasks.id = trigger_runs.task_id", Boolean), "widget")],
+            id="literal-column",
+        ),
+        pytest.param(
+            [
+                (
+                    and_(
+                        Task.agent_config["widget_session_id"].as_string().isnot(None),
+                        literal_column("tasks.id = trigger_runs.task_id", Boolean),
+                    ),
+                    "widget",
+                )
+            ],
+            id="literal-column-nested",
+        ),
+        # column() is bound to no table either; it renders a bare identifier.
+        pytest.param([(column("trigger_runs_flag", Boolean), "widget")], id="column"),
         # A VARCHAR expression. SQLite coerces it as a CASE condition (the
         # marker value below starts with a digit so it coerces truthy);
         # PostgreSQL rejects it at execute time.
@@ -1522,3 +1555,100 @@ def test_validator_rejects_non_boolean_and_cross_table_predicates(
     # A bare boolean ORM column is accepted once unwrapped to its Column.
     assert str(branches[1][0]) == "tasks.is_visible"
     assert branches[2][0] is valid
+
+
+@contextmanager
+def _count_session_rollbacks():
+    count = {"rollbacks": 0}
+
+    def _after_rollback(_session: Session) -> None:
+        count["rollbacks"] += 1
+
+    event.listen(Session, "after_rollback", _after_rollback)
+    try:
+        yield count
+    finally:
+        event.remove(Session, "after_rollback", _after_rollback)
+
+
+def test_hook_db_failure_rolls_back_the_request_session(
+    _reset_external_task_hooks: Any,
+) -> None:
+    hooks = _reset_external_task_hooks
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Bad Query Hook Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="External task behind a hook that breaks its transaction",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    def _bad_query_source_hook(db: Session) -> list[tuple[Any, str]]:
+        db.execute(text("SELECT 1 FROM no_such_table"))
+        return []
+
+    def _bad_query_context_hook(db: Session, _task: Task, _ui: str) -> None:
+        db.execute(text("SELECT 1 FROM no_such_table"))
+        return None
+
+    hooks.set_external_task_source_hook(_bad_query_source_hook)
+    hooks.set_external_task_context_hook(_bad_query_context_hook)
+
+    # On PostgreSQL the failed statement aborts the request transaction, so the
+    # fail-soft path must roll back before the endpoint issues its own queries.
+    with _count_session_rollbacks() as count:
+        response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_counts"]["rest_api"] == 1
+    assert count["rollbacks"] >= 1
+
+    with _count_session_rollbacks() as count:
+        detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["log"]["source"] == "rest_api"
+    assert detail.json()["metadata"]["public_context"] is None
+    # One rollback for the source hook, one for the context hook.
+    assert count["rollbacks"] >= 2
+
+
+def test_mcp_actor_tasks_stay_out_of_conversation_logs() -> None:
+    headers = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Actor Agent")
+    actor_task_id = _create_task_row(
+        user_id=admin_id,
+        title="MCP OAuth negotiation turn",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True},
+    )
+    session_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Session transport conversation",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: False},
+    )
+    plain_task_id = _create_task_row(
+        user_id=admin_id,
+        title="Session transport conversation without the key",
+        source="external",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+
+    response = client.get("/api/conversation-logs", headers=headers)
+    assert response.status_code == 200, response.text
+    assert {item["task_id"] for item in response.json()["logs"]} == {
+        session_task_id,
+        plain_task_id,
+    }
+    assert response.json()["source_counts"]["all"] == 2
+
+    detail = client.get(f"/api/conversation-logs/{actor_task_id}", headers=headers)
+    assert detail.status_code == 404, detail.text

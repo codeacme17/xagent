@@ -7,8 +7,10 @@ from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, selectinload
-from sqlalchemy.sql import ColumnElement
+from sqlalchemy.sql import ColumnElement, visitors
+from sqlalchemy.sql.elements import ColumnClause, TextClause
 from sqlalchemy.types import Boolean
 
 from ..auth_dependencies import get_current_user
@@ -21,8 +23,8 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.conversation_log_sources import (
     EXTERNAL_TASK_SOURCE,
-    external_task_public_context,
-    external_task_source_branches,
+    get_external_task_public_context,
+    get_external_task_source_branches,
 )
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
@@ -33,6 +35,7 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_runtime import MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
 from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
@@ -118,10 +121,6 @@ def _ui_source_from_values(source: str, trigger_type: str | None) -> str | None:
     return None
 
 
-def _stored_source(task: Task) -> str:
-    return str(getattr(task, "source", "") or "")
-
-
 def _validated_external_source_branches(
     db: Session,
 ) -> list[tuple[ColumnElement[bool], str]]:
@@ -136,15 +135,17 @@ def _validated_external_source_branches(
     going down.
     """
     try:
-        entries = external_task_source_branches(db)
-    except Exception:
+        entries = get_external_task_source_branches(db)
+    except Exception as exc:
         logger.exception("External task source hook failed; using default")
+        _rollback_after_hook_failure(db, exc)
         return []
     branches: list[tuple[ColumnElement[bool], str]] = []
     for entry in entries:
         try:
             branch = _validated_source_branch(entry)
-        except Exception:
+        except Exception as exc:
+            _rollback_after_hook_failure(db, exc)
             # Hook-supplied objects run their own code inside the checks
             # (``__clause_element__``, SQL compilation); a failure there is a
             # malformed entry, not a page outage.
@@ -182,6 +183,18 @@ def _validated_source_branch(entry: Any) -> tuple[ColumnElement[bool], str] | No
             predicate,
         )
         return None
+    raw_sql = _raw_sql_fragments(predicate)
+    if raw_sql:
+        # text() and literal_column() declare no FROM entries, so the check
+        # below cannot see the tables they name; they fail at execute time
+        # instead ("missing FROM-clause entry" on PostgreSQL).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s embeds raw SQL "
+            "%s; build predicates from Task columns and bound parameters",
+            predicate,
+            ", ".join(repr(fragment) for fragment in raw_sql),
+        )
+        return None
     if not isinstance(predicate.type, Boolean):
         # SQLite coerces a non-boolean CASE condition; PostgreSQL raises
         # "argument of CASE/WHEN must be type boolean" at execute time.
@@ -210,6 +223,49 @@ def _validated_source_branch(entry: Any) -> tuple[ColumnElement[bool], str] | No
         )
         return None
     return predicate, ui_source
+
+
+def _rollback_after_hook_failure(db: Session, exc: BaseException) -> None:
+    """Restore the request session after a deployment hook failed on it.
+
+    A hook statement that errors leaves the PostgreSQL transaction aborted,
+    so every later statement in the request would be refused and the
+    fail-soft default could never be rendered. Both endpoints are read-only
+    GETs and call their hooks before any write, so nothing durable is
+    discarded (same reasoning as ``connector_team_scope``'s hook seam). A
+    failure that never reached the database leaves the transaction usable,
+    so only SQLAlchemy errors roll back; this keeps the identity map warm
+    for the rest of the request.
+    """
+    if not isinstance(exc, SQLAlchemyError):
+        return
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "Rolling back after a failed external task hook failed", exc_info=True
+        )
+
+
+def _raw_sql_fragments(predicate: ColumnElement[bool]) -> list[str]:
+    """Raw SQL embedded in ``predicate``: ``text()`` and table-less columns.
+
+    ``literal_column()`` and ``column()`` both produce a ``ColumnClause`` bound
+    to no table, so they contribute no FROM entries and name whatever they
+    like. ``exists()`` renders its projection as ``literal_column("*")``; that
+    one literal is structural and allowed.
+    """
+    fragments: list[str] = []
+    for element in visitors.iterate(predicate):
+        if isinstance(element, TextClause):
+            fragments.append(element.text)
+        elif (
+            isinstance(element, ColumnClause)
+            and element.table is None
+            and element.name != "*"
+        ):
+            fragments.append(str(element.name))
+    return fragments
 
 
 def _foreign_from_names(predicate: ColumnElement[bool]) -> list[str]:
@@ -254,7 +310,7 @@ def _external_ui_source_for_task(db: Session, task: Task) -> str:
 
 
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
-    source = _stored_source(task)
+    source = str(task.source or "")
     if source == EXTERNAL_TASK_SOURCE:
         return _external_ui_source_for_task(db, task)
     return _ui_source_from_values(source, _trigger_type_for_task(db, task))
@@ -273,6 +329,14 @@ def _apply_external_task_scope(query: Any, user: User) -> Any:
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
+        # MCP actor/OAuth-negotiation turns are stored as hidden external
+        # tasks too (``channel_runtime`` selects them by this key). They are
+        # channel plumbing, not conversations, so keep them off this page as
+        # they were before ``external`` entered the scope. NULL IS NOT TRUE
+        # holds, so rows without the key are unaffected.
+        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY]
+        .as_boolean()
+        .isnot(True),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
@@ -562,13 +626,14 @@ def _serialize_trigger_metadata(
 def _serialize_public_context(
     db: Session, task: Task, ui_source: str
 ) -> dict[str, Any] | None:
-    if _stored_source(task) == EXTERNAL_TASK_SOURCE:
+    if str(task.source or "") == EXTERNAL_TASK_SOURCE:
         # The session transport does not populate agent_config with widget or
         # share details, so external rows carry only deployment-provided context.
         try:
-            return external_task_public_context(db, task, ui_source)
-        except Exception:
+            return get_external_task_public_context(db, task, ui_source)
+        except Exception as exc:
             logger.exception("External task context hook failed; omitting context")
+            _rollback_after_hook_failure(db, exc)
             return None
     config = _agent_config(task)
     if ui_source == SOURCE_WIDGET:

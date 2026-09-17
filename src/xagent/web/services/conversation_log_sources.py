@@ -10,6 +10,14 @@ Conversation Logs page asks the deployment layer through the two hooks below.
 Both hooks are optional. With none registered every ``external`` row is shown
 under "REST API" and carries no public context, which keeps the rows visible
 instead of dropping them from every channel filter.
+
+This module is a transitional bridge for xorbitsai/xagent-saas#1366. The
+stored value cannot change on the write side today because the SaaS external
+task resolvers use ``Task.source == "external"`` as an ownership predicate.
+Once the transport stamps a durable, per-transport origin that this page can
+map directly in ``DIRECT_SOURCE_TO_UI_SOURCE`` (and the existing rows are
+backfilled), both hooks and the validator in ``api/conversation_logs.py``
+can be deleted.
 """
 
 from __future__ import annotations
@@ -44,9 +52,19 @@ EXTERNAL_TASK_SOURCE = "external"
 # ``(predicate, ui_source)`` pair (tuple or list), is skipped one at a time
 # with a warning; a hook that raises is treated as unregistered.
 #
+# Raw SQL (``text()``, ``literal_column()``) is rejected as well: it declares
+# no FROM entries, so the consumer cannot check which tables it names. Build
+# predicates from ``Task`` columns and bound parameters.
+#
 # READ-ONLY CONTRACT: both hooks run inside a GET request on the caller-owned
 # ``db`` session. They may query through it but must not add, flush, commit,
-# roll back or close it.
+# roll back or close it. If a hook statement fails, the consumer rolls the
+# session back before rendering the default.
+#
+# DETERMINISM: the list and the detail endpoint call the source hook
+# independently, with no shared snapshot. The pairs must depend only on
+# ``Task`` columns and on state that does not change between two requests,
+# or list and detail can disagree about the same task.
 #
 # Application layers inject it via set_external_task_source_hook(). Only one
 # hook of each kind is held: a later set_* call replaces the earlier one.
@@ -69,7 +87,7 @@ def set_external_task_source_hook(hook: ExternalTaskSourceHook | None) -> None:
     _external_task_source_hook = hook
 
 
-def external_task_source_branches(db: Session) -> list[tuple[Any, str]]:
+def get_external_task_source_branches(db: Session) -> list[tuple[Any, str]]:
     """Return the deployment's ``(predicate, ui_source)`` pairs, in order."""
     if _external_task_source_hook is None:
         return []
@@ -82,7 +100,7 @@ def set_external_task_context_hook(hook: ExternalTaskContextHook | None) -> None
     _external_task_context_hook = hook
 
 
-def external_task_public_context(
+def get_external_task_public_context(
     db: Session, task: Task, ui_source: str
 ) -> dict[str, Any] | None:
     """Return the deployment-provided public context for one external task."""
@@ -95,8 +113,8 @@ __all__ = [
     "EXTERNAL_TASK_SOURCE",
     "ExternalTaskContextHook",
     "ExternalTaskSourceHook",
-    "external_task_public_context",
-    "external_task_source_branches",
+    "get_external_task_public_context",
+    "get_external_task_source_branches",
     "set_external_task_context_hook",
     "set_external_task_source_hook",
 ]
