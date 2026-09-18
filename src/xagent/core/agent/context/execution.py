@@ -232,6 +232,20 @@ class MergeStrategy(str, Enum):
     PREFER_FIRST = "prefer_first"
 
 
+# Where ``CompactConfig.threshold`` came from, recorded in the compaction trace
+# metadata so an operator can tell a threshold derived from the model's context
+# window apart from the global fallback without reading the model table.
+COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW = "context_window"
+COMPACT_THRESHOLD_SOURCE_DEFAULT = "default"
+# Restored from a checkpoint written before the field existed.
+COMPACT_THRESHOLD_SOURCE_UNKNOWN = "unknown"
+
+# Set on a blocked compact request when the compact model's context window is
+# unknown, so no summary request can be sized. ``PatternRuntime`` reads it to
+# tell this apart from a request that is merely too large.
+LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY = "llm_compact_context_window_unknown"
+
+
 @dataclass
 class CompactConfig:
     """Compaction policy for message history.
@@ -240,10 +254,13 @@ class CompactConfig:
     first and to fall back to dropping messages only when it cannot; this
     dataclass configures the threshold that triggers either, and
     ``max_messages`` sizes the retained tail when messages are dropped.
+    ``threshold_source`` says whether ``threshold`` was derived from the
+    model's context window or is the global fallback.
     """
 
     enabled: bool = True
     threshold: int = 32000
+    threshold_source: str = COMPACT_THRESHOLD_SOURCE_DEFAULT
     max_messages: int = 20
 
 
@@ -1270,6 +1287,7 @@ class ExecutionContext:
             "compact_config": {
                 "enabled": self.compact_config.enabled,
                 "threshold": self.compact_config.threshold,
+                "threshold_source": self.compact_config.threshold_source,
                 "max_messages": self.compact_config.max_messages,
             },
             # Backward compatibility for older serialized payloads.
@@ -1313,6 +1331,10 @@ class ExecutionContext:
         compact_config = CompactConfig(
             enabled=compact.get("enabled", True),
             threshold=compact.get("threshold", CompactConfig().threshold),
+            # Older checkpoints carry no provenance; do not invent one.
+            threshold_source=compact.get(
+                "threshold_source", COMPACT_THRESHOLD_SOURCE_UNKNOWN
+            ),
             max_messages=compact.get("max_messages", 20),
         )
         created_at = (
@@ -1437,10 +1459,11 @@ class ExecutionContext:
         metadata: dict[str, Any] = {
             "original_tokens": total_tokens,
             "threshold": self.compact_config.threshold,
+            "threshold_source": self.compact_config.threshold_source,
             "max_summary_tokens": max_tokens,
         }
         if not isinstance(context_window, int) or context_window <= 0:
-            metadata["llm_compact_context_window_unknown"] = True
+            metadata[LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY] = True
             return {
                 "blocked": True,
                 "messages": messages,
@@ -1546,6 +1569,9 @@ class ExecutionContext:
     ) -> CompactResult:
         result.metadata.setdefault("original_tokens", original_tokens)
         result.metadata.setdefault("threshold", self.compact_config.threshold)
+        result.metadata.setdefault(
+            "threshold_source", self.compact_config.threshold_source
+        )
         if result.compacted:
             compacted_tokens = self.estimate_context_tokens()
             result.metadata.setdefault("compacted_tokens", compacted_tokens)
