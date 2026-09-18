@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
 
+from ....config import get_compact_threshold_ratio
 from ...context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
@@ -240,10 +241,25 @@ COMPACT_THRESHOLD_SOURCE_DEFAULT = "default"
 # Restored from a checkpoint written before the field existed.
 COMPACT_THRESHOLD_SOURCE_UNKNOWN = "unknown"
 
+
+def derive_compact_threshold(context_window: Any) -> tuple[int, str] | None:
+    """Threshold and provenance for a positive integer context window, else None."""
+    if isinstance(context_window, int) and context_window > 0:
+        return (
+            max(1, int(context_window * get_compact_threshold_ratio())),
+            COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+        )
+    return None
+
+
 # Set on a blocked compact request when the compact model's context window is
 # unknown, so no summary request can be sized. ``PatternRuntime`` reads it to
 # tell this apart from a request that is merely too large.
 LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY = "llm_compact_context_window_unknown"
+# Set on a blocked compact request when the summary prompt could not be sized
+# because the local tokenizer failed to load. ``PatternRuntime`` reads it to
+# tell this apart from a request that is merely too large for a known window.
+LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY = "llm_compact_tokenizer_unavailable"
 
 
 @dataclass
@@ -1482,7 +1498,7 @@ class ExecutionContext:
         except Exception as exc:  # noqa: BLE001
             metadata.update(
                 {
-                    "llm_compact_tokenizer_unavailable": True,
+                    LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY: True,
                     "compact_tokenizer_error_type": type(exc).__name__,
                 }
             )

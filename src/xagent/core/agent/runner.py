@@ -11,7 +11,6 @@ from uuid import uuid4
 from ...config import (
     COMPACT_THRESHOLD_DEFAULT,
     get_compact_threshold_default,
-    get_compact_threshold_ratio,
 )
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
@@ -26,13 +25,14 @@ from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .context.execution import (
-    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    derive_compact_threshold,
 )
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message, set_assistant_message
 from .runtime import (
+    THRESHOLD_WARNING_KEY_PREFIX,
     ExecutionInterrupted,
     PatternRuntime,
     compact_model_key,
@@ -945,11 +945,9 @@ class AgentRunner:
         context_window = getattr(llm, "context_window", None)
         # context_window is typed int | None end to end (DB Integer -> Pydantic
         # Optional[int]); bool is not a valid value, so a plain int check suffices.
-        if isinstance(context_window, int) and context_window > 0:
-            return (
-                max(1, int(context_window * get_compact_threshold_ratio())),
-                COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
-            )
+        derived = derive_compact_threshold(context_window)
+        if derived is not None:
+            return derived
         threshold = get_compact_threshold_default()
         # A virtual model resolves its concrete window per call and
         # ``prepare_llm_for_context`` recomputes the threshold then, so its
@@ -957,7 +955,7 @@ class AgentRunner:
         if llm is not None and not callable(getattr(llm, "prepare_for_call", None)):
             model_key = compact_model_key(llm)
             warn_once_per_model(
-                f"threshold:{model_key}",
+                THRESHOLD_WARNING_KEY_PREFIX + model_key,
                 "Model %s has no context_window; the context compaction "
                 "threshold falls back to %d tokens (%s). Set context_window "
                 "on the model so compaction triggers at a fraction of its "

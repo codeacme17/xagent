@@ -1992,6 +1992,86 @@ async def test_run_records_compact_threshold_source_on_context(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_run_resume_warns_when_restored_threshold_is_the_default(
+    tmp_path: Path, caplog
+) -> None:
+    """A task resumed in a fresh process has no in-memory record of why its
+    compaction threshold is what it is; ``AgentRunner.run`` re-issues the
+    fallback warning from the restored checkpoint so the missing
+    ``context_window`` column is still visible in this process's log."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-warn"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    assert (
+        checkpoint_context.compact_config.threshold_source
+        == COMPACT_THRESHOLD_SOURCE_DEFAULT
+    )
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(None, "moonshotai.kimi-k2.5"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "resumed task" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "moonshotai.kimi-k2.5" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_run_resume_stays_silent_when_model_now_has_a_window(
+    tmp_path: Path, caplog
+) -> None:
+    """The model row backing this resumed task now has a ``context_window``
+    (populated after the checkpoint was written, or simply since a fresh
+    process last saw it), so the restored default threshold is not running
+    blind and must not be re-warned about."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-silent"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(256_000, "sized"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    assert not any("resumed task" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_run_resume_raises_corrupt_on_contextless_checkpoint() -> None:
     runner = AgentRunner(
         agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
