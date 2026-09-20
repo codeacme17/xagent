@@ -365,3 +365,246 @@ def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
             ).scalars()
         )
         assert "public_mcp_apps" not in table_names
+
+
+# --- mcp_servers reconciliation (rollout collisions; #2506 review G3) ---
+
+
+def _create_server_tables(connection, *, with_identity_columns=True):
+    extra = (
+        ", transport VARCHAR(50), url VARCHAR(500), auth JSON, command VARCHAR(500),"
+        " env JSON, headers JSON, runtime_input_schema JSON, runtime_bindings JSON"
+        if with_identity_columns
+        else ""
+    )
+
+    connection.execute(
+        text(
+            "CREATE TABLE mcp_servers ("
+            "id INTEGER PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE" + extra + ")"
+        )
+    )
+    connection.execute(
+        text(
+            """
+            CREATE TABLE user_mcpservers (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                mcpserver_id INTEGER NOT NULL,
+                is_owner BOOLEAN NOT NULL DEFAULT 0,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            )
+            """
+        )
+    )
+
+
+def _insert_server(
+    connection,
+    *,
+    name,
+    url,
+    auth,
+    transport="streamable_http",
+    owner_user_id=None,
+    server_id=1,
+    headers=None,
+):
+    connection.execute(
+        text(
+            "INSERT INTO mcp_servers (id, name, transport, url, auth, headers) "
+            "VALUES (:id, :name, :transport, :url, :auth, :headers)"
+        ),
+        {
+            "id": server_id,
+            "name": name,
+            "transport": transport,
+            "url": url,
+            "auth": json.dumps(auth) if auth is not None else None,
+            "headers": json.dumps(headers) if headers is not None else None,
+        },
+    )
+    if owner_user_id is not None:
+        connection.execute(
+            text(
+                "INSERT INTO user_mcpservers (user_id, mcpserver_id, is_owner, is_active) "
+                "VALUES (:user_id, :server_id, 1, 1)"
+            ),
+            {"user_id": owner_user_id, "server_id": server_id},
+        )
+
+
+def test_upgrade_refuses_user_owned_server_with_foreign_url(tmp_path):
+    """A custom streamable_http server a user created under this app_id before
+    the identity existed points at a foreign URL. Seeding the catalog row would
+    let the listing present that row as the official card (it resolves by
+    normalized transport + name) while the runtime keeps using the foreign
+    URL/auth, so the migration must fail closed and leave the row alone."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name=APP_ID,
+            url="https://evil.example/mcp",
+            auth={"type": "mcp_oauth"},
+            owner_user_id=7,
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
+        assert connection.execute(text("SELECT url FROM mcp_servers")).scalar_one() == (
+            "https://evil.example/mcp"
+        )
+
+
+def test_upgrade_refuses_user_owned_server_even_with_matching_url(tmp_path):
+    """A matching URL is not enough: the owner keeps edit rights and could swap
+    in a foreign URL later that every user of the catalog card would then hit
+    (the same reasoning as _reject_user_owned_catalog_squat at connect time)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name=APP_ID,
+            url=migration.ROW["launch_config"]["url"],
+            auth={"type": "mcp_oauth"},
+            owner_user_id=7,
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
+
+
+def test_upgrade_refuses_server_named_after_display_name(tmp_path):
+    """The listing also claims rows named after the display name (see
+    _catalog_app_keys), so an unowned custom row under that spelling is a
+    collision too, not just an exact app_id match."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name=migration.ROW["name"],
+            url="https://other.example/mcp",
+            auth={"type": "bearer", "token": "x"},
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
+
+
+def test_upgrade_accepts_unowned_connect_created_row_round_trip(tmp_path):
+    """upgrade -> a user connects (our connect path creates the shared row:
+    name == app_id, catalog transport/URL, auth.type mcp_oauth, no owner) ->
+    downgrade -> upgrade must succeed: that row is ours, not a squatter."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _run(connection, migration, "upgrade")
+        _insert_server(
+            connection,
+            name=APP_ID,
+            url=migration.ROW["launch_config"]["url"],
+            auth={"type": "mcp_oauth"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO user_mcpservers (user_id, mcpserver_id, is_owner, is_active) "
+                "VALUES (7, 1, 0, 1)"
+            )
+        )
+        _run(connection, migration, "downgrade")
+        assert APP_ID not in _app_ids(connection)
+        _run(connection, migration, "upgrade")
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id=:app_id"),
+            {"app_id": APP_ID},
+        ).scalar_one()
+    assert count == 1
+
+
+def test_upgrade_raises_when_mcp_servers_cannot_prove_ownership(tmp_path):
+    """Without url/auth/transport columns a colliding row's provenance cannot
+    be established, so the migration must fail loudly rather than guess."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection, with_identity_columns=False)
+        connection.execute(
+            text("INSERT INTO mcp_servers (id, name) VALUES (1, :name)"),
+            {"name": APP_ID},
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
+
+
+def test_upgrade_ignores_unrelated_servers(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name="my-other-server",
+            url="https://other.example/mcp",
+            auth=None,
+            owner_user_id=7,
+        )
+        _run(connection, migration, "upgrade")
+        assert APP_ID in _app_ids(connection)
+
+
+def test_upgrade_refuses_unowned_row_on_a_foreign_transport(tmp_path):
+    """Same name and URL but a different HTTP transport is not the row our
+    connect path creates (it mirrors the transport check in
+    _ensure_catalog_mcp_oauth_server)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name=APP_ID,
+            url=migration.ROW["launch_config"]["url"],
+            auth={"type": "mcp_oauth"},
+            transport="sse",
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
+
+
+def test_upgrade_refuses_unowned_row_carrying_its_own_policy(tmp_path):
+    """An ownerless row (its owner account was deleted, or an admin edited it
+    after a downgrade) whose name/transport/URL/auth.type all match but that
+    carries static headers is a custom server's policy, not our shared row:
+    adopting it would send every user's calls with those headers."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _create_server_tables(connection)
+        _insert_server(
+            connection,
+            name=APP_ID,
+            url=migration.ROW["launch_config"]["url"],
+            auth={"type": "mcp_oauth"},
+            headers={"X-Proxy": "attacker"},
+        )
+        with pytest.raises(RuntimeError, match="mcp_servers"):
+            _run(connection, migration, "upgrade")
+        assert APP_ID not in _app_ids(connection)
