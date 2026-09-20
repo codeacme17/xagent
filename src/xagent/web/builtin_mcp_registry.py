@@ -1021,6 +1021,76 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "fireflies",
+            "name": "Fireflies",
+            "description": "Connect to Fireflies to search meeting transcripts, summaries and action items through the hosted Fireflies MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=fireflies.ai&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion: Fireflies
+            # hosts the server itself (docs.fireflies.ai/getting-started/
+            # mcp-configuration) and exposes its meeting tools; there is no
+            # local module to launch. Users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth 2.1
+            # Authorization Code + PKCE). The protected-resource metadata at
+            # /.well-known/oauth-protected-resource/mcp names
+            # "https://api.fireflies.ai/" as the authorization server, whose
+            # metadata advertises a registration_endpoint, PKCE S256 and
+            # token_endpoint_auth_method "none" (verified 2026-09-20), so
+            # Dynamic Client Registration is used and no static client
+            # credentials are required. Fireflies also accepts a static API
+            # key as a bearer header; that shape is deliberately not used
+            # here because the catalog has no remote-plus-static-header
+            # connect path (classify_app_auth would report "unconnectable").
+            "launch_config": {
+                "url": "https://api.fireflies.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian/miro rows above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "fireflies",
+                    "version": 1,
+                },
+            },
+        },
+        {
+            "app_id": "rocketlane",
+            "name": "Rocketlane",
+            "description": "Connect to Rocketlane to work with customer onboarding projects, tasks and timesheets through Rocketlane's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=rocketlane.com&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion: Rocketlane
+            # hosts the server itself (help.rocketlane.com article 67000754219)
+            # and exposes its project tools; there is no local module to
+            # launch. Users connect via POST /api/mcp/apps/{id}/oauth/connect
+            # (per-user OAuth 2.1 Authorization Code + PKCE). The
+            # protected-resource metadata at
+            # /.well-known/oauth-protected-resource/mcp delegates to a
+            # Scalekit-hosted authorization server
+            # (rocketlane.scalekit.com/resources/<id>) whose metadata
+            # advertises a registration_endpoint, PKCE S256 and
+            # token_endpoint_auth_method "none" (verified 2026-09-20), so
+            # Dynamic Client Registration is used and no static client
+            # credentials are required.
+            "launch_config": {
+                "url": "https://rocket-mcp.rl-platforms.rocketlane.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian/miro rows above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "rocketlane",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "aws",
             "name": "AWS",
             "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",
