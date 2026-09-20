@@ -16,6 +16,7 @@ from xagent.builtin_identity import (
     builtin_provenance_identity,
     canonicalize_builtin_identity,
 )
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +51,41 @@ MCP_SERVERS_TABLE = sa.table(
     sa.column("headers", sa.JSON),
     sa.column("runtime_input_schema", sa.JSON),
     sa.column("runtime_bindings", sa.JSON),
+    sa.column("args", sa.JSON),
+    sa.column("cwd", sa.String),
+    sa.column("timeout", sa.Integer),
+    sa.column("concurrency_safe", sa.Boolean),
+    sa.column("concurrent_tools", sa.JSON),
+    sa.column("allow_delegated_authorization", sa.Boolean),
+    sa.column("managed", sa.String),
+    sa.column("restart_policy", sa.String),
 )
-# Fields a fresh connect-created shared row never carries; a colliding row
-# holding any of them is a custom server's own policy (or an admin edit), not
-# our row, even when name/transport/URL/auth.type all match -- mirrors
-# _server_has_policy_beyond_catalog_identity on the stdio connect path.
+# Fields a fresh connect-created shared row never carries (they are all
+# NULL/false/empty on the row _ensure_catalog_mcp_oauth_server writes). A
+# colliding row holding any of them is a custom server's own policy (or an
+# admin edit), not our row, even when name/transport/URL/auth.type all match.
+# Same intent as _server_has_policy_beyond_catalog_identity on the stdio
+# connect path, which once missed fields by hand-picking a subset; here
+# tests/alembic pins this tuple against the ORM columns so a new MCPServer
+# policy column cannot slip past this seed. The lifecycle fields managed and
+# restart_policy are checked against their defaults below rather than for
+# truthiness; the docker_*/container_*/volumes/bind_ports/auto_start columns
+# are deliberately not consulted because a streamable_http row cannot carry a
+# meaningful value in them. concurrency_safe and concurrent_tools matter most:
+# the runtime copies them into the transport config and ReAct runs
+# declared-safe tool calls concurrently.
 MCP_SERVER_POLICY_COLUMNS = (
     "command",
+    "args",
+    "cwd",
     "env",
     "headers",
+    "timeout",
     "runtime_input_schema",
     "runtime_bindings",
+    "concurrency_safe",
+    "concurrent_tools",
+    "allow_delegated_authorization",
 )
 USER_MCPSERVERS_TABLE = sa.table(
     "user_mcpservers",
@@ -113,7 +138,13 @@ ROW = {
 # _ensure_catalog_mcp_oauth_server (transport/URL match and
 # _reject_user_owned_catalog_squat) only run when someone connects and cannot
 # repair an already-misattributed listing, so the check has to happen here,
-# before the identity is claimed. Unlike the shopify seed, the trusted
+# before the identity is claimed. A collision does not abort the upgrade: a
+# custom server is a supported pre-existing state, try_upgrade_db re-raises
+# migration errors during startup, and with no catalog row seeded nothing
+# claims the server, so the seed is skipped with an actionable error log and
+# the operator's rows are left untouched (the exact public_mcp_apps app_id
+# collision above still fails closed, because there the squatting row itself
+# is what the builtin overlay would key off). Unlike the shopify seed, the trusted
 # round-trip row is recognised by ownership rather than a marker in
 # MCPServer.auth: create_mcp_server does not reject a caller-supplied
 # builtin_provenance key inside auth, so such a marker is forgeable, whereas
@@ -137,21 +168,23 @@ def _collides_with_atlassian_identity(value: object) -> bool:
     }
 
 
-def _reconcile_mcp_servers(bind: sa.engine.Connection, inspector: sa.Inspector) -> None:
-    """Fail closed when an mcp_servers row already carries this identity.
+def _reconcile_mcp_servers(bind: sa.engine.Connection, inspector: sa.Inspector) -> bool:
+    """Whether the catalog identity may be claimed given existing mcp_servers.
 
     The single accepted collision is the shared row our own mcp_oauth connect
     path creates: name == app_id, catalog transport and URL, auth.type ==
-    "mcp_oauth", and no user_mcpservers link with is_owner=true. That row
-    exists legitimately on a downgrade -> upgrade round trip. Anything else
-    (a user-owned row, a foreign URL or transport, a row carrying its own
-    headers/env/bindings, a row named after the display name, or a schema
-    that cannot prove ownership) aborts the upgrade so the operator
-    renames or deletes the row before the catalog identity is claimed.
+    "mcp_oauth", none of MCP_SERVER_POLICY_COLUMNS set, and no user_mcpservers
+    link with is_owner=true. That row exists legitimately on a downgrade ->
+    upgrade round trip. Anything else (a user-owned row, a foreign URL or
+    transport, a row carrying its own policy, a row named after the display
+    name, or a schema that cannot prove ownership) returns False: the caller
+    skips seeding, leaves every row untouched and logs which rows to rename
+    or delete before re-seeding manually. Like the name-only skip in
+    upgrade(), this skip is permanent for this revision.
     """
     tables = set(inspector.get_table_names())
     if "mcp_servers" not in tables:
-        return
+        return True
     server_columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
     colliding = [
         row
@@ -161,17 +194,22 @@ def _reconcile_mcp_servers(bind: sa.engine.Connection, inspector: sa.Inspector) 
         if _collides_with_atlassian_identity(row["name"])
     ]
     if not colliding:
-        return
+        return True
     described = sorted((int(row["id"]), str(row["name"])) for row in colliding)
     if (
         not {"transport", "url", "auth"} <= server_columns
         or "user_mcpservers" not in tables
     ):
-        raise RuntimeError(
-            "Cannot seed builtin Atlassian connector: mcp_servers row(s) "
-            f"{described} collide with '{APP_ID}' and the schema cannot prove "
-            "which one our connect path created"
+        logger.error(
+            "Permanently skipping builtin Atlassian seed: mcp_servers row(s) %s "
+            "collide with '%s' and the schema cannot prove which one our "
+            "connect path created. Re-running `alembic upgrade head` will NOT "
+            "retry this; rename or delete the rows and seed the catalog row "
+            "manually (see this migration's ROW/BUILTIN_PROVENANCE).",
+            described,
+            APP_ID,
         )
+        return False
     if len(colliding) == 1:
         policy_columns = [c for c in MCP_SERVER_POLICY_COLUMNS if c in server_columns]
         server = (
@@ -182,13 +220,28 @@ def _reconcile_mcp_servers(bind: sa.engine.Connection, inspector: sa.Inspector) 
                     MCP_SERVERS_TABLE.c.url,
                     MCP_SERVERS_TABLE.c.auth,
                     *(MCP_SERVERS_TABLE.c[c] for c in policy_columns),
+                    *(
+                        MCP_SERVERS_TABLE.c[c]
+                        for c in ("managed", "restart_policy")
+                        if c in server_columns
+                    ),
                 ).where(MCP_SERVERS_TABLE.c.id == described[0][0])
             )
             .mappings()
             .one()
         )
         auth = server["auth"] if isinstance(server["auth"], dict) else {}
-        carries_policy = any(server[c] for c in policy_columns)
+        carries_policy = (
+            any(server[c] for c in policy_columns)
+            or (
+                "managed" in server_columns
+                and server["managed"] not in (None, "external")
+            )
+            or (
+                "restart_policy" in server_columns
+                and server["restart_policy"] not in (None, "no")
+            )
+        )
         owned = bind.execute(
             sa.select(USER_MCPSERVERS_TABLE.c.mcpserver_id).where(
                 USER_MCPSERVERS_TABLE.c.mcpserver_id == described[0][0],
@@ -203,12 +256,18 @@ def _reconcile_mcp_servers(bind: sa.engine.Connection, inspector: sa.Inspector) 
             and not carries_policy
             and owned is None
         ):
-            return
-    raise RuntimeError(
-        "Cannot seed builtin Atlassian connector: mcp_servers row(s) "
-        f"{described} collide with '{APP_ID}' and could not all be proven to "
-        "come from the catalog connect path; rename or delete them before upgrading"
+            return True
+    logger.error(
+        "Permanently skipping builtin Atlassian seed: mcp_servers row(s) %s collide "
+        "with '%s' and could not all be proven to come from the catalog connect "
+        "path (user-owned, foreign transport/URL, or carrying their own policy). "
+        "Re-running `alembic upgrade head` will NOT retry this; rename or delete "
+        "the rows and seed the catalog row manually (see this migration's "
+        "ROW/BUILTIN_PROVENANCE).",
+        described,
+        APP_ID,
     )
+    return False
 
 
 def upgrade() -> None:
@@ -284,7 +343,8 @@ def upgrade() -> None:
         )
         return
 
-    _reconcile_mcp_servers(bind, inspector)
+    if not _reconcile_mcp_servers(bind, inspector):
+        return
 
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
@@ -303,20 +363,19 @@ def downgrade() -> None:
         return
     columns = {column["name"] for column in inspector.get_columns("public_mcp_apps")}
     if "launch_config" not in columns:
+        # Without launch_config there is no provenance marker to compare, so
+        # ownership of a same-app_id row cannot be established; leave it.
         return
-    # Only a provenance-owned catalog entry is removed. No oauth_providers row
-    # exists for Atlassian (auth is per-user Dynamic Client Registration, not a
-    # shared static client), and any MCPServer/UserMCPServer/MCPOAuth* rows
-    # created by users who already connected are intentionally left in place
-    # -- connect-driven rows are not owned by this migration and are cleaned
-    # up through the normal disconnect path.
-    existing = bind.execute(
-        sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
-            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
-        )
-    ).scalar_one_or_none()
-    if not _has_provenance(existing):
-        return
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-    )
+    # Only the row this migration seeded is removed, and only while it still
+    # matches the frozen seed snapshot: the shared helper compares every
+    # seeded column (launch_config included, which is where the provenance
+    # marker lives, so an unprovenanced operator row never matches) and
+    # preserves a row an administrator has since edited through the admin
+    # PATCH endpoint (description, icon, category, visibility). No
+    # oauth_providers row exists for Atlassian (auth is per-user Dynamic Client
+    # Registration, not a shared static client), and any
+    # MCPServer/UserMCPServer/MCPOAuth* rows created by users who already
+    # connected are intentionally left in place -- connect-driven rows are not
+    # owned by this migration and are cleaned up through the normal disconnect
+    # path.
+    delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])

@@ -369,15 +369,18 @@ def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
 
 # --- mcp_servers reconciliation (rollout collisions; #2506 review G3) ---
 
+_SERVER_IDENTITY_DDL = (
+    ", transport VARCHAR(50), url VARCHAR(500), auth JSON, command VARCHAR(500),"
+    " env JSON, headers JSON, runtime_input_schema JSON, runtime_bindings JSON,"
+    " concurrency_safe BOOLEAN NOT NULL DEFAULT 0, concurrent_tools JSON,"
+    " timeout INTEGER, allow_delegated_authorization BOOLEAN NOT NULL DEFAULT 0,"
+    " args JSON, cwd VARCHAR(500), managed VARCHAR(20) NOT NULL DEFAULT 'external',"
+    " restart_policy VARCHAR(50) NOT NULL DEFAULT 'no'"
+)
+
 
 def _create_server_tables(connection, *, with_identity_columns=True):
-    extra = (
-        ", transport VARCHAR(50), url VARCHAR(500), auth JSON, command VARCHAR(500),"
-        " env JSON, headers JSON, runtime_input_schema JSON, runtime_bindings JSON"
-        if with_identity_columns
-        else ""
-    )
-
+    extra = _SERVER_IDENTITY_DDL if with_identity_columns else ""
     connection.execute(
         text(
             "CREATE TABLE mcp_servers ("
@@ -399,6 +402,17 @@ def _create_server_tables(connection, *, with_identity_columns=True):
     )
 
 
+_JSON_SERVER_COLUMNS = {
+    "auth",
+    "env",
+    "headers",
+    "runtime_input_schema",
+    "runtime_bindings",
+    "concurrent_tools",
+    "args",
+}
+
+
 def _insert_server(
     connection,
     *,
@@ -408,21 +422,20 @@ def _insert_server(
     transport="streamable_http",
     owner_user_id=None,
     server_id=1,
-    headers=None,
+    **policy,
 ):
+    values = {"id": server_id, "name": name, "transport": transport, "url": url}
+    values["auth"] = json.dumps(auth) if auth is not None else None
+    for column, value in policy.items():
+        values[column] = (
+            json.dumps(value)
+            if column in _JSON_SERVER_COLUMNS and value is not None
+            else value
+        )
+    columns = ", ".join(values)
+    placeholders = ", ".join(f":{c}" for c in values)
     connection.execute(
-        text(
-            "INSERT INTO mcp_servers (id, name, transport, url, auth, headers) "
-            "VALUES (:id, :name, :transport, :url, :auth, :headers)"
-        ),
-        {
-            "id": server_id,
-            "name": name,
-            "transport": transport,
-            "url": url,
-            "auth": json.dumps(auth) if auth is not None else None,
-            "headers": json.dumps(headers) if headers is not None else None,
-        },
+        text(f"INSERT INTO mcp_servers ({columns}) VALUES ({placeholders})"), values
     )
     if owner_user_id is not None:
         connection.execute(
@@ -434,12 +447,30 @@ def _insert_server(
         )
 
 
-def test_upgrade_refuses_user_owned_server_with_foreign_url(tmp_path):
+def _server_rows(connection):
+    return list(
+        connection.execute(text("SELECT id, name, url FROM mcp_servers ORDER BY id"))
+    )
+
+
+def _assert_skipped_without_claiming(connection, migration, caplog, servers_before):
+    """The catalog identity is not claimed, the colliding server rows are left
+    exactly as they were, and the operator gets an actionable error log
+    naming the rows. The upgrade itself does not abort: a custom server is a
+    supported pre-existing state, and try_upgrade_db re-raises migration
+    errors during startup, so raising here would take the service down."""
+    assert APP_ID not in _app_ids(connection)
+    assert _server_rows(connection) == servers_before
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("mcp_servers" in m and APP_ID in m for m in messages), messages
+
+
+def test_upgrade_skips_when_a_user_owned_server_has_a_foreign_url(tmp_path, caplog):
     """A custom streamable_http server a user created under this app_id before
     the identity existed points at a foreign URL. Seeding the catalog row would
     let the listing present that row as the official card (it resolves by
-    normalized transport + name) while the runtime keeps using the foreign
-    URL/auth, so the migration must fail closed and leave the row alone."""
+    normalized transport + name) while the runtime kept using the foreign
+    URL/auth, so the identity must not be claimed."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()
     with engine.begin() as connection:
@@ -452,15 +483,14 @@ def test_upgrade_refuses_user_owned_server_with_foreign_url(tmp_path):
             auth={"type": "mcp_oauth"},
             owner_user_id=7,
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
-        assert APP_ID not in _app_ids(connection)
-        assert connection.execute(text("SELECT url FROM mcp_servers")).scalar_one() == (
-            "https://evil.example/mcp"
-        )
+        before = _server_rows(connection)
+        _run(connection, migration, "upgrade")  # must not raise
+        _assert_skipped_without_claiming(connection, migration, caplog, before)
 
 
-def test_upgrade_refuses_user_owned_server_even_with_matching_url(tmp_path):
+def test_upgrade_skips_when_a_user_owned_server_matches_the_catalog_url(
+    tmp_path, caplog
+):
     """A matching URL is not enough: the owner keeps edit rights and could swap
     in a foreign URL later that every user of the catalog card would then hit
     (the same reasoning as _reject_user_owned_catalog_squat at connect time)."""
@@ -476,12 +506,12 @@ def test_upgrade_refuses_user_owned_server_even_with_matching_url(tmp_path):
             auth={"type": "mcp_oauth"},
             owner_user_id=7,
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
-        assert APP_ID not in _app_ids(connection)
+        before = _server_rows(connection)
+        _run(connection, migration, "upgrade")
+        _assert_skipped_without_claiming(connection, migration, caplog, before)
 
 
-def test_upgrade_refuses_server_named_after_display_name(tmp_path):
+def test_upgrade_skips_when_a_server_is_named_after_the_display_name(tmp_path, caplog):
     """The listing also claims rows named after the display name (see
     _catalog_app_keys), so an unowned custom row under that spelling is a
     collision too, not just an exact app_id match."""
@@ -496,9 +526,9 @@ def test_upgrade_refuses_server_named_after_display_name(tmp_path):
             url="https://other.example/mcp",
             auth={"type": "bearer", "token": "x"},
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
-        assert APP_ID not in _app_ids(connection)
+        before = _server_rows(connection)
+        _run(connection, migration, "upgrade")
+        _assert_skipped_without_claiming(connection, migration, caplog, before)
 
 
 def test_upgrade_accepts_unowned_connect_created_row_round_trip(tmp_path):
@@ -533,9 +563,9 @@ def test_upgrade_accepts_unowned_connect_created_row_round_trip(tmp_path):
     assert count == 1
 
 
-def test_upgrade_raises_when_mcp_servers_cannot_prove_ownership(tmp_path):
+def test_upgrade_skips_when_mcp_servers_cannot_prove_ownership(tmp_path, caplog):
     """Without url/auth/transport columns a colliding row's provenance cannot
-    be established, so the migration must fail loudly rather than guess."""
+    be established, so the identity is not claimed rather than guessed."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()
     with engine.begin() as connection:
@@ -545,9 +575,13 @@ def test_upgrade_raises_when_mcp_servers_cannot_prove_ownership(tmp_path):
             text("INSERT INTO mcp_servers (id, name) VALUES (1, :name)"),
             {"name": APP_ID},
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
+        _run(connection, migration, "upgrade")
         assert APP_ID not in _app_ids(connection)
+        assert connection.execute(
+            text("SELECT name FROM mcp_servers")
+        ).scalar_one() == (APP_ID)
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("mcp_servers" in m for m in messages), messages
 
 
 def test_upgrade_ignores_unrelated_servers(tmp_path):
@@ -567,7 +601,7 @@ def test_upgrade_ignores_unrelated_servers(tmp_path):
         assert APP_ID in _app_ids(connection)
 
 
-def test_upgrade_refuses_unowned_row_on_a_foreign_transport(tmp_path):
+def test_upgrade_skips_when_an_unowned_row_uses_a_foreign_transport(tmp_path, caplog):
     """Same name and URL but a different HTTP transport is not the row our
     connect path creates (it mirrors the transport check in
     _ensure_catalog_mcp_oauth_server)."""
@@ -583,16 +617,40 @@ def test_upgrade_refuses_unowned_row_on_a_foreign_transport(tmp_path):
             auth={"type": "mcp_oauth"},
             transport="sse",
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
-        assert APP_ID not in _app_ids(connection)
+        before = _server_rows(connection)
+        _run(connection, migration, "upgrade")
+        _assert_skipped_without_claiming(connection, migration, caplog, before)
 
 
-def test_upgrade_refuses_unowned_row_carrying_its_own_policy(tmp_path):
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"headers": {"X-Proxy": "attacker"}},
+        {"env": {"TOKEN": "x"}},
+        {"command": "python"},
+        {"runtime_bindings": {"a": "b"}},
+        {"runtime_input_schema": {"type": "object"}},
+        {"concurrency_safe": True},
+        {"concurrent_tools": ["create_issue"]},
+        {"timeout": 30},
+        {"allow_delegated_authorization": True},
+        {"args": ["--flag"]},
+        {"cwd": "/srv/custom"},
+        {"managed": "internal"},
+        {"restart_policy": "always"},
+    ],
+    ids=lambda p: next(iter(p)),
+)
+def test_upgrade_skips_when_an_unowned_row_carries_its_own_policy(
+    tmp_path, caplog, policy
+):
     """An ownerless row (its owner account was deleted, or an admin edited it
     after a downgrade) whose name/transport/URL/auth.type all match but that
-    carries static headers is a custom server's policy, not our shared row:
-    adopting it would send every user's calls with those headers."""
+    carries any policy field is a custom server's configuration, not our
+    shared row. concurrency_safe/concurrent_tools matter most: the runtime
+    copies them into the transport config and ReAct runs declared-safe tool
+    calls concurrently, so adopting the row would run non-idempotent remote
+    operations under a concurrency policy that belonged to the custom row."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()
     with engine.begin() as connection:
@@ -603,8 +661,79 @@ def test_upgrade_refuses_unowned_row_carrying_its_own_policy(tmp_path):
             name=APP_ID,
             url=migration.ROW["launch_config"]["url"],
             auth={"type": "mcp_oauth"},
-            headers={"X-Proxy": "attacker"},
+            **policy,
         )
-        with pytest.raises(RuntimeError, match="mcp_servers"):
-            _run(connection, migration, "upgrade")
-        assert APP_ID not in _app_ids(connection)
+        before = _server_rows(connection)
+        _run(connection, migration, "upgrade")
+        _assert_skipped_without_claiming(connection, migration, caplog, before)
+
+
+def test_policy_columns_cover_every_persisted_server_policy_field():
+    """Pin the reject set against the ORM: every configurable MCPServer column
+    beyond identity (name/transport/url/auth/description) must be in
+    MCP_SERVER_POLICY_COLUMNS, so a future column cannot slip past the seed
+    the way a hand-picked subset once did on the connect path."""
+    from xagent.web.models.mcp import MCPServer
+
+    migration = _load_migration()
+    persisted = {c.name for c in MCPServer.__table__.columns}
+    identity = {
+        "id",
+        "name",
+        "description",
+        "transport",
+        "url",
+        "auth",
+        "created_at",
+        "updated_at",
+    }
+    # Lifecycle fields are compared against their defaults in the migration
+    # rather than for truthiness, so they live outside the tuple.
+    checked_against_default = {"managed", "restart_policy"}
+    docker_only = {c for c in persisted if c.startswith(("docker_", "container_"))} | {
+        "volumes",
+        "bind_ports",
+        "auto_start",
+    }
+    expected = persisted - identity - docker_only - checked_against_default
+    assert expected <= set(migration.MCP_SERVER_POLICY_COLUMNS), sorted(
+        expected - set(migration.MCP_SERVER_POLICY_COLUMNS)
+    )
+
+
+# --- downgrade preserves supported admin edits (#2506 review round 3) ---
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("description", "Edited by an administrator"),
+        ("icon", "https://cdn.example/custom.png"),
+        ("category", "Support"),
+        ("is_visible_in_connector", 0),
+    ],
+)
+def test_downgrade_preserves_a_provenance_owned_row_an_admin_edited(
+    tmp_path, column, value
+):
+    """Admin PATCH may edit the presentation fields while the provenance
+    marker stays intact. Downgrade must delete only a row that still matches
+    the frozen seed snapshot; an edited row is supported configuration."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration()
+    with engine.begin() as connection:
+        _create_apps_table(connection)
+        _run(connection, migration, "upgrade")
+        connection.execute(
+            text(
+                f"UPDATE public_mcp_apps SET {column} = :value WHERE app_id = :app_id"
+            ),
+            {"value": value, "app_id": APP_ID},
+        )
+        _run(connection, migration, "downgrade")
+        assert APP_ID in _app_ids(connection)
+        stored = connection.execute(
+            text(f"SELECT {column} FROM public_mcp_apps WHERE app_id = :app_id"),
+            {"app_id": APP_ID},
+        ).scalar_one()
+        assert stored == value
