@@ -3,9 +3,10 @@
 import json
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import JSON, create_engine, text
 
 from xagent.migrations.seed_helpers import (
+    MCP_SERVERS_TABLE,
     REMOTE_MCP_SERVER_POLICY_COLUMNS,
     remote_mcp_server_identity_is_claimable,
 )
@@ -319,7 +320,9 @@ def test_policy_columns_cover_every_persisted_server_policy_field():
     beyond identity must be in REMOTE_MCP_SERVER_POLICY_COLUMNS or be a
     lifecycle field compared against its default, so a future column cannot
     slip past the seeds the way a hand-picked subset once did on the connect
-    path. Docker-only columns are excluded on purpose."""
+    path. Docker-only columns are excluded on purpose. Then pin the
+    lightweight MCP_SERVERS_TABLE the helper selects through: it must declare
+    every column the helper reads, with the ORM's JSON typing."""
     from xagent.web.models.mcp import MCPServer
 
     persisted = {c.name for c in MCPServer.__table__.columns}
@@ -343,3 +346,16 @@ def test_policy_columns_cover_every_persisted_server_policy_field():
     assert expected == set(REMOTE_MCP_SERVER_POLICY_COLUMNS), sorted(
         expected ^ set(REMOTE_MCP_SERVER_POLICY_COLUMNS)
     )
+
+    # The helper reads each policy and lifecycle column through
+    # MCP_SERVERS_TABLE.c[...], so the lightweight sa.table() must declare every
+    # one, and declare the JSON ones as sa.JSON like the ORM does: an untyped
+    # column comes back as the driver's raw string and "[]" would then read as
+    # configured.
+    declared = {c.name: c.type for c in MCP_SERVERS_TABLE.columns}
+    orm_types = {c.name: c.type for c in MCPServer.__table__.columns}
+    read_by_helper = expected | checked_against_default
+    assert read_by_helper <= set(declared), sorted(read_by_helper - set(declared))
+    assert {n for n, t in declared.items() if isinstance(t, JSON)} == {
+        n for n in declared if isinstance(orm_types.get(n), JSON)
+    }
