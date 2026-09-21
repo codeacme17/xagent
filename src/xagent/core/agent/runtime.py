@@ -943,7 +943,7 @@ class PatternRuntime:
             # never arrive, so this is worth a warning.
             logger.warning(
                 "Dropping agent outbound message for execution %s: no outbound "
-                "message handler is installed (type=%s, expect_response=%s)",
+                "message handler is installed (type=%r, expect_response=%s)",
                 self.execution_id,
                 message_type,
                 expect_response,
@@ -951,7 +951,7 @@ class PatternRuntime:
         else:
             logger.debug(
                 "Dropping agent outbound message for execution %s: no outbound "
-                "message handler is installed (type=%s, expect_response=%s)",
+                "message handler is installed (type=%r, expect_response=%s)",
                 self.execution_id,
                 message_type,
                 expect_response,

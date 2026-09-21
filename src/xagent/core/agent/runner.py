@@ -262,7 +262,9 @@ class AgentRunner:
         # A runner registered by post_user_message before the host installed
         # its handler would otherwise resume handler-less (#1328); an
         # explicit handler passed to the resumed run wins over the
-        # constructor-time one.
+        # constructor-time one. Passing None here means "inherit the
+        # constructor-time handler," not "clear it"; no caller clears a
+        # handler today, so there is deliberately no sentinel for that.
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
             execution_id=execution_id,

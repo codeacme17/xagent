@@ -2508,8 +2508,10 @@ async def test_dropping_messages_publishes_no_summary_to_replay() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["question", "confirmation"])
 async def test_runtime_send_message_warns_when_no_outbound_handler(
     monkeypatch: pytest.MonkeyPatch,
+    message_type: str,
 ) -> None:
     """#1328: an agent rebuilt from history (process restart, cache miss,
     other worker) can end up with no outbound message handler installed.
@@ -2518,7 +2520,9 @@ async def test_runtime_send_message_warns_when_no_outbound_handler(
     logged to say the delivery never happened. This pins that a warning is
     logged instead, naming the execution and the message shape but never
     the message text itself (message content can be arbitrary agent/user
-    output and must not be duplicated into logs)."""
+    output and must not be duplicated into logs). The warning must fire on
+    expect_response=True regardless of message_type, because react.py's
+    send_message tool handler reads the two arguments independently."""
 
     recording_logger = RecordingLogger()
     monkeypatch.setattr(runtime_module, "logger", recording_logger)
@@ -2526,7 +2530,7 @@ async def test_runtime_send_message_warns_when_no_outbound_handler(
 
     payload = await runtime.send_message(
         message="Question?",
-        message_type="question",
+        message_type=message_type,
         expect_response=True,
     )
 

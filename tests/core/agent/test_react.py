@@ -2244,9 +2244,7 @@ async def test_react_keeps_send_message_bundled_with_work_tool(
     pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
     context.add_user_message("Calculate 2+2")
-    runtime = PatternRuntime(
-        execution_id="task-1", outbound_message_handler=OutboundCollector()
-    )
+    runtime = PatternRuntime(execution_id="task-1")
 
     with caplog.at_level(
         logging.WARNING, logger="xagent.core.agent.pattern.react.react"
@@ -2302,9 +2300,7 @@ async def test_react_keeps_control_only_final_answer_batch(
     pattern = ReActPattern(max_iterations=1)
     context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
     context.add_user_message("Do the thing")
-    runtime = PatternRuntime(
-        execution_id="task-1", outbound_message_handler=OutboundCollector()
-    )
+    runtime = PatternRuntime(execution_id="task-1")
 
     with caplog.at_level(
         logging.WARNING, logger="xagent.core.agent.pattern.react.react"
