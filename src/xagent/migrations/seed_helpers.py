@@ -284,6 +284,7 @@ _REMOTE_MCP_SERVER_LIFECYCLE_DEFAULTS: dict[str, tuple[Any, ...]] = {
     "restart_policy": (None, "no"),
 }
 _REMOTE_MCP_SERVER_IDENTITY_COLUMNS: tuple[str, ...] = ("transport", "url", "auth")
+_USER_MCPSERVER_OWNERSHIP_COLUMNS: tuple[str, ...] = ("mcpserver_id", "is_owner")
 
 MCP_SERVERS_TABLE = sa.table(
     "mcp_servers",
@@ -353,7 +354,9 @@ def remote_mcp_server_identity_is_claimable(
     overwrite), none of :data:`REMOTE_MCP_SERVER_POLICY_COLUMNS` set, lifecycle
     fields at their defaults, and no ``user_mcpservers`` link with
     ``is_owner=true``. That row exists legitimately on a downgrade -> upgrade
-    round trip. Anything else returns False and logs an ERROR naming the rows:
+    round trip. Anything else, including a schema that lacks the identity
+    columns on ``mcp_servers`` or the ownership columns on
+    ``user_mcpservers``, returns False and logs an ERROR naming the rows:
     the caller skips seeding and leaves every row untouched. Skipping rather
     than raising keeps ``alembic upgrade head`` (and therefore startup) going;
     with no catalog row seeded nothing claims the server. Alembic stamps the
@@ -386,9 +389,14 @@ def remote_mcp_server_identity_is_claimable(
         return True
     described = sorted((int(row["id"]), str(row["name"])) for row in colliding)
 
+    user_link_columns = (
+        {column["name"] for column in inspector.get_columns("user_mcpservers")}
+        if "user_mcpservers" in tables
+        else set()
+    )
     if (
         not set(_REMOTE_MCP_SERVER_IDENTITY_COLUMNS) <= server_columns
-        or "user_mcpservers" not in tables
+        or not set(_USER_MCPSERVER_OWNERSHIP_COLUMNS) <= user_link_columns
     ):
         logger.error(
             "Permanently skipping builtin %s seed: mcp_servers row(s) %s collide "

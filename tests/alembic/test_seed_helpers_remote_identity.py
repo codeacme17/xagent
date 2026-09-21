@@ -40,8 +40,11 @@ def _engine(tmp_path):
     return create_engine(f"sqlite:///{tmp_path / 'test.db'}")
 
 
-def _create_server_tables(connection, *, with_identity_columns=True):
+def _create_server_tables(
+    connection, *, with_identity_columns=True, with_owner_column=True
+):
     extra = _SERVER_IDENTITY_DDL if with_identity_columns else ""
+    owner = "is_owner BOOLEAN NOT NULL DEFAULT 0," if with_owner_column else ""
     connection.execute(
         text(
             "CREATE TABLE mcp_servers ("
@@ -55,7 +58,9 @@ def _create_server_tables(connection, *, with_identity_columns=True):
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 mcpserver_id INTEGER NOT NULL,
-                is_owner BOOLEAN NOT NULL DEFAULT 0,
+                """
+            + owner
+            + """
                 is_active BOOLEAN NOT NULL DEFAULT 1
             )
             """
@@ -115,14 +120,21 @@ def _server_rows(connection):
     )
 
 
-def _assert_refused(connection, caplog, servers_before):
+# The two refusal branches in remote_mcp_server_identity_is_claimable, by the
+# phrase only that branch logs.
+UNPROVABLE_SCHEMA = "schema cannot prove"
+UNPROVEN_ROWS = "could not all be proven"
+
+
+def _assert_refused(connection, caplog, servers_before, reason):
     """Refused without touching any server row, and the operator gets an
-    actionable ERROR naming the rows and the app_id."""
+    actionable ERROR naming the rows, the app_id and the specific reason."""
     assert _server_rows(connection) == servers_before
     messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("mcp_servers" in m and APP_ID in m and "Acme" in m for m in messages), (
-        messages
-    )
+    assert any(
+        "mcp_servers" in m and APP_ID in m and "Acme" in m and reason in m
+        for m in messages
+    ), messages
 
 
 def test_claimable_when_mcp_servers_table_is_absent(tmp_path):
@@ -149,7 +161,7 @@ def test_refuses_user_owned_server_with_foreign_url(tmp_path, caplog):
         _insert_server(connection, url="https://evil.example/mcp", owner_user_id=7)
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 def test_refuses_user_owned_server_even_with_matching_url(tmp_path, caplog):
@@ -161,7 +173,7 @@ def test_refuses_user_owned_server_even_with_matching_url(tmp_path, caplog):
         _insert_server(connection, owner_user_id=7)
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 @pytest.mark.parametrize(
@@ -181,7 +193,7 @@ def test_refuses_servers_whose_name_normalizes_to_the_identity(tmp_path, caplog,
         )
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 def test_refuses_unowned_row_on_a_foreign_transport(tmp_path, caplog):
@@ -190,7 +202,7 @@ def test_refuses_unowned_row_on_a_foreign_transport(tmp_path, caplog):
         _insert_server(connection, transport="sse")
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 @pytest.mark.parametrize(
@@ -215,7 +227,7 @@ def test_refuses_unowned_row_whose_auth_differs_from_the_catalog_auth(
         _insert_server(connection, auth=auth)
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +262,7 @@ def test_refuses_unowned_row_carrying_its_own_policy(tmp_path, caplog, policy):
         _insert_server(connection, **policy)
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 def test_accepts_the_unowned_connect_created_row(tmp_path):
@@ -284,7 +296,7 @@ def test_refuses_when_two_rows_collide_even_if_one_is_ours(tmp_path, caplog):
         )
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVEN_ROWS)
 
 
 def test_refuses_when_schema_cannot_prove_ownership(tmp_path, caplog):
@@ -298,7 +310,7 @@ def test_refuses_when_schema_cannot_prove_ownership(tmp_path, caplog):
         )
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVABLE_SCHEMA)
 
 
 def test_refuses_when_user_mcpservers_table_is_missing(tmp_path, caplog):
@@ -312,7 +324,19 @@ def test_refuses_when_user_mcpservers_table_is_missing(tmp_path, caplog):
         _insert_server(connection)
         before = _server_rows(connection)
         assert _claimable(connection) is False
-        _assert_refused(connection, caplog, before)
+        _assert_refused(connection, caplog, before, UNPROVABLE_SCHEMA)
+
+
+def test_refuses_when_user_mcpservers_lacks_the_ownership_column(tmp_path, caplog):
+    """user_mcpservers exists but predates is_owner: ownership cannot be
+    proven, so refuse instead of letting the ownership query raise out of
+    upgrade()."""
+    with _engine(tmp_path).begin() as connection:
+        _create_server_tables(connection, with_owner_column=False)
+        _insert_server(connection)
+        before = _server_rows(connection)
+        assert _claimable(connection) is False
+        _assert_refused(connection, caplog, before, UNPROVABLE_SCHEMA)
 
 
 def test_policy_columns_cover_every_persisted_server_policy_field():
@@ -326,23 +350,19 @@ def test_policy_columns_cover_every_persisted_server_policy_field():
     from xagent.web.models.mcp import MCPServer
 
     persisted = {c.name for c in MCPServer.__table__.columns}
-    identity = {
-        "id",
-        "name",
-        "description",
-        "transport",
-        "url",
-        "auth",
-        "created_at",
-        "updated_at",
-    }
+    identity = {"id", "name", "transport", "url", "auth"}
+    # Not compared at all: the catalog card renders from the static registry,
+    # and timestamps carry no operator configuration.
+    not_compared = {"description", "created_at", "updated_at"}
     checked_against_default = {"managed", "restart_policy"}
     docker_only = {c for c in persisted if c.startswith(("docker_", "container_"))} | {
         "volumes",
         "bind_ports",
         "auto_start",
     }
-    expected = persisted - identity - docker_only - checked_against_default
+    expected = (
+        persisted - identity - not_compared - docker_only - checked_against_default
+    )
     assert expected == set(REMOTE_MCP_SERVER_POLICY_COLUMNS), sorted(
         expected ^ set(REMOTE_MCP_SERVER_POLICY_COLUMNS)
     )
