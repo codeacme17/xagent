@@ -14,10 +14,20 @@ Three properties the backfill is shaped around:
   column that is not there fails the statement and takes the whole upgrade
   chain down with it, so each source is probed before it is used.
 
-* **It leaves a row NULL rather than inventing a timestamp.** When neither a
-  message nor ``tasks.created_at`` can supply an instant, the anchor stays
-  NULL, and ``retention_anchor()`` resolves that to "no anchor" -- a task the
-  predicate refuses to expire. Unanchored data is retained, never guessed at.
+* **It leaves a row NULL rather than inventing a timestamp**, and NULL is
+  much weaker protection than it looks. ``retention_anchor()`` is
+  ``COALESCE(last_activity_at, created_at)``, so a NULL anchor beside a live
+  ``created_at`` is not refused -- it expires the task from its creation date,
+  which for a long conversation is far too early. NULL is only harmless where
+  ``tasks.created_at`` does not exist either, and there it is harmless for a
+  blunt reason rather than a designed one: the predicate cannot run against
+  such a schema at all, because the mapped column it selects is not there.
+
+  So the invariant this revision must hold is not "NULL is safe" but "NULL
+  must never mean the backfill has not run". Wherever an instant exists, the
+  upgrade writes it before the revision is stamped; where no source can
+  supply one, the row stays NULL on a schema the predicate cannot read. The
+  offline path refuses outright rather than stamping without filling.
 
 * **It pages forward by primary key.** Selecting the remaining NULL set on
   every pass looks equivalent and is not: a row written to NULL stays in that
@@ -49,7 +59,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260922_task_last_activity_at"
-down_revision = "20260922_seed_rocketlane_mcp_app"
+down_revision = "20260921_word_contract"
 branch_labels = None
 depends_on = None
 
@@ -67,8 +77,12 @@ def _has_column(inspector: sa.Inspector, table: str, column: str) -> bool:
 def _anchor_expression(*, with_messages: bool, with_created_at: bool) -> str | None:
     """The SQL for one row's anchor, using only sources that exist.
 
-    ``None`` means no source is available, which is not an error: the column
-    stays NULL and the predicate declines to expire those rows.
+    ``None`` means no source is available, which is not an error. Such a
+    database has no instant to offer, and it is also one the retention
+    predicate cannot query: ``retention_anchor()`` selects ``tasks.created_at``
+    through the mapped column, so a schema without it raises rather than
+    returning an anchor. Leaving these rows NULL is therefore moot, not a
+    safety property to rely on elsewhere.
     """
     message_max = "(SELECT MAX(m.created_at) FROM task_chat_messages m WHERE m.task_id = tasks.id)"
     if with_messages and with_created_at:
@@ -80,28 +94,41 @@ def _anchor_expression(*, with_messages: bool, with_created_at: bool) -> str | N
     return None
 
 
-def _backfill(connection: sa.Connection, *, anchor_sql: str) -> int:
+def _backfill(connection: sa.Connection, *, anchor_sql: str) -> None:
     """Fill every NULL anchor, paging forward by primary key.
 
-    Returns the number of rows written. Terminates because the cursor only
-    moves forward: a batch that writes NULL still advances it, where a
-    re-select of the NULL set would hand the same row back on every pass.
+    Terminates because the cursor only moves forward: a batch that writes
+    NULL still advances it, where a re-select of the NULL set would hand the
+    same row back on every pass. Deliberately returns nothing -- a count
+    would have to say whether it meant rows selected or rows written, and
+    since the guard below can skip a row those differ.
     """
     select_batch = sa.text(
         "SELECT id FROM tasks "
         "WHERE id > :after AND last_activity_at IS NULL "
         "ORDER BY id LIMIT :batch"
     )
+    # ``AND last_activity_at IS NULL`` repeats the SELECT's predicate on
+    # purpose; it is not redundant. The ids were chosen by an earlier
+    # statement, and on PostgreSQL each batch commits separately, so a
+    # transcript writer can advance a selected task's anchor in between. A
+    # blocked UPDATE re-checks its search condition against the *target* row
+    # once the lock is released, but the ``MAX()`` subquery reads
+    # ``task_chat_messages`` -- other rows -- and keeps the original command
+    # snapshot, so without this guard the backfill would overwrite the newer
+    # anchor with a value computed before that message existed. With it, a row
+    # someone else has already anchored is simply skipped: touches only ever
+    # move forward, so their value is the better one.
+    #
     # noqa: S608 is on the UPDATE below: `anchor_sql` comes only from
     # _anchor_expression above, which returns one of three literals. No
     # caller-supplied text reaches it, and every value is bound.
     update_batch = sa.text(
         f"UPDATE tasks SET last_activity_at = {anchor_sql} "  # noqa: S608
-        "WHERE id IN :ids"
+        "WHERE id IN :ids AND last_activity_at IS NULL"
     ).bindparams(sa.bindparam("ids", expanding=True))
 
     after = -1
-    written = 0
     while True:
         ids = [
             row[0]
@@ -110,9 +137,8 @@ def _backfill(connection: sa.Connection, *, anchor_sql: str) -> int:
             )
         ]
         if not ids:
-            return written
+            return
         connection.execute(update_batch, {"ids": ids})
-        written += len(ids)
         after = ids[-1]
 
 
@@ -122,15 +148,38 @@ def upgrade() -> None:
     # establishes, so it cannot be reached when a test drives upgrade()
     # through Operations.context(). Both read the same flag.
     if op.get_context().as_sql:
-        # Offline (--sql) hands us a MockConnection: it cannot be inspected
-        # and it cannot read rows back, so emit the DDL deterministically and
-        # leave the backfill to an online run. A NULL anchor is the safe
-        # state -- the predicate declines to expire those rows.
-        op.add_column(
-            "tasks",
-            sa.Column("last_activity_at", sa.DateTime(timezone=True), nullable=True),
+        # Refuse, rather than render. This revision cannot be applied offline
+        # safely, and every alternative was worse:
+        #
+        # * Emitting only the ADD COLUMN stamps ``alembic_version`` too, so a
+        #   later online ``upgrade head`` considers the revision applied and
+        #   never backfills. Every historical task keeps a NULL anchor, which
+        #   ``retention_anchor()`` resolves to ``created_at`` -- reporting a
+        #   task created 400 days ago with a message from last week as expired
+        #   at 90 days. That is the data-loss path this refusal closes.
+        #
+        # * Emitting the backfill too puts a full-table correlated UPDATE
+        #   inside the same transaction as the ALTER, because offline mode has
+        #   no per-migration boundaries and no ``autocommit_block``. On
+        #   PostgreSQL the rendered script is BEGIN / ALTER / UPDATE / COMMIT,
+        #   so ACCESS EXCLUSIVE on ``tasks`` is held for the whole scan -- the
+        #   outage the online path takes care to avoid, reintroduced in a form
+        #   the operator cannot split. It also has to name
+        #   ``task_chat_messages`` and ``tasks.created_at`` unconditionally,
+        #   since offline cannot inspect, so against the legacy shapes the
+        #   online path handles it fails and rolls back the whole chain.
+        #
+        # Refusing costs little: offline generation across the full chain
+        # already fails earlier in this repository (20260317 reflects through
+        # a MockConnection), so this is not a working path being withdrawn.
+        raise RuntimeError(
+            "20260922_task_last_activity_at cannot be generated with --sql. "
+            "It backfills tasks.last_activity_at row by row, and an offline "
+            "script would stamp the revision without running that backfill, "
+            "leaving historical tasks with an anchor that reads as their "
+            "creation date and expires them early. Run this revision online "
+            "(alembic upgrade head against the database)."
         )
-        return
 
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -161,6 +210,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Unlike upgrade(), this renders offline: dropping the column needs no
+    # row work, so the emitted statement is the whole of the revision.
     if op.get_context().as_sql:
         op.drop_column("tasks", "last_activity_at")
         return

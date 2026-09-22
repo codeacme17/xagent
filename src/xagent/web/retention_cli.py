@@ -33,6 +33,7 @@ from .services.task_retention import (
     count_quiescent_tasks,
     count_retention_candidate_trace_events,
     count_retention_candidates,
+    retention_cutoff,
 )
 
 #: Offered as the default sweep because they are the options on the table in
@@ -81,13 +82,33 @@ def run_preview(args: argparse.Namespace) -> int:
         )
         return 2
 
+    now = datetime.now(timezone.utc)
+    # Ask the arithmetic itself rather than inventing a ceiling. Both legs can
+    # overflow and they differ: ``timedelta(days=1_000_000_000)`` refuses to
+    # construct, while ``days=999_999_999`` constructs and then overflows the
+    # subtraction. Any hand-written bound would guess one of the two wrong.
+    # The check stays here and not in ``retention_cutoff``: that is library
+    # code, and #2563 wants the exception rather than a silent clamp.
+    unrepresentable = []
+    for days in days_list:
+        try:
+            retention_cutoff(now=now, days=days)
+        except OverflowError:
+            unrepresentable.append(days)
+    if unrepresentable:
+        print(
+            "--days is too large to express as a date: "
+            f"{', '.join(str(d) for d in unrepresentable)}.",
+            file=sys.stderr,
+        )
+        return 2
+
     print(
         "Scanning an unindexed column, one sequential pass per period; "
         "prefer off-peak on a large deployment.",
         file=sys.stderr,
     )
     configure_db(args.database_url, read_only=True)
-    now = datetime.now(timezone.utc)
     sessions = get_session_local()
     with sessions() as db:
         quiescent = count_quiescent_tasks(db, now=now)

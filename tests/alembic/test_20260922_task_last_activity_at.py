@@ -9,6 +9,7 @@ most likely to behave differently across the pair.
 from __future__ import annotations
 
 import importlib
+import pathlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,9 @@ from tests.web.services.task_database_shared import engine as engine_fixture
 engine = engine_fixture
 
 MODULE = "xagent.migrations.versions.20260922_task_last_activity_at"
+
+migration_module = importlib.import_module(MODULE)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -460,36 +464,141 @@ def test_sqlite_backfills_inside_the_migration_transaction(migration, monkeypatc
     assert calls == ["backfill"]
 
 
-def test_offline_mode_emits_ddl_and_skips_the_backfill(migration, monkeypatch):
-    """``--sql`` cannot read rows back, so it must emit DDL and stop.
+def test_offline_upgrade_refuses_instead_of_stamping_without_a_backfill(
+    migration, monkeypatch
+):
+    """``--sql`` must fail closed, and fail before anything is emitted.
 
-    Offline SQL generation is a supported path in this repo, and a
-    MockConnection cannot be inspected -- reaching the inspector at all would
-    raise rather than render.
+    An offline script stamps ``alembic_version`` along with its DDL, so a
+    script that adds the column without filling it leaves every historical
+    task NULL and a later online ``upgrade head`` never revisits them --
+    ``retention_anchor()`` then resolves those to ``created_at`` and reports
+    a task created 400 days ago with a message from last week as expired at
+    90 days. Emitting the backfill instead is worse: offline has no
+    per-migration transaction boundary, so the rendered PostgreSQL script is
+    BEGIN / ALTER / UPDATE / COMMIT and holds ACCESS EXCLUSIVE on ``tasks``
+    for the whole scan.
+
+    So nothing may be emitted at all: not the DDL, not the UPDATE.
     """
-    calls: list[str] = []
+    emitted: list[str] = []
 
     class _Context:
         as_sql = True
 
     monkeypatch.setattr(migration.op, "get_context", _Context)
     monkeypatch.setattr(
-        migration.op, "add_column", lambda *a, **k: calls.append("add_column")
+        migration.op, "add_column", lambda *a, **k: emitted.append("add_column")
     )
-    monkeypatch.setattr(
-        migration.sa,
-        "inspect",
-        lambda _bind: pytest.fail("offline mode must not inspect"),
-    )
-    monkeypatch.setattr(
-        migration, "_backfill", lambda *a, **k: pytest.fail("offline must not backfill")
-    )
+    monkeypatch.setattr(migration.op, "execute", lambda sql: emitted.append(str(sql)))
 
-    migration.upgrade()
-    assert calls == ["add_column"]
+    with pytest.raises(RuntimeError, match="cannot be generated with --sql"):
+        migration.upgrade()
+
+    assert emitted == []
+
+
+def test_offline_upgrade_refusal_is_reachable_through_alembic(tmp_path):
+    """Drive the real ``alembic upgrade --sql`` rather than a stubbed context.
+
+    The stubbed test above replaces ``op.get_context``; this one proves the
+    refusal is what an operator actually meets, through the same command they
+    would run. Without it the pair could pass while the real offline render
+    happily produced a script.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "upgrade",
+            f"{migration_module.down_revision}:{migration_module.revision}",
+            "--sql",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, result.stdout
+    assert "cannot be generated with --sql" in result.stderr
+    assert "ADD COLUMN last_activity_at" not in result.stdout
+
+
+def test_offline_downgrade_still_renders(migration, monkeypatch):
+    """Dropping the column needs no row work, so it stays offline-renderable."""
+    dropped: list[str] = []
+
+    class _Context:
+        as_sql = True
+
+    monkeypatch.setattr(migration.op, "get_context", _Context)
+    monkeypatch.setattr(
+        migration.op, "drop_column", lambda *a, **k: dropped.append("drop_column")
+    )
+    migration.downgrade()
+    assert dropped == ["drop_column"]
+
+
+def test_backfill_never_overwrites_an_anchor_set_after_the_select(engine, migration):
+    """A row anchored between the SELECT and the UPDATE keeps the newer value.
+
+    The ids come from an earlier statement and, on PostgreSQL, each batch
+    commits separately -- so a transcript writer can anchor a selected task in
+    between. Without ``AND last_activity_at IS NULL`` on the UPDATE the
+    backfill overwrites it, and it overwrites it with a *stale* value: a
+    blocked UPDATE re-checks its search condition on the target row, but the
+    MAX() subquery reads another table under the original snapshot and cannot
+    see the message that just arrived.
+
+    What this test reaches, and what it does not: it anchors the row on the
+    same connection before the UPDATE runs, which reproduces the *state* the
+    racing writer leaves behind and proves the guard skips such a row. It
+    does not reproduce the MVCC half -- no second session, no lock re-check,
+    and no message inserted -- so the stale-snapshot mechanism above is
+    reasoning about PostgreSQL, not something asserted here. SQLite has no
+    row locks for it to exercise.
+    """
+    metadata, tasks, messages = _schema(with_messages=True)
+    metadata.create_all(engine)
+    concurrent_anchor = NOW - timedelta(minutes=1)
+    with _migration_env(engine) as connection:
+        connection.execute(
+            tasks.insert(), {"id": 1, "created_at": NOW - timedelta(days=400)}
+        )
+        connection.execute(
+            messages.insert(),
+            {"id": 10, "task_id": 1, "created_at": NOW - timedelta(days=200)},
+        )
+
+        real_execute = connection.execute
+        anchored: list[bool] = []
+
+        def racing_execute(statement, *args, **kwargs):
+            # Between the batch SELECT and its UPDATE, stand in for a
+            # transcript writer that has just anchored this task.
+            text = str(statement)
+            if text.startswith("UPDATE tasks SET last_activity_at") and not anchored:
+                anchored.append(True)
+                real_execute(
+                    sa.text("UPDATE tasks SET last_activity_at = :ts WHERE id = 1"),
+                    {"ts": concurrent_anchor},
+                )
+            return real_execute(statement, *args, **kwargs)
+
+        connection.execute = racing_execute  # type: ignore[method-assign]
+        try:
+            migration.upgrade()
+        finally:
+            connection.execute = real_execute  # type: ignore[method-assign]
+
+        assert anchored, "the racing write never ran; the test proves nothing"
+        assert _anchors(connection)[1] == concurrent_anchor
 
 
 def test_revision_chains_onto_the_previous_head(migration):
     """A second head would break the repository's single-head invariant."""
     assert migration.revision == "20260922_task_last_activity_at"
-    assert migration.down_revision == "20260922_seed_rocketlane_mcp_app"
+    assert migration.down_revision == "20260921_word_contract"
