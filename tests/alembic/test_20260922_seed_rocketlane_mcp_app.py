@@ -56,6 +56,21 @@ def _app_ids(connection):
     return set(connection.execute(text("SELECT app_id FROM public_mcp_apps")).scalars())
 
 
+def _stored_row(connection, migration):
+    """The seeded row as the migration's own typed table sees it: JSON columns
+    deserialize and booleans come back as real bools, so it compares to ROW
+    directly (including the builtin_provenance marker inside launch_config)."""
+    return (
+        connection.execute(
+            select(migration.PUBLIC_MCP_APPS_TABLE).where(
+                migration.PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+            )
+        )
+        .mappings()
+        .first()
+    )
+
+
 def _run(connection, migration, *steps):
     with patch.object(migration, "op", _operations(connection)):
         for step in steps:
@@ -68,19 +83,7 @@ def test_upgrade_inserts_row_matching_seed_snapshot(tmp_path):
     with engine.begin() as connection:
         _create_apps_table(connection)
         _run(connection, migration, "upgrade")
-        # Full-row comparison through the migration's own typed table object:
-        # JSON columns deserialize and booleans come back as real bools, so
-        # the persisted row compares to ROW directly (including the
-        # builtin_provenance marker inside launch_config).
-        row = (
-            connection.execute(
-                select(migration.PUBLIC_MCP_APPS_TABLE).where(
-                    migration.PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
-                )
-            )
-            .mappings()
-            .first()
-        )
+        row = _stored_row(connection, migration)
         assert row is not None
         assert dict(row) == migration.ROW
 
@@ -95,7 +98,11 @@ def test_upgrade_is_idempotent_for_provenance_owned_row(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id=:app_id"),
             {"app_id": APP_ID},
         ).scalar_one()
+        # Cardinality alone cannot tell a no-op apart from a refresh that
+        # rewrote the row in place, so pin the contents too.
+        stored = _stored_row(connection, migration)
     assert count == 1
+    assert dict(stored) == migration.ROW
 
 
 def test_upgrade_is_idempotent_even_with_an_unrelated_later_collision(tmp_path):
@@ -120,7 +127,9 @@ def test_upgrade_is_idempotent_even_with_an_unrelated_later_collision(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id=:app_id"),
             {"app_id": APP_ID},
         ).scalar_one()
+        stored = _stored_row(connection, migration)
     assert count == 1
+    assert dict(stored) == migration.ROW
 
 
 def test_upgrade_accepts_owned_row_from_an_older_provenance_version(tmp_path):
@@ -149,7 +158,13 @@ def test_upgrade_accepts_owned_row_from_an_older_provenance_version(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id=:app_id"),
             {"app_id": APP_ID},
         ).scalar_one()
+        stored = _stored_row(connection, migration)
     assert count == 1
+    # Accepted and left alone, not deleted and reseeded: a reseed would bump
+    # the marker to the current BUILTIN_PROVENANCE version while leaving the
+    # count at 1, and downgrade() -- which deletes only rows still matching the
+    # frozen snapshot -- would then start removing a row it preserves today.
+    assert stored["launch_config"]["builtin_provenance"]["version"] == 0
 
 
 def test_upgrade_refuses_custom_catalog_collision(tmp_path):
@@ -169,7 +184,11 @@ def test_upgrade_refuses_custom_catalog_collision(tmp_path):
             ),
             {"app_id": APP_ID},
         )
-        with pytest.raises(RuntimeError, match="public_mcp_apps"):
+        # "public_mcp_apps" appears in both of the migration's RuntimeError
+        # messages; "builtin_provenance" only in the intended one, so a
+        # regression in the launch_config-column guard cannot pass this test
+        # by raising the other error.
+        with pytest.raises(RuntimeError, match="builtin_provenance"):
             _run(connection, migration, "upgrade")
         row = connection.execute(
             text("SELECT name FROM public_mcp_apps WHERE app_id=:app_id"),
@@ -214,7 +233,7 @@ def test_upgrade_skips_seeding_on_a_name_only_collision(tmp_path, app_id, name):
         assert row == (app_id, name)
 
 
-def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path):
+def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path, caplog):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration()
     with engine.begin() as connection:
@@ -233,6 +252,14 @@ def test_upgrade_skips_columns_missing_from_a_reduced_schema(tmp_path):
         )
         _run(connection, migration, "upgrade")
         assert APP_ID in _app_ids(connection)
+        # The dropped columns are absent from the fixture's own DDL, and a
+        # failure to filter them would make the INSERT raise, so filtering is
+        # already proven by this test passing. What is not otherwise pinned is
+        # the operator-facing warning naming what was dropped.
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "missing columns" in m and "is_visible_in_connector" in m for m in warnings
+        ), warnings
 
 
 def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
@@ -483,7 +510,15 @@ def test_upgrade_skips_when_a_user_owned_server_squats_the_identity(tmp_path, ca
             "https://evil.example/mcp"
         )
         messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-        assert any("mcp_servers" in m and APP_ID in m for m in messages), messages
+        # Both logger.error branches in remote_mcp_server_identity_is_claimable
+        # name mcp_servers and the app_id; only the ownership branch says "could
+        # not all be proven", so matching on it is what proves the squatter was
+        # refused for ownership rather than for an incomplete schema. The shared
+        # helper's own tests pin the same substring
+        # (tests/alembic/test_seed_helpers_remote_identity.py UNPROVEN_ROWS).
+        assert any("could not all be proven" in m and APP_ID in m for m in messages), (
+            messages
+        )
 
 
 def test_upgrade_accepts_the_connect_created_row_on_a_round_trip(tmp_path):
