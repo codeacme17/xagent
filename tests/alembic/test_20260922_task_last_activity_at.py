@@ -125,6 +125,35 @@ def test_harness_supplies_what_an_autocommit_block_needs(engine):
             connection.execute(sa.text("SELECT 1"))
 
 
+def _script_statements(script: str) -> list[str]:
+    """The migration's own statements from a rendered script.
+
+    Alembic's bookkeeping is dropped: ``alembic_version`` is the harness's
+    table, not this schema's, and BEGIN/COMMIT are supplied by the connection
+    the test already holds.
+    """
+    # Strip comment lines before splitting: Alembic writes
+    # ``-- Running upgrade X -> Y`` on its own line with no semicolon, so a
+    # naive split glues it onto the statement that follows and the whole
+    # thing then looks like a comment.
+    body = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("--")
+    )
+    statements = []
+    for raw in body.split(";"):
+        statement = " ".join(raw.split())
+        if not statement or statement in {"BEGIN", "COMMIT"}:
+            continue
+        # Drop only Alembic's own bookkeeping write, matched exactly. A
+        # substring test for "alembic_version" would silently swallow any
+        # other statement that merely mentions it, which is how a script
+        # carrying an extra anchor-clobbering UPDATE could still pass.
+        if statement.startswith("UPDATE alembic_version SET version_num"):
+            continue
+        statements.append(statement)
+    return statements
+
+
 def _has_anchor_column(connection: sa.Connection) -> bool:
     return any(
         c["name"] == "last_activity_at"
@@ -464,50 +493,27 @@ def test_sqlite_backfills_inside_the_migration_transaction(migration, monkeypatc
     assert calls == ["backfill"]
 
 
-def test_offline_upgrade_refuses_instead_of_stamping_without_a_backfill(
-    migration, monkeypatch
-):
-    """``--sql`` must fail closed, and fail before anything is emitted.
+def _render_offline_script(database_url: str | None = None) -> str:
+    """The script ``alembic upgrade <predecessor>:<this> --sql`` produces.
 
-    An offline script stamps ``alembic_version`` along with its DDL, so a
-    script that adds the column without filling it leaves every historical
-    task NULL and a later online ``upgrade head`` never revisits them --
-    ``retention_anchor()`` then resolves those to ``created_at`` and reports
-    a task created 400 days ago with a message from last week as expired at
-    90 days. Emitting the backfill instead is worse: offline has no
-    per-migration transaction boundary, so the rendered PostgreSQL script is
-    BEGIN / ALTER / UPDATE / COMMIT and holds ACCESS EXCLUSIVE on ``tasks``
-    for the whole scan.
-
-    So nothing may be emitted at all: not the DDL, not the UPDATE.
+    Driven as a subprocess through the real command rather than a stubbed
+    ``op.get_context``. An earlier version of these tests stubbed it and
+    asserted substrings, and a mutation that emitted a semantically inverted
+    expression inline passed every one of them -- so what the migration
+    actually renders is the only thing worth asserting on.
     """
-    emitted: list[str] = []
-
-    class _Context:
-        as_sql = True
-
-    monkeypatch.setattr(migration.op, "get_context", _Context)
-    monkeypatch.setattr(
-        migration.op, "add_column", lambda *a, **k: emitted.append("add_column")
-    )
-    monkeypatch.setattr(migration.op, "execute", lambda sql: emitted.append(str(sql)))
-
-    with pytest.raises(RuntimeError, match="cannot be generated with --sql"):
-        migration.upgrade()
-
-    assert emitted == []
-
-
-def test_offline_upgrade_refusal_is_reachable_through_alembic(tmp_path):
-    """Drive the real ``alembic upgrade --sql`` rather than a stubbed context.
-
-    The stubbed test above replaces ``op.get_context``; this one proves the
-    refusal is what an operator actually meets, through the same command they
-    would run. Without it the pair could pass while the real offline render
-    happily produced a script.
-    """
+    import os
     import subprocess
     import sys
+
+    # The dialect comes from the environment, not from any engine the test
+    # holds, so it must be pinned to whatever the script will be applied to.
+    # Left ambient, the PostgreSQL parametrisation rendered SQLite DDL
+    # (``ADD COLUMN ... DATETIME``) and applied it to PostgreSQL, which has no
+    # such type -- green locally, red in CI.
+    env = dict(os.environ)
+    if database_url is not None:
+        env["DATABASE_URL"] = database_url
 
     result = subprocess.run(
         [
@@ -521,10 +527,108 @@ def test_offline_upgrade_refusal_is_reachable_through_alembic(tmp_path):
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        env=env,
     )
-    assert result.returncode != 0, result.stdout
-    assert "cannot be generated with --sql" in result.stderr
-    assert "ADD COLUMN last_activity_at" not in result.stdout
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_offline_script_carries_the_backfill_before_the_version_stamp():
+    """Offline must fill, and must fill before the revision is stamped.
+
+    Alembic appends the ``alembic_version`` update after whatever the
+    migration emits. A script that adds the column without filling it stamps
+    the revision anyway, so a later online ``upgrade head`` skips the backfill
+    and every historical task keeps a NULL anchor -- which
+    ``retention_anchor()`` resolves to ``created_at``, reporting a task
+    created 400 days ago with a message from last week as expired at 90 days.
+    Order is the whole guarantee, so it is asserted, not assumed.
+    """
+    script = _render_offline_script()
+
+    add_column = script.index("ADD COLUMN last_activity_at")
+    backfill = script.index("UPDATE tasks SET last_activity_at")
+    stamp = script.index("UPDATE alembic_version")
+
+    assert add_column < backfill < stamp
+    assert migration_module.OFFLINE_ANCHOR_SQL in script
+
+
+def test_offline_script_anchors_real_rows_on_their_newest_message(engine, request):
+    """Apply what the command actually emitted, against seeded rows.
+
+    Several messages per task, deliberately: with one message MIN, MAX and
+    "the only row" are indistinguishable, and the review asked for
+    ``last_activity_at = MAX(task_chat_messages.created_at)``. Executing a
+    hand-written copy of the statement is also what let an earlier version of
+    this test pass while the migration emitted something else, so the
+    statements applied here are parsed out of the rendered script.
+    """
+    metadata, tasks, messages = _schema(with_messages=True)
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            tasks.insert(),
+            [
+                {"id": 1, "created_at": NOW - timedelta(days=400)},
+                {"id": 2, "created_at": NOW - timedelta(days=300)},
+            ],
+        )
+        connection.execute(
+            messages.insert(),
+            [
+                # Out of id order as well as out of time order, so neither
+                # "first row" nor "last row" can stand in for the maximum.
+                {"id": 10, "task_id": 1, "created_at": NOW - timedelta(days=200)},
+                {"id": 11, "task_id": 1, "created_at": NOW - timedelta(days=10)},
+                {"id": 12, "task_id": 1, "created_at": NOW - timedelta(days=90)},
+            ],
+        )
+
+        script = _render_offline_script(str(engine.url))
+        for statement in _script_statements(script):
+            connection.execute(sa.text(statement))
+
+        anchors = _anchors(connection)
+        # The scenario the review names: created long ago, spoken to recently.
+        # 400 days would be created_at, 200 the oldest message, 90 the middle.
+        assert anchors[1] == NOW - timedelta(days=10)
+        # No message at all: the task's own creation time is the fallback.
+        assert anchors[2] == NOW - timedelta(days=300)
+
+
+def test_offline_script_does_not_disturb_an_already_anchored_row(engine):
+    """The emitted UPDATE is guarded, so re-application cannot clobber.
+
+    A row anchored by an online run, or by an earlier application of this
+    same script, must survive it.
+    """
+    metadata, tasks, messages = _schema(with_messages=True)
+    metadata.create_all(engine)
+    existing = NOW - timedelta(minutes=5)
+    with engine.begin() as connection:
+        connection.execute(
+            tasks.insert(), {"id": 1, "created_at": NOW - timedelta(days=400)}
+        )
+        connection.execute(
+            messages.insert(),
+            {"id": 10, "task_id": 1, "created_at": NOW - timedelta(days=200)},
+        )
+
+        statements = _script_statements(_render_offline_script(str(engine.url)))
+        for statement in statements:
+            connection.execute(sa.text(statement))
+
+        # Stand in for a later anchor, then re-run only the backfill.
+        connection.execute(
+            sa.text("UPDATE tasks SET last_activity_at = :ts WHERE id = 1"),
+            {"ts": existing},
+        )
+        for statement in statements:
+            if statement.startswith("UPDATE tasks SET last_activity_at"):
+                connection.execute(sa.text(statement))
+
+        assert _anchors(connection)[1] == existing
 
 
 def test_offline_downgrade_still_renders(migration, monkeypatch):
@@ -536,10 +640,14 @@ def test_offline_downgrade_still_renders(migration, monkeypatch):
 
     monkeypatch.setattr(migration.op, "get_context", _Context)
     monkeypatch.setattr(
-        migration.op, "drop_column", lambda *a, **k: dropped.append("drop_column")
+        migration.op,
+        "drop_column",
+        lambda table, column: dropped.append((table, column)),
     )
     migration.downgrade()
-    assert dropped == ["drop_column"]
+    # Record the arguments: a stub that swallowed them passed even when the
+    # migration dropped an unrelated column.
+    assert dropped == [("tasks", "last_activity_at")]
 
 
 def test_backfill_never_overwrites_an_anchor_set_after_the_select(engine, migration):

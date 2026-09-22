@@ -24,10 +24,11 @@ Three properties the backfill is shaped around:
   such a schema at all, because the mapped column it selects is not there.
 
   So the invariant this revision must hold is not "NULL is safe" but "NULL
-  must never mean the backfill has not run". Wherever an instant exists, the
-  upgrade writes it before the revision is stamped; where no source can
-  supply one, the row stays NULL on a schema the predicate cannot read. The
-  offline path refuses outright rather than stamping without filling.
+  must never mean the backfill has not run". Every path that adds the column
+  therefore also fills it before the revision can be stamped: the online
+  upgrade runs the paged backfill below, and the offline script carries its
+  own single-statement one ahead of the ``alembic_version`` update Alembic
+  appends.
 
 * **It pages forward by primary key.** Selecting the remaining NULL set on
   every pass looks equivalent and is not: a row written to NULL stays in that
@@ -35,7 +36,14 @@ Three properties the backfill is shaped around:
   ceiling. The cursor advances whatever value was written, which also keeps
   the walk linear instead of re-scanning the rows already done.
 
-On PostgreSQL the backfill runs inside ``autocommit_block()``. Without it
+On PostgreSQL the backfill runs inside ``autocommit_block()``, on the online
+path and the offline one alike. Offline rendering honours it -- on a
+transactional-DDL dialect Alembic emits the COMMIT into the generated script
+-- so an operator applying that script gets BEGIN / ALTER / COMMIT and then
+the UPDATE outside the transaction, rather than holding the ALTER's lock for
+a full pass over ``tasks``.
+
+Without it
 the ``ADD COLUMN`` and every batch share one transaction (``env.py`` sets
 ``transaction_per_migration`` for this dialect), and ``ALTER TABLE ... ADD
 COLUMN`` holds ACCESS EXCLUSIVE on ``tasks`` until that transaction commits --
@@ -66,6 +74,13 @@ depends_on = None
 #: Rows per UPDATE. Bounded so one statement cannot take an unbounded lock
 #: footprint over a multi-million-row ``tasks`` table.
 BACKFILL_BATCH_SIZE = 5000
+
+#: The anchor expression the offline script carries. Shared with the test that
+#: applies the rendered script, so the two cannot drift.
+OFFLINE_ANCHOR_SQL = (
+    "COALESCE((SELECT MAX(m.created_at) FROM task_chat_messages m "
+    "WHERE m.task_id = tasks.id), tasks.created_at)"
+)
 
 
 def _has_column(inspector: sa.Inspector, table: str, column: str) -> bool:
@@ -148,38 +163,40 @@ def upgrade() -> None:
     # establishes, so it cannot be reached when a test drives upgrade()
     # through Operations.context(). Both read the same flag.
     if op.get_context().as_sql:
-        # Refuse, rather than render. This revision cannot be applied offline
-        # safely, and every alternative was worse:
+        # Offline renders the backfill as well as the DDL, and the order
+        # matters: Alembic appends the ``alembic_version`` update after this,
+        # so filling here means the revision cannot be stamped complete while
+        # historical anchors are still NULL. Emitting only the ADD COLUMN was
+        # the round-1 defect -- a later online ``upgrade head`` would see the
+        # revision applied, skip the backfill, and leave every historical task
+        # reading as expired from its creation date.
         #
-        # * Emitting only the ADD COLUMN stamps ``alembic_version`` too, so a
-        #   later online ``upgrade head`` considers the revision applied and
-        #   never backfills. Every historical task keeps a NULL anchor, which
-        #   ``retention_anchor()`` resolves to ``created_at`` -- reporting a
-        #   task created 400 days ago with a message from last week as expired
-        #   at 90 days. That is the data-loss path this refusal closes.
-        #
-        # * Emitting the backfill too puts a full-table correlated UPDATE
-        #   inside the same transaction as the ALTER, because offline mode has
-        #   no per-migration boundaries and no ``autocommit_block``. On
-        #   PostgreSQL the rendered script is BEGIN / ALTER / UPDATE / COMMIT,
-        #   so ACCESS EXCLUSIVE on ``tasks`` is held for the whole scan -- the
-        #   outage the online path takes care to avoid, reintroduced in a form
-        #   the operator cannot split. It also has to name
-        #   ``task_chat_messages`` and ``tasks.created_at`` unconditionally,
-        #   since offline cannot inspect, so against the legacy shapes the
-        #   online path handles it fails and rolls back the whole chain.
-        #
-        # Refusing costs little: offline generation across the full chain
-        # already fails earlier in this repository (20260317 reflects through
-        # a MockConnection), so this is not a working path being withdrawn.
-        raise RuntimeError(
-            "20260922_task_last_activity_at cannot be generated with --sql. "
-            "It backfills tasks.last_activity_at row by row, and an offline "
-            "script would stamp the revision without running that backfill, "
-            "leaving historical tasks with an anchor that reads as their "
-            "creation date and expires them early. Run this revision online "
-            "(alembic upgrade head against the database)."
+        # Unconditional and unpaged, because offline has a MockConnection:
+        # nothing can be inspected and no rowcount can be read back. The
+        # online path probes its sources for the legacy ``tasks`` shapes it
+        # can meet; this one cannot, and does not need to for the range it
+        # serves -- a database at the immediate predecessor carries the modern
+        # schema. Generating offline SQL from an ancient revision is already
+        # unavailable in this repository for an unrelated reason: 20260317
+        # reflects through the MockConnection and raises first.
+        op.add_column(
+            "tasks",
+            sa.Column("last_activity_at", sa.DateTime(timezone=True), nullable=True),
         )
+        # Same reason as the online path: commit the ALTER before the scan so
+        # its ACCESS EXCLUSIVE lock is held for the DDL rather than for a full
+        # pass over ``tasks``. ``autocommit_block`` is honoured in offline
+        # rendering too -- on a transactional-DDL dialect it emits the COMMIT
+        # into the script (alembic/runtime/migration.py, emit_commit under
+        # ``as_sql``), so PostgreSQL gets BEGIN / ALTER / COMMIT and then the
+        # UPDATE outside that transaction.
+        with op.get_context().autocommit_block():
+            op.execute(
+                # noqa: S608 -- OFFLINE_ANCHOR_SQL is a module literal.
+                "UPDATE tasks SET last_activity_at = "  # noqa: S608
+                f"{OFFLINE_ANCHOR_SQL} WHERE last_activity_at IS NULL"
+            )
+        return
 
     bind = op.get_bind()
     inspector = sa.inspect(bind)
