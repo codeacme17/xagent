@@ -1,7 +1,7 @@
 """seed built-in Freshdesk (key-based) MCP connector
 
 Revision ID: 20260923_seed_freshdesk_mcp_app
-Revises: 20260921_word_contract
+Revises: 20260922_task_last_activity_at
 Create Date: 2026-09-23 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260923_seed_freshdesk_mcp_app"
-down_revision: Union[str, None] = "20260921_word_contract"
+down_revision: Union[str, None] = "20260922_task_last_activity_at"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
