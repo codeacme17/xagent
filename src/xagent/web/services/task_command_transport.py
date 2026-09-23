@@ -38,6 +38,12 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .task_admission_execution import (
+    AdmissionWaiting,
+    admission_execution,
+    return_to_admission_queue,
+)
+from ..models.task_admission import TaskAdmissionTicket
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
     stage_terminal_event,
@@ -220,6 +226,7 @@ class ClaimedTaskCommand:
     attempt_count: int
     failure_count: int = 0
     defer_count: int = 0
+    admission_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -895,6 +902,9 @@ def claim_task_command(
         .populate_existing()
         .one()
     )
+    from .task_admission_observation import record_command_admission
+
+    record_command_admission(db, fresh)
     payload: dict[str, Any] = fresh.payload if isinstance(fresh.payload, dict) else {}
     return ClaimedTaskCommand(
         id=int(fresh.id),
@@ -907,6 +917,7 @@ def claim_task_command(
         payload=payload,
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
+        admission_required=db.get(TaskAdmissionTicket, fresh.id) is not None,
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )
@@ -1531,7 +1542,14 @@ async def _dispatch_task_command(
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
-        result = await executor(command)
+        with admission_execution(command.id, command.task_id, command.admission_required):
+            result = await executor(command)
+    except AdmissionWaiting:
+        disposition_name = "return_to_admission_queue"
+        def persist_admission_wait() -> bool:
+            return return_to_admission_queue(command.id, runner_id, command.attempt_count)
+
+        disposition_operation = persist_admission_wait
     except asyncio.CancelledError:
         # Leave the processing claim intact. Another worker may reclaim it only
         # after the claim expires, which avoids concurrent replay on shutdown.
