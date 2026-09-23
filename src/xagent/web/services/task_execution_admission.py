@@ -24,7 +24,7 @@ from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 from .task_coordinator_service import TaskLease
 
-_EXECUTION_KINDS = {"start", "resume", "resume_input", "message"}
+_EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
 
 
