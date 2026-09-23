@@ -59,14 +59,26 @@ _CAPACITY_ERROR_MARKERS = (
 
 
 def _causes(error: BaseException) -> list[BaseException]:
-    """Walk an exception's cause chain once, tolerating self-referential links."""
+    """Walk an exception's explicit cause chain, tolerating cyclic links.
+
+    ``__cause__`` only, deliberately unlike
+    :func:`xagent.core.model.chat.error.is_context_length_error`, which also
+    falls back to ``__context__``. ``__context__`` is set implicitly for any
+    exception raised while another was being handled, including unrelated
+    cleanup failures, so a marker found there can belong to an exception that
+    has nothing to do with the request. Here that costs resilience rather
+    than merely misreporting: classifying a transient fault as a capacity
+    refusal cuts it from the model's full budget to two attempts. Every chat
+    adapter chains its provider errors explicitly (``raise ... from e``), so
+    the shapes this has to recognize all carry ``__cause__``.
+    """
     seen: set[int] = set()
     chain: list[BaseException] = []
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
-        current = current.__cause__ or current.__context__
+        current = current.__cause__
     return chain
 
 

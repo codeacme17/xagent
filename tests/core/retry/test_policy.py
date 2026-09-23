@@ -175,3 +175,44 @@ class TestChatRetryBudget:
         assert budget.deadline_seconds == default_deadline
         assert budget.capacity_max_attempts == default_attempts
         assert budget.deadline_seconds is not None
+
+
+class TestChainWalkIsExplicitOnly:
+    """The walk follows ``__cause__`` only, and a test has to hold that.
+
+    ``__context__`` is set implicitly whenever an exception is raised while
+    another is being handled, so a marker found there can belong to an
+    unrelated cleanup failure. Misclassifying a transient fault as a capacity
+    refusal cuts its budget from the model's full ``max_retries`` to two, so
+    the fallback costs resilience and must not come back.
+    """
+
+    def test_a_context_only_link_is_not_followed(self):
+        capacity = RuntimeError("Exceeded on-demand capacity.")
+        try:
+            try:
+                raise capacity
+            except RuntimeError:
+                # No ``from``, so only __context__ links the two.
+                raise RuntimeError("connection reset by peer")
+        except RuntimeError as unrelated:
+            assert unrelated.__context__ is capacity
+            assert unrelated.__cause__ is None
+            assert is_capacity_error(unrelated) is False
+
+    def test_an_explicit_cause_is_followed(self):
+        capacity = RuntimeError("Exceeded on-demand capacity.")
+        try:
+            raise RuntimeError("OpenAI API error") from capacity
+        except RuntimeError as wrapped:
+            assert is_capacity_error(wrapped) is True
+
+    def test_retry_after_also_ignores_a_context_only_link(self):
+        hinted = _status_error(429, "slow down", headers={"retry-after": "9"})
+        try:
+            try:
+                raise hinted
+            except openai.APIStatusError:
+                raise RuntimeError("unrelated cleanup failure")
+        except RuntimeError as unrelated:
+            assert retry_after_seconds(unrelated) is None
