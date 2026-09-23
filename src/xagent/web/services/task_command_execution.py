@@ -3377,7 +3377,7 @@ def _load_command_actor(actor_user_id: int | None) -> _CommandActor:
 
 async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one DB-claimed command; personal replies use the host callback.
 
     A runner without an originating connection discards personal replies while
@@ -3423,6 +3423,14 @@ async def _execute_durable_task_command(
             lambda: _load_command_task_run_id(command.task_id)
         )
         if current_run_id != command.target_run_id:
+            if command.kind == TaskCommandKind.PAUSE:
+                from .task_execution_admission import settle_queued_start_for_pause
+
+                settled = await run_db_io_cancellation_safe(
+                    lambda: settle_queued_start_for_pause(command)
+                )
+                if settled is not None:
+                    return settled
             raise TaskCommandRejected(
                 f"Task run changed before {command.kind.value} command "
                 f"{command.command_id} was applied",
@@ -3813,7 +3821,7 @@ async def execute_durable_task_command(
 
 async def _execute_and_report_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one command and expose only terminal transport failures to clients."""
 
     try:

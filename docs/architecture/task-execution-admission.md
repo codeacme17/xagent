@@ -80,6 +80,11 @@ that old state and persist their terminal events before committing completion. A
 control does not discard queued work. Active execution cancellation retains its
 slot until its cleanup actually finishes.
 
+A PAUSE aimed at the future run of an unreserved START settles that exact START
+and the PAUSE atomically, before the START can schedule after capacity opens.
+It requires the live claim, current identities, unchanged run/version, and an
+unreserved ticket. The terminal START retains classification for explicit retry.
+
 ## Matching and trust boundaries
 
 | Axis | Gate |
