@@ -2,7 +2,7 @@ import os
 from typing import Callable, Optional
 
 from ....model import ChatModelConfig, ModelConfig
-from ....retry import create_retry_wrapper
+from ....retry import chat_retry_budget, create_retry_wrapper
 from ...providers import (
     AUTO_MODEL_NAME,
     ROUTER_PROVIDER,
@@ -171,4 +171,9 @@ def create_base_llm(
         retry_methods={"chat", "vision_chat", "stream_chat"},
         max_retries=model.max_retries,
         retry_on=retry_on,
+        # ``max_retries`` alone cannot bound how long one call holds an
+        # execution slot, because each attempt may consume a full request
+        # timeout. The budget adds the wall-clock ceiling and the short
+        # capacity-refusal budget on top of it.
+        budget=chat_retry_budget(),
     )

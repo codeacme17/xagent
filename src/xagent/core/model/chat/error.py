@@ -40,6 +40,12 @@ def is_context_length_error(error: BaseException) -> bool:
     return False
 
 
+def _openai_status_code(error: openai.APIStatusError) -> int | None:
+    """Read an openai status error's HTTP status, or ``None`` if unusable."""
+    status = getattr(error, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 def retry_on(e: Exception) -> bool:
     if is_context_length_error(e):
         return False
@@ -72,6 +78,25 @@ def retry_on(e: Exception) -> bool:
             return (
                 exc.response.status_code == 429 or 500 <= exc.response.status_code < 600
             )
+
+        # Handle openai SDK status errors. The status lives on the exception,
+        # not on an httpx response the branch above can reach, so a provider
+        # 5xx arriving through the openai SDK used to fall through to the
+        # tuple test below and be treated as permanent. The SDK's own retry
+        # budget hid that; now that the clients are built with
+        # ``max_retries=0`` (see ``OpenAICompatibleLLM._ensure_client``) this
+        # is the only layer left to recognize them, which is also what
+        # ``OpenRouterLLM._chat_with_compat_retry``'s contract already assumed.
+        #
+        # Deliberately additive: this branch can only turn a "no" into a
+        # "yes" and never the reverse, so no failure shape that retries today
+        # stops retrying. An unusable status falls through to the tuple test
+        # rather than raising out of the predicate, which would turn a
+        # retryable provider error into an unrelated crash.
+        if isinstance(exc, openai.APIStatusError):
+            status = _openai_status_code(exc)
+            if status is not None and (status == 429 or 500 <= status < 600):
+                return True
 
         # Handle Zai/Zhipu SDK errors
         if ZaiAPIStatusError and isinstance(exc, ZaiAPIStatusError):

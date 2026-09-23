@@ -14,9 +14,16 @@ from typing import (
     runtime_checkable,
 )
 
+from .policy import RetryBudget, retry_after_seconds
 from .strategy import ExponentialBackoff, RetryStrategy
 
 logger = logging.getLogger(__name__)
+
+# Structured markers for the two give-up paths a budget adds. They exist so a
+# capacity refusal is searchable in the log cluster instead of looking like a
+# slow call, which is how the incident behind this policy first presented.
+GIVE_UP_CAPACITY = "llm_capacity_refusal"
+GIVE_UP_DEADLINE = "retry_deadline_exceeded"
 
 
 @runtime_checkable
@@ -33,14 +40,74 @@ class RetryWrapper(Retryable):
         strategy: RetryStrategy = ExponentialBackoff(),
         max_retries: int = 10,
         retry_on: Callable[[Exception], bool] = lambda _: True,
+        budget: Optional[RetryBudget] = None,
     ):
         self.target = target
         self.strategy = strategy
         self.max_retries = max_retries
         self.retry_on = retry_on
+        # Optional by design: every caller that passes nothing keeps the exact
+        # attempt-counting behaviour it had before budgets existed.
+        self.budget = budget
+
+    def _deadline(self) -> Optional[float]:
+        """Stamp the wall-clock ceiling for one retry loop, if there is one."""
+        if self.budget is None or self.budget.deadline_seconds is None:
+            return None
+        return time.monotonic() + self.budget.deadline_seconds
+
+    def _log_give_up(
+        self,
+        reason: str,
+        attempt: int,
+        error: Exception,
+        method_name: Optional[str] = None,
+    ) -> None:
+        """Record a budget-driven stop under its structured reason marker."""
+        logger.warning(
+            "%s: giving up on %s after %d attempt(s): %s",
+            reason,
+            method_name or "call",
+            attempt + 1,
+            error,
+        )
+
+    def _plan_retry(
+        self, error: Exception, attempt: int, deadline: Optional[float]
+    ) -> float | str:
+        """Seconds to wait before the next attempt, or a give-up marker.
+
+        A float is a delay; a ``GIVE_UP_*`` string means stop and re-raise.
+        Returning one or the other, rather than a pair, is what makes "no
+        delay to sleep" unrepresentable instead of merely documented.
+
+        Only reached once ``retry_on`` has already accepted ``error``, so a
+        budget can lower this call's ceiling and can never raise it.
+        """
+        delay = self.strategy.get_delay(attempt) / 1000.0
+        budget = self.budget
+        if budget is None:
+            return delay
+
+        attempt_limit = budget.attempt_limit(error)
+        if attempt_limit is not None and attempt + 1 >= attempt_limit:
+            return GIVE_UP_CAPACITY
+
+        # A provider that tells us when to come back knows better than our
+        # backoff curve does; the SDK honoured this until we took its retry
+        # budget away, so the wrapper has to honour it now.
+        hint = retry_after_seconds(error)
+        if hint is not None:
+            delay = hint
+
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            return GIVE_UP_DEADLINE
+
+        return delay
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        deadline = self._deadline()
 
         for attempt in range(self.max_retries):
             try:
@@ -51,7 +118,11 @@ class RetryWrapper(Retryable):
 
                 last_exception = e
                 if attempt < self.max_retries - 1:
-                    delay = self.strategy.get_delay(attempt) / 1000.0
+                    plan = self._plan_retry(e, attempt, deadline)
+                    if isinstance(plan, str):
+                        self._log_give_up(plan, attempt, e)
+                        break
+                    delay = plan
                     logger.warning(
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
@@ -63,6 +134,7 @@ class RetryWrapper(Retryable):
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        deadline = self._deadline()
 
         for attempt in range(self.max_retries):
             try:
@@ -73,7 +145,11 @@ class RetryWrapper(Retryable):
 
                 last_exception = e
                 if attempt < self.max_retries - 1:
-                    delay = self.strategy.get_delay(attempt) / 1000.0
+                    plan = self._plan_retry(e, attempt, deadline)
+                    if isinstance(plan, str):
+                        self._log_give_up(plan, attempt, e)
+                        break
+                    delay = plan
                     logger.warning(
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
@@ -98,6 +174,7 @@ def create_retry_wrapper(
     strategy: RetryStrategy | None = None,
     max_retries: int = 10,
     retry_on: Callable[[Exception], bool] = lambda _: True,
+    budget: RetryBudget | None = None,
 ) -> T:
     # 1. Ensure we implement the mandatory abstract methods of Runnable
     methods_to_implement = retry_methods or set()
@@ -110,6 +187,7 @@ def create_retry_wrapper(
                 strategy=strategy or ExponentialBackoff(),
                 max_retries=max_retries,
                 retry_on=retry_on,
+                budget=budget,
             )
 
         def __getattr__(self, name: str) -> Any:
@@ -129,6 +207,7 @@ def create_retry_wrapper(
                     # Define an inner async generator that handles retries
                     async def _retry_generator() -> AsyncIterator[Any]:
                         last_exception: Optional[Exception] = None
+                        deadline = self._retry_wrapper._deadline()
 
                         for attempt in range(self._retry_wrapper.max_retries):
                             yielded_item = False
@@ -155,10 +234,15 @@ def create_retry_wrapper(
 
                                 last_exception = e
                                 if attempt < self._retry_wrapper.max_retries - 1:
-                                    delay = (
-                                        self._retry_wrapper.strategy.get_delay(attempt)
-                                        / 1000.0
+                                    plan = self._retry_wrapper._plan_retry(
+                                        e, attempt, deadline
                                     )
+                                    if isinstance(plan, str):
+                                        self._retry_wrapper._log_give_up(
+                                            plan, attempt, e, method_name
+                                        )
+                                        break
+                                    delay = plan
                                     logger.warning(
                                         f"Async generator {method_name} attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                                     )
