@@ -20,13 +20,19 @@ import json
 import logging
 import os
 import re
+import socket
 from typing import Any
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from ....core.utils.security import redact_sensitive_text
+from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils.security import (
+    PrivateNetworkHostError,
+    redact_sensitive_text,
+    reject_private_network_host,
+)
 from ...utils.graphql_errors import truncate_error_text
 from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
 
@@ -38,14 +44,40 @@ setup_proxy_env()
 
 mcp = FastMCP("freshdesk-mcp")
 
+# One module-level session, configured exactly as zendesk.py configures its
+# own -- that connector is this one's closest analogue (helpdesk, subdomain
+# label, fixed vendor domain, Basic auth), so it is the right thing to copy.
+_session = requests.Session()
+# trust_env=False so requests never falls back to an ambient/OS-native proxy
+# that get_trusted_proxy_url() does not police. A proxy does its own DNS
+# resolution for the real connection, so an ambient one silently bypasses the
+# private-network check _base_url() performs on the addresses *this* process
+# resolved -- the exact hole that check exists to close. It also disables
+# .netrc auto-auth, which a redirect would otherwise use to attach someone
+# else's credentials to the target host.
+_session.trust_env = False
+# trust_env=False also turns off requests' own REQUESTS_CA_BUNDLE/
+# CURL_CA_BUNDLE lookup, so it is re-applied explicitly: an operator opting
+# into a trusted egress proxy is the textbook TLS-intercepting corporate proxy
+# with an internal CA, which would otherwise fail closed with an opaque
+# SSLError.
+_ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+if _ca_bundle:
+    _session.verify = _ca_bundle
+
 # The only host this connector ever talks to. Freshdesk serves each tenant at
-# <subdomain>.freshdesk.com and, per the vendor's MCP/API documentation, does
-# not support custom domains for programmatic access -- so the host is composed
-# from a validated label here rather than accepted as a URL from the user.
-# That is the whole SSRF story for this connector: there is no user-supplied
-# host, port, scheme or path to validate, unlike magento.py, whose store URL is
-# genuinely customer-controlled and therefore needs DNS pinning and
-# private-network rejection.
+# <subdomain>.freshdesk.com and does not support custom domains for
+# programmatic access, so the host is composed from a validated label rather
+# than accepted as a URL.
+#
+# That is NOT the whole SSRF story, and an earlier revision of this file
+# wrongly said it was. Composing the host only settles who chose the *string*;
+# a perfectly legitimate hostname can still be rebound by DNS to a private or
+# internal address at request time, which is orthogonal. zendesk.py -- the
+# closest analogue in this repo, same label-plus-fixed-domain shape -- makes
+# exactly that point and resolves and checks every address anyway, as
+# posthog.py does for its two hardcoded hostnames. _base_url() below follows
+# them.
 FRESHDESK_DOMAIN = "freshdesk.com"
 
 # A DNS label: 1-63 chars, alphanumeric, internal hyphens only. Deliberately
@@ -67,6 +99,9 @@ DEFAULT_PER_PAGE = 30
 # 10, so one query can reach at most 300 tickets however it is paged.
 SEARCH_PAGE_SIZE = 30
 MAX_SEARCH_PAGE = 10
+# "Query string must be enclosed between a pair of double quotes and can have
+# up to 512 characters" -- the quotes are inside the budget.
+MAX_QUERY_LENGTH = 512
 
 # Freshdesk's built-in ticket statuses. NOT an exhaustive set: a helpdesk can
 # define custom statuses, which are assigned instance-specific numeric values
@@ -82,6 +117,32 @@ TICKET_STATUSES = {2: "Open", 3: "Pending", 4: "Resolved", 5: "Closed"}
 # so it is validated as a closed set.
 PRIORITY_LOW = 1
 TICKET_PRIORITIES = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
+
+
+# A Freshdesk URL carries the caller's search terms -- a contact email, a
+# ticket query -- in its query string, and a urllib3 RequestException embeds
+# the full URL in its message. redact_sensitive_text only knows
+# credential-shaped keys (api_key/token/...), not `query=`, so the query string
+# is scrubbed wholesale before any exception text is logged or returned to the
+# model. Copied from zendesk.py, which closed the same hole.
+_QUERY_STRING_PATTERN = re.compile(r"\?[^\s\"'()<>]+")
+# Only redact when the "?" is immediately preceded, within the same
+# whitespace-delimited token, by something path-shaped (containing a "/"), so
+# ordinary prose ending in a question mark is left alone.
+_PATH_LIKE_TOKEN_PATTERN = re.compile(r"[^\s\"'()<>]*$")
+
+
+def _scrub_query_strings(text: str) -> str:
+    def _redact(match: re.Match[str]) -> str:
+        preceding_token = _PATH_LIKE_TOKEN_PATTERN.search(text[: match.start()])
+        token = preceding_token.group(0) if preceding_token else ""
+        return "?<query redacted>" if "/" in token else match.group(0)
+
+    return _QUERY_STRING_PATTERN.sub(_redact, text)
+
+
+def _sanitize_exception_text(exc: BaseException) -> str:
+    return _scrub_query_strings(redact_sensitive_text(str(exc)))
 
 
 def _success(**payload: Any) -> str:
@@ -114,7 +175,23 @@ def _subdomain() -> str:
 
 
 def _base_url() -> str:
-    return f"https://{_subdomain()}.{FRESHDESK_DOMAIN}/api/v2"
+    """Compose the tenant's API root, refusing one that resolves privately.
+
+    The label check in _subdomain() settles which *name* is contacted; this
+    settles which *address*. Both are needed -- see FRESHDESK_DOMAIN's comment.
+    """
+    hostname = f"{_subdomain()}.{FRESHDESK_DOMAIN}"
+    try:
+        resolved = socket.getaddrinfo(
+            hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        for *_, sockaddr in resolved:
+            reject_private_network_host(str(sockaddr[0]))
+    except PrivateNetworkHostError as exc:
+        raise ValueError(f"FRESHDESK_SUBDOMAIN is not allowed: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"Freshdesk host could not be resolved: {exc}") from exc
+    return f"https://{hostname}/api/v2"
 
 
 def _api_key() -> str:
@@ -173,9 +250,22 @@ def _send(
     ``Link`` response header, which the parsed body does not carry.
     """
     try:
-        response = requests.request(
+        proxy_url = get_trusted_proxy_url()
+    except PrivateNetworkHostError as exc:
+        raise type(exc)(redact_sensitive_text(str(exc))) from exc
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
+    try:
+        response = _session.request(
             method=method,
             url=f"{_base_url()}{path}",
+            proxies=proxies,
+            # Never follow a redirect with the Basic Auth credential attached.
+            # Freshdesk's documented API does not redirect, so a 3xx is either
+            # a misconfiguration or a host trying to relay the request -- and a
+            # 307/308 would replay the body (ticket text, contact search terms)
+            # to wherever Location points.
+            allow_redirects=False,
             # Freshdesk authenticates with HTTP Basic using the API key as the
             # username and an ignored password ("X" by the vendor's own
             # convention) -- not a bearer token. Note this differs from their
@@ -197,8 +287,14 @@ def _send(
         # URL, which may carry embedded user:pass@ credentials
         # (setup_proxy_env() exports whatever the OS has configured).
         raise RuntimeError(
-            f"Freshdesk request failed: {truncate_error_text(redact_sensitive_text(str(exc)))}"
+            f"Freshdesk request failed: {truncate_error_text(_sanitize_exception_text(exc))}"
         ) from exc
+
+    if 300 <= response.status_code < 400:
+        raise RuntimeError(
+            f"Freshdesk returned an unexpected redirect (HTTP {response.status_code}); "
+            "refusing to follow it with credentials attached"
+        )
 
     if response.status_code >= 400:
         detail = _extract_error_detail(response)
@@ -207,7 +303,9 @@ def _send(
         # The response body is host-controlled content -- if it echoes request
         # headers (a misconfigured proxy/WAF error page), redact the Basic Auth
         # credential before it reaches logs or the LLM's context.
-        detail = truncate_error_text(redact_sensitive_text(detail))
+        detail = truncate_error_text(
+            _scrub_query_strings(redact_sensitive_text(detail))
+        )
         # 429 is the one error a caller can act on, and Freshdesk puts the wait
         # in Retry-After. Surfacing it turns "rate limited" into a decision the
         # caller can actually make.
@@ -373,6 +471,23 @@ def _success_with_capped_list(list_field: str, payload: dict[str, Any]) -> str:
     return response
 
 
+def _coerce_int(value: Any, field_name: str) -> int:
+    """Coerce to int, refusing anything that would silently change meaning.
+
+    ``int()`` truncates: ``int(9.7)`` is 9, so a fractional value used to be
+    accepted as a different, valid-looking number. ``bool`` is an ``int``
+    subclass, so ``True`` would otherwise pass as 1.
+    """
+    if isinstance(value, bool):
+        raise RuntimeError(f"{field_name} must be an integer, got {value!r}")
+    if isinstance(value, float) and not value.is_integer():
+        raise RuntimeError(f"{field_name} must be a whole number, got {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{field_name} must be an integer, got {value!r}") from None
+
+
 def _positive_id(value: Any, field_name: str) -> int:
     """Coerce and bounds-check an object id.
 
@@ -382,10 +497,7 @@ def _positive_id(value: Any, field_name: str) -> int:
     ``field_name`` is echoed so a bad contact id does not report a complaint
     about a ticket id.
     """
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"{field_name} must be an integer, got {value!r}") from None
+    parsed = _coerce_int(value, field_name)
     if parsed <= 0:
         raise RuntimeError(f"{field_name} must be a positive integer, got {parsed}")
     return parsed
@@ -400,10 +512,7 @@ def _validated_priority(value: Any) -> int | None:
     """
     if value is None:
         return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"priority must be an integer, got {value!r}") from None
+    parsed = _coerce_int(value, "priority")
     if parsed not in TICKET_PRIORITIES:
         legal = ", ".join(f"{k} ({v})" for k, v in sorted(TICKET_PRIORITIES.items()))
         raise RuntimeError(f"priority must be one of: {legal}; got {parsed}")
@@ -425,10 +534,7 @@ def _validated_status(value: Any) -> int | None:
     """
     if value is None:
         return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"status must be an integer, got {value!r}") from None
+    parsed = _coerce_int(value, "status")
     if parsed < MIN_TICKET_STATUS:
         legal = ", ".join(f"{k} ({v})" for k, v in sorted(TICKET_STATUSES.items()))
         raise RuntimeError(
@@ -462,7 +568,9 @@ def freshdesk_list_tickets(
     response distinguishes "no older tickets exist" from "older tickets were
     not looked at" -- has_more goes false at the end of the 30-day window. To
     cover anything older, pass updated_since explicitly, or use
-    freshdesk_search_tickets, which is not windowed this way.
+    freshdesk_search_tickets, which is not windowed this way -- though it
+    excludes archived tickets, so on a tenant with archiving enabled neither
+    path reaches everything old.
 
     This endpoint offers only Freshdesk's canned views, not arbitrary
     filtering: use freshdesk_search_tickets for conditions such as
@@ -474,12 +582,16 @@ def freshdesk_list_tickets(
     updated_since: ISO 8601 timestamp, e.g. "2026-09-01T00:00:00Z"; returns
     only tickets updated at or after it, and lifts the 30-day default window
     described above.
-    include: comma-separated side-loads, e.g. "requester,stats". Each one
-    enlarges every ticket in the page, which makes size truncation more
-    likely -- pair it with a smaller per_page.
+    include: comma-separated side-loads, e.g. "description,requester,stats".
+    On accounts created after 2018-11-30 the ticket body is NOT returned by
+    this endpoint unless you pass include=description -- without it the
+    tickets come back with metadata only. Each side-load enlarges every ticket
+    in the page, which makes size truncation more likely, so pair
+    include=description with a smaller per_page.
     order_by: "created_at", "due_by", "updated_at" or "status".
     order_type: "asc" or "desc".
-    page: 1-based page number.
+    page: 1-based page number. Freshdesk serves at most 300 pages (30,000
+    tickets) from this endpoint; narrow with updated_since to reach past that.
     per_page: tickets per page (default 30, hard cap 100).
 
     The response carries has_more, taken from Freshdesk's own Link header, so
@@ -502,7 +614,7 @@ def freshdesk_list_tickets(
             },
         )
     except Exception as exc:
-        logger.error("Error in freshdesk_list_tickets: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_list_tickets: %s", exc)
         return _error(str(exc))
 
 
@@ -513,8 +625,10 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
 
     ticket_id: the ticket's numeric id (the number in its Freshdesk URL).
     include: comma-separated side-loads, e.g. "conversations,requester,stats".
-    Note that "conversations" returns only the most recent ten -- use
-    freshdesk_list_ticket_conversations to page through all of them.
+    Note that "conversations" returns only the OLDEST ten ("up to ten
+    conversations sorted by created_at in ascending order"), so on a long
+    thread it shows the start, not the latest exchange -- use
+    freshdesk_list_ticket_conversations to reach the rest.
     """
     try:
         ticket = _validated_dict(
@@ -527,7 +641,7 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
         )
         return success_with_capped_dict("ticket", ticket)
     except Exception as exc:
-        logger.error("Error in freshdesk_get_ticket: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_get_ticket: %s", exc)
         return _error(str(exc))
 
 
@@ -550,6 +664,10 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     per page and refuses pages beyond 10, so at most 300 tickets are
     reachable for one query -- narrow the query rather than paging further.
 
+    Archived tickets are NOT included in the results, so this is not a
+    complete substitute for the 30-day window on freshdesk_list_tickets when a
+    tenant has archiving enabled.
+
     The response carries total, Freshdesk's own count of matches, which can
     exceed the number reachable through paging.
     """
@@ -557,6 +675,17 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
         expression = (query or "").strip()
         if not expression:
             raise RuntimeError("query must not be empty")
+        # Freshdesk caps the quoted query at 512 characters, and the two
+        # quotes added below count toward it -- so the budget for the caller's
+        # expression is 510. Rejecting locally beats spending a request to be
+        # told, and the message can say by how much it overran.
+        quoted_length = len(expression) + 2
+        if quoted_length > MAX_QUERY_LENGTH:
+            raise RuntimeError(
+                f"query is {quoted_length} characters once quoted, over "
+                f"Freshdesk's {MAX_QUERY_LENGTH}-character limit; shorten it by "
+                f"{quoted_length - MAX_QUERY_LENGTH}"
+            )
         page_number = max(1, int(page))
         if page_number > MAX_SEARCH_PAGE:
             raise RuntimeError(
@@ -594,7 +723,7 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
             },
         )
     except Exception as exc:
-        logger.error("Error in freshdesk_search_tickets: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_search_tickets: %s", exc)
         return _error(str(exc))
 
 
@@ -605,6 +734,7 @@ def freshdesk_create_ticket(
     email: str | None = None,
     requester_id: int | None = None,
     phone: str | None = None,
+    name: str | None = None,
     status: int = STATUS_OPEN,
     priority: int = PRIORITY_LOW,
     responder_id: int | None = None,
@@ -617,9 +747,12 @@ def freshdesk_create_ticket(
 
     subject: the ticket's subject line.
     description: the ticket body; Freshdesk renders it as HTML.
-    email / requester_id / phone: how the requester is identified. Exactly
-    one is enough and at least one is required -- Freshdesk creates a new
-    contact for an unknown email or phone.
+    email / requester_id / phone: how the requester is identified. At least
+    one is required -- Freshdesk creates a new contact for an unknown email
+    or phone.
+    name: the requester's name. Freshdesk makes this MANDATORY when phone is
+    given without email ("If the phone number is set and the email address is
+    not, then the name attribute is mandatory"), and ignores it otherwise.
     status: 2 Open (default), 3 Pending, 4 Resolved, 5 Closed.
     priority: 1 Low (default), 2 Medium, 3 High, 4 Urgent.
     responder_id: the agent to assign; omit to leave unassigned.
@@ -632,14 +765,20 @@ def freshdesk_create_ticket(
             raise RuntimeError("subject must not be empty")
         if not (description or "").strip():
             raise RuntimeError("description must not be empty")
-        if (
-            requester_id is None
-            and not (email or "").strip()
-            and not (phone or "").strip()
-        ):
+        has_email = bool((email or "").strip())
+        has_phone = bool((phone or "").strip())
+        if requester_id is None and not has_email and not has_phone:
             raise RuntimeError(
                 "one of email, requester_id or phone is required to identify "
                 "the requester"
+            )
+        # Freshdesk rejects a phone-only create that carries no name. Catching
+        # it here names the missing argument; forwarding it spends a request to
+        # be told "Validation failed".
+        if has_phone and not has_email and requester_id is None and not (name or "").strip():
+            raise RuntimeError(
+                "name is required when creating a ticket from a phone number "
+                "without an email address"
             )
         payload: dict[str, Any] = {
             "subject": subject,
@@ -651,6 +790,7 @@ def freshdesk_create_ticket(
             "email": email,
             "requester_id": requester_id,
             "phone": phone,
+            "name": name,
             "responder_id": responder_id,
             "group_id": group_id,
             "tags": tags,
@@ -662,7 +802,7 @@ def freshdesk_create_ticket(
         )
         return success_with_capped_dict("ticket", ticket)
     except Exception as exc:
-        logger.error("Error in freshdesk_create_ticket: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_create_ticket: %s", exc)
         return _error(str(exc))
 
 
@@ -721,7 +861,7 @@ def freshdesk_update_ticket(
         )
         return success_with_capped_dict("ticket", ticket)
     except Exception as exc:
-        logger.error("Error in freshdesk_update_ticket: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_update_ticket: %s", exc)
         return _error(str(exc))
 
 
@@ -754,9 +894,7 @@ def freshdesk_list_ticket_conversations(
             per_page=per_page,
         )
     except Exception as exc:
-        logger.error(
-            "Error in freshdesk_list_ticket_conversations: %s", exc, exc_info=True
-        )
+        logger.error("Error in freshdesk_list_ticket_conversations: %s", exc)
         return _error(str(exc))
 
 
@@ -795,7 +933,7 @@ def freshdesk_reply_to_ticket(
         )
         return success_with_capped_dict("reply", reply)
     except Exception as exc:
-        logger.error("Error in freshdesk_reply_to_ticket: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_reply_to_ticket: %s", exc)
         return _error(str(exc))
 
 
@@ -833,7 +971,7 @@ def freshdesk_add_note_to_ticket(
         )
         return success_with_capped_dict("note", note)
     except Exception as exc:
-        logger.error("Error in freshdesk_add_note_to_ticket: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_add_note_to_ticket: %s", exc)
         return _error(str(exc))
 
 
@@ -857,7 +995,7 @@ def freshdesk_get_contact(contact_id: int) -> str:
         )
         return success_with_capped_dict("contact", contact)
     except Exception as exc:
-        logger.error("Error in freshdesk_get_contact: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_get_contact: %s", exc)
         return _error(str(exc))
 
 
@@ -923,7 +1061,7 @@ def freshdesk_search_contacts(
             filters=active_filters,
         )
     except Exception as exc:
-        logger.error("Error in freshdesk_search_contacts: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_search_contacts: %s", exc)
         return _error(str(exc))
 
 
@@ -953,7 +1091,7 @@ def freshdesk_list_agents(
             filters={"email": email, "state": state},
         )
     except Exception as exc:
-        logger.error("Error in freshdesk_list_agents: %s", exc, exc_info=True)
+        logger.error("Error in freshdesk_list_agents: %s", exc)
         return _error(str(exc))
 
 

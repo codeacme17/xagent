@@ -7,6 +7,7 @@ live tenant, which is still outstanding on xorbitsai/xagent-saas#1409.
 """
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -198,6 +199,40 @@ def test_extract_error_detail_returns_none_for_non_dict_json():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail fast if a test reaches the real session instead of a recorder.
+
+    Without this, a test that forgets to patch _session.request silently opens
+    a socket to acme.freshdesk.com and shows up as a multi-second hang rather
+    than a readable failure.
+    """
+
+    def _unpatched(**kwargs: Any) -> None:
+        raise AssertionError(
+            "this test issued a real HTTP request; install a recorder with "
+            f"_install(monkeypatch, ...) first (url={kwargs.get('url')!r})"
+        )
+
+    monkeypatch.setattr(freshdesk._session, "request", _unpatched)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_base_url() resolves the tenant host and rejects private addresses.
+
+    Autouse so no test in this module can reach real DNS -- one that did would
+    make the suite depend on the network and on whatever *.freshdesk.com
+    happens to resolve to. The two tests that exercise resolution override this
+    with their own addresses.
+    """
+    monkeypatch.setattr(
+        freshdesk.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+
 @pytest.fixture
 def configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRESHDESK_SUBDOMAIN", "acme")
@@ -217,7 +252,7 @@ def test_request_uses_basic_auth_with_key_as_username(
         captured.update(kwargs)
         return _FakeResponse(payload={"ok": True}, content=b"{}")
 
-    monkeypatch.setattr(requests, "request", fake_request)
+    monkeypatch.setattr(freshdesk._session, "request", fake_request)
     freshdesk._request("GET", "/tickets")
 
     assert captured["auth"] == ("secret-key", "X")
@@ -235,7 +270,7 @@ def test_request_drops_none_and_empty_params(
         captured.update(kwargs)
         return _FakeResponse(payload={}, content=b"{}")
 
-    monkeypatch.setattr(requests, "request", fake_request)
+    monkeypatch.setattr(freshdesk._session, "request", fake_request)
     freshdesk._request(
         "GET", "/tickets", params={"status": "", "priority": None, "page": 2}
     )
@@ -247,7 +282,7 @@ def test_request_raises_with_detail_on_error_status(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(
             status_code=404,
@@ -272,7 +307,7 @@ def test_request_surfaces_rate_limit_retry_after(
     an error that must be actionable.
     """
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(
             status_code=429,
@@ -301,7 +336,7 @@ def test_request_redacts_credentials_from_transport_errors(
             "ProxyError: https://bob:hunter2@proxy.internal:3128"
         )
 
-    monkeypatch.setattr(requests, "request", raise_proxy_error)
+    monkeypatch.setattr(freshdesk._session, "request", raise_proxy_error)
     with pytest.raises(RuntimeError) as excinfo:
         freshdesk._request("GET", "/tickets")
 
@@ -313,7 +348,7 @@ def test_request_returns_empty_dict_for_204(
 ):
     """Freshdesk answers a successful DELETE with 204 and no body."""
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(status_code=204, content=b""),
     )
@@ -325,7 +360,7 @@ def test_request_rejects_non_json_success_body(
 ):
     """A 200 carrying an HTML body means a gateway answered, not Freshdesk."""
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(status_code=200, text="<html>hi</html>"),
     )
@@ -417,7 +452,7 @@ def test_request_hints_at_wrong_subdomain_on_bodyless_404(
     deleted ticket.
     """
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(status_code=404, text="", content=b""),
     )
@@ -436,7 +471,7 @@ def test_request_keeps_a_real_404_description_over_the_subdomain_hint(
     a subdomain hint would send the caller chasing the wrong problem.
     """
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(
             status_code=404,
@@ -456,7 +491,7 @@ def test_request_hints_at_credentials_on_bodyless_401(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(status_code=401, text="", content=b""),
     )
@@ -473,7 +508,7 @@ def test_subdomain_hint_does_not_leak_the_api_key(
     the same env block -- pin that only the subdomain is echoed.
     """
     monkeypatch.setattr(
-        requests,
+        freshdesk._session,
         "request",
         lambda **_: _FakeResponse(status_code=404, text="", content=b""),
     )
@@ -516,7 +551,7 @@ class _Recorder:
 
 def _install(monkeypatch: pytest.MonkeyPatch, *responses: _FakeResponse) -> _Recorder:
     recorder = _Recorder(*responses)
-    monkeypatch.setattr(requests, "request", recorder)
+    monkeypatch.setattr(freshdesk._session, "request", recorder)
     return recorder
 
 
@@ -1043,3 +1078,185 @@ def test_a_missing_credential_surfaces_through_the_tool_boundary(
     assert result["status"] == "error"
     assert "FRESHDESK_API_KEY" in result["message"]
     assert recorder.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Preflight regressions
+#
+# Each of these pins a defect the preflight fan-out found in the code written
+# to answer the previous review round.
+# ---------------------------------------------------------------------------
+
+
+def test_log_output_does_not_leak_a_proxy_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_env: None,
+    caplog: pytest.LogCaptureFixture,
+):
+    """The error envelope was redacted but the LOG was not.
+
+    _send raises RuntimeError(redacted) `from exc`, and logging with
+    exc_info=True formats the whole __cause__ chain -- including the original
+    ProxyError, which echoes HTTPS_PROXY with its embedded user:pass@. The
+    redaction in _send exists precisely for that string, so the log line undid
+    a deliberate control. Reproduced before the fix.
+    """
+
+    def raise_proxy_error(**_: Any) -> None:
+        raise requests.exceptions.ProxyError(
+            "HTTPSConnectionPool: Max retries exceeded "
+            "(Caused by ProxyError('https://bob:s3cr3tpass@proxy.internal:8080'))"
+        )
+
+    monkeypatch.setattr(freshdesk._session, "request", raise_proxy_error)
+
+    with caplog.at_level(logging.ERROR, logger="freshdesk-mcp"):
+        result = freshdesk.freshdesk_list_tickets()
+
+    assert _payload(result)["status"] == "error"
+    assert "s3cr3tpass" not in result
+    assert "s3cr3tpass" not in caplog.text
+    assert caplog.records, "the failure must still be logged for operators"
+
+
+def test_search_terms_are_scrubbed_from_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_env: None,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A urllib3 exception embeds the full URL, and a Freshdesk URL carries the
+    caller's search terms -- end-user PII -- in its query string.
+    redact_sensitive_text only knows credential-shaped keys, not `query=`.
+    """
+
+    def raise_with_url(**_: Any) -> None:
+        raise requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='acme.freshdesk.com', port=443): "
+            "Max retries exceeded with url: "
+            "/api/v2/search/contacts?query=patient%40clinic.example "
+            "(Caused by NewConnectionError())"
+        )
+
+    monkeypatch.setattr(freshdesk._session, "request", raise_with_url)
+
+    with caplog.at_level(logging.ERROR, logger="freshdesk-mcp"):
+        result = freshdesk.freshdesk_search_tickets("status:2")
+
+    assert "patient%40clinic.example" not in result
+    assert "patient%40clinic.example" not in caplog.text
+    assert "<query redacted>" in result
+
+
+def test_a_redirect_is_refused_rather_than_followed(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Following a 3xx would attach the Basic credential to whatever Location
+    names, and a 307/308 would replay the request body there too.
+    """
+    recorder = _install(monkeypatch, _json_response({}, status_code=302))
+    monkeypatch.setattr(freshdesk._session, "request", recorder)
+
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "error"
+    assert "redirect" in result["message"].lower()
+    assert recorder.call["allow_redirects"] is False
+
+
+def test_the_session_does_not_trust_ambient_proxy_env():
+    """An ambient OS proxy does its own DNS resolution, bypassing the
+    private-network check _base_url() performs on the addresses this process
+    resolved -- the hole that check exists to close.
+    """
+    assert freshdesk._session.trust_env is False
+
+
+def test_base_url_refuses_a_host_that_resolves_privately(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """A legitimate *.freshdesk.com label can still be rebound by DNS to an
+    internal address at request time; the label check is orthogonal to that.
+    """
+    monkeypatch.setattr(
+        freshdesk.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+    with pytest.raises(ValueError, match="not allowed"):
+        freshdesk._base_url()
+
+
+def test_base_url_accepts_a_public_address(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    monkeypatch.setattr(
+        freshdesk.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    assert freshdesk._base_url() == "https://acme.freshdesk.com/api/v2"
+
+
+@pytest.mark.parametrize("bad", [9.7, 2.5, True, False])
+def test_non_integral_values_are_refused_rather_than_truncated(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, bad: Any
+):
+    """int() truncates: status=9.7 used to be rejected by the closed enum, but
+    once the enum opened for custom statuses it would have shipped as 9.
+    bool is an int subclass, so True would pass as priority 1.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_update_ticket(3, status=bad))
+    assert result["status"] == "error"
+    assert recorder.calls == []
+
+
+def test_an_overlong_search_query_is_refused_locally(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The tool adds the two enclosing quotes, and they count toward
+    Freshdesk's 512-character limit -- so a 511-character expression would
+    have been sent as 513 and rejected remotely.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_search_tickets("a" * 511))
+    assert result["status"] == "error"
+    assert "512" in result["message"]
+    assert recorder.calls == []
+
+    # 510 + 2 quotes == exactly the limit, and must still be sent.
+    recorder = _install(monkeypatch, _json_response({"results": [], "total": 0}))
+    assert (
+        _payload(freshdesk.freshdesk_search_tickets("a" * 510))["status"] == "success"
+    )
+
+
+def test_phone_only_create_requires_a_name(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """ "If the phone number is set and the email address is not, then the name
+    attribute is mandatory." Without the local guard this always 400s.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_create_ticket("s", "d", phone="+15551234567"))
+    assert result["status"] == "error"
+    assert "name" in result["message"]
+    assert recorder.calls == []
+
+    recorder = _install(monkeypatch, _json_response({"id": 1}))
+    ok = _payload(
+        freshdesk.freshdesk_create_ticket("s", "d", phone="+15551234567", name="Jo")
+    )
+    assert ok["status"] == "success"
+    assert recorder.call["json"]["name"] == "Jo"
+
+
+def test_email_create_does_not_require_a_name(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The name requirement is phone-only; demanding it for an email create
+    would be narrower than the API.
+    """
+    _install(monkeypatch, _json_response({"id": 1}))
+    result = _payload(freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c"))
+    assert result["status"] == "success"
