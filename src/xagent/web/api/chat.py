@@ -1665,6 +1665,35 @@ async def delete_task(
             raise HTTPException(status_code=404, detail="Task no longer exists")
         invalidate_task_cache(task_id)
 
+        # Before the next await, not after it. The rows are committed as
+        # deleted at this point, and everything below suspends: a cancelled
+        # request would otherwise leave this task's WebSocket connections
+        # attached and its background execution running, with no row left to
+        # reconcile them against. ``CancelledError`` is a ``BaseException``, so
+        # neither handler below would catch it either.
+        #
+        # ``asyncio.create_task`` hands the cleanup to the loop, so it survives
+        # the cancellation of this handler. It only schedules, though: the
+        # cancellation of the background turn races the workspace removal below
+        # rather than preceding it, and the two unwind on separate worker
+        # threads onto the same tree. ``TaskWorkspace.cleanup`` tolerates
+        # losing that race, so neither reports a directory as leaked that the
+        # other has already removed.
+        from ..services.task_execution import background_task_manager
+        from .websocket import manager
+
+        connections = manager.detach_task_connections(task_id)
+
+        async def _cleanup_runtime_state() -> None:
+            await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
+            for connection in list(connections):
+                try:
+                    await connection.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close WebSocket connection: {e}")
+
+        asyncio.create_task(_cleanup_runtime_state())
+
         # The task's own owner, not the requester: an admin deleting someone
         # else's task would otherwise send cleanup at the admin's user-scoped
         # workspace root and leave the owner's directory behind.
@@ -1699,21 +1728,6 @@ async def delete_task(
                 task_id,
                 exc_info=True,
             )
-
-        from ..services.task_execution import background_task_manager
-        from .websocket import manager
-
-        connections = manager.detach_task_connections(task_id)
-
-        async def _cleanup_runtime_state() -> None:
-            await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
-            for connection in list(connections):
-                try:
-                    await connection.close()
-                except Exception as e:
-                    logger.warning(f"Failed to close WebSocket connection: {e}")
-
-        asyncio.create_task(_cleanup_runtime_state())
 
         logger.info(f"Task {task_id} deleted successfully")
 

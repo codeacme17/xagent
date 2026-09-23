@@ -37,6 +37,7 @@ from ..services.task_workspace_cleanup import (
     WorkspaceCleanupTarget,
     capture_workspace_cleanup_target_best_effort,
     remove_task_workspace,
+    unscoped_workspace_cleanup_target,
 )
 from ..services.user_admin_scope import hidden_user_ids
 
@@ -217,7 +218,7 @@ def _record_settled_bindings_sync(
 
 def _capture_page_workspace_targets_sync(
     task_rows: list[tuple[int, int, str | None, object]],
-) -> tuple[list[WorkspaceCleanupTarget], int]:
+) -> tuple[list[WorkspaceCleanupTarget], set[int]]:
     """Capture one page's cleanup targets, and count the ones that failed.
 
     A task whose scope will not resolve loses only its own directory; it must
@@ -233,7 +234,7 @@ def _capture_page_workspace_targets_sync(
     """
 
     targets: list[WorkspaceCleanupTarget] = []
-    dropped = 0
+    dropped: set[int] = set()
     for task_id, task_user_id, _source, _agent_config in task_rows:
         target = capture_workspace_cleanup_target_best_effort(
             int(task_id),
@@ -242,7 +243,16 @@ def _capture_page_workspace_targets_sync(
             prefer_active_scope=False,
         )
         if target is None:
-            dropped += 1
+            # Degrade to the unscoped candidates rather than abandoning the
+            # task: that is the set the task-level path falls back to when it
+            # re-captures after the row is gone, so both paths reclaim the same
+            # directories. Still counted as dropped -- what these candidates
+            # cannot name is a workspace under a scope segment, which is
+            # precisely the leak the failed capture predicts.
+            dropped.add(int(task_id))
+            targets.append(
+                unscoped_workspace_cleanup_target(int(task_id), int(task_user_id))
+            )
         else:
             targets.append(target)
     return targets, dropped
@@ -250,19 +260,23 @@ def _capture_page_workspace_targets_sync(
 
 def _remove_workspaces_sync(
     *, targets: list[WorkspaceCleanupTarget], user_id: int
-) -> int:
-    """Remove the captured workspaces, reporting how many were left behind.
+) -> set[int]:
+    """Remove the captured workspaces, reporting which were left behind.
+
+    Task ids rather than a count, because a task whose capture failed is
+    already pending and is in ``targets`` as well: summing the two would
+    report one task as two leaked directories.
 
     Runs after the rows are committed as deleted, so nothing here can fail the
     request: a raised error would tell the admin the account still exists.
     """
 
-    pending = 0
+    pending: set[int] = set()
     for target in targets:
         try:
             remove_task_workspace(target)
         except Exception:
-            pending += 1
+            pending.add(target.task_id)
             logger.error(
                 "User %s was deleted but the workspace of task %s could not be "
                 "removed; the directory is leaked and needs manual reconciliation",
@@ -436,7 +450,7 @@ async def delete_user(
     # and it is held because removal cannot happen until the deletion commits,
     # by which point no page can be re-read.
     workspace_targets: list[WorkspaceCleanupTarget] = []
-    workspace_capture_failures = 0
+    workspace_capture_failures: set[int] = set()
     extension_cleanup_required = bool(registered_task_extensions())
     session_factory = get_session_local()
     cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
@@ -470,7 +484,7 @@ async def delete_user(
             _capture_page_workspace_targets_sync, task_rows
         )
         workspace_targets.extend(page_targets)
-        workspace_capture_failures += page_dropped
+        workspace_capture_failures |= page_dropped
         if not extension_cleanup_required:
             continue
         page = [
@@ -540,7 +554,7 @@ async def delete_user(
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
 
-    pending = workspace_capture_failures + await asyncio.to_thread(
+    pending = workspace_capture_failures | await asyncio.to_thread(
         _remove_workspaces_sync, targets=workspace_targets, user_id=user_id
     )
 
@@ -548,8 +562,8 @@ async def delete_user(
         logger.error(
             "User %s was deleted with %d of %d task workspace(s) left on disk",
             user_id,
-            pending,
-            len(workspace_targets) + workspace_capture_failures,
+            len(pending),
+            len(workspace_targets),
         )
 
     return {

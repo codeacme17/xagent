@@ -8,6 +8,7 @@ looks successful while leaving the directory on disk forever.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -23,11 +24,13 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.task_runtime import TaskRuntimeContribution
 from xagent.web.api import admin_users
+from xagent.web.api import websocket as websocket_module
 from xagent.web.api.admin_users import delete_user
 from xagent.web.api.chat import delete_task
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager
+from xagent.web.services import task_execution as task_execution_module
 from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
@@ -309,6 +312,7 @@ async def test_a_failed_capture_is_reported_as_pending_not_as_cleaned(
         db.add(task)
         db.commit()
         task_id = int(task.id)
+        workspace = _make_workspace(_workspace_root / f"user_{int(owner.id)}", task_id)
 
         def _unresolvable(*args, **kwargs):
             raise RuntimeError("scope resolver is down")
@@ -323,6 +327,10 @@ async def test_a_failed_capture_is_reported_as_pending_not_as_cleaned(
 
         assert result["success"] is True
         assert result["workspace_cleanup_pending"] is True
+        # Pending is the honest answer for a scope nobody could resolve, but
+        # the unscoped candidates are still probed: an unscoped workspace is
+        # reclaimed rather than abandoned alongside the warning.
+        assert not workspace.exists()
         assert db.query(Task).filter(Task.id == task_id).count() == 0
     finally:
         db.close()
@@ -449,5 +457,159 @@ async def test_user_delete_removes_workspaces_only_after_the_rows_are_gone(
             "a workspace was removed while its task row still existed: "
             f"{rows_at_removal}"
         )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_user_delete_cleans_a_scoped_workspace(_workspace_root: Path) -> None:
+    """The account path resolves each task's own scope, not one shared answer.
+
+    It captures for many tasks at once, so it cannot use an activated scope;
+    every task's segments have to come from its own row.
+    """
+    _admin_headers()
+    _register_second_user("bulk-scoped-owner", "bulkscopedpass1")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "bulk-scoped-owner").one()
+        scope = ExecutionScope(
+            sandbox_key_suffix="team-4", workspace_segments=("team-4",)
+        )
+        task = Task(
+            user_id=int(target.id),
+            title="bulk scoped",
+            description="",
+            agent_config={EXECUTION_SCOPE_AGENT_CONFIG_KEY: scope.to_dict()},
+        )
+        db.add(task)
+        db.commit()
+        workspace = _make_workspace(
+            _workspace_root / f"user_{int(target.id)}" / "team-4", int(task.id)
+        )
+        target_id = int(target.id)
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
+        assert not workspace.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_user_delete_reports_pending_when_a_capture_fails(
+    _workspace_root: Path, monkeypatch
+) -> None:
+    """A scope nobody can resolve is a pending cleanup, not a clean account.
+
+    The unscoped candidates are still probed, so an unscoped directory is
+    reclaimed -- but a workspace under a scope segment cannot be named by
+    them, and that is what the flag is reporting.
+    """
+    _admin_headers()
+    _register_second_user("bulk-capture-owner", "bulkcapturepass1")
+    db = _direct_db_session()
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        target = db.query(User).filter(User.username == "bulk-capture-owner").one()
+        task = Task(user_id=int(target.id), title="bulk capture", description="")
+        db.add(task)
+        db.commit()
+        workspace = _make_workspace(
+            _workspace_root / f"user_{int(target.id)}", int(task.id)
+        )
+        target_id = int(target.id)
+
+        def _unresolvable(*args, **kwargs):
+            raise RuntimeError("scope resolver is down")
+
+        monkeypatch.setattr(
+            "xagent.web.services.task_workspace_cleanup."
+            "capture_workspace_cleanup_target",
+            _unresolvable,
+        )
+
+        response = await delete_user(target_id, admin, db)
+
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": True,
+        }
+        assert not workspace.exists()
+        assert db.query(User).filter(User.id == target_id).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_delete_still_detaches_the_deleted_tasks_runtime(
+    _workspace_root: Path, monkeypatch
+) -> None:
+    """Cancellation must not strand a deleted task's connections.
+
+    Everything after the row delete suspends, and ``CancelledError`` is a
+    ``BaseException``, so no handler in the endpoint catches it. If the detach
+    and the runtime cleanup sat below that suspension point, a cancelled
+    request would leave the WebSocket connections of a task that no longer
+    exists attached, and its background execution still running.
+    """
+    _admin_headers()
+    _register_second_user("cancelled-owner", "cancelledpass1")
+    db = _direct_db_session()
+    try:
+        owner = db.query(User).filter(User.username == "cancelled-owner").one()
+        task = Task(user_id=int(owner.id), title="cancelled", description="")
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+
+        detached: list[int] = []
+        real_detach = websocket_module.manager.detach_task_connections
+
+        def _record_detach(observed_task_id):
+            detached.append(observed_task_id)
+            return real_detach(observed_task_id)
+
+        monkeypatch.setattr(
+            websocket_module.manager, "detach_task_connections", _record_detach
+        )
+
+        def _cancelled(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            type(get_agent_manager()), "_cleanup_workspace_directory", _cancelled
+        )
+
+        cancelled: list[int] = []
+
+        async def _record_cancel(observed_task_id, timeout_seconds=None):
+            cancelled.append(observed_task_id)
+
+        monkeypatch.setattr(
+            task_execution_module.background_task_manager,
+            "cancel_task",
+            _record_cancel,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await delete_task(task_id, db=db, user=owner)
+
+        # Scheduled before the suspension point, so it is already owned by the
+        # loop and runs even though the handler never returned.
+        await asyncio.sleep(0)
+
+        assert detached == [task_id], (
+            "the deleted task's connections were never detached"
+        )
+        assert cancelled == [task_id], (
+            "the deleted task's background execution was never cancelled"
+        )
+        assert db.query(Task).filter(Task.id == task_id).count() == 0
     finally:
         db.close()

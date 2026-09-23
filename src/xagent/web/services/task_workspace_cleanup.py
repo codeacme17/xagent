@@ -26,6 +26,7 @@ from typing import Optional
 
 from ...config import get_uploads_dir
 from ...core.execution_scope import (
+    ExecutionScope,
     get_execution_scope,
     resolve_execution_scope_off_turn,
 )
@@ -85,7 +86,7 @@ def capture_workspace_cleanup_target(
     would be looked for under a base directory that was never theirs.
     """
 
-    base_dirs: list[str] = []
+    scope = None
     if owner_id:
         # Contextvar-first for the same reason as get_agent_for_task:
         # cleanup inside an activated turn reuses the turn's resolution.
@@ -98,6 +99,19 @@ def capture_workspace_cleanup_target(
             # so the off-turn helper takes that answer and warns. Every other
             # resolution failure still propagates.
             scope = resolve_execution_scope_off_turn(task_id)
+
+    return _target_for(task_id, owner_id, scope)
+
+
+def _target_for(
+    task_id: int,
+    owner_id: Optional[int],
+    scope: Optional[ExecutionScope],
+) -> WorkspaceCleanupTarget:
+    """Assemble the candidate list for an already-decided scope."""
+
+    base_dirs: list[str] = []
+    if owner_id:
         segments = scope.workspace_segments if scope is not None else ()
         for base_dir in (
             canonical_workspace_base(owner_id, segments),
@@ -114,6 +128,26 @@ def capture_workspace_cleanup_target(
         owner_id=owner_id,
         base_dirs=tuple(base_dirs),
     )
+
+
+def unscoped_workspace_cleanup_target(
+    task_id: int,
+    owner_id: int,
+) -> WorkspaceCleanupTarget:
+    """The candidates that remain when the scope cannot be resolved.
+
+    A caller whose capture failed still has somewhere to look: the owner's
+    un-segmented root and the legacy uploads root. That is exactly what the
+    task-level path falls back to when it re-captures after the row is gone,
+    so a caller that captures up front degrades to the same set instead of
+    abandoning the directory entirely.
+
+    It cannot name a workspace written under a scope segment -- that is the
+    leak the failed capture predicts, and why callers still report the task as
+    pending cleanup rather than treating this as a full answer.
+    """
+
+    return _target_for(task_id, owner_id, None)
 
 
 def capture_workspace_cleanup_target_best_effort(
@@ -150,13 +184,13 @@ def capture_workspace_cleanup_target_best_effort(
         return None
 
 
-def remove_task_workspace(target: WorkspaceCleanupTarget) -> bool:
+def remove_task_workspace(target: WorkspaceCleanupTarget) -> None:
     """Delete the captured workspace directory. Idempotent.
 
-    Returns whether a directory was found and removed. Finding nothing is a
-    success, not a failure: the agent-owned cleanup path may already have
-    removed it, and a retry of an interrupted deletion must be able to
-    complete.
+    Finding nothing is a success, not a failure: the agent-owned cleanup path
+    may already have removed it, and a retry of an interrupted deletion must be
+    able to complete. Callers learn that a removal failed from the exception,
+    which is the only outcome any of them acts on.
     """
 
     from ...core.workspace import TaskWorkspace
@@ -200,11 +234,10 @@ def remove_task_workspace(target: WorkspaceCleanupTarget) -> bool:
             target.owner_id,
             workspace_path,
         )
-        return True
+        return
 
     logger.info(
         "No workspace directory found for task %s (user %s)",
         target.task_id,
         target.owner_id,
     )
-    return False
