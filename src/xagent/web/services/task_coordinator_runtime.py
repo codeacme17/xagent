@@ -440,6 +440,8 @@ class TaskCoordinator:
                     )
                     if self.state != CoordinatorState.ACTIVE:
                         raise _CoordinatorClosed
+                if not self._children and self._execution_task is None:
+                    await run_db_io_cancellation_safe(self._release_settled_admissions)
                 if not self._healthy:
                     from .task_command_transport import TaskCommandDeferred
 
@@ -473,11 +475,26 @@ class TaskCoordinator:
         ):
             self._idle_task = asyncio.create_task(self._check_idle())
 
+    def _release_settled_admissions(self) -> None:
+        from .task_execution_admission import release_task_admissions
+
+        assert self.lease is not None
+        with self._registry.session_factory() as db, db.begin():
+            if lock_task_lease_no_commit(db, self.lease):
+                task = db.get(Task, self.task_id)
+                if task is not None and task.status != TaskStatus.RUNNING:
+                    release_task_admissions(db, self.lease)
+
     def _release_if_idle(self) -> str:
         assert self.lease is not None
         with self._registry.session_factory() as db, db.begin():
             if not lock_task_lease_no_commit(db, self.lease):
                 return "released"
+            task = db.get(Task, self.task_id)
+            if task is not None and task.status != TaskStatus.RUNNING:
+                from .task_execution_admission import release_task_admissions
+
+                release_task_admissions(db, self.lease)
             pending = db.execute(
                 select(TaskExecutionCommand.id)
                 .where(
