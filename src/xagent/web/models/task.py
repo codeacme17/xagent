@@ -240,6 +240,24 @@ class Task(Base):  # type: ignore
             "lease_expires_at",
             "id",
         ),
+        # The retention purge's candidate scan (#2563). Declared here as well
+        # as in 20260923_task_retention_scan_index because a fresh install
+        # never runs migrations: db/migration.py stamps head on an empty
+        # database and the schema is built from this metadata, so an index
+        # that lived only in the migration would exist on upgraded
+        # deployments and nowhere else -- and autogenerate would then propose
+        # dropping it.
+        #
+        # The second element is an expression, not a column: the scan filters
+        # ``COALESCE(last_activity_at, created_at)`` (retention_anchor()),
+        # which a btree on the raw nullable column cannot range-bound. The
+        # text must stay byte-identical to the migration's ANCHOR_SQL; the
+        # contract test compares the two.
+        Index(
+            "ix_tasks_retention_scan",
+            "status",
+            text("coalesce(last_activity_at, created_at)"),
+        ),
         # The task-level marker for the protocol version of the interaction
         # row this task's readers should expect. NULL means "no v1 row was
         # staged for the current wait" and readers fall back to the legacy
@@ -344,12 +362,10 @@ class Task(Base):  # type: ignore
     # ``ALTER TABLE`` stamp every pre-existing row with the migration's own
     # clock, which is exactly the value the backfill exists to avoid.
     #
-    # No index yet. The set-scanning consumer is the purge job (#2563), not
-    # the read-only preview in this revision, and a plain CREATE INDEX on a
-    # multi-million-row ``tasks`` table takes a lock for its duration --
-    # PostgreSQL wants CONCURRENTLY, which cannot run inside Alembic's
-    # migration transaction. Whoever adds the scan adds the index, with the
-    # deployment procedure that goes with it.
+    # Indexed by ``ix_tasks_retention_scan`` below, added with the purge that
+    # scans on it (#2563). Not by this column alone: the scan filters
+    # ``COALESCE(last_activity_at, created_at)``, so the index carries that
+    # expression -- see the index's own comment.
     last_activity_at = Column(DateTime(timezone=True), nullable=True)
     runner_id = Column(String(255), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)

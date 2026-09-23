@@ -429,3 +429,35 @@ Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead
 `XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
 
 This change adds no migration and no index.
+
+## 2026-09-24 — Retention scan index
+
+The index the retention purge's candidate scan reads. Added separately from the job so the `CREATE INDEX CONCURRENTLY` procedure below is not buried in a change about deletion behaviour.
+
+### Deployment impact
+
+Migration `20260923_task_retention_scan_index` adds `ix_tasks_retention_scan` on `tasks (status, coalesce(last_activity_at, created_at))`. The second element is an expression, not a column: the purge filters `COALESCE(last_activity_at, created_at)` because the anchor column is nullable, and a plain btree on the raw column cannot range-bound that.
+
+Nothing else here is active by default. The purge job starts only when a retention period is configured, and no deployment configures one yet.
+
+On PostgreSQL the index is built with `CREATE INDEX CONCURRENTLY`, inside an Alembic `autocommit_block` — including in offline (`--sql`) rendering, where the statement is emitted between a `COMMIT` and a `BEGIN` so it lands outside the migration's transaction. The build does not block reads or writes on `tasks`, but it takes two passes over the table and can run for minutes on a large one. Other dialects get an ordinary index and no `CONCURRENTLY` keyword.
+
+### The failure mode to know about
+
+A `CREATE INDEX CONCURRENTLY` that does not finish — cancelled session, deadlock, crashed backend — leaves an **invalid** index behind rather than nothing. PostgreSQL will not use it, and `CREATE INDEX ... IF NOT EXISTS` will not replace it, so an unattended retry would skip it forever and the purge would seq-scan `tasks` on every sweep.
+
+The migration handles this: it reads `pg_index.indisvalid` through `to_regclass` (so the lookup resolves by `search_path`, exactly as the DDL that created the index did) and drops an invalid leftover concurrently before rebuilding. Re-running `alembic upgrade head` after a failed build is therefore the correct recovery, and is safe. It also replaces a *valid* index of the same name whose definition does not match — which is what an installation that ran this revision's first version holds.
+
+To check by hand:
+
+```sql
+SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid)
+FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+WHERE c.oid = to_regclass('ix_tasks_retention_scan');
+```
+
+An `indisvalid` of `f` is a leftover. An empty result means the index is absent. Compare `pg_get_indexdef` against the expression above before assuming a present index is the right one.
+
+### Rollback
+
+Downgrading the migration drops the index, concurrently on PostgreSQL, and changes nothing else. The purge still runs without it; it sequentially scans `tasks` on every sweep instead.
