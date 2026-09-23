@@ -26,7 +26,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,13 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 )
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+CONVERSATION_RETENTION_DAYS = "XAGENT_CONVERSATION_RETENTION_DAYS"
+TRACE_RETENTION_DAYS = "XAGENT_TRACE_RETENTION_DAYS"
+RETENTION_ENABLED = "XAGENT_RETENTION_ENABLED"
+RETENTION_DRY_RUN = "XAGENT_RETENTION_DRY_RUN"
+RETENTION_BATCH_SIZE = "XAGENT_RETENTION_BATCH_SIZE"
+RETENTION_SWEEP_INTERVAL_SECONDS = "XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS"
+RETENTION_BATCH_PAUSE_SECONDS = "XAGENT_RETENTION_BATCH_PAUSE_SECONDS"
 TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
     "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
 )
@@ -3239,3 +3246,177 @@ def get_max_trace_payload_bytes() -> int:
         except ValueError:
             logger.warning(f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value: {env_str!r}")
     return 50_000
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2557). Every getter below is read fresh on
+# each sweep rather than captured at startup, so a period change or a
+# kill-switch flip reaches a *running* purge without a restart.
+#
+# Starting one is different: whether the loop runs at all is decided once, at
+# application startup, from the values configured then. Turning retention on
+# in a process that started with none configured needs a restart; turning it
+# off, or changing a period, does not. The asymmetry is deliberate -- the
+# direction that needs no restart is the one an operator reaches for in a
+# hurry.
+# ---------------------------------------------------------------------------
+
+
+def _get_retention_days_env(env_var: str) -> int | None:
+    """Parse a retention period, defaulting to *off* on anything unusable.
+
+    Unlike every other numeric getter in this module, an invalid value here
+    does not fall back to a working default. A default would be a number of
+    days, and a number of days deletes data: an operator who typos
+    ``XAGENT_CONVERSATION_RETENTION_DAYS=90d`` must get "retention disabled",
+    never "retention at whatever this module considered reasonable". Off is
+    the only fallback that cannot destroy anything.
+
+    ``0`` is not a typo but the documented way to spell "disabled", so it is
+    accepted silently; a negative value is neither, and warns.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; retention stays disabled", env_var, value)
+        return None
+    if parsed == 0:
+        return None  # the documented way to spell "disabled"
+    if parsed < 0:
+        logger.warning("Invalid %s=%r; retention stays disabled", env_var, value)
+        return None
+    return parsed
+
+
+def get_conversation_retention_days() -> int | None:
+    """Days of conversation retention, or ``None`` when retention is disabled.
+
+    Priority:
+        1. XAGENT_CONVERSATION_RETENTION_DAYS environment variable
+        2. Default ``None`` -- no conversation is ever expired
+
+    ``None`` is what keeps the purge job off in every deployment that has not
+    opted in, which is the shipping state until the policy decision in #2567
+    is made.
+
+    Returns:
+        Retention period in days, or None when disabled.
+    """
+    return _get_retention_days_env(CONVERSATION_RETENTION_DAYS)
+
+
+def get_trace_retention_days() -> int | None:
+    """Days of execution-trace retention.
+
+    Priority:
+        1. XAGENT_TRACE_RETENTION_DAYS environment variable
+        2. XAGENT_CONVERSATION_RETENTION_DAYS (traces expire with the
+           conversation they belong to)
+        3. Default ``None`` -- no trace is ever expired
+
+    Unset *and* ``0`` both mean "same as the conversation period" here, which
+    is deliberately not what ``0`` means for the conversation period itself:
+    a trace period normally shortens the conversation period, so its
+    "unconfigured" value is the period it shortens.
+
+    Configuring this alone, with no conversation period, is a supported
+    deployment rather than an accident -- traces are the bulk of the stored
+    bytes and are debugging data, so "keep conversations indefinitely, expire
+    traces after N days" is one of the shapes #2567 has on the table. The
+    single switch that stops all expiry regardless of periods is
+    :func:`get_retention_enabled`.
+
+    A trace period *longer* than the conversation period is accepted and has
+    no effect: the conversation path deletes the traces first.
+
+    Returns:
+        Retention period in days, or None when disabled.
+    """
+    configured = _get_retention_days_env(TRACE_RETENTION_DAYS)
+    if configured is not None:
+        return configured
+    return get_conversation_retention_days()
+
+
+def get_retention_enabled() -> bool:
+    """Operational kill switch for the retention purge job.
+
+    Priority:
+        1. XAGENT_RETENTION_ENABLED environment variable
+        2. Default ``True``
+
+    Defaulting to true is safe because it enables nothing on its own: with no
+    period configured the job has nothing to expire. This switch exists so an
+    operator can stop a sweep that is already running against a configured
+    period without editing the period itself -- the purge re-reads it between
+    tasks, so flipping it takes effect mid-batch.
+
+    Returns:
+        False only when explicitly disabled.
+    """
+    return _get_bool_env(RETENTION_ENABLED, True)
+
+
+def get_retention_dry_run() -> bool:
+    """Whether the purge reports what it would delete without deleting it.
+
+    Priority:
+        1. XAGENT_RETENTION_DRY_RUN environment variable
+        2. Default ``False``
+
+    Returns:
+        True when the sweep must perform no writes.
+    """
+    return _get_bool_env(RETENTION_DRY_RUN, False)
+
+
+def get_retention_batch_size() -> int:
+    """How many tasks one purge batch may consider.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_SIZE environment variable
+        2. Default ``100``
+
+    Returns:
+        Positive batch size.
+    """
+    return _get_positive_int_env(RETENTION_BATCH_SIZE, 100)
+
+
+def get_retention_sweep_interval_seconds() -> float:
+    """Seconds between purge sweeps once the eligible backlog is drained.
+
+    Priority:
+        1. XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default ``86400`` (daily)
+
+    The default is daily because #2557 proposes wording the customer-facing
+    commitment as "within 7 days after the retention period ends"; a daily
+    sweep leaves six days of headroom for a backlog.
+
+    Returns:
+        Interval in seconds.
+    """
+    return cast(
+        float, _get_positive_float_env(RETENTION_SWEEP_INTERVAL_SECONDS, 86400.0)
+    )
+
+
+def get_retention_batch_pause_seconds() -> float:
+    """Seconds to pause between batches while a backlog remains.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_PAUSE_SECONDS environment variable
+        2. Default ``5``
+
+    This is the rate limit. Deleting millions of rows pressures autovacuum and
+    replication on PostgreSQL (item H of the side-effect review on #2557), so
+    a drained backlog waits a full interval while a live one only pauses.
+
+    Returns:
+        Pause in seconds.
+    """
+    return cast(float, _get_positive_float_env(RETENTION_BATCH_PAUSE_SECONDS, 5.0))

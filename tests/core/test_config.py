@@ -3071,3 +3071,96 @@ def test_worker_count_rejects_invalid_values(monkeypatch, value):
         ValueError, match="XAGENT_WORKER_COUNT must be a positive integer"
     ):
         config.get_worker_count()
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2563). Every case here is about the same
+# property: a value this module cannot make sense of must leave retention
+# *off*, because the alternative fallback is a number of days and a number of
+# days deletes conversations.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_retention_env(monkeypatch):
+    for name in (
+        config.CONVERSATION_RETENTION_DAYS,
+        config.TRACE_RETENTION_DAYS,
+        config.RETENTION_ENABLED,
+        config.RETENTION_DRY_RUN,
+        config.RETENTION_BATCH_SIZE,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("", None),
+        ("0", None),
+        ("365", 365),
+        ("1", 1),
+        # Everything below is a mistake, and every one of them must disable
+        # retention rather than fall back to some working default.
+        ("-1", None),
+        ("90d", None),
+        ("ninety", None),
+        ("9.5", None),
+    ],
+)
+def test_conversation_retention_days_defaults_to_disabled(
+    no_retention_env, value, expected
+):
+    if value is not None:
+        no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    assert config.get_conversation_retention_days() == expected
+
+
+@pytest.mark.parametrize(
+    "conversation,trace,expected",
+    [
+        # Unset and 0 both mean "expire traces with the conversation".
+        ("365", None, 365),
+        ("365", "0", 365),
+        ("365", "90", 90),
+        # Longer than the conversation period: accepted, and inert, because
+        # conversation expiry takes the whole task first.
+        ("365", "3650", 3650),
+        # Traces alone: conversations kept indefinitely. A supported shape,
+        # not an accident -- traces are the bulk of the stored bytes.
+        (None, "90", 90),
+        (None, None, None),
+    ],
+)
+def test_trace_retention_days_falls_back_to_the_conversation_period(
+    no_retention_env, conversation, trace, expected
+):
+    if conversation is not None:
+        no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, conversation)
+    if trace is not None:
+        no_retention_env.setenv(config.TRACE_RETENTION_DAYS, trace)
+    assert config.get_trace_retention_days() == expected
+
+
+def test_retention_kill_switch_defaults_to_enabled(no_retention_env):
+    """True by default because it enables nothing: no period, no expiry."""
+    assert config.get_retention_enabled() is True
+    no_retention_env.setenv(config.RETENTION_ENABLED, "false")
+    assert config.get_retention_enabled() is False
+
+
+def test_retention_dry_run_defaults_to_off(no_retention_env):
+    assert config.get_retention_dry_run() is False
+    no_retention_env.setenv(config.RETENTION_DRY_RUN, "1")
+    assert config.get_retention_dry_run() is True
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 100), ("250", 250), ("0", 100), ("nope", 100)]
+)
+def test_retention_batch_size(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_SIZE, value)
+    assert config.get_retention_batch_size() == expected
