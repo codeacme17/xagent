@@ -1,5 +1,6 @@
 """Unit tests for core/config.py configuration functions."""
 
+import logging
 import os
 import subprocess
 import sys
@@ -3074,10 +3075,12 @@ def test_worker_count_rejects_invalid_values(monkeypatch, value):
 
 
 # ---------------------------------------------------------------------------
-# Conversation data retention (#2563). Every case here is about the same
-# property: a value this module cannot make sense of must leave retention
-# *off*, because the alternative fallback is a number of days and a number of
-# days deletes conversations.
+# Conversation data retention (#2563).
+#
+# Two properties run through these cases, and every test here is one of them:
+# a period that cannot be read disables the leg it configures rather than
+# falling back to a number of days, and a switch that cannot be read resolves
+# to whichever side deletes nothing.
 # ---------------------------------------------------------------------------
 
 
@@ -3085,21 +3088,17 @@ def test_worker_count_rejects_invalid_values(monkeypatch, value):
 def no_retention_env(monkeypatch):
     """Clear every retention variable, so no case inherits another's state.
 
-    Listed exhaustively rather than by prefix: a new variable that nobody adds
-    here inherits whatever the surrounding suite left behind, which is the
-    kind of test that passes for a reason unrelated to its name.
+    Driven from ``config.RETENTION_ENV_VARS`` rather than a list written here,
+    so a setting added without a test cannot silently inherit whatever the
+    surrounding suite left behind.
     """
-    for name in (
-        config.CONVERSATION_RETENTION_DAYS,
-        config.TRACE_RETENTION_DAYS,
-        config.RETENTION_ENABLED,
-        config.RETENTION_DRY_RUN,
-        config.RETENTION_BATCH_SIZE,
-        config.RETENTION_SWEEP_INTERVAL_SECONDS,
-        config.RETENTION_BATCH_PAUSE_SECONDS,
-    ):
+    for name in config.RETENTION_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records]
 
 
 @pytest.mark.parametrize(
@@ -3107,112 +3106,58 @@ def no_retention_env(monkeypatch):
     [
         (None, None),
         ("", None),
+        ("   ", None),
         ("0", None),
         ("365", 365),
         ("1", 1),
-        # Everything below is a mistake, and every one of them must disable
-        # retention rather than fall back to some working default.
+        (str(config.MAX_RETENTION_DAYS), config.MAX_RETENTION_DAYS),
+        # Every one of these is a mistake, and must disable rather than fall
+        # back to some working number of days.
         ("-1", None),
         ("90d", None),
         ("ninety", None),
         ("9.5", None),
         # An operator pasting a date. Parses as an integer, and no date can
         # express it -- `now - timedelta(days=20260923)` raises OverflowError,
-        # which a sweep would hit on every run forever.
+        # which a consumer would hit on every use.
         ("20260923", None),
         ("1000000000", None),
+        (str(config.MAX_RETENTION_DAYS + 1), None),
     ],
 )
-def test_conversation_retention_days_defaults_to_disabled(
-    no_retention_env, value, expected
-):
+def test_conversation_retention_days(no_retention_env, value, expected):
     if value is not None:
         no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
     assert config.get_conversation_retention_days() == expected
 
 
-@pytest.mark.parametrize(
-    "conversation,trace,expected",
-    [
-        # Unset and 0 both mean "expire traces with the conversation".
-        ("365", None, 365),
-        ("365", "0", 365),
-        ("365", "90", 90),
-        # Longer than the conversation period: accepted, and inert, because
-        # conversation expiry takes the whole task first.
-        ("365", "3650", 3650),
-        # Traces alone: conversations kept indefinitely. A supported shape,
-        # not an accident -- traces are the bulk of the stored bytes.
-        (None, "90", 90),
-        (None, None, None),
-    ],
-)
-def test_trace_retention_days_falls_back_to_the_conversation_period(
-    no_retention_env, conversation, trace, expected
-):
-    if conversation is not None:
-        no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, conversation)
-    if trace is not None:
-        no_retention_env.setenv(config.TRACE_RETENTION_DAYS, trace)
-    assert config.get_trace_retention_days() == expected
-
-
-def test_retention_kill_switch_defaults_to_enabled(no_retention_env):
-    """True by default because it enables nothing: no period, no expiry."""
-    assert config.get_retention_enabled() is True
-    no_retention_env.setenv(config.RETENTION_ENABLED, "false")
-    assert config.get_retention_enabled() is False
-
-
-def test_retention_dry_run_defaults_to_off(no_retention_env):
-    assert config.get_retention_dry_run() is False
-    no_retention_env.setenv(config.RETENTION_DRY_RUN, "1")
-    assert config.get_retention_dry_run() is True
-
-
-@pytest.mark.parametrize(
-    "value,expected", [(None, 100), ("250", 250), ("0", 100), ("nope", 100)]
-)
-def test_retention_batch_size(no_retention_env, value, expected):
-    if value is not None:
-        no_retention_env.setenv(config.RETENTION_BATCH_SIZE, value)
-    assert config.get_retention_batch_size() == expected
-
-
-@pytest.mark.parametrize("days", [config.MAX_RETENTION_DAYS, 1, 365])
-def test_an_accepted_period_can_always_be_expressed_as_a_date(no_retention_env, days):
+def test_an_accepted_period_can_always_be_expressed_as_a_date(no_retention_env):
     """The bound is only correct if everything under it actually works.
 
-    Pins the bound against the arithmetic it exists to protect rather than
-    against a number written twice: `retention_cutoff` is what raises, so it
-    is what decides whether `MAX_RETENTION_DAYS` is set right.
+    Pinned against the arithmetic it protects rather than against a number
+    written twice: ``retention_cutoff`` is what raises, so it decides whether
+    ``MAX_RETENTION_DAYS`` is set right. This caught the first value written.
     """
     from datetime import datetime, timezone
 
     from xagent.web.services.task_retention import retention_cutoff
 
-    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, str(days))
+    no_retention_env.setenv(
+        config.CONVERSATION_RETENTION_DAYS, str(config.MAX_RETENTION_DAYS)
+    )
     parsed = config.get_conversation_retention_days()
 
-    assert parsed == days
+    assert parsed == config.MAX_RETENTION_DAYS
     assert retention_cutoff(now=datetime.now(timezone.utc), days=parsed) is not None
-
-
-def test_a_period_just_over_the_bound_is_refused(no_retention_env):
-    no_retention_env.setenv(
-        config.CONVERSATION_RETENTION_DAYS, str(config.MAX_RETENTION_DAYS + 1)
-    )
-    assert config.get_conversation_retention_days() is None
 
 
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        # Every spelling of zero inherits the conversation period, because
-        # "0" is documented as meaning "same as the conversation period" and
-        # int() is the authority on what zero is. Comparing the raw string
-        # against "0" instead disagreed with int() about these two, and
-        # silently disabled trace expiry for them.
+        # Every spelling of zero inherits the conversation period, because "0"
+        # means "same as the conversation period" and ``int`` is the authority
+        # on what zero is. Comparing the raw string against "0" instead
+        # disagreed with ``int`` about these, and silently disabled traces.
         ("0", 365),
         (" 0 ", 365),
         ("00", 365),
@@ -3220,8 +3165,9 @@ def test_a_period_just_over_the_bound_is_refused(no_retention_env):
         # Absent, likewise inherits.
         ("", 365),
         ("   ", 365),
-        # A period of its own.
         ("90", 90),
+        # Longer than the conversation period: accepted, and inert.
+        ("3650", 3650),
         # Unusable: disables the leg being configured rather than inheriting.
         ("0.0", None),
         ("90d", None),
@@ -3238,18 +3184,52 @@ def test_trace_period_reads_every_spelling_the_way_int_does(
     assert config.get_trace_retention_days() == expected
 
 
-def test_an_unusable_trace_period_disables_trace_expiry(no_retention_env):
-    """It must not inherit the conversation period.
+def test_trace_alone_expires_traces_while_conversations_are_kept(no_retention_env):
+    """A supported shape, not an accident: traces are most of the bytes."""
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "90")
 
-    The operator was configuring the trace leg and mistyped it; handing them
-    365 days of trace retention because that is what the other variable says
-    is a silent answer to a question they did not ask.
-    """
-    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "365")
-    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "90d")
+    assert config.get_trace_retention_days() == 90
+    assert config.get_conversation_retention_days() is None
 
+
+def test_an_unusable_conversation_period_does_not_reach_the_trace_leg(
+    no_retention_env,
+):
+    """Each leg is disabled on its own; neither failure contaminates the other."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "90d")
+
+    assert config.get_conversation_retention_days() is None
     assert config.get_trace_retention_days() is None
-    assert config.get_conversation_retention_days() == 365
+
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "30")
+    assert config.get_trace_retention_days() == 30
+
+
+def test_both_periods_zero_disables_everything(no_retention_env):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "0")
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "0")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+
+
+@pytest.mark.parametrize("value", ["-1", "90d", str(config.MAX_RETENTION_DAYS + 1)])
+def test_an_unusable_period_warns(no_retention_env, caplog, value):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert any(config.CONVERSATION_RETENTION_DAYS in m for m in _warnings(caplog))
+
+
+@pytest.mark.parametrize("value", ["0", "", "   ", "365"])
+def test_a_usable_or_absent_period_does_not_warn(no_retention_env, caplog, value):
+    """Zero and blank are documented spellings, not mistakes."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert _warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
@@ -3257,16 +3237,19 @@ def test_an_unusable_trace_period_disables_trace_expiry(no_retention_env):
     [
         (None, False),
         ("true", True),
+        ("TRUE", True),
+        (" yes ", True),
         ("1", True),
         ("y", True),
         ("false", False),
         ("n", False),
-        # Unrecognised. The runbook tells operators to set this before a first
-        # real run, so the failure direction has to be "reported, not deleted".
+        ("off", False),
+        # Unrecognised: this is the setting an operator reaches for before a
+        # first real run, so the failure direction is "reported, not deleted".
         ("enabled", True),
         ("maybe", True),
         # Blank is unset, not a typo: a compose file interpolating an unset
-        # shell variable passes an empty string, and that says nothing.
+        # shell variable passes an empty string, which says nothing.
         ("", False),
         ("   ", False),
     ],
@@ -3285,11 +3268,14 @@ def test_dry_run_resolves_an_unrecognised_value_to_dry(
         (None, True),
         ("true", True),
         ("y", True),
+        (" ON ", True),
         ("false", False),
         ("off", False),
+        ("n", False),
         # Unrecognised resolves to "stopped": for a kill switch, refusing to
         # act is the side that cannot delete anything.
         ("enabled", False),
+        ("t", False),
         # Blank is unset, so it must not read as a deliberate stop.
         ("", True),
         ("   ", True),
@@ -3303,14 +3289,57 @@ def test_kill_switch_resolves_an_unrecognised_value_to_stopped(
     assert config.get_retention_enabled() is expected
 
 
-def test_an_unrecognised_switch_warns(no_retention_env, caplog):
-    """Unlike a period, there is no legitimate spelling this rejects."""
-    import logging
-
-    no_retention_env.setenv(config.RETENTION_DRY_RUN, "enabled")
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+def test_an_unrecognised_switch_warns(no_retention_env, caplog, name):
+    """Unlike a period, there is no legitimate spelling a switch rejects."""
+    no_retention_env.setenv(name, "enabled")
     with caplog.at_level(logging.WARNING, logger="xagent.config"):
         config.get_retention_dry_run()
-    assert any("XAGENT_RETENTION_DRY_RUN" in r.getMessage() for r in caplog.records)
+        config.get_retention_enabled()
+
+    assert any(name in message for message in _warnings(caplog))
+
+
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+@pytest.mark.parametrize("value", ["", "   ", "true", "no"])
+def test_a_readable_or_blank_switch_does_not_warn(
+    no_retention_env, caplog, name, value
+):
+    no_retention_env.setenv(name, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_retention_dry_run()
+        config.get_retention_enabled()
+
+    assert _warnings(caplog) == []
+
+
+def test_blank_is_unset_for_every_setting(no_retention_env):
+    """All four parsers must agree about what an empty value means.
+
+    They did not at first: the periods read blank as unset while the switches
+    read it as an unrecognised value and the batch size read it as invalid.
+    The visible consequence was a compose file interpolating an unset shell
+    variable turning into a deliberate stop, warning on every read.
+    """
+    for name in config.RETENTION_ENV_VARS:
+        no_retention_env.setenv(name, "")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+    assert config.get_retention_enabled() is True
+    assert config.get_retention_dry_run() is False
+    assert config.get_retention_batch_size() == 100
+    assert config.get_retention_sweep_interval_seconds() == 86400.0
+    assert config.get_retention_batch_pause_seconds() == 5.0
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 100), ("250", 250), ("0", 100), ("nope", 100), ("", 100)]
+)
+def test_retention_batch_size(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_SIZE, value)
+    assert config.get_retention_batch_size() == expected
 
 
 @pytest.mark.parametrize(
@@ -3324,8 +3353,7 @@ def test_retention_sweep_interval(no_retention_env, value, expected):
 
 
 @pytest.mark.parametrize(
-    "value,expected",
-    [(None, 5.0), ("0.5", 0.5), ("0", 5.0), ("nope", 5.0)],
+    "value,expected", [(None, 5.0), ("0.5", 0.5), ("0", 5.0), ("nope", 5.0)]
 )
 def test_retention_batch_pause(no_retention_env, value, expected):
     if value is not None:
@@ -3333,71 +3361,51 @@ def test_retention_batch_pause(no_retention_env, value, expected):
     assert config.get_retention_batch_pause_seconds() == expected
 
 
-def test_blank_is_unset_for_switches_exactly_as_it_is_for_periods(no_retention_env):
-    """The two parsers must agree about what an empty value means.
-
-    They did not at first: the periods read blank as unset while the switches
-    read it as an unrecognised value. The visible consequence was a compose
-    file interpolating an unset shell variable turning into a deliberate stop,
-    with a warning on every read.
-    """
-    for name in (
-        config.CONVERSATION_RETENTION_DAYS,
-        config.TRACE_RETENTION_DAYS,
-        config.RETENTION_ENABLED,
-        config.RETENTION_DRY_RUN,
-    ):
-        no_retention_env.setenv(name, "")
-
-    assert config.get_conversation_retention_days() is None
-    assert config.get_trace_retention_days() is None
-    assert config.get_retention_enabled() is True
-    assert config.get_retention_dry_run() is False
-
-
 def test_no_module_assigns_a_retention_environment_variable():
-    """Pins the claim the docs make, rather than the broader one they used to.
+    """Pins the claim the section comment makes about needing a restart.
 
-    The comment in config.py says these values cannot change within a process.
-    That is only true while nothing writes them into ``os.environ`` -- and
-    other code in this repository does write ``os.environ`` (``worker_pool``
-    sets the execution role for the processes it spawns), so the claim has to
-    be checked rather than assumed.
+    That claim holds only while nothing writes these names into the
+    environment, and other code in this repository does write ``os.environ``
+    (``worker_pool`` sets the execution role for the processes it spawns), so
+    it has to be checked rather than assumed.
+
+    The scan is a heuristic and says so: it covers assignment, ``update``,
+    ``setdefault``, ``putenv`` and ``load_dotenv(override=True)``, spelled
+    through either the literal name or the constant. A computed key would slip
+    past it. It is worth having anyway -- every way this claim has actually
+    been broken in review is on the list -- but it is a tripwire, not a proof.
     """
     import re
     from pathlib import Path as _Path
 
-    names = [
-        config.CONVERSATION_RETENTION_DAYS,
-        config.TRACE_RETENTION_DAYS,
-        config.RETENTION_ENABLED,
-        config.RETENTION_DRY_RUN,
-        config.RETENTION_BATCH_SIZE,
-        config.RETENTION_SWEEP_INTERVAL_SECONDS,
-        config.RETENTION_BATCH_PAUSE_SECONDS,
-    ]
     source_root = _Path(config.__file__).parent
-    # Matches an assignment through either the literal name or the constant,
-    # e.g. os.environ["XAGENT_RETENTION_ENABLED"] = ... and
-    # os.environ[RETENTION_ENABLED] = ...
-    constants = "|".join(
-        [re.escape(name) for name in names]
-        + ["CONVERSATION_RETENTION_DAYS", "TRACE_RETENTION_DAYS", "RETENTION_ENABLED"]
-        + ["RETENTION_DRY_RUN", "RETENTION_BATCH_SIZE"]
-        + ["RETENTION_SWEEP_INTERVAL_SECONDS", "RETENTION_BATCH_PAUSE_SECONDS"]
+    names = "|".join(
+        [re.escape(name) for name in config.RETENTION_ENV_VARS]
+        + [
+            re.escape(name.removeprefix("XAGENT_"))
+            for name in config.RETENTION_ENV_VARS
+        ]
     )
+    quoted = rf"""["']?({names})["']?"""
     pattern = re.compile(
-        rf"""(environ\[\s*["']?({constants})["']?\s*\]\s*=)"""
-        rf"""|(environ\.setdefault\(\s*["']?({constants})["']?)""",
+        "|".join(
+            [
+                rf"environ\[\s*{quoted}\s*\]\s*=",
+                rf"environ\.setdefault\(\s*{quoted}",
+                rf"putenv\(\s*{quoted}",
+                rf"environ\.update\([^)]*{quoted}",
+                r"load_dotenv\([^)]*override\s*=\s*True",
+            ]
+        )
     )
 
-    offenders = [
+    offenders = sorted(
         str(path.relative_to(source_root))
         for path in source_root.rglob("*.py")
         if pattern.search(path.read_text(encoding="utf-8", errors="ignore"))
-    ]
+    )
 
     assert offenders == [], (
-        "these modules assign a retention variable at run time, which breaks "
-        f"the documented 'takes a restart' guarantee: {offenders}"
+        "these modules can change a retention variable after start-up, which "
+        f"breaks the documented 'takes a restart' guarantee: {offenders}"
     )

@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import math
@@ -3251,161 +3252,142 @@ def get_max_trace_payload_bytes() -> int:
 # ---------------------------------------------------------------------------
 # Conversation data retention (#2557).
 #
-# Every getter here reads ``os.getenv`` at call time, which is NOT the same as
-# being changeable at run time. ``.env`` is loaded once per process, at start
-# (``web/__main__.py``, ``web/worker.py``, ``web/retention_cli.py``), and none
-# of the seven names below is ever assigned into ``os.environ`` afterwards, so
-# within one process every one of these functions returns the same value
-# forever. Changing any of them -- a period, the kill switch, the dry-run flag
-# -- takes a restart.
+# Nothing in this repository reads these yet; the job that expires data is a
+# follow-up change. They are settings, and the docstrings below describe what
+# each one means rather than what a consumer will do with it.
 #
-# The narrow claim is deliberate: other code in this repository *does* write
-# ``os.environ`` (``web/worker_pool.py`` sets the execution role and worker id
-# for the processes it spawns), so "nothing mutates the environment" would be
-# false. ``test_no_module_assigns_a_retention_environment_variable`` pins the
-# claim that is actually made.
+# All of them are read once per process. These getters call ``os.getenv`` at
+# call time, but ``.env`` is loaded at start-up and no code assigns these names
+# afterwards, so within one process each returns the same value forever:
+# changing any of them takes a restart. ``RETENTION_ENV_VARS`` names the set,
+# and ``test_no_module_assigns_a_retention_environment_variable`` pins it.
 #
-# That is worth stating because the opposite is easy to assume from the call
-# pattern, and because a kill switch that cannot be flipped under a running
-# sweep is a different operational tool from one that can. Making it live
-# needs a source the process re-reads, such as a database setting; that is not
-# built, and the docs must not imply it is.
+# Two rules run through the whole section:
+#   * a value that cannot be read disables the leg it configures, rather than
+#     falling back to a working default -- a default here is a number of days,
+#     and a number of days deletes conversations;
+#   * a switch that cannot be read resolves to whichever side deletes nothing.
 # ---------------------------------------------------------------------------
 
+#: Every environment variable this section reads. One list, consumed by the
+#: getters' tests and by the guard that checks none of them is assigned at run
+#: time, so a new setting cannot be added to only some of those places.
+RETENTION_ENV_VARS: tuple[str, ...] = (
+    CONVERSATION_RETENTION_DAYS,
+    TRACE_RETENTION_DAYS,
+    RETENTION_ENABLED,
+    RETENTION_DRY_RUN,
+    RETENTION_BATCH_SIZE,
+    RETENTION_SWEEP_INTERVAL_SECONDS,
+    RETENTION_BATCH_PAUSE_SECONDS,
+)
 
-#: The largest period the date arithmetic downstream can express. Above this,
+#: The largest period the date arithmetic downstream can express. Above it,
 #: ``retention_cutoff``'s ``now - timedelta(days=days)`` raises OverflowError
-#: rather than returning a cutoff -- deliberately, because ``retention_cli.py``
-#: decided that library code should raise rather than silently clamp, naming
-#: this issue as the reason. That decision is why the bound lives here at the
-#: parse instead: a period no date can express is unusable in exactly the sense
-#: this parser already handles, so an operator who pastes a date
-#: (``20260923``) gets "disabled" rather than a sweep that raises forever.
+#: instead of returning a cutoff, so an operator pasting a date (``20260923``)
+#: would otherwise configure a period that fails on every use.
 #:
-#: The real limit is the distance back to ``datetime.min`` (year 1), which is
-#: about 739,900 days today and grows by one per day. Fixed well below it so
-#: the constant stays correct without tracking the clock; a retention period of
-#: 1,900 years is already indistinguishable from "keep everything", which is
-#: spelled by leaving the variable unset.
+#: The true limit is the distance back to ``datetime.min``, about 739,900 days
+#: today and growing daily; this sits far below so it needs no clock. A period
+#: of 1,900 years already means "keep everything", which is spelled by leaving
+#: the variable unset. It does not catch every mistyped date -- ``260923`` is
+#: 714 years and passes -- but such a value is inert rather than broken.
 #:
-#: ``retention_cli.py`` says a hand-written bound "would guess one of the two
-#: wrong" and asks the arithmetic instead. That is right where it stands --
-#: it reports which of the operator's candidate periods are unrepresentable,
-#: so it needs the exact boundary. Here the question is different: whether to
-#: accept a value at all. A ceiling far below the boundary answers that
-#: without needing to know where the boundary is, and the test asserts the
-#: arithmetic accepts it rather than trusting the number.
-#:
-#: It does not catch every mistyped date. ``260923`` (YYMMDD) is 714 years and
-#: passes -- which is wrong but inert, because the resulting cutoff predates
-#: every row.
+#: ``retention_cli.py`` deliberately asks the arithmetic instead of bounding:
+#: it reports which of an operator's candidate periods are unrepresentable and
+#: needs the exact boundary. This decides only whether to accept a value, which
+#: a ceiling answers without knowing where the boundary is.
 MAX_RETENTION_DAYS = 700_000
 
 
-#: How a retention period variable was configured. The two getters below read
-#: the same four cases differently -- ``ZERO`` disables the conversation period
-#: and inherits it for the trace period -- so the classification is made once,
-#: here, rather than each caller re-deriving "was this zero?" from the raw
-#: string. That re-derivation is precisely what went wrong first: a string
-#: comparison against ``"0"`` disagreed with ``int()`` about ``"00"`` and
-#: ``"-0"``, so those spellings disabled trace expiry instead of inheriting.
-RETENTION_UNSET = "unset"
-RETENTION_ZERO = "zero"
-RETENTION_DAYS = "days"
-RETENTION_INVALID = "invalid"
+class _RetentionDays(enum.Enum):
+    """How a period variable was configured.
+
+    Four cases rather than a nullable int, because the two getters read them
+    differently: ``ZERO`` disables the conversation period and inherits it for
+    the trace period. Classifying once is what keeps those two readings from
+    disagreeing about which spellings are zero.
+    """
+
+    UNSET = "unset"
+    ZERO = "zero"
+    DAYS = "days"
+    INVALID = "invalid"
 
 
-def _classify_retention_days(env_var: str) -> tuple[str, int | None]:
-    """Read one retention period variable into (case, days).
+def _classify_retention_days(env_var: str) -> tuple[_RetentionDays, int | None]:
+    """Read one period variable into (case, days).
 
-    ``days`` is set only for :data:`RETENTION_DAYS`. Every other case carries
-    ``None``, because none of them names a period.
-
-    Unlike every other numeric getter in this module, an unusable value here
-    does not fall back to a working default. A default would be a number of
-    days, and a number of days deletes data: an operator who typos
-    ``XAGENT_CONVERSATION_RETENTION_DAYS=90d`` must get "retention disabled",
-    never "retention at whatever this module considered reasonable".
-
-    ``0`` is not a typo but a documented spelling, so it is classified rather
-    than warned about; a negative value, an unparsable one, or one too large
-    for the date arithmetic is a mistake, and warns.
+    ``days`` is set only for :attr:`_RetentionDays.DAYS`; no other case names a
+    period. ``0`` is a documented spelling and is classified silently, while a
+    negative, unparsable or too-large value warns.
     """
     value = os.getenv(env_var)
     if value is None or not value.strip():
-        return RETENTION_UNSET, None
+        return _RetentionDays.UNSET, None
     try:
         parsed = int(value)
     except ValueError:
-        logger.warning("Invalid %s=%r; retention stays disabled", env_var, value)
-        return RETENTION_INVALID, None
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
     if parsed == 0:
-        return RETENTION_ZERO, None
+        return _RetentionDays.ZERO, None
     if parsed < 0 or parsed > MAX_RETENTION_DAYS:
-        logger.warning("Invalid %s=%r; retention stays disabled", env_var, value)
-        return RETENTION_INVALID, None
-    return RETENTION_DAYS, parsed
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    return _RetentionDays.DAYS, parsed
 
 
-def _get_retention_bool_env(env_var: str, *, unset: bool, safe: bool) -> bool:
-    """Parse a retention switch, resolving anything unrecognised to "do not delete".
+def _get_retention_bool_env(env_var: str, *, permissive: bool) -> bool:
+    """Parse a retention switch, resolving what it cannot read to "delete nothing".
 
-    Deliberately not :func:`_get_bool_env`, which reads every unrecognised
-    value as ``False`` -- correct for a feature flag, wrong for these two.
-    Under that helper ``XAGENT_RETENTION_DRY_RUN=enabled`` becomes a real
-    purge, and ``XAGENT_RETENTION_ENABLED=y`` silently disables retention
-    while reading, to the operator who wrote it, like "yes". This function
-    accepts ``y``/``n`` and warns on anything else instead of guessing.
+    ``permissive`` is the value that lets expiry proceed, and is also the
+    default: both switches ship in their permissive position, since neither is
+    meant to restrain a deployment that has configured no period. An
+    unrecognised value therefore resolves to ``not permissive``.
 
-    Both mistakes resolve here to the same side: no deletion happens. That is
-    the safe direction for a dry-run flag and for a kill switch alike, and it
-    is the same rule :func:`_parse_retention_days` applies to the periods.
-    Unlike those, an unrecognised switch also warns -- there is no legitimate
-    spelling this function does not accept, so anything it rejects is a typo.
+    Deliberately not :func:`_get_bool_env`, which reads anything unrecognised
+    as ``False`` -- fine for a feature flag, wrong here, where that turns
+    ``XAGENT_RETENTION_DRY_RUN=enabled`` into a real purge and
+    ``XAGENT_RETENTION_ENABLED=y`` into a silent stop.
 
-    ``unset`` is the value when the variable says nothing. ``safe`` is the
-    value that means "nothing is deleted" for this particular switch --
-    ``True`` for a dry-run flag, ``False`` for a kill switch -- and is what an
-    unrecognised value resolves to.
-
-    Absent and blank are the same case, matching
-    :func:`_classify_retention_days`. They have to: a compose file that writes
-    ``XAGENT_RETENTION_ENABLED=${SOMETHING}`` with the shell variable unset
-    passes an empty string, and reading that as a typo would both warn on
-    every call -- the purge asks per task -- and resolve a deployment that
-    configured nothing into a deliberate stop. An empty value is
-    indistinguishable from an absent one and is treated as one.
+    Blank counts as unset, matching :func:`_classify_retention_days`: a compose
+    file interpolating an unset shell variable passes an empty string, which
+    states nothing and must not warn on every read.
     """
     value = os.getenv(env_var)
     if value is None or not value.strip():
-        return unset
+        return permissive
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on", "y"}:
         return True
     if normalized in {"0", "false", "no", "off", "n"}:
         return False
     logger.warning(
-        "Unrecognised %s=%r; resolving it to %r so that nothing is deleted",
+        "Unrecognised %s=%r; reading it as %r so that nothing is deleted",
         env_var,
         value,
-        safe,
+        not permissive,
     )
-    return safe
+    return not permissive
 
 
 def get_conversation_retention_days() -> int | None:
-    """Days of conversation retention, or ``None`` when retention is disabled.
+    """Days of conversation retention, or ``None`` when conversations never expire.
 
     Priority:
         1. XAGENT_CONVERSATION_RETENTION_DAYS environment variable
-        2. Default ``None`` -- no conversation is ever expired
+        2. Default ``None``
 
-    ``None`` is what keeps the purge job off in every deployment that has not
-    opted in, which is the shipping state until the policy decision in #2567
-    is made.
+    ``None`` disables conversation expiry only. Traces can still expire under
+    their own period, which is a supported configuration.
 
     Returns:
-        Retention period in days, or None when disabled.
+        Retention period in days, or None.
     """
     return _classify_retention_days(CONVERSATION_RETENTION_DAYS)[1]
 
@@ -3417,111 +3399,106 @@ def get_trace_retention_days() -> int | None:
         1. XAGENT_TRACE_RETENTION_DAYS environment variable
         2. XAGENT_CONVERSATION_RETENTION_DAYS (traces expire with the
            conversation they belong to)
-        3. Default ``None`` -- no trace is ever expired
+        3. Default ``None`` -- no trace ever expires
 
-    Unset *and* ``0`` both mean "same as the conversation period" here, which
-    is deliberately not what ``0`` means for the conversation period itself:
-    a trace period normally shortens the conversation period, so its
-    "unconfigured" value is the period it shortens.
+    Unset and ``0`` both mean "same as the conversation period", which is
+    deliberately not what ``0`` means for the conversation period itself: a
+    trace period normally shortens the conversation period, so its
+    unconfigured value is the period it shortens.
 
-    A value that is set but unusable is a third case, and it does *not* fall
-    back to the conversation period: an operator who typos
-    ``XAGENT_TRACE_RETENTION_DAYS=90d`` was asking for 90 days and must not
-    silently receive 365. It disables trace expiry, leaving the conversation
-    period to act on its own -- the same "unusable means off" rule the parse
-    applies, landing on the leg the operator was configuring.
+    A value that is set but unusable is a third case and does *not* inherit:
+    an operator who typos ``XAGENT_TRACE_RETENTION_DAYS=90d`` was asking for
+    90 days and must not silently receive 365. It disables trace expiry,
+    leaving the conversation period to act alone.
 
-    Configuring this alone, with no conversation period, is a supported
-    deployment rather than an accident -- traces are the bulk of the stored
-    bytes and are debugging data, so "keep conversations indefinitely, expire
-    traces after N days" is one of the shapes #2567 has on the table. The
-    single switch that stops all expiry regardless of periods is
-    :func:`get_retention_enabled`.
+    Configuring this alone is supported rather than accidental -- traces are
+    the bulk of the stored bytes and are debugging data, so "keep
+    conversations indefinitely, expire traces after N days" is one of the
+    shapes #2567 has on the table.
 
-    A trace period *longer* than the conversation period is accepted and has
-    no effect: the conversation path deletes the traces first.
+    A trace period longer than the conversation period is accepted and will
+    have no effect, because whole-conversation expiry removes the traces with
+    the conversation.
 
     Returns:
-        Retention period in days, or None when disabled.
+        Retention period in days, or None when traces never expire.
     """
     case, days = _classify_retention_days(TRACE_RETENTION_DAYS)
-    if case == RETENTION_DAYS:
+    if case is _RetentionDays.DAYS:
         return days
-    if case == RETENTION_INVALID:
-        # Set, and unusable: off, rather than inheriting a period the operator
-        # was not configuring.
+    if case is _RetentionDays.INVALID:
         return None
     return get_conversation_retention_days()
 
 
 def get_retention_enabled() -> bool:
-    """Operational kill switch for the retention purge job.
+    """Kill switch for retention expiry.
 
     Priority:
         1. XAGENT_RETENTION_ENABLED environment variable
         2. Default ``True``
 
-    Defaulting to true is safe because it enables nothing on its own: with no
-    period configured the job has nothing to expire. This switch exists so an
-    operator can stop expiry without editing the period itself, which is the
-    setting they would otherwise have to get right twice.
+    Defaulting to true enables nothing on its own: with no period configured
+    there is nothing to expire. The switch exists so that stopping expiry does
+    not mean editing the periods, which are the settings an operator would
+    otherwise have to restore correctly afterwards.
 
-    **It takes effect on restart, not live.** ``.env`` is read once per
-    process and nothing assigns this name into ``os.environ`` afterwards, so
-    this getter reads the same value for the life of the process however often
-    it is called. A switch that could be flipped under a running sweep would
-    need a source the process re-reads -- a database setting -- which is not
-    built.
+    It takes effect on restart, like every setting in this section. Making it
+    changeable under a running process would need a source that process
+    re-reads, such as a database setting; that is not built.
 
-    An unrecognised value resolves to ``False``: see
-    :func:`_get_retention_bool_env` for why a switch spelled ``y`` must not be
-    read as "off by accident, delete nothing by luck" but as a deliberate stop.
+    An unrecognised value resolves to ``False``.
 
     Returns:
         False when explicitly disabled, and when the value cannot be read.
     """
-    return _get_retention_bool_env(RETENTION_ENABLED, unset=True, safe=False)
+    return _get_retention_bool_env(RETENTION_ENABLED, permissive=True)
 
 
 def get_retention_dry_run() -> bool:
-    """Whether the purge reports what it would delete without deleting it.
+    """Whether expiry should report what it would delete and delete nothing.
 
     Priority:
         1. XAGENT_RETENTION_DRY_RUN environment variable
         2. Default ``False``
 
-    An unrecognised value resolves to ``True``. This is the setting the
-    runbook tells an operator to reach for before the first real run, so a
-    typo in it must not be the difference between a report and a deletion.
+    An unrecognised value resolves to ``True``. This is the setting an
+    operator is meant to reach for before a first real run, so a typo in it
+    must not be the difference between a report and a deletion.
 
     Returns:
-        True when the sweep must perform no writes, including when the
-        configured value cannot be read.
+        True when no writes may be performed, including when the configured
+        value cannot be read.
     """
-    return _get_retention_bool_env(RETENTION_DRY_RUN, unset=False, safe=True)
+    return _get_retention_bool_env(RETENTION_DRY_RUN, permissive=False)
 
 
 def get_retention_batch_size() -> int:
-    """How many tasks one purge batch may consider.
+    """How many tasks one expiry batch may consider.
 
     Priority:
         1. XAGENT_RETENTION_BATCH_SIZE environment variable
         2. Default ``100``
 
+    Blank counts as unset, matching the rest of this section.
+
     Returns:
         Positive batch size.
     """
+    value = os.getenv(RETENTION_BATCH_SIZE)
+    if value is None or not value.strip():
+        return 100
     return _get_positive_int_env(RETENTION_BATCH_SIZE, 100)
 
 
 def get_retention_sweep_interval_seconds() -> float:
-    """Seconds between purge sweeps once the eligible backlog is drained.
+    """Seconds between expiry sweeps once the eligible backlog is drained.
 
     Priority:
         1. XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS environment variable
         2. Default ``86400`` (daily)
 
-    The default is daily because #2557 proposes wording the customer-facing
+    Daily by default because #2557 proposes wording the customer-facing
     commitment as "within 7 days after the retention period ends"; a daily
     sweep leaves six days of headroom for a backlog.
 
@@ -3541,7 +3518,7 @@ def get_retention_batch_pause_seconds() -> float:
 
     This is the rate limit. Deleting millions of rows pressures autovacuum and
     replication on PostgreSQL (item H of the side-effect review on #2557), so
-    a drained backlog waits a full interval while a live one only pauses.
+    a drained backlog can wait a full interval while a live one only pauses.
 
     Returns:
         Pause in seconds.
