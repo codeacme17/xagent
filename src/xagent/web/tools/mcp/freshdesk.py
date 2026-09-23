@@ -188,6 +188,23 @@ def _request(
             if response.status_code == 429 and retry_after
             else ""
         )
+        if not detail:
+            # freshdesk.com is wildcard-resolved: an unknown tenant answers
+            # every path with a body-less 404 from the edge rather than
+            # anything naming the real problem (verified against a
+            # nonexistent subdomain). Without this hint a mistyped
+            # FRESHDESK_SUBDOMAIN is indistinguishable from a deleted ticket,
+            # and the caller retries against a tenant that does not exist.
+            # Only for a detail-less 404 -- a real Freshdesk 404 carries a
+            # description, and overriding that would bury it.
+            if response.status_code == 404:
+                detail = (
+                    "no response body -- if this happens for every request, "
+                    f"check that FRESHDESK_SUBDOMAIN ({_subdomain()!r}) names "
+                    "an existing Freshdesk account"
+                )
+            elif response.status_code in (401, 403):
+                detail = "check that FRESHDESK_API_KEY is current and that the key's agent has permission for this operation"
         raise RuntimeError(
             f"Freshdesk API error (status {response.status_code}){suffix}"
             + (f": {detail}" if detail else "")

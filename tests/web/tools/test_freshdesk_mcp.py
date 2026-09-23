@@ -407,3 +407,78 @@ def test_registry_entry_classifies_as_api_key():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "freshdesk"
     )
     assert classify_app_auth(row["transport"], row["launch_config"]) == "api_key"
+
+
+def test_request_hints_at_wrong_subdomain_on_bodyless_404(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """freshdesk.com is wildcard-resolved, so a mistyped subdomain answers
+    every path with a body-less 404 from the edge rather than anything naming
+    the real problem. Without the hint that is indistinguishable from a
+    deleted ticket.
+    """
+    monkeypatch.setattr(
+        requests,
+        "request",
+        lambda **_: _FakeResponse(status_code=404, text="", content=b""),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        freshdesk._request("GET", "/tickets")
+
+    message = str(excinfo.value)
+    assert "FRESHDESK_SUBDOMAIN" in message
+    assert "acme" in message
+
+
+def test_request_keeps_a_real_404_description_over_the_subdomain_hint(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """A genuine Freshdesk 404 names the missing resource; burying that under
+    a subdomain hint would send the caller chasing the wrong problem.
+    """
+    monkeypatch.setattr(
+        requests,
+        "request",
+        lambda **_: _FakeResponse(
+            status_code=404,
+            payload={"description": "Resource not found"},
+            content=b"{}",
+        ),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        freshdesk._request("GET", "/tickets/999999999")
+
+    message = str(excinfo.value)
+    assert "Resource not found" in message
+    assert "FRESHDESK_SUBDOMAIN" not in message
+
+
+def test_request_hints_at_credentials_on_bodyless_401(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    monkeypatch.setattr(
+        requests,
+        "request",
+        lambda **_: _FakeResponse(status_code=401, text="", content=b""),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        freshdesk._request("GET", "/tickets")
+
+    assert "FRESHDESK_API_KEY" in str(excinfo.value)
+
+
+def test_subdomain_hint_does_not_leak_the_api_key(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The hint interpolates the subdomain, which is adjacent to the key in
+    the same env block -- pin that only the subdomain is echoed.
+    """
+    monkeypatch.setattr(
+        requests,
+        "request",
+        lambda **_: _FakeResponse(status_code=404, text="", content=b""),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        freshdesk._request("GET", "/tickets")
+
+    assert "secret-key" not in str(excinfo.value)
