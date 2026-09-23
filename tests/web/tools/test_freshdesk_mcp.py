@@ -482,3 +482,520 @@ def test_subdomain_hint_does_not_leak_the_api_key(
         freshdesk._request("GET", "/tickets")
 
     assert "secret-key" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Tools
+#
+# Every tool is exercised against a recorded stand-in for the REST contract
+# documented at developers.freshdesk.com/api. These prove the request this
+# module builds and how it translates a response -- NOT that the documented
+# shape matches a live tenant, which is still outstanding.
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """Capture each outbound request and answer from a scripted queue."""
+
+    def __init__(self, *responses: _FakeResponse) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return (
+            self.responses.pop(0)
+            if self.responses
+            else _FakeResponse(payload={}, content=b"{}")
+        )
+
+    @property
+    def call(self) -> dict[str, Any]:
+        assert len(self.calls) == 1, f"expected one request, made {len(self.calls)}"
+        return self.calls[0]
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, *responses: _FakeResponse) -> _Recorder:
+    recorder = _Recorder(*responses)
+    monkeypatch.setattr(requests, "request", recorder)
+    return recorder
+
+
+def _payload(raw: str) -> dict[str, Any]:
+    parsed = json.loads(raw)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _json_response(
+    body: Any, *, headers: dict[str, str] | None = None, status_code: int = 200
+) -> _FakeResponse:
+    return _FakeResponse(
+        status_code=status_code,
+        payload=body,
+        content=json.dumps(body).encode(),
+        headers=headers,
+    )
+
+
+# --- list_tickets ----------------------------------------------------------
+
+
+def test_list_tickets_sends_filters_and_clamped_page_size(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response([{"id": 1}]))
+
+    result = _payload(
+        freshdesk.freshdesk_list_tickets(
+            filter_name="new_and_my_open",
+            updated_since="2026-09-01T00:00:00Z",
+            order_by="updated_at",
+            page=0,
+            per_page=5000,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["tickets"] == [{"id": 1}]
+    params = recorder.call["params"]
+    # `filter` is the wire name; `filter_name` is the tool parameter, because
+    # `filter` shadows a builtin in the signature.
+    assert params["filter"] == "new_and_my_open"
+    assert params["updated_since"] == "2026-09-01T00:00:00Z"
+    assert params["order_by"] == "updated_at"
+    assert params["page"] == 1, "page must be clamped to >= 1"
+    assert params["per_page"] == freshdesk.MAX_PER_PAGE
+    assert "include" not in params, "unset optional filters must not be sent"
+
+
+def test_list_tickets_reads_has_more_from_the_link_header(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Freshdesk returns no total on list endpoints, so has_more comes from
+    its Link header. Inferring it from a full page would report a phantom
+    next page every time the last page is exactly full.
+    """
+    full_page = [{"id": n} for n in range(freshdesk.DEFAULT_PER_PAGE)]
+    _install(
+        monkeypatch,
+        _json_response(
+            full_page,
+            headers={
+                "Link": '<https://acme.freshdesk.com/api/v2/tickets?page=2>; rel="next"'
+            },
+        ),
+    )
+    assert _payload(freshdesk.freshdesk_list_tickets())["has_more"] is True
+
+    _install(monkeypatch, _json_response(full_page))
+    assert _payload(freshdesk.freshdesk_list_tickets())["has_more"] is False
+
+
+def test_list_tickets_rejects_an_envelope_where_an_array_is_documented(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The list endpoints are documented to return a bare array. If a tenant
+    ever answers with an object instead, failing loudly beats reporting zero
+    tickets as though the helpdesk were empty.
+    """
+    _install(monkeypatch, _json_response({"tickets": [{"id": 1}]}))
+    result = _payload(freshdesk.freshdesk_list_tickets())
+    assert result["status"] == "error"
+    assert "/tickets" in result["message"]
+
+
+def test_list_tickets_truncates_an_oversized_page(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """A ticket carries its full description, so a page of 100 can exceed the
+    platform's output cap. The dropped ones are not on the next page, so the
+    response must say so rather than silently shrinking.
+    """
+    monkeypatch.setattr(freshdesk, "get_tool_max_output_length", lambda: 2000)
+    fat = [{"id": n, "description": "x" * 500} for n in range(40)]
+    _install(monkeypatch, _json_response(fat))
+
+    result = _payload(freshdesk.freshdesk_list_tickets(per_page=40))
+
+    assert result["truncated"] is True
+    assert len(result["tickets"]) < 40
+    assert "smaller per_page" in result["message"]
+
+
+# --- get_ticket ------------------------------------------------------------
+
+
+def test_get_ticket_requests_the_id_path(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 42, "subject": "hi"}))
+
+    result = _payload(freshdesk.freshdesk_get_ticket(42, include="requester"))
+
+    assert result["ticket"]["id"] == 42
+    assert recorder.call["url"].endswith("/api/v2/tickets/42")
+    assert recorder.call["params"]["include"] == "requester"
+
+
+@pytest.mark.parametrize("bad", ["12 OR 1=1", "../agents", "abc", 0, -3, None])
+def test_ticket_id_is_validated_before_it_reaches_the_path(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, bad: Any
+):
+    """The id is interpolated into the request path, so a non-numeric value
+    must fail locally rather than being pasted into the URL.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_get_ticket(bad))
+    assert result["status"] == "error"
+    assert recorder.calls == [], "no request may be issued for an invalid id"
+
+
+# --- search_tickets --------------------------------------------------------
+
+
+def test_search_tickets_wraps_the_expression_in_double_quotes(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Freshdesk requires the filter expression to arrive double-quoted. The
+    tool adds them so a caller passing a bare expression works, and so a
+    pre-quoted one cannot become a doubly-quoted always-empty search.
+    """
+    recorder = _install(monkeypatch, _json_response({"results": [], "total": 0}))
+
+    freshdesk.freshdesk_search_tickets("status:2 AND priority:4")
+
+    assert recorder.call["params"]["query"] == '"status:2 AND priority:4"'
+    assert recorder.call["url"].endswith("/api/v2/search/tickets")
+
+
+def test_search_tickets_returns_total_and_results(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    _install(monkeypatch, _json_response({"results": [{"id": 7}], "total": 1}))
+    result = _payload(freshdesk.freshdesk_search_tickets("status:2"))
+    assert result["results"] == [{"id": 7}]
+    assert result["total"] == 1
+    assert result["has_more"] is False
+
+
+def test_search_tickets_reports_more_only_while_pages_remain(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The search endpoint has no Link header: a full 30-result page is the
+    only "maybe more" signal, and page 10 is Freshdesk's hard ceiling.
+    """
+    full = [{"id": n} for n in range(freshdesk.SEARCH_PAGE_SIZE)]
+    _install(monkeypatch, _json_response({"results": full, "total": 900}))
+    assert _payload(freshdesk.freshdesk_search_tickets("status:2"))["has_more"] is True
+
+    _install(monkeypatch, _json_response({"results": full, "total": 900}))
+    last = _payload(
+        freshdesk.freshdesk_search_tickets("status:2", page=freshdesk.MAX_SEARCH_PAGE)
+    )
+    assert last["has_more"] is False, "page 10 is the last page Freshdesk serves"
+
+
+def test_search_tickets_refuses_a_page_past_the_vendor_ceiling(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_search_tickets("status:2", page=11))
+    assert result["status"] == "error"
+    assert "narrow the query" in result["message"]
+    assert recorder.calls == []
+
+
+def test_search_tickets_rejects_a_blank_query(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch)
+    assert _payload(freshdesk.freshdesk_search_tickets("   "))["status"] == "error"
+    assert recorder.calls == []
+
+
+# --- create_ticket ---------------------------------------------------------
+
+
+def test_create_ticket_posts_defaults_and_requester(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 9}))
+
+    result = _payload(
+        freshdesk.freshdesk_create_ticket(
+            subject="Printer down",
+            description="It is on fire",
+            email="user@example.com",
+        )
+    )
+
+    assert result["ticket"]["id"] == 9
+    body = recorder.call["json"]
+    assert body["subject"] == "Printer down"
+    assert body["email"] == "user@example.com"
+    assert body["status"] == freshdesk.STATUS_OPEN
+    assert body["priority"] == freshdesk.PRIORITY_LOW
+    assert "responder_id" not in body, "unset optionals must not be sent"
+
+
+def test_create_ticket_requires_a_requester_identifier(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Freshdesk rejects a ticket with no requester; catching it here names
+    the three fields that would satisfy it instead of relaying a 400.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_create_ticket(subject="s", description="d"))
+    assert result["status"] == "error"
+    assert "requester" in result["message"]
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("field,value", [("status", 1), ("priority", 9)])
+def test_create_ticket_rejects_values_outside_the_vendor_enums(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, field: str, value: int
+):
+    """status=1 is the trap: it is a legal *priority* and not a legal status,
+    so an LLM reaches for it. Naming the legal set beats "Validation failed".
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(
+        freshdesk.freshdesk_create_ticket(
+            subject="s", description="d", email="a@b.c", **{field: value}
+        )
+    )
+    assert result["status"] == "error"
+    assert field in result["message"]
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_create_ticket_rejects_blank_subject_or_description(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, blank: str
+):
+    recorder = _install(monkeypatch)
+    assert (
+        _payload(
+            freshdesk.freshdesk_create_ticket(
+                subject=blank, description="d", email="a@b.c"
+            )
+        )["status"]
+        == "error"
+    )
+    assert (
+        _payload(
+            freshdesk.freshdesk_create_ticket(
+                subject="s", description=blank, email="a@b.c"
+            )
+        )["status"]
+        == "error"
+    )
+    assert recorder.calls == []
+
+
+# --- update_ticket ---------------------------------------------------------
+
+
+def test_update_ticket_sends_only_the_fields_given(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+
+    freshdesk.freshdesk_update_ticket(3, status=4)
+
+    assert recorder.call["method"] == "PUT"
+    assert recorder.call["json"] == {"status": 4}
+
+
+def test_update_ticket_distinguishes_clearing_tags_from_leaving_them(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """tags=[] means "remove every tag" and must reach Freshdesk; tags=None
+    means "leave them alone" and must not. Collapsing the two would either
+    silently wipe a ticket's tags or make clearing impossible.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+    freshdesk.freshdesk_update_ticket(3, tags=[])
+    assert recorder.call["json"] == {"tags": []}
+
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+    freshdesk.freshdesk_update_ticket(3, status=2, tags=None)
+    assert "tags" not in recorder.call["json"]
+
+
+def test_update_ticket_requires_at_least_one_field(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """An empty PUT would report success while changing nothing."""
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_update_ticket(3))
+    assert result["status"] == "error"
+    assert recorder.calls == []
+
+
+# --- conversations ---------------------------------------------------------
+
+
+def test_list_ticket_conversations_pages_the_ticket_subpath(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(
+        monkeypatch,
+        _json_response(
+            [{"id": 1, "private": True}],
+            headers={"Link": '<...?page=2>; rel="next"'},
+        ),
+    )
+
+    result = _payload(freshdesk.freshdesk_list_ticket_conversations(8, per_page=10))
+
+    assert result["conversations"] == [{"id": 1, "private": True}]
+    assert result["has_more"] is True
+    assert recorder.call["url"].endswith("/api/v2/tickets/8/conversations")
+    assert recorder.call["params"]["per_page"] == 10
+
+
+def test_reply_posts_to_the_reply_subpath(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 11}))
+
+    freshdesk.freshdesk_reply_to_ticket(8, "on our way", cc_emails=["b@c.d"])
+
+    assert recorder.call["method"] == "POST"
+    assert recorder.call["url"].endswith("/api/v2/tickets/8/reply")
+    assert recorder.call["json"] == {"body": "on our way", "cc_emails": ["b@c.d"]}
+
+
+def test_note_defaults_to_private(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """A note that defaults to public would disclose internal discussion to
+    the requester, and nothing in the call site would show it.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 12}))
+
+    freshdesk.freshdesk_add_note_to_ticket(8, "refund approved by finance")
+
+    assert recorder.call["url"].endswith("/api/v2/tickets/8/notes")
+    assert recorder.call["json"]["private"] is True
+
+
+def test_note_can_be_made_public_explicitly(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 12}))
+    freshdesk.freshdesk_add_note_to_ticket(8, "visible", private=False)
+    assert recorder.call["json"]["private"] is False
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_reply_and_note_reject_an_empty_body(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, blank: str
+):
+    recorder = _install(monkeypatch)
+    assert _payload(freshdesk.freshdesk_reply_to_ticket(8, blank))["status"] == "error"
+    assert (
+        _payload(freshdesk.freshdesk_add_note_to_ticket(8, blank))["status"] == "error"
+    )
+    assert recorder.calls == []
+
+
+# --- contacts and agents ---------------------------------------------------
+
+
+def test_get_contact_requests_the_id_path(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 5, "name": "Jo"}))
+    result = _payload(freshdesk.freshdesk_get_contact(5))
+    assert result["contact"]["name"] == "Jo"
+    assert recorder.call["url"].endswith("/api/v2/contacts/5")
+
+
+def test_search_contacts_uses_autocomplete_for_a_term(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response([{"id": 5}]))
+
+    result = _payload(freshdesk.freshdesk_search_contacts(term="jo"))
+
+    assert result["contacts"] == [{"id": 5}]
+    assert recorder.call["url"].endswith("/api/v2/contacts/autocomplete")
+    assert recorder.call["params"]["term"] == "jo"
+    assert result["has_more"] is False
+
+
+def test_search_contacts_uses_exact_filters_without_a_term(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response([{"id": 5}]))
+
+    freshdesk.freshdesk_search_contacts(email="jo@example.com")
+
+    assert recorder.call["url"].endswith("/api/v2/contacts")
+    assert recorder.call["params"]["email"] == "jo@example.com"
+
+
+def test_search_contacts_refuses_term_mixed_with_exact_filters(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The two go to different endpoints, so honouring one and dropping the
+    other would silently answer a narrower question than was asked.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(
+        freshdesk.freshdesk_search_contacts(term="jo", email="jo@example.com")
+    )
+    assert result["status"] == "error"
+    assert "email" in result["message"]
+    assert recorder.calls == []
+
+
+def test_list_agents_filters_and_pages(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response([{"id": 2}]))
+
+    result = _payload(freshdesk.freshdesk_list_agents(state="fulltime", per_page=101))
+
+    assert result["agents"] == [{"id": 2}]
+    assert recorder.call["params"]["state"] == "fulltime"
+    assert recorder.call["params"]["per_page"] == freshdesk.MAX_PER_PAGE
+
+
+# --- error propagation through the tool boundary ---------------------------
+
+
+def test_a_vendor_error_becomes_an_error_envelope_not_an_exception(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Every tool returns a JSON string; an exception escaping one would
+    surface to the agent as a tool crash instead of a readable message.
+    """
+    _install(
+        monkeypatch,
+        _json_response(
+            {"description": "Validation failed", "errors": [{"field": "status"}]},
+            status_code=400,
+        ),
+    )
+    result = _payload(freshdesk.freshdesk_update_ticket(3, status=4))
+    assert result["status"] == "error"
+    assert "Validation failed" in result["message"]
+    assert "status" in result["message"]
+
+
+def test_a_missing_credential_surfaces_through_the_tool_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FRESHDESK_SUBDOMAIN", "acme")
+    monkeypatch.delenv("FRESHDESK_API_KEY", raising=False)
+    recorder = _install(monkeypatch)
+
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "error"
+    assert "FRESHDESK_API_KEY" in result["message"]
+    assert recorder.calls == []
