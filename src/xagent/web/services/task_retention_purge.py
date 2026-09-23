@@ -1,0 +1,577 @@
+"""The scheduled purge that acts on the retention predicate (#2563).
+
+#2562 decided *whether* a task may be expired; this module deletes. It runs
+disabled: with no period configured (:func:`get_conversation_retention_days`
+and :func:`get_trace_retention_days` both ``None``) the loop never starts, and
+the shipping default configures neither.
+
+Two paths, both per whole task, never by age within a task:
+
+* **conversation expiry** removes the task outright, reusing
+  :func:`purge_task_rows` so the foreign-key ordering that path already got
+  right is not restated here.
+* **trace expiry** keeps the conversation and removes only the execution
+  trace. It exists because traces are the bulk of the stored bytes and are
+  debugging data rather than a customer asset, so #2567 has a shorter period
+  for them on the table.
+
+Why trace expiry is safe for a terminal task: a new turn rebuilds the model's
+conversation history from ``task_chat_messages``, not from traces
+(``_load_persisted_conversation_history``), so what a purged trace costs is
+mid-run resume state. A terminal task has no run to resume. Non-terminal
+tasks are refused by the predicate's status leg, which is what makes that
+reasoning hold rather than merely sound plausible.
+
+PostgreSQL only
+---------------
+:func:`assess_task_retention` takes ``SELECT ... FOR UPDATE`` on the task row,
+and on SQLite SQLAlchemy compiles that clause away entirely -- the assessment
+is then a read with no fence between it and the delete. Rather than build a
+second serialization mechanism for a store no deployment runs retention on,
+:func:`ensure_retention_purge_supported` refuses to start the job on any other
+dialect and says so once. The row-level functions below stay dialect-neutral
+so their semantics can be tested on both.
+
+What the lock actually fences, including the three unverified producers
+-----------------------------------------------------------------------
+#2562 verified that several command producers lock the task row before
+inserting, and explicitly left three unverified -- ``api/websocket.py``,
+``services/task_interaction_service.py`` and ``services/workforce_runtime.py``
+-- for this issue to confirm or fence. Neither was necessary, because the
+fence does not depend on the producer at all:
+
+``task_execution_commands.task_id`` is ``NOT NULL`` with a real foreign key to
+``tasks.id`` (``models/task_command.py``, created in
+``20260711_add_task_execution_commands``). PostgreSQL validates that reference
+by taking ``FOR KEY SHARE`` on the parent row, which conflicts with the
+``FOR UPDATE`` this purge holds. So *any* insert of a command for a task being
+assessed blocks until the purge's transaction ends, whichever module issues it
+and whether or not it locked anything itself.
+``test_task_retention_purge_postgresql.py`` proves this against a real server
+with two sessions rather than leaving it as a reading of the lock matrix.
+
+The race therefore resolves one of two ways, both clean: the producer commits
+first and the purge's command leg sees the row and skips the task; or the
+purge holds the lock and the producer blocks, then fails against a task that
+no longer exists. An accepted command is never silently deleted.
+
+The same lock is what makes a second replica harmless. One loop starts per
+web process, so a deployment running several of them sweeps several times
+over: two purges that pick the same task serialize on its row, and the loser's
+assessment then finds no row and reports it as not eligible. The cost is
+duplicated scanning, not duplicated deletion, which is why this ships without
+an advisory lock -- ``docs/deployment.md`` says so rather than the code
+pretending the case cannot arise.
+
+There is deliberately no second re-check just before the commit. For the
+trace path it would be redundant with the lock, and for the conversation path
+it cannot exist at all -- the row whose legs it would re-read is the row being
+deleted. A backstop that is impossible on one path and redundant on the other
+is worse than the lock it pretends to supplement, because it invites reading
+the lock as optional. The lock is the fence; the PostgreSQL test is what keeps
+that claim honest.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import logging
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from typing import Callable
+
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session, sessionmaker
+
+from ...config import (
+    get_conversation_retention_days,
+    get_retention_batch_pause_seconds,
+    get_retention_batch_size,
+    get_retention_dry_run,
+    get_retention_enabled,
+    get_retention_sweep_interval_seconds,
+    get_trace_retention_days,
+)
+from ..models.task import (
+    Task,
+    TraceCheckpointBlob,
+    TraceEvent,
+    TraceMessageBlob,
+)
+from ..models.task_interaction import TaskInteractionRequest
+from .task_deletion import purge_task_rows
+from .task_interaction_schema import interaction_requests_table_exists
+from .task_retention import (
+    RetentionDisposition,
+    assess_task_retention,
+    retention_candidate_condition,
+)
+
+logger = logging.getLogger(__name__)
+
+#: The one dialect whose row lock makes an assessment a deletion licence.
+SUPPORTED_DIALECT = "postgresql"
+
+#: Interaction status that the trace path refuses to purge around. Spelled
+#: here rather than imported because it is the value the CHECK constraint
+#: ``ck_task_interaction_requests_active_anchor`` is written against, not an
+#: application-side vocabulary member.
+INTERACTION_STATUS_ACTIVE = "active"
+
+
+class RetentionPurgeUnsupported(RuntimeError):
+    """Raised when the configured store cannot fence the purge."""
+
+
+class RetentionPurgeAction(enum.Enum):
+    """What one task's turn through the purge actually did, or would do."""
+
+    PURGED_CONVERSATION = "purged_conversation"
+    PURGED_TRACES = "purged_traces"
+    #: The predicate refused it: live status, live lease, or a command owed
+    #: execution. Expected and uninteresting -- a task can become busy between
+    #: the batch scan and its own assessment.
+    SKIPPED_BUSY = "skipped_busy"
+    #: Trace expiry only: the task still holds an ``active`` interaction row,
+    #: whose anchor the trace delete would try to NULL against
+    #: ``ck_task_interaction_requests_active_anchor``.
+    SKIPPED_ACTIVE_INTERACTION = "skipped_active_interaction"
+
+
+@dataclass(frozen=True)
+class RetentionPurgeReport:
+    """One sweep's outcome, in the shape the audit line prints."""
+
+    eligible: int = 0
+    purged_conversations: int = 0
+    purged_traces: int = 0
+    skipped_busy: int = 0
+    skipped_active_interaction: int = 0
+    dry_run: bool = False
+    #: Highest task id this batch considered, or ``None`` when it considered
+    #: none. The loop resumes after it rather than from the start of the
+    #: table, which is what stops an undeletable page being re-read forever.
+    last_task_id: int | None = None
+
+    @property
+    def purged(self) -> int:
+        return self.purged_conversations + self.purged_traces
+
+    def with_action(self, action: RetentionPurgeAction) -> RetentionPurgeReport:
+        """This report plus one task's outcome.
+
+        Every member of :class:`RetentionPurgeAction` increments exactly one
+        counter. Written out rather than resolved through a name lookup so the
+        counters are type-checked; a new action has to add its line here, and
+        ``test_every_action_increments_exactly_one_counter`` is what fails if
+        it does not.
+        """
+        return replace(
+            self,
+            purged_conversations=self.purged_conversations
+            + int(action is RetentionPurgeAction.PURGED_CONVERSATION),
+            purged_traces=self.purged_traces
+            + int(action is RetentionPurgeAction.PURGED_TRACES),
+            skipped_busy=self.skipped_busy
+            + int(action is RetentionPurgeAction.SKIPPED_BUSY),
+            skipped_active_interaction=self.skipped_active_interaction
+            + int(action is RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION),
+        )
+
+    def audit_line(self) -> str:
+        """The single line one sweep logs.
+
+        One line, not one per task: a sweep that expires a backlog of tens of
+        thousands of tasks must not be the reason a log budget is spent, and
+        the per-task detail that matters (*why* a task was skipped) is carried
+        by the counters rather than by prose.
+        """
+        return (
+            f"retention purge {'dry-run' if self.dry_run else 'run'}: "
+            f"eligible={self.eligible} "
+            f"purged_conversations={self.purged_conversations} "
+            f"purged_traces={self.purged_traces} "
+            f"skipped_busy={self.skipped_busy} "
+            f"skipped_active_interaction={self.skipped_active_interaction}"
+        )
+
+
+def ensure_retention_purge_supported(db: Session) -> None:
+    """Refuse to purge on a store whose row lock does not fence.
+
+    Raises:
+        RetentionPurgeUnsupported: On any dialect but PostgreSQL.
+    """
+    dialect = db.get_bind().dialect.name
+    if dialect != SUPPORTED_DIALECT:
+        raise RetentionPurgeUnsupported(
+            f"retention purge requires {SUPPORTED_DIALECT}, not {dialect!r}: "
+            "SELECT ... FOR UPDATE does not fence there, so an assessment is "
+            "not a deletion licence"
+        )
+
+
+def select_purge_candidates(
+    db: Session,
+    *,
+    now: datetime,
+    conversation_days: int | None,
+    trace_days: int | None,
+    limit: int,
+    after_task_id: int = 0,
+) -> list[int]:
+    """Up to ``limit`` task ids that some path would expire, lowest id first.
+
+    Scans without locking; every id is re-assessed under a lock before
+    anything is deleted, so a candidate going busy in between costs one
+    skipped assessment and nothing else.
+
+    ``after_task_id`` is what keeps a sweep from starving. A task this purge
+    declines stays eligible -- an ``active`` interaction row is not something
+    the purge resolves, and nothing else clears it either -- so a scan that
+    always restarted at the lowest id would hand back the same undeletable
+    page forever and never reach the tasks behind it. That is not theoretical:
+    before this parameter existed, three tasks holding active interaction rows
+    kept a fourth, conversation-expired task alive across every sweep at
+    ``limit=3``.
+
+    The caller resumes past the page it processed and resets to ``0`` once a
+    page comes back short, so the table is walked in order and then from the
+    top again -- the same cross-tick cursor ``orphan_upload_gc`` carries, for
+    the same reason.
+
+    The shorter of the two periods decides candidacy, because it admits the
+    wider set: the trace path applies to tasks the conversation path is not
+    yet due to take.
+    """
+    days = _shortest_period(conversation_days, trace_days)
+    if days is None:
+        return []
+    rows = db.execute(
+        select(Task.id)
+        .where(
+            Task.id > after_task_id,
+            retention_candidate_condition(now=now, days=days),
+        )
+        .order_by(Task.id.asc())
+        .limit(limit)
+    ).scalars()
+    return [int(row) for row in rows]
+
+
+def _shortest_period(
+    conversation_days: int | None, trace_days: int | None
+) -> int | None:
+    """The shorter of the two periods, which is the one that admits more tasks.
+
+    ``None`` means unlimited on either side, so it never narrows the other.
+    """
+    periods = [days for days in (conversation_days, trace_days) if days is not None]
+    if not periods:
+        return None
+    return min(periods)
+
+
+def _has_active_interaction(db: Session, task_id: int) -> bool:
+    """Whether this task holds an ``active`` interaction row.
+
+    Gated on table presence for the same reason ``purge_task_rows`` gates its
+    delete: a deployment upgraded to a revision before the table exists must
+    still be able to expire data.
+    """
+    if not interaction_requests_table_exists(db):
+        return False
+    return bool(
+        db.execute(
+            select(TaskInteractionRequest.id)
+            .where(
+                TaskInteractionRequest.task_id == task_id,
+                TaskInteractionRequest.status == INTERACTION_STATUS_ACTIVE,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+    )
+
+
+def _purge_trace_rows(db: Session, task_id: int) -> None:
+    """Delete one task's trace, keeping the task and its conversation.
+
+    Statement order matches ``purge_task_rows`` where it overlaps, and for the
+    same reason: ``tasks.last_checkpoint_trace_event_id`` is a foreign key
+    into ``trace_events``, so a task still pointing at a row blocks that row's
+    delete.
+
+    Both checkpoint pointers are cleared, not just the foreign-key one.
+    ``last_checkpoint_event_id`` carries the trace event's application-level
+    id, which after this delete resolves to nothing; leaving it set would hand
+    a later reader a pointer that looks live and is not.
+
+    ``dag_executions`` is deliberately kept, which is the one place this
+    diverges from ``purge_task_rows`` beyond keeping the task itself: a DAG
+    execution is the task's own plan and progress, not a trace of how it ran,
+    and the task survives this path. Trace expiry removes ``trace_events`` and
+    the two blob tables, and nothing else.
+
+    ``updated_at`` is pinned rather than allowed to fire its ``onupdate``.
+    Expiring a trace is maintenance, not execution activity, and #2557's
+    side-effect review names maintenance writes that advance ``updated_at`` as
+    a hazard in their own right.
+    """
+    db.execute(
+        update(Task)
+        .where(Task.id == task_id)
+        .values(
+            last_checkpoint_event_id=None,
+            last_checkpoint_trace_event_id=None,
+            updated_at=Task.updated_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    for model in (TraceCheckpointBlob, TraceMessageBlob):
+        db.execute(
+            delete(model)
+            .where(model.task_id == task_id)
+            .execution_options(synchronize_session=False)
+        )
+    db.execute(
+        delete(TraceEvent)
+        .where(TraceEvent.task_id == task_id)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def purge_task(
+    db: Session,
+    task_id: int,
+    *,
+    now: datetime,
+    conversation_days: int | None,
+    trace_days: int | None,
+    dry_run: bool = False,
+) -> RetentionPurgeAction:
+    """Assess one task under a lock and expire what its disposition allows.
+
+    Owns its transaction: it commits what it deleted, or rolls back. One
+    transaction per task is what keeps the lock held from the assessment to
+    the delete, and what keeps a task that fails from taking a whole batch
+    with it.
+
+    ``dry_run`` computes the same action against the same locked assessment
+    and then rolls back, so what it reports is what a real run would do rather
+    than a separately-derived estimate. It performs no external call because
+    this module makes none at all: external cleanup is #2564's, and every
+    statement here is a row delete.
+
+    Every exit rolls back or commits, so the ``FOR UPDATE`` the assessment
+    took is never held past this call -- a sweep that left one open per task
+    inspected would hold locks across the whole batch.
+    """
+    committed = False
+    try:
+        assessment = assess_task_retention(
+            db,
+            task_id,
+            now=now,
+            conversation_days=conversation_days,
+            trace_days=trace_days,
+        )
+        if assessment.disposition is RetentionDisposition.NOT_ELIGIBLE:
+            return RetentionPurgeAction.SKIPPED_BUSY
+
+        if assessment.disposition is RetentionDisposition.CONVERSATION_EXPIRED:
+            action = RetentionPurgeAction.PURGED_CONVERSATION
+        else:
+            if _has_active_interaction(db, task_id):
+                return RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION
+            action = RetentionPurgeAction.PURGED_TRACES
+
+        if dry_run:
+            return action
+
+        if action is RetentionPurgeAction.PURGED_CONVERSATION:
+            purge_task_rows(db, task_id=task_id)
+        else:
+            _purge_trace_rows(db, task_id)
+        db.commit()
+        committed = True
+        return action
+    finally:
+        # Covers every exit -- the two skips, the dry run, the purge (both
+        # branches converge on one return) and any exception -- because
+        # each one either committed or must not.
+        # Written as a flag rather than as a rollback before each ``return``
+        # so a later exit added without one cannot leak the row lock.
+        if not committed:
+            db.rollback()
+
+
+def run_retention_purge_batch(
+    session_factory: sessionmaker[Session],
+    *,
+    now: datetime | None = None,
+    limit: int | None = None,
+    after_task_id: int = 0,
+    should_continue: Callable[[], bool] | None = None,
+) -> RetentionPurgeReport:
+    """Purge one bounded batch and return what it did.
+
+    The retention periods and the dry-run flag are read from configuration
+    here and are deliberately not overridable by argument. Elsewhere in this
+    module ``days=None`` means *unlimited retention*; a parameter that also
+    accepted ``None`` as "use the configured value" would give one value two
+    opposite meanings, and the dangerous reading -- a caller passing ``None``
+    for "expire nothing" and getting the configured period -- deletes
+    conversations. Tests that need specific periods call :func:`purge_task`,
+    where ``None`` keeps its one meaning.
+
+    Configuration is read per batch rather than captured at import. That is
+    not the same as being changeable at run time, and this module used to
+    claim it was: ``.env`` is read once at process start and nothing mutates
+    the environment afterwards, so within one process these values never
+    change. Reading them per batch is about not caching a value across a
+    restart boundary, not about live reconfiguration.
+
+    The kill switch is still checked per task for one reason: it decides
+    whether a *restarted* process resumes sweeping, and checking it in the
+    loop rather than only at startup keeps that decision in one place.
+
+    ``should_continue`` is the one that genuinely changes under the batch --
+    it is how shutdown reaches in -- and it is checked between tasks, the only
+    place stopping is free: each task's purge owns one transaction, so a batch
+    that stops there leaves committed work behind it and untouched tasks in
+    front of it, with nothing in between. That is also what keeps shutdown
+    quick, since this runs in a worker thread that cancelling the calling task
+    would detach rather than end.
+
+    Raises:
+        RetentionPurgeUnsupported: If the store is not PostgreSQL.
+    """
+    now = now or datetime.now(timezone.utc)
+    conversation_days = get_conversation_retention_days()
+    trace_days = get_trace_retention_days()
+    limit = limit if limit is not None else get_retention_batch_size()
+    dry_run = get_retention_dry_run()
+
+    with session_factory() as db:
+        ensure_retention_purge_supported(db)
+        candidates = select_purge_candidates(
+            db,
+            now=now,
+            conversation_days=conversation_days,
+            trace_days=trace_days,
+            limit=limit,
+            after_task_id=after_task_id,
+        )
+
+    report = RetentionPurgeReport(
+        eligible=len(candidates),
+        dry_run=dry_run,
+        last_task_id=candidates[-1] if candidates else None,
+    )
+    for task_id in candidates:
+        if should_continue is not None and not should_continue():
+            logger.info("retention purge stopping after %d task(s)", report.purged)
+            break
+        if not get_retention_enabled():
+            logger.info(
+                "retention purge stopped by kill switch after %d task(s)",
+                report.purged,
+            )
+            break
+        with session_factory() as db:
+            action = purge_task(
+                db,
+                task_id,
+                now=now,
+                conversation_days=conversation_days,
+                trace_days=trace_days,
+                dry_run=dry_run,
+            )
+        report = report.with_action(action)
+
+    logger.info(report.audit_line())
+    return report
+
+
+def retention_purge_configured() -> bool:
+    """Whether any period is configured and the kill switch is up."""
+    if not get_retention_enabled():
+        return False
+    return (
+        get_conversation_retention_days() is not None
+        or get_trace_retention_days() is not None
+    )
+
+
+async def run_retention_purge_loop(
+    session_factory: sessionmaker[Session],
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Sweep until stopped, walking the table with a cursor.
+
+    A full page advances the cursor past it and pauses only briefly, so a
+    large initial backlog is worked down without waiting a sweep interval per
+    batch. A short page means the backlog behind the cursor is drained: the
+    cursor resets and the next sweep starts from the top of the table after a
+    full interval. Same cross-tick cursor ``orphan_upload_gc`` carries, for the
+    same reason -- without it a page the purge cannot delete is re-read
+    forever, and because a full page also shortens the pause, the loop would
+    spin on it at the batch pause rather than merely stalling.
+
+    A page the purge declines is therefore re-assessed once per pass over the
+    table rather than continuously, which is the right cadence: what makes
+    such a task purgeable is something outside this loop finishing.
+
+    The loop never raises out: a failed batch is logged with its traceback and
+    retried on the next interval. An unattended sweep has no other surface,
+    and a purge that stops permanently on one bad task would look exactly like
+    a purge that had nothing to do.
+
+    ``stop_event`` reaches the batch itself, not just the sleep between
+    batches. It has to: the batch runs in a worker thread, and cancelling this
+    coroutine would detach that thread rather than end it -- leaving a sweep
+    of a full batch still deleting while the process tried to exit.
+    """
+    stop = stop_event if stop_event is not None else asyncio.Event()
+    after_task_id = 0
+    while not stop.is_set():
+        pause = get_retention_sweep_interval_seconds()
+        try:
+            limit = get_retention_batch_size()
+            report = await asyncio.to_thread(
+                run_retention_purge_batch,
+                session_factory,
+                limit=limit,
+                after_task_id=after_task_id,
+                should_continue=lambda: not stop.is_set(),
+            )
+            if report.eligible >= limit and report.last_task_id is not None:
+                after_task_id = report.last_task_id
+                pause = get_retention_batch_pause_seconds()
+            else:
+                after_task_id = 0
+        except RetentionPurgeUnsupported:
+            # Configuration, not weather: retrying cannot fix the dialect.
+            logger.warning("retention purge stopped", exc_info=True)
+            return
+        except Exception:  # noqa: BLE001
+            logger.warning("retention purge batch failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=pause)
+        except TimeoutError:
+            continue
+
+
+__all__ = [
+    "RetentionPurgeAction",
+    "RetentionPurgeReport",
+    "RetentionPurgeUnsupported",
+    "ensure_retention_purge_supported",
+    "purge_task",
+    "retention_purge_configured",
+    "run_retention_purge_batch",
+    "run_retention_purge_loop",
+    "select_purge_candidates",
+]

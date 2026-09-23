@@ -46,10 +46,14 @@ the A2A cancel path, which conditionally updates the task row.
 
 Three producers were *not* verified to lock the task row:
 ``api/websocket.py``, ``services/task_interaction_service.py``, and
-``services/workforce_runtime.py``. A command inserted by one of those
-between this assessment and a later delete would not be fenced by this
-lock. #2563 must confirm or fence them before it deletes on this predicate's
-word; this module deliberately does not claim it already holds.
+``services/workforce_runtime.py``. That gap turned out not to need closing,
+and #2563 resolved it without changing any of them: ``task_execution_commands``
+carries a NOT NULL foreign key to ``tasks.id``, which PostgreSQL validates by
+taking ``FOR KEY SHARE`` on the parent row -- and that conflicts with the
+``FOR UPDATE`` above. A command insert for a task under assessment therefore
+blocks until this transaction ends, whichever module issues it and whatever
+it locks itself. ``test_task_retention_purge_postgresql.py`` pins that against
+a real server rather than against a reading of the lock-compatibility matrix.
 """
 
 from __future__ import annotations

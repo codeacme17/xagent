@@ -680,6 +680,112 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
             )
 
 
+#: How long shutdown waits for the retention purge loop to stop on its own
+#: before cancelling it. One task's purge has to finish first, and a purge is
+#: a handful of indexed deletes -- not a bound anyone should have to tune, so
+#: it is a constant rather than another environment variable.
+RETENTION_PURGE_STOP_GRACE_SECONDS = 10.0
+
+
+def start_retention_purge_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the conversation/trace retention purge loop, if configured (#2563).
+
+    Returns ``None`` -- having started nothing -- in every deployment that has
+    not opted in, which is all of them until the policy decision in #2567 is
+    made. The loop is also the only thing that reads the configured periods, so
+    a deployment with none configured pays nothing for this call.
+
+    The loop itself refuses to run against anything but PostgreSQL, because the
+    row lock its eligibility check depends on is a no-op elsewhere; it logs the
+    refusal and returns rather than retrying something configuration cannot fix.
+    That refusal is also what makes this safe to leave unguarded under pytest,
+    unlike the sweeps either side of it: a test suite runs on SQLite, so a loop
+    started by one ends itself on its first batch.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_retention_purge import (
+        retention_purge_configured,
+        run_retention_purge_loop,
+    )
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "retention_purge_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        # Same reporting the neighbouring starters do: a loop that died took
+        # its traceback with it, and this is the last place to say so.
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous retention purge loop failed", exc_info=failure)
+        app_instance.state.retention_purge_task = None
+
+    if not retention_purge_configured():
+        return None
+
+    stop_event = asyncio.Event()
+    app_instance.state.retention_purge_stop = stop_event
+    task = asyncio.create_task(
+        run_retention_purge_loop(get_session_local(), stop_event=stop_event)
+    )
+    app_instance.state.retention_purge_task = task
+    logger.info("Started retention purge loop")
+    return task
+
+
+async def stop_retention_purge_task(app_instance: FastAPI) -> None:
+    """Ask the retention purge loop to stop, give it a moment, then cancel it.
+
+    The signal is not a courtesy. A sweep runs its batch in a worker thread, so
+    cancelling the loop's task would *detach* that thread rather than end it,
+    leaving deletes running while the process tries to exit. The stop event
+    reaches inside the batch, which checks it between tasks and returns.
+
+    The grace window is bounded because between-tasks is not instant: one
+    task's purge has to finish first. Cancelling after it expires costs
+    nothing either way -- each task owns its transaction, so whatever was
+    committed stays and whatever was not rolls back.
+    """
+
+    stop_event = getattr(app_instance.state, "retention_purge_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    app_instance.state.retention_purge_stop = None
+
+    task = getattr(app_instance.state, "retention_purge_task", None)
+    app_instance.state.retention_purge_task = None
+    if task is None:
+        return
+    if not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=RETENTION_PURGE_STOP_GRACE_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            logger.info("Cancelling retention purge loop after stop grace period...")
+            task.cancel()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Retention purge loop stopped after failure", exc_info=exc)
+            return
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Retention purge loop stopped after failure", exc_info=exc)
+
+
 def start_temp_file_cleanup_task(
     app_instance: FastAPI,
 ) -> asyncio.Task[Any] | None:
@@ -1339,6 +1445,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
         start_task_lease_recovery_task(app_instance)
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
+    start_retention_purge_task(app_instance)
 
 
 async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
@@ -1935,6 +2042,7 @@ async def shutdown_event() -> None:
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
+    await stop_retention_purge_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 
