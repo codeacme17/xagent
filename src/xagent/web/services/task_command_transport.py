@@ -1271,6 +1271,10 @@ def retry_failed_task_command(
 ) -> bool:
     """Reset one failed command without retargeting its immutable execution."""
 
+    from .task_execution_admission import prepare_task_admission_retry
+
+    prepare_task_admission_retry(db, command_db_id)
+
     now = _utc_now()
     updated = (
         db.query(TaskExecutionCommand)

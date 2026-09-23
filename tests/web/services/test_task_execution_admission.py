@@ -15,6 +15,7 @@ from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
@@ -149,6 +150,50 @@ async def test_cancel_overtakes_capacity_wait_and_prevents_later_execution(host)
     assert transport.load_task_command(waiting.command_id).status == "failed"
     assert not await transport.dispatch_one_task_command(execute)
     assert executed == [cancel.command_id]
+    with host.sessions() as db:
+        event = (
+            db.query(TaskCommandTerminalEvent)
+            .filter_by(task_command_id=waiting.command_id)
+            .one()
+        )
+        assert event.outcome == "failed"
+        assert event.outcome_version == 0
+
+
+async def test_failed_command_retry_keeps_admission_and_pending_budget(host):
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("retry", 1, 1)
+    )
+    first = enqueue(host)
+
+    async def reject(command):
+        raise transport.TaskCommandRejected("Refused", reason="test_refusal")
+
+    assert await transport.dispatch_one_task_command(reject)
+    active = enqueue(host)
+    execute = Execution(host)
+    await dispatch_next(execute)
+    waiting = enqueue(host)
+    with host.sessions() as db, pytest.raises(admission.AdmissionQueueFull):
+        transport.retry_failed_task_command(db, first.command_id)
+    assert transport.load_task_command(first.command_id).status == "failed"
+    execute.finish.set()
+    execute.cleanup.set()
+    await dispatch_next(execute)
+    await asyncio.sleep(0.1)
+    with host.sessions() as db:
+        assert transport.retry_failed_task_command(db, first.command_id)
+    with host.sessions() as db:
+        assert not transport.retry_failed_task_command(db, first.command_id)
+    blocker = Execution(host)
+    assert await transport.dispatch_one_task_command(
+        blocker, command_db_id=first.command_id
+    )
+    other = enqueue(host)
+    assert not await transport.dispatch_one_task_command(
+        blocker, command_db_id=other.command_id
+    )
+    assert execute.started == [active.command_id, waiting.command_id]
 
 
 async def test_prompt_dispatch_cannot_jump_older_waiting_work_in_its_bucket(host):
@@ -288,6 +333,33 @@ async def test_rejected_command_releases_its_admission(host):
     assert rejected == [first.command_id, second.command_id]
 
 
+async def test_live_guidance_joins_existing_execution_without_an_extra_slot(host):
+    first = enqueue(host)
+    execute = Execution(host)
+    assert await transport.dispatch_one_task_command(execute)
+    with host.sessions() as db:
+        task_id = db.get(TaskExecutionCommand, first.command_id).task_id
+    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    delivered = []
+
+    async def inject(command):
+        delivered.append(command.id)
+        return {}
+
+    assert await transport.dispatch_one_task_command(
+        inject, command_db_id=message.command_id
+    )
+    assert delivered == [message.command_id]
+    other = enqueue(host)
+    assert not await transport.dispatch_one_task_command(
+        execute, command_db_id=other.command_id
+    )
+    execute.finish.set()
+    execute.cleanup.set()
+    await dispatch_next(execute)
+    assert execute.started == [first.command_id, other.command_id]
+
+
 async def test_policy_change_does_not_silently_change_existing_bucket(host):
     enqueue(host)
     admission.set_task_admission_hook(
@@ -295,6 +367,36 @@ async def test_policy_change_does_not_silently_change_existing_bucket(host):
     )
     with pytest.raises(ValueError, match="policy"):
         enqueue(host)
+
+
+async def test_message_cannot_borrow_an_existing_execution_from_another_bucket(host):
+    first = enqueue(host)
+    original = Execution(host)
+    assert await transport.dispatch_one_task_command(original)
+    with host.sessions() as db:
+        task_id = db.get(TaskExecutionCommand, first.command_id).task_id
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("other-lane", 1, 20)
+    )
+    second = enqueue(host)
+    occupied = Execution(host)
+    assert await transport.dispatch_one_task_command(occupied)
+    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    delivered = []
+
+    async def inject(command):
+        delivered.append(command.id)
+        return {}
+
+    assert not await transport.dispatch_one_task_command(
+        inject, command_db_id=message.command_id
+    )
+    assert transport.load_task_command(message.command_id).attempt_count == 0
+    occupied.finish.set()
+    occupied.cleanup.set()
+    await dispatch_next(inject)
+    assert delivered == [message.command_id]
+    assert occupied.started == [second.command_id]
 
 
 async def test_next_turn_on_same_owner_does_not_retain_previous_turn_slot(host):

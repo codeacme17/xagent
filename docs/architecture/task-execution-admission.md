@@ -51,7 +51,11 @@ of its coordinator. It consumes capacity until the actual execution handles
 and their cleanup have drained. Publishing COMPLETED, PAUSED, or
 WAITING_FOR_USER alone does not release the slot. Before the same owner begins
 another command, a drained, non-running previous execution releases its tickets.
-Tool waits and model retries keep their active slot.
+Tool waits and model retries keep their active slot. MESSAGE guidance delivered
+to a running execution in the same bucket joins its existing slot. It still
+obeys the pending-command budget at acceptance. A differently classified
+MESSAGE reserves its own bucket conservatively until execution cleanup; it
+cannot borrow another bucket's slot if routing changes to a new turn.
 
 Lease expiry alone is not capacity recovery. The existing recovery path must
 retire the owner token first. A live successor does not inherit the old
@@ -60,8 +64,9 @@ Crash recovery preserves the existing task execution semantics: this change
 does not replay completed START handoffs or promise exactly-once external tool
 side effects.
 
-Terminal tickets are removed on normal release; retryable commands return to
-waiting. Existing command rows retain idempotency and outcome records. Abrupt
+Completed tickets are removed on normal release. Failed commands retain their
+classification so an explicit retry rechecks the pending budget and waits for
+capacity again. Existing command rows retain idempotency and outcome records. Abrupt
 owner loss leaves inactive ticket evidence until recovery or ordinary command/
 task deletion; foreign-key cascades clean up the dependent ticket rows.
 
@@ -71,7 +76,7 @@ CANCEL and PAUSE do not acquire execution capacity. They may overtake only
 older pending commands that have not reserved a slot. Their existing executor
 still validates ownership, authorization, run and state version. Successful
 controls that change the target state invalidate earlier waiting commands for
-that old state before committing their completion. A rejected or ineffective
+that old state and persist their terminal events before committing completion. A rejected or ineffective
 control does not discard queued work. Active execution cancellation retains its
 slot until its cleanup actually finishes.
 

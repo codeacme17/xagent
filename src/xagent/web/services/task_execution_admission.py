@@ -13,13 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from ...config import get_shared_task_execution_enabled
-from ..models.task import Task
+from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 from .task_coordinator_service import TaskLease
@@ -83,20 +83,7 @@ def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
     bucket = _lock_bucket(db, policy.bucket)
     if (bucket.capacity, bucket.max_pending) != (policy.capacity, policy.max_pending):
         raise ValueError("Drain the admission bucket before changing its policy")
-    pending = db.scalar(
-        select(func.count())
-        .select_from(TaskAdmissionTicket)
-        .join(
-            TaskExecutionCommand,
-            TaskExecutionCommand.id == TaskAdmissionTicket.command_id,
-        )
-        .where(
-            TaskAdmissionTicket.bucket_key == policy.bucket,
-            ~_held_ticket(TaskAdmissionTicket),
-            TaskExecutionCommand.status.notin_(_TERMINAL),
-        )
-    )
-    if pending is not None and pending >= policy.max_pending:
+    if _pending_count(db, policy.bucket) >= policy.max_pending:
         raise AdmissionQueueFull("Execution queue is full")
     db.add(
         TaskAdmissionTicket(
@@ -104,6 +91,40 @@ def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
         )
     )
     db.flush()
+
+
+def _pending_count(db: Session, key: str) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(TaskAdmissionTicket)
+            .join(
+                TaskExecutionCommand,
+                TaskExecutionCommand.id == TaskAdmissionTicket.command_id,
+            )
+            .where(
+                TaskAdmissionTicket.bucket_key == key,
+                ~_held_ticket(TaskAdmissionTicket),
+                TaskExecutionCommand.status.notin_(_TERMINAL),
+            )
+        )
+        or 0
+    )
+
+
+def prepare_task_admission_retry(db: Session, command_id: int) -> None:
+    """Recheck pending capacity while preserving the original classification."""
+    ticket = db.get(TaskAdmissionTicket, command_id)
+    if ticket is None:
+        return
+    # Keep the task-before-bucket lock order used by acceptance and dispatch.
+    db.execute(select(Task.id).where(Task.id == ticket.task_id).with_for_update())
+    bucket = _lock_bucket(db, str(ticket.bucket_key))
+    command = db.get(TaskExecutionCommand, command_id, populate_existing=True)
+    if command is None or command.status != "failed":
+        return
+    if _pending_count(db, str(bucket.key)) >= int(bucket.max_pending):
+        raise AdmissionQueueFull("Execution queue is full")
 
 
 def _lock_bucket(db: Session, key: str) -> TaskAdmissionBucket:
@@ -175,7 +196,28 @@ def admission_eligible() -> ColumnElement[bool]:
         )
         .correlate(TaskExecutionCommand, Task)
     )
-    return ~blocked
+    return or_(~blocked, _joins_running_execution())
+
+
+def _joins_running_execution() -> ColumnElement[bool]:
+    ticket, incoming = aliased(TaskAdmissionTicket), aliased(TaskAdmissionTicket)
+    return and_(
+        TaskExecutionCommand.kind == "message",
+        task_status_predicate.eq(TaskStatus.RUNNING),
+        Task.control_state == "running",
+        exists(
+            select(1)
+            .select_from(ticket)
+            .join(incoming, incoming.bucket_key == ticket.bucket_key)
+            .where(
+                incoming.command_id == TaskExecutionCommand.id,
+                ticket.task_id == Task.id,
+                ticket.runner_id == Task.runner_id,
+                ticket.owner_attempt_id == Task.lease_attempt_id,
+            )
+            .correlate(Task, TaskExecutionCommand)
+        ),
+    )
 
 
 def _older_waiter() -> ColumnElement[bool]:
@@ -202,6 +244,13 @@ def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bo
     bucket = _lock_bucket(db, str(ticket.bucket_key))
     if ticket.task_id != lease.task_id:
         raise ValueError("Admission ticket belongs to another task")
+    if db.scalar(
+        select(_joins_running_execution())
+        .select_from(TaskExecutionCommand)
+        .join(Task, Task.id == TaskExecutionCommand.task_id)
+        .where(TaskExecutionCommand.id == command_id)
+    ):
+        return True
     if (ticket.runner_id, ticket.owner_attempt_id) == (
         lease.runner_id,
         lease.attempt_id,
@@ -232,7 +281,7 @@ def release_task_admissions(db: Session, lease: TaskLease) -> None:
             *owned,
             TaskAdmissionTicket.command_id.in_(
                 select(TaskExecutionCommand.id).where(
-                    TaskExecutionCommand.status.in_(_TERMINAL)
+                    TaskExecutionCommand.status == "completed"
                 )
             ),
         )
@@ -255,7 +304,18 @@ def waiting_admission(command_id: object) -> ColumnElement[bool]:
 
 
 def settle_cancelled_admissions(db: Session, command_id: int) -> None:
-    """A successful control invalidates older waiting commands for its old state."""
+    """Settle unreserved completions and commands invalidated by a control."""
+    from .task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        stage_terminal_event,
+    )
+
+    db.execute(
+        delete(TaskAdmissionTicket).where(
+            TaskAdmissionTicket.command_id == command_id,
+            TaskAdmissionTicket.owner_attempt_id.is_(None),
+        )
+    )
     control = db.get(TaskExecutionCommand, command_id)
     if control is None or control.kind not in {"cancel", "pause"}:
         return
@@ -278,9 +338,18 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .returning(TaskExecutionCommand.id)
     ).all()
-    if cancelled:
-        db.execute(
-            delete(TaskAdmissionTicket).where(
-                TaskAdmissionTicket.command_id.in_(cancelled)
-            )
+    for cancelled_id in cancelled:
+        command = db.get(TaskExecutionCommand, cancelled_id, populate_existing=True)
+        assert command is not None
+        scope = (
+            command.payload.get("scope") if isinstance(command.payload, dict) else None
+        )
+        stage_terminal_event(
+            db,
+            command_db_id=cancelled_id,
+            draft=TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=scope != "external",
+            ),
         )
