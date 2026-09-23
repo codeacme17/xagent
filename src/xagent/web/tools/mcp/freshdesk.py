@@ -775,7 +775,12 @@ def freshdesk_create_ticket(
         # Freshdesk rejects a phone-only create that carries no name. Catching
         # it here names the missing argument; forwarding it spends a request to
         # be told "Validation failed".
-        if has_phone and not has_email and requester_id is None and not (name or "").strip():
+        if (
+            has_phone
+            and not has_email
+            and requester_id is None
+            and not (name or "").strip()
+        ):
             raise RuntimeError(
                 "name is required when creating a ticket from a phone number "
                 "without an email address"
