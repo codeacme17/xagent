@@ -19,6 +19,10 @@ from xagent.core.execution_scope import (
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.services.agent_service_manager import AgentServiceManager
+from xagent.web.services.task_workspace_cleanup import (
+    capture_workspace_cleanup_target,
+    remove_task_workspace,
+)
 
 OWNER_ID = 7
 TASK_ID = 42
@@ -87,3 +91,22 @@ def test_an_authority_mismatch_still_deletes_the_workspace(tmp_path, monkeypatch
     AgentServiceManager()._cleanup_workspace_directory(TASK_ID, OWNER_ID)
 
     assert not workspace.exists()
+
+
+def test_removal_is_idempotent(tmp_path, monkeypatch):
+    """A second pass over an already-clean target is a success, not an error.
+
+    Deletion removes the directory either through the cached agent or through
+    a captured target, and a retry of an interrupted deletion runs over
+    whatever the first attempt already finished.
+    """
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    register_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
+    workspace = _make_workspace(tmp_path / "uploads" / f"user_{OWNER_ID}")
+
+    target = capture_workspace_cleanup_target(TASK_ID, OWNER_ID)
+
+    assert remove_task_workspace(target) is True
+    assert not workspace.exists()
+    assert remove_task_workspace(target) is False
