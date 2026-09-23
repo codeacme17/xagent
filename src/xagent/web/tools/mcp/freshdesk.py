@@ -772,7 +772,9 @@ def freshdesk_create_ticket(
     or phone.
     name: the requester's name. Freshdesk makes this MANDATORY when phone is
     given without email ("If the phone number is set and the email address is
-    not, then the name attribute is mandatory"), and ignores it otherwise.
+    not, then the name attribute is mandatory"), and otherwise uses it to name
+    the contact it creates for an unknown email -- so it is worth passing
+    whenever the requester may be new, not only on the phone-only path.
     status: 2 Open (default), 3 Pending, 4 Resolved, 5 Closed.
     priority: 1 Low (default), 2 Medium, 3 High, 4 Urgent.
     responder_id: the agent to assign; omit to leave unassigned.
@@ -785,8 +787,18 @@ def freshdesk_create_ticket(
             raise RuntimeError("subject must not be empty")
         if not (description or "").strip():
             raise RuntimeError("description must not be empty")
-        has_email = bool((email or "").strip())
-        has_phone = bool((phone or "").strip())
+
+        # Normalize once and use the normalized values everywhere below: the
+        # guards used to read stripped values while the payload sent the raw
+        # ones, so a whitespace-only email was judged absent and still sent
+        # (the "" filter below does not catch "   ").
+        email = (email or "").strip() or None
+        phone = (phone or "").strip() or None
+        name = (name or "").strip() or None
+        subject = subject.strip()
+        description = description.strip()
+        has_email = email is not None
+        has_phone = phone is not None
         if requester_id is None and not has_email and not has_phone:
             raise RuntimeError(
                 "one of email, requester_id or phone is required to identify "
@@ -795,12 +807,7 @@ def freshdesk_create_ticket(
         # Freshdesk rejects a phone-only create that carries no name. Catching
         # it here names the missing argument; forwarding it spends a request to
         # be told "Validation failed".
-        if (
-            has_phone
-            and not has_email
-            and requester_id is None
-            and not (name or "").strip()
-        ):
+        if has_phone and not has_email and requester_id is None and name is None:
             raise RuntimeError(
                 "name is required when creating a ticket from a phone number "
                 "without an email address"

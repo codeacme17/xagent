@@ -1428,3 +1428,38 @@ def test_the_catalog_row_ships_hidden_until_verified():
     assert rows["zendesk"]["is_visible_in_connector"] is False, (
         "the precedent this follows"
     )
+
+
+def test_create_ticket_sends_normalized_identifiers(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The guards read stripped values while the payload sent the raw ones, so
+    a padded address went to Freshdesk with its whitespace intact.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 1}))
+
+    freshdesk.freshdesk_create_ticket(
+        "  s  ", "  d  ", email="  a@b.c  ", name="  Jo  "
+    )
+
+    body = recorder.call["json"]
+    assert body["email"] == "a@b.c"
+    assert body["name"] == "Jo"
+    assert body["subject"] == "s"
+    assert body["description"] == "d"
+
+
+def test_a_whitespace_only_identifier_is_absent_not_sent_blank(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """`email="   "` was judged absent by the guard and still sent, because
+    the payload filter drops "" but not "   ".
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 1}))
+
+    freshdesk.freshdesk_create_ticket(
+        "s", "d", phone="+15551234567", email="   ", name="Jo"
+    )
+
+    assert "email" not in recorder.call["json"]
+    assert recorder.call["json"]["phone"] == "+15551234567"
