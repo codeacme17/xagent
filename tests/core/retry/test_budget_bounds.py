@@ -26,16 +26,18 @@ class FakeTime:
     implementation happens to call ``monotonic()``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, overshoot: float = 0.0) -> None:
         self.now = 0.0
         self.slept: list[float] = []
+        # A real sleep can wake late: a busy scheduler, a blocked event loop.
+        self.overshoot = overshoot
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
-        self.now += seconds
+        self.now += seconds + self.overshoot
 
 
 class FakeAsyncio:
@@ -78,6 +80,15 @@ class AlwaysFails:
 def clock(monkeypatch):
     """Install the simulated clock on both sleep paths the wrapper uses."""
     fake = FakeTime()
+    monkeypatch.setattr(wrapper_module, "time", fake)
+    monkeypatch.setattr(wrapper_module, "asyncio", FakeAsyncio(fake))
+    return fake
+
+
+@pytest.fixture
+def late_clock(monkeypatch):
+    """A clock whose sleeps wake 20 simulated seconds late."""
+    fake = FakeTime(overshoot=20.0)
     monkeypatch.setattr(wrapper_module, "time", fake)
     monkeypatch.setattr(wrapper_module, "asyncio", FakeAsyncio(fake))
     return fake
@@ -369,3 +380,71 @@ class TestFactoryPassthrough:
             wrapped.run()
 
         assert inner.call_count == 2
+
+
+class TestDeadlineIsRecheckedAtAttemptStart:
+    """A late wake must not buy a whole extra provider request.
+
+    ``_plan_retry`` clears a retry against the *nominal* delay. If the sleep
+    overshoots -- a busy scheduler, a blocked event loop -- the loop would
+    otherwise start another attempt past the deadline, and that attempt can
+    then consume a full per-attempt timeout. Distinct from the documented
+    overrun of an attempt already in flight when the deadline passes.
+    """
+
+    def test_a_late_wake_does_not_start_another_attempt(self, late_clock):
+        target = AlwaysFails(RuntimeError("Connection error."))
+        wrapper = _wrapper(
+            target,
+            max_retries=10,
+            strategy=FixedDelay(delay_ms=1000),
+            budget=RetryBudget(deadline_seconds=10.0),
+        )
+
+        with pytest.raises(RuntimeError, match="Connection error."):
+            wrapper.invoke()
+
+        # The nominal 1s delay cleared the 10s deadline, but waking 21s later
+        # puts attempt 2 past it.
+        assert late_clock.slept == [1.0]
+        assert target.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_late_wake_does_not_start_another_async_attempt(self, late_clock):
+        target = AlwaysFails(RuntimeError("Connection error."))
+        wrapper = _wrapper(
+            target,
+            max_retries=10,
+            strategy=FixedDelay(delay_ms=1000),
+            budget=RetryBudget(deadline_seconds=10.0),
+        )
+
+        with pytest.raises(RuntimeError):
+            await wrapper.ainvoke()
+
+        assert target.call_count == 1
+
+    def test_a_punctual_wake_still_retries(self, clock):
+        """The recheck must not cost a retry that fits inside the deadline."""
+        target = AlwaysFails(RuntimeError("Connection error."))
+        wrapper = _wrapper(
+            target,
+            max_retries=3,
+            strategy=FixedDelay(delay_ms=1000),
+            budget=RetryBudget(deadline_seconds=100.0),
+        )
+
+        with pytest.raises(RuntimeError):
+            wrapper.invoke()
+
+        assert target.call_count == 3
+
+    def test_no_budget_means_no_recheck(self, late_clock):
+        """Callers that pass no budget keep their exact attempt count."""
+        target = AlwaysFails(RuntimeError("Connection error."))
+        wrapper = _wrapper(target, max_retries=3, strategy=FixedDelay(delay_ms=1))
+
+        with pytest.raises(RuntimeError):
+            wrapper.invoke()
+
+        assert target.call_count == 3

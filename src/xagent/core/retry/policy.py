@@ -32,6 +32,8 @@ The two deployment knobs live in :mod:`xagent.config` with every other
 setting; this module only assembles them into a budget.
 """
 
+import email.utils
+import time
 from dataclasses import dataclass
 
 from ...config import get_llm_capacity_max_attempts, get_llm_retry_deadline_seconds
@@ -91,6 +93,26 @@ def is_capacity_error(error: BaseException) -> bool:
     return False
 
 
+def _as_seconds(raw: str, divisor: float) -> float | None:
+    """Read one header value as a delay, numeric or HTTP-date.
+
+    A date is a legal ``Retry-After``, and both SDKs whose retry budget we
+    disabled honoured it: they fall through to ``email.utils.parsedate_tz``
+    and return ``date - now``, under the same ceiling applied here. Dropping
+    a date would spend a capacity refusal's single retry on the local backoff
+    against a provider that had named a later time.
+    """
+    try:
+        return float(raw) / divisor
+    except (TypeError, ValueError):
+        pass
+
+    parsed = email.utils.parsedate_tz(raw)
+    if parsed is None:
+        return None
+    return float(email.utils.mktime_tz(parsed) - time.time())
+
+
 def _parse_retry_after(headers: object) -> float | None:
     """Read a usable delay out of one response's ``Retry-After`` headers."""
     getter = getattr(headers, "get", None)
@@ -101,13 +123,8 @@ def _parse_retry_after(headers: object) -> float | None:
         raw = getter(header)
         if raw is None:
             continue
-        try:
-            # An HTTP-date is a legal Retry-After value that we cannot use
-            # without a clock comparison; treat it as absent.
-            seconds = float(str(raw).strip()) / divisor
-        except (TypeError, ValueError):
-            continue
-        if 0 < seconds <= MAX_HONORED_RETRY_AFTER_SECONDS:
+        seconds = _as_seconds(str(raw).strip(), divisor)
+        if seconds is not None and 0 < seconds <= MAX_HONORED_RETRY_AFTER_SECONDS:
             return seconds
     return None
 

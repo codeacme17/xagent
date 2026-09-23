@@ -16,6 +16,7 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
+from ..error import is_retryable_http_status
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -1167,9 +1168,9 @@ class ClaudeLLM(BaseLLM):
                     # blanket retry of 4xx is a separate defect, not one to
                     # copy here.
                     status = getattr(e, "status_code", None)
-                    if isinstance(status, int) and (
-                        status == 429 or 500 <= status < 600
-                    ):
+                    # Same status set the shared predicate uses, so the
+                    # streaming guard and ``retry_on`` cannot drift apart.
+                    if isinstance(status, int) and is_retryable_http_status(status):
                         raise LLMRetryableError(
                             f"Claude API status error: {str(e)}"
                         ) from e

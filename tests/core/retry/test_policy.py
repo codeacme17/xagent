@@ -1,5 +1,8 @@
 """Bounds that attempt counting cannot express: deadlines and capacity budgets."""
 
+import email.utils
+import time
+
 import httpx
 import openai
 import pytest
@@ -216,3 +219,45 @@ class TestChainWalkIsExplicitOnly:
                 raise RuntimeError("unrelated cleanup failure")
         except RuntimeError as unrelated:
             assert retry_after_seconds(unrelated) is None
+
+
+class TestRetryAfterHttpDate:
+    """A date is a legal ``Retry-After``, and the SDKs we replaced honoured it.
+
+    ``openai`` 2.24.0 and ``anthropic`` 0.84.0 both fall through to
+    ``email.utils.parsedate_tz`` and return ``date - time.time()``, subject to
+    the same 60s ceiling. Dropping a date meant a capacity refusal spent its
+    single retry on the ~200ms local backoff against a provider that had named
+    a later time.
+    """
+
+    def _dated(self, offset_seconds: float) -> openai.APIStatusError:
+        value = email.utils.formatdate(time.time() + offset_seconds, usegmt=True)
+        return _status_error(429, "slow down", headers={"retry-after": value})
+
+    def test_a_future_date_is_honoured(self):
+        assert retry_after_seconds(self._dated(30)) == pytest.approx(30, abs=2)
+
+    def test_a_past_date_is_ignored(self):
+        assert retry_after_seconds(self._dated(-30)) is None
+
+    def test_a_date_beyond_the_ceiling_is_ignored(self):
+        """Same bound as a numeric hint: we will not hold a slot that long."""
+        assert retry_after_seconds(self._dated(600)) is None
+
+    def test_a_numeric_hint_still_wins_over_a_date(self):
+        error = _status_error(
+            429,
+            "slow down",
+            headers={
+                "retry-after": "5",
+                "retry-after-ms": "1500",
+            },
+        )
+
+        assert retry_after_seconds(error) == pytest.approx(1.5)
+
+    def test_unparseable_text_is_still_ignored(self):
+        error = _status_error(429, "slow down", headers={"retry-after": "soon"})
+
+        assert retry_after_seconds(error) is None

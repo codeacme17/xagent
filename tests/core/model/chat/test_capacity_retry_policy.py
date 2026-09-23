@@ -378,3 +378,78 @@ class TestStreamingTransientFaultsStillReachTheWrapper:
 
         with pytest.raises(LLMRetryableError):
             await self._drain(llm, [{"role": "user", "content": "hi"}])
+
+
+class TestProviderRetryVetoAndTransientStatuses:
+    """What the SDK budget carried besides an attempt count.
+
+    Removing the SDK's retries removed three things with it: its
+    ``Retry-After`` date handling, its ``x-should-retry`` header precedence,
+    and its classification of 408/409. The first lives in
+    ``core/retry/policy.py``; the other two are here.
+    """
+
+    def _status(self, cls, status: int, headers=None) -> openai.APIStatusError:
+        return cls(
+            "boom",
+            response=httpx.Response(status, request=REQUEST, headers=headers or {}),
+            body=None,
+        )
+
+    @pytest.mark.parametrize("status", [408, 409])
+    def test_transient_request_statuses_are_retryable(self, status):
+        """The locked SDKs retried these; with their budget gone we must."""
+        error = self._status(openai.APIStatusError, status, None)
+
+        assert retry_on(error) is True
+        assert retry_on(_as_adapter_raises(error, "OpenAI API error")) is True
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+    def test_other_4xx_stay_permanent(self, status):
+        error = self._status(openai.APIStatusError, status, None)
+
+        assert retry_on(error) is False
+
+    @pytest.mark.parametrize("status", [500, 503, 408, 409])
+    def test_a_provider_veto_is_honoured(self, status):
+        """``x-should-retry: false`` is the provider telling us not to."""
+        error = self._status(openai.APIStatusError, status, {"x-should-retry": "false"})
+
+        assert retry_on(error) is False
+
+    def test_the_veto_does_not_change_the_pre_existing_429_path(self):
+        """A vetoed 429 retried before this PR, through the ERRORS tuple.
+
+        Narrowing that is a separate behaviour change, not a repair of what
+        this PR introduced, so the veto must not reach it.
+        """
+        error = self._status(openai.RateLimitError, 429, {"x-should-retry": "false"})
+
+        assert retry_on(error) is True
+
+    def test_a_veto_on_a_permanent_status_stays_permanent(self):
+        error = self._status(openai.APIStatusError, 400, {"x-should-retry": "false"})
+
+        assert retry_on(error) is False
+
+    @pytest.mark.parametrize("status", [408, 409])
+    async def test_claude_streaming_transient_statuses_reach_the_wrapper(
+        self, mocker, status
+    ):
+        """The streaming guard must agree with the predicate on every status."""
+        from anthropic import APIStatusError as AnthropicStatusError
+
+        from xagent.core.model.chat.exceptions import LLMRetryableError
+
+        llm = ClaudeLLM("claude-sonnet-4", base_url=None, api_key="k")
+        client = mocker.AsyncMock()
+        client.messages.create.side_effect = AnthropicStatusError(
+            "request timeout",
+            response=httpx.Response(status, request=REQUEST),
+            body=None,
+        )
+        llm._client = client
+
+        with pytest.raises(LLMRetryableError):
+            async for _ in llm.stream_chat([{"role": "user", "content": "hi"}]):
+                pass

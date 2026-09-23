@@ -72,6 +72,18 @@ class RetryWrapper(Retryable):
             error,
         )
 
+    def _deadline_passed(self, deadline: Optional[float]) -> bool:
+        """Whether the wall clock ran out while we were asleep.
+
+        ``_plan_retry`` clears a retry against the *nominal* delay, so a sleep
+        that wakes late -- a busy scheduler, a blocked event loop -- would
+        otherwise start another provider request past the deadline, and that
+        request can then consume a full per-attempt timeout. This is the
+        attempt-start boundary; an attempt already in flight when the deadline
+        passes is a separate, documented limit.
+        """
+        return deadline is not None and time.monotonic() >= deadline
+
     def _plan_retry(
         self, error: Exception, attempt: int, deadline: Optional[float]
     ) -> float | str:
@@ -110,6 +122,10 @@ class RetryWrapper(Retryable):
         deadline = self._deadline()
 
         for attempt in range(self.max_retries):
+            if attempt and self._deadline_passed(deadline):
+                if last_exception is not None:
+                    self._log_give_up(GIVE_UP_DEADLINE, attempt - 1, last_exception)
+                break
             try:
                 return self.target.invoke(*args, **kwargs)
             except Exception as e:
@@ -137,6 +153,10 @@ class RetryWrapper(Retryable):
         deadline = self._deadline()
 
         for attempt in range(self.max_retries):
+            if attempt and self._deadline_passed(deadline):
+                if last_exception is not None:
+                    self._log_give_up(GIVE_UP_DEADLINE, attempt - 1, last_exception)
+                break
             try:
                 return await self.target.ainvoke(*args, **kwargs)
             except Exception as e:
@@ -210,6 +230,17 @@ def create_retry_wrapper(
                         deadline = self._retry_wrapper._deadline()
 
                         for attempt in range(self._retry_wrapper.max_retries):
+                            if attempt and self._retry_wrapper._deadline_passed(
+                                deadline
+                            ):
+                                if last_exception is not None:
+                                    self._retry_wrapper._log_give_up(
+                                        GIVE_UP_DEADLINE,
+                                        attempt - 1,
+                                        last_exception,
+                                        method_name,
+                                    )
+                                break
                             yielded_item = False
                             try:
                                 # Get a new async generator for each attempt
