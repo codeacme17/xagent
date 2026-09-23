@@ -1685,10 +1685,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # (<subdomain>.freshdesk.com, with no custom-domain support for
             # programmatic access), so the subdomain identifies the account and
             # the key authenticates within it. Both are per-user values and ride
-            # the existing encrypted per-user env path -- the connector composes
-            # the host from the validated subdomain label rather than accepting
-            # a URL, so there is no user-supplied host to guard (unlike magento,
-            # whose store URL is genuinely customer-controlled).
+            # the existing encrypted per-user env path. The subdomain IS
+            # user-supplied, so the connector validates it as a bare DNS label
+            # and then resolves the host it composes and rejects a private
+            # address -- a legitimate name can still be rebound by DNS at
+            # request time, which the label check alone does not cover. Same
+            # posture as the zendesk row above.
             #
             # This deliberately goes through Freshdesk's REST API rather than
             # their own remote MCP endpoint: that endpoint is metered separately

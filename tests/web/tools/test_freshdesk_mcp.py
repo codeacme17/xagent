@@ -346,7 +346,11 @@ def test_request_redacts_credentials_from_transport_errors(
 def test_request_returns_empty_dict_for_204(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
-    """Freshdesk answers a successful DELETE with 204 and no body."""
+    """A 204 or an empty body must decode to {} rather than raising.
+
+    No tool here issues a DELETE today, but _request is shared by all of them
+    and Freshdesk answers several writes with an empty body.
+    """
     monkeypatch.setattr(
         freshdesk._session,
         "request",
@@ -721,8 +725,11 @@ def test_search_tickets_returns_total_and_results(
 def test_search_tickets_reports_more_only_while_pages_remain(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
-    """The search endpoint has no Link header: a full 30-result page is the
-    only "maybe more" signal, and page 10 is Freshdesk's hard ceiling.
+    """Page 10 is Freshdesk's hard ceiling, whatever `total` says.
+
+    The signal itself comes from `total` where available -- see
+    test_search_has_more_comes_from_total_not_page_fullness; this pins the
+    ceiling that caps it either way.
     """
     full = [{"id": n} for n in range(freshdesk.SEARCH_PAGE_SIZE)]
     _install(monkeypatch, _json_response({"results": full, "total": 900}))
@@ -1100,11 +1107,12 @@ def test_log_output_does_not_leak_a_proxy_credential(
 ):
     """The error envelope was redacted but the LOG was not.
 
-    _send raises RuntimeError(redacted) `from exc`, and logging with
-    exc_info=True formats the whole __cause__ chain -- including the original
-    ProxyError, which echoes HTTPS_PROXY with its embedded user:pass@. The
-    redaction in _send exists precisely for that string, so the log line undid
-    a deliberate control. Reproduced before the fix.
+    _send raises RuntimeError(redacted) `from exc`, so anything that formats
+    the __cause__ chain -- an exc_info=True this module no longer passes --
+    reaches the original ProxyError, which echoes HTTPS_PROXY with its
+    embedded user:pass@. The redaction in _send exists precisely for that
+    string. Reproduced against the leaking version before it was fixed; this
+    keeps the log line from regaining the chain.
     """
 
     def raise_proxy_error(**_: Any) -> None:
@@ -1463,3 +1471,76 @@ def test_a_whitespace_only_identifier_is_absent_not_sent_blank(
 
     assert "email" not in recorder.call["json"]
     assert recorder.call["json"]["phone"] == "+15551234567"
+
+
+def test_a_401_with_a_body_still_gets_the_credential_hint(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """A real Freshdesk 401 carries a message, so gating the hint on an empty
+    detail meant it never fired in the only case it was written for.
+    """
+    _install(
+        monkeypatch,
+        _json_response({"message": "Access denied"}, status_code=401),
+    )
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert "Access denied" in result["message"], "the vendor's own message survives"
+    assert "FRESHDESK_API_KEY" in result["message"], "and the hint is appended"
+
+
+def test_a_403_gets_the_permission_hint(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    _install(
+        monkeypatch,
+        _json_response({"description": "Forbidden"}, status_code=403),
+    )
+    result = _payload(freshdesk.freshdesk_list_tickets())
+    assert "Forbidden" in result["message"]
+    assert "permission" in result["message"]
+
+
+def test_tags_are_stripped_and_blanks_dropped(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """ "vip " silently fails to match the canonical "vip" already on the
+    account, and a blank entry is a wasted tag.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+    freshdesk.freshdesk_update_ticket(3, tags=["vip ", "", "  urgent"])
+    assert recorder.call["json"]["tags"] == ["vip", "urgent"]
+
+
+def test_an_all_blank_tag_list_is_refused_not_treated_as_a_clear(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Freshdesk replaces the whole tag list, so collapsing ["  "] into the
+    same request as an explicit clear would wipe the tags off a ticket nobody
+    asked to untag.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_update_ticket(3, tags=["  ", ""]))
+
+    assert result["status"] == "error"
+    assert "explicitly clear" in result["message"]
+    assert recorder.calls == []
+
+
+def test_an_explicit_empty_tag_list_still_clears(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+    freshdesk.freshdesk_update_ticket(3, tags=[])
+    assert recorder.call["json"]["tags"] == []
+
+
+def test_create_ticket_cleans_tags_too(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The same field, the same replace semantics -- fixing only update_ticket
+    would leave the sibling to be re-raised.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 1}))
+    freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c", tags=["vip ", ""])
+    assert recorder.call["json"]["tags"] == ["vip"]

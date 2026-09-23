@@ -315,23 +315,27 @@ def _send(
             if response.status_code == 429 and retry_after
             else ""
         )
-        if not detail:
-            # freshdesk.com is wildcard-resolved: an unknown tenant answers
-            # every path with a body-less 404 from the edge rather than
-            # anything naming the real problem (verified against a
-            # nonexistent subdomain). Without this hint a mistyped
-            # FRESHDESK_SUBDOMAIN is indistinguishable from a deleted ticket,
-            # and the caller retries against a tenant that does not exist.
-            # Only for a detail-less 404 -- a real Freshdesk 404 carries a
-            # description, and overriding that would bury it.
-            if response.status_code == 404:
-                detail = (
-                    "no response body -- if this happens for every request, "
-                    f"check that FRESHDESK_SUBDOMAIN ({_subdomain()!r}) names "
-                    "an existing Freshdesk account"
-                )
-            elif response.status_code in (401, 403):
-                detail = "check that FRESHDESK_API_KEY is current and that the key's agent has permission for this operation"
+        # A detail-less 404 means the edge answered, not the tenant:
+        # freshdesk.com is wildcard-resolved, so an unknown subdomain returns a
+        # body-less 404 from every path (verified against a nonexistent
+        # subdomain). Only when there is no detail -- a real Freshdesk 404
+        # carries a description, and replacing it would bury the real cause.
+        if not detail and response.status_code == 404:
+            detail = (
+                "no response body -- if this happens for every request, "
+                f"check that FRESHDESK_SUBDOMAIN ({_subdomain()!r}) names "
+                "an existing Freshdesk account"
+            )
+        # The credential hint is APPENDED rather than substituted: a real
+        # Freshdesk 401/403 carries a message, so gating this on an empty
+        # detail (as an earlier revision did) meant it never fired in
+        # practice, which is the only case it was written for.
+        if response.status_code in (401, 403):
+            credential_hint = (
+                "check that FRESHDESK_API_KEY is current and that the key's "
+                "agent has permission for this operation"
+            )
+            detail = f"{detail} -- {credential_hint}" if detail else credential_hint
         raise RuntimeError(
             f"Freshdesk API error (status {response.status_code}){suffix}"
             + (f": {detail}" if detail else "")
@@ -486,6 +490,41 @@ def _coerce_int(value: Any, field_name: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         raise RuntimeError(f"{field_name} must be an integer, got {value!r}") from None
+
+
+def _clean_tags(tags: list[str]) -> list[str]:
+    """Strip each tag and drop the blanks.
+
+    FastMCP validates only that this is a list of strings, and an LLM caller
+    is exactly the source likely to pass "vip " -- which silently fails to
+    match the canonical "vip" already on the account -- or an empty string
+    left over from a split upstream of this tool.
+    """
+    return [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+
+
+def _resolve_tags(tags: list[str] | None) -> list[str] | None:
+    """Resolve the caller's tags into what to send, or None to omit the field.
+
+    Three states, and the middle one matters: None omits, an explicit empty
+    list clears, and a non-empty list is cleaned. A non-empty list that cleans
+    down to nothing -- ["  ", ""], the sloppiness _clean_tags absorbs -- must
+    NOT collapse into the same request as an explicit clear. Freshdesk replaces
+    the whole tag list, so that would wipe the tags off a ticket nobody asked
+    to untag, with no undo in this connector. Ported from zendesk.py, which
+    replaces its tag list the same way.
+    """
+    if tags is None:
+        return None
+    if not tags:
+        return []
+    cleaned = _clean_tags(tags)
+    if not cleaned:
+        raise RuntimeError(
+            "tags contained no usable values (all entries were blank) -- pass "
+            "an empty list [] to explicitly clear tags instead"
+        )
+    return cleaned
 
 
 def _positive_id(value: Any, field_name: str) -> int:
@@ -835,7 +874,7 @@ def freshdesk_create_ticket(
             "name": name,
             "responder_id": responder_id,
             "group_id": group_id,
-            "tags": tags,
+            "tags": _resolve_tags(tags),
             "cc_emails": cc_emails,
         }
         payload.update({k: v for k, v in optional.items() if v not in (None, "", [])})
@@ -886,8 +925,9 @@ def freshdesk_update_ticket(
             payload["group_id"] = _positive_id(group_id, "group_id")
         # An explicit empty list is a real instruction ("clear the tags") and
         # must survive, unlike None which means "leave them alone".
-        if tags is not None:
-            payload["tags"] = tags
+        resolved_tags = _resolve_tags(tags)
+        if resolved_tags is not None:
+            payload["tags"] = resolved_tags
         if not payload:
             raise RuntimeError(
                 "pass at least one of status, priority, responder_id, group_id "
