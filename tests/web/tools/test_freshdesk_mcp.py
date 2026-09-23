@@ -501,11 +501,13 @@ def test_request_hints_at_credentials_on_bodyless_401(
     assert "FRESHDESK_API_KEY" in str(excinfo.value)
 
 
-def test_subdomain_hint_does_not_leak_the_api_key(
+def test_subdomain_hint_echoes_the_subdomain_and_nothing_from_its_neighbour(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
-    """The hint interpolates the subdomain, which is adjacent to the key in
-    the same env block -- pin that only the subdomain is echoed.
+    """The hint exists to name the wrong subdomain, so pin that it does.
+
+    An earlier version of this test only asserted the API key was absent,
+    which the hint never interpolates -- it could not fail and proved nothing.
     """
     monkeypatch.setattr(
         freshdesk._session,
@@ -515,7 +517,10 @@ def test_subdomain_hint_does_not_leak_the_api_key(
     with pytest.raises(RuntimeError) as excinfo:
         freshdesk._request("GET", "/tickets")
 
-    assert "secret-key" not in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "'acme'" in message, "the hint must name the subdomain it used"
+    assert "FRESHDESK_SUBDOMAIN" in message
+    assert "secret-key" not in message
 
 
 # ---------------------------------------------------------------------------
@@ -1133,14 +1138,14 @@ def test_search_terms_are_scrubbed_from_error_text(
         raise requests.exceptions.ConnectionError(
             "HTTPSConnectionPool(host='acme.freshdesk.com', port=443): "
             "Max retries exceeded with url: "
-            "/api/v2/search/contacts?query=patient%40clinic.example "
+            "/api/v2/contacts?email=patient%40clinic.example "
             "(Caused by NewConnectionError())"
         )
 
     monkeypatch.setattr(freshdesk._session, "request", raise_with_url)
 
     with caplog.at_level(logging.ERROR, logger="freshdesk-mcp"):
-        result = freshdesk.freshdesk_search_tickets("status:2")
+        result = freshdesk.freshdesk_search_contacts(email="patient@clinic.example")
 
     assert "patient%40clinic.example" not in result
     assert "patient%40clinic.example" not in caplog.text
@@ -1260,3 +1265,166 @@ def test_email_create_does_not_require_a_name(
     _install(monkeypatch, _json_response({"id": 1}))
     result = _payload(freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c"))
     assert result["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (xorbitsai/xagent#2601)
+# ---------------------------------------------------------------------------
+
+
+def test_an_untrusted_ambient_proxy_is_refused(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """setup_proxy_env() promotes whatever proxy the OS has into the
+    environment. A proxy resolves the target host itself, bypassing the
+    private-network check _base_url() performs, so an untrusted one must stop
+    the request rather than silently carry the Basic credential.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    recorder = _install(monkeypatch)
+
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "error"
+    assert recorder.calls == [], "no request may go through an untrusted proxy"
+
+
+def test_a_trusted_proxy_is_forwarded_explicitly(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Opting in routes through the proxy via an explicit proxies= argument
+    rather than trust_env, which stays off.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    recorder = _install(monkeypatch, _json_response([]))
+
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "success"
+    assert recorder.call["proxies"]["https"] == "http://proxy.internal:8080"
+    assert freshdesk._session.trust_env is False
+
+
+def test_an_unresolvable_host_is_an_actionable_error(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The OSError branch of _base_url()'s lookup was never exercised."""
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("Name or service not known")
+
+    monkeypatch.setattr(freshdesk.socket, "getaddrinfo", boom)
+    recorder = _install(monkeypatch)
+
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "error"
+    assert "could not be resolved" in result["message"]
+    assert recorder.calls == []
+
+
+def test_a_429_without_retry_after_still_reports_the_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Retry-After is documented but not guaranteed; the status must still be
+    legible without it rather than producing a bare "(retry after s)".
+    """
+    _install(
+        monkeypatch,
+        _json_response({"description": "You have exceeded the limit"}, status_code=429),
+    )
+    result = _payload(freshdesk.freshdesk_list_tickets())
+
+    assert result["status"] == "error"
+    assert "429" in result["message"]
+    assert "retry after" not in result["message"], (
+        "no Retry-After header means no retry hint, not an empty one"
+    )
+
+
+@pytest.mark.parametrize("wrapped", ['"status:2"', '  "status:2"  '])
+def test_a_pre_quoted_expression_is_unwrapped_not_double_quoted(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, wrapped: str
+):
+    """A caller that already wrapped the expression is the common mistake, and
+    it used to produce '""status:2""' -- syntactically fine, always empty.
+    """
+    recorder = _install(monkeypatch, _json_response({"results": [], "total": 0}))
+    freshdesk.freshdesk_search_tickets(wrapped)
+    assert recorder.call["params"]["query"] == '"status:2"'
+
+
+def test_an_interior_double_quote_is_refused(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Freshdesk quotes string values with single quotes, so an interior
+    double quote cannot be legitimate -- and guessing its intent would
+    silently change the query.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_search_tickets('tag:"urgent"'))
+    assert result["status"] == "error"
+    assert "single quotes" in result["message"]
+    assert recorder.calls == []
+
+
+def test_search_has_more_comes_from_total_not_page_fullness(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """total is exact and arrives in the same response; the full-page
+    heuristic reported a phantom page whenever the last page was exactly full.
+    """
+    full = [{"id": n} for n in range(freshdesk.SEARCH_PAGE_SIZE)]
+
+    # Exactly one full page and total says that is all there is.
+    _install(monkeypatch, _json_response({"results": full, "total": 30}))
+    assert _payload(freshdesk.freshdesk_search_tickets("status:2"))["has_more"] is False
+
+    # A full page with more behind it.
+    _install(monkeypatch, _json_response({"results": full, "total": 90}))
+    assert _payload(freshdesk.freshdesk_search_tickets("status:2"))["has_more"] is True
+
+    # No usable total -- fall back to the heuristic.
+    _install(monkeypatch, _json_response({"results": full}))
+    assert _payload(freshdesk.freshdesk_search_tickets("status:2"))["has_more"] is True
+
+
+@pytest.mark.parametrize("field", ["requester_id", "responder_id", "group_id"])
+def test_body_ids_are_validated_like_path_ids(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, field: str
+):
+    """These reach Freshdesk in the request body, so they escaped the
+    validation every path-embedded id gets: requester_id=0 was forwarded.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(
+        freshdesk.freshdesk_create_ticket("s", "d", email="a@b.c", **{field: 0})
+    )
+    assert result["status"] == "error"
+    assert field in result["message"]
+    assert recorder.calls == []
+
+
+def test_update_ticket_validates_its_body_ids_too(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_update_ticket(3, responder_id=-1))
+    assert result["status"] == "error"
+    assert "responder_id" in result["message"]
+    assert recorder.calls == []
+
+
+def test_the_catalog_row_ships_hidden_until_verified():
+    """Nothing here has been run against a live tenant and the connector can
+    email a requester, so it ships hidden like zendesk and intercom.
+    """
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    rows = {r["app_id"]: r for r in get_builtin_public_mcp_app_rows()}
+    assert rows["freshdesk"]["is_visible_in_connector"] is False
+    assert rows["zendesk"]["is_visible_in_connector"] is False, (
+        "the precedent this follows"
+    )

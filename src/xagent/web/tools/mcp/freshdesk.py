@@ -673,8 +673,22 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
     """
     try:
         expression = (query or "").strip()
+        # A caller that already wrapped the expression is the common mistake,
+        # and the old code turned it into '""status:2""' -- syntactically fine
+        # for Freshdesk, and always empty. Strip exactly one surrounding pair,
+        # then refuse any double quote that remains: Freshdesk quotes string
+        # values with single quotes, so an interior double quote cannot be a
+        # legitimate part of the expression and guessing at its intent would
+        # silently change the query.
+        if len(expression) >= 2 and expression[0] == '"' and expression[-1] == '"':
+            expression = expression[1:-1].strip()
         if not expression:
             raise RuntimeError("query must not be empty")
+        if '"' in expression:
+            raise RuntimeError(
+                "query must not contain a double quote; Freshdesk quotes "
+                "string values with single quotes, e.g. tag:'urgent'"
+            )
         # Freshdesk caps the quoted query at 512 characters, and the two
         # quotes added below count toward it -- so the budget for the caller's
         # expression is 510. Rejecting locally beats spending a request to be
@@ -702,6 +716,7 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
             params={"query": f'"{expression}"', "page": page_number},
         )
         payload = _validated_dict(_body(response), "/search/tickets")
+        total = payload.get("total")
         results = payload.get("results")
         if not isinstance(results, list):
             raise RuntimeError(
@@ -711,15 +726,20 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
             "results",
             {
                 "results": results,
-                "total": payload.get("total"),
+                "total": total,
                 "page": page_number,
-                # Unlike the list endpoints, this one sends no Link header,
-                # so a full page is the only available "maybe more" signal --
-                # the inference _has_next_page exists to avoid, used here
-                # because there is nothing better. It can report one phantom
-                # page when the last page is exactly full.
+                # This endpoint sends no Link header, but it does return an
+                # exact total in the same response, so use that and fall back
+                # to the full-page heuristic only when it is missing or not a
+                # number. The heuristic alone reported a phantom page whenever
+                # the last page was exactly full. Either way page 10 is
+                # Freshdesk's ceiling, so nothing beyond it is reachable.
                 "has_more": page_number < MAX_SEARCH_PAGE
-                and len(results) == SEARCH_PAGE_SIZE,
+                and (
+                    page_number * SEARCH_PAGE_SIZE < total
+                    if isinstance(total, int) and not isinstance(total, bool)
+                    else len(results) == SEARCH_PAGE_SIZE
+                ),
             },
         )
     except Exception as exc:
@@ -785,6 +805,16 @@ def freshdesk_create_ticket(
                 "name is required when creating a ticket from a phone number "
                 "without an email address"
             )
+        # Body ids get the same validation as path ids: 0 and negatives are
+        # not valid Freshdesk object ids, and forwarding one spends a request
+        # to be told so.
+        for field_name, field_value in (
+            ("requester_id", requester_id),
+            ("responder_id", responder_id),
+            ("group_id", group_id),
+        ):
+            if field_value is not None:
+                _positive_id(field_value, field_name)
         payload: dict[str, Any] = {
             "subject": subject,
             "description": description,
@@ -844,9 +874,9 @@ def freshdesk_update_ticket(
         if validated_priority is not None:
             payload["priority"] = validated_priority
         if responder_id is not None:
-            payload["responder_id"] = responder_id
+            payload["responder_id"] = _positive_id(responder_id, "responder_id")
         if group_id is not None:
-            payload["group_id"] = group_id
+            payload["group_id"] = _positive_id(group_id, "group_id")
         # An explicit empty list is a real instruction ("clear the tags") and
         # must survive, unlike None which means "leave them alone".
         if tags is not None:

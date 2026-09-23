@@ -69,7 +69,9 @@ def test_upgrade_inserts_freshdesk(tmp_path):
         ).first()
         assert row[0] == "stdio"
         assert row[1] is None
-        assert row[2] == 1
+        # Seeded hidden: nothing here has been verified against a live tenant
+        # and the connector can email a requester. Matches zendesk/intercom.
+        assert row[2] == 0
         assert "xagent.web.tools.mcp.freshdesk" in str(row[3])
         # Both halves of the per-user configuration must be declared: a
         # subdomain without a key cannot authenticate, and a key without a
@@ -172,6 +174,34 @@ def test_seed_row_classifies_api_key():
         classify_app_auth(migration.ROW["transport"], migration.ROW["launch_config"])
         == "api_key"
     )
+
+
+def test_downgrade_leaves_an_operator_modified_row_alone(tmp_path):
+    """upgrade() skips seeding when the app_id already exists, so an
+    unconditional delete by app_id would drop a row this migration never
+    created -- an operator's own freshdesk entry, or one a later migration
+    edited.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        # Someone flips the row visible after the fact -- exactly what the
+        # follow-up verification migration will do.
+        connection.execute(
+            text(
+                "UPDATE public_mcp_apps SET is_visible_in_connector=1 "
+                "WHERE app_id='freshdesk'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "freshdesk" in _app_ids(connection), (
+            "a row that no longer matches this migration's seed snapshot "
+            "must survive its downgrade"
+        )
 
 
 def test_downgrade_removes_freshdesk(tmp_path):

@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
@@ -50,7 +52,10 @@ ROW = {
     "provider_name": None,
     "category": "Support",
     "oauth_scopes": None,
-    "is_visible_in_connector": True,
+    # Hidden until manually verified against a live Freshdesk tenant, matching
+    # the zendesk/intercom precedent. Flipped by a follow-up migration once the
+    # end-to-end check on xorbitsai/xagent-saas#1409 passes.
+    "is_visible_in_connector": False,
     "launch_config": {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.freshdesk"],
@@ -101,6 +106,9 @@ def downgrade() -> None:
     # already connected are intentionally left in place -- connect-driven rows
     # are not owned by this migration and are cleaned up through the normal
     # disconnect path. Matches chartmogul's/posthog's identical downgrade.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-    )
+    # Only rows still matching this migration's own seed snapshot are removed.
+    # upgrade() skips seeding when the app_id already exists, so an
+    # unconditional delete by app_id would drop a row this migration never
+    # created -- the same reason atlassian/miro/fireflies/rocketlane use this
+    # helper.
+    delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])
