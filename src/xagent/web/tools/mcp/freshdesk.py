@@ -68,11 +68,18 @@ DEFAULT_PER_PAGE = 30
 SEARCH_PAGE_SIZE = 30
 MAX_SEARCH_PAGE = 10
 
-# Freshdesk's numeric enums. Validated locally so a plausible-but-wrong value
-# (status=1, which does not exist) names the legal set instead of coming back
-# as the vendor's generic "Validation failed".
+# Freshdesk's built-in ticket statuses. NOT an exhaustive set: a helpdesk can
+# define custom statuses, which are assigned instance-specific numeric values
+# above these, so this connector cannot know which values are legal for a given
+# tenant. It is therefore used to *name* the defaults in an error message, never
+# to reject an unrecognized value -- rejecting would make this connector
+# narrower than the API it fronts and break every helpdesk with a custom status.
 STATUS_OPEN = 2
+MIN_TICKET_STATUS = 2
 TICKET_STATUSES = {2: "Open", 3: "Pending", 4: "Resolved", 5: "Closed"}
+
+# Priority, unlike status, is a fixed four-value field with no customization,
+# so it is validated as a closed set.
 PRIORITY_LOW = 1
 TICKET_PRIORITIES = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
 
@@ -268,6 +275,36 @@ def _has_next_page(response: requests.Response) -> bool:
     return 'rel="next"' in (response.headers.get("Link") or "")
 
 
+def _paged_list(
+    path: str,
+    field: str,
+    *,
+    page: int,
+    per_page: int,
+    filters: dict[str, Any] | None = None,
+) -> str:
+    """Fetch one page of a bare-array list endpoint and build its envelope.
+
+    The four list tools differ only in path, response field and filters, so
+    the pagination clamping, array validation, Link-header reading and output
+    capping live here once rather than being repeated with four chances to
+    drift apart.
+    """
+    response = _send(
+        "GET",
+        path,
+        params={
+            **(filters or {}),
+            "page": max(1, int(page)),
+            "per_page": _clamp_per_page(per_page),
+        },
+    )
+    items = _validated_list(_body(response), path)
+    return _success_with_capped_list(
+        field, {field: items, "has_more": _has_next_page(response)}
+    )
+
+
 def _clamp_per_page(per_page: int) -> int:
     return clamp_limit(per_page, max_limit=MAX_PER_PAGE)
 
@@ -336,40 +373,69 @@ def _success_with_capped_list(list_field: str, payload: dict[str, Any]) -> str:
     return response
 
 
-def _ticket_id(value: Any) -> int:
-    """Coerce and bounds-check a ticket id.
+def _positive_id(value: Any, field_name: str) -> int:
+    """Coerce and bounds-check an object id.
 
     Interpolated into the request path, so it is validated as a positive
     integer here rather than trusted: an LLM passing "12 OR 1=1", a float, or
     a path fragment would otherwise be pasted straight into the URL.
+    ``field_name`` is echoed so a bad contact id does not report a complaint
+    about a ticket id.
     """
     try:
-        ticket_id = int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
-        raise RuntimeError(f"ticket_id must be an integer, got {value!r}") from None
-    if ticket_id <= 0:
-        raise RuntimeError(f"ticket_id must be a positive integer, got {ticket_id}")
-    return ticket_id
+        raise RuntimeError(f"{field_name} must be an integer, got {value!r}") from None
+    if parsed <= 0:
+        raise RuntimeError(f"{field_name} must be a positive integer, got {parsed}")
+    return parsed
 
 
-def _validated_choice(
-    value: Any, allowed: dict[int, str], field_name: str
-) -> int | None:
-    """Validate a Freshdesk numeric enum locally.
+def _validated_priority(value: Any) -> int | None:
+    """Validate priority against its closed set.
 
-    Rejecting here rather than forwarding turns an LLM's plausible-but-wrong
-    value (status=1, which does not exist) into a message naming the legal
-    values, instead of Freshdesk's generic "Validation failed".
+    Rejecting locally turns an LLM's plausible-but-wrong value into a message
+    naming the legal ones instead of Freshdesk's generic "Validation failed".
+    Safe to close because priority is not customizable.
     """
     if value is None:
         return None
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        raise RuntimeError(f"{field_name} must be an integer, got {value!r}") from None
-    if parsed not in allowed:
-        legal = ", ".join(f"{k} ({v})" for k, v in sorted(allowed.items()))
-        raise RuntimeError(f"{field_name} must be one of: {legal}; got {parsed}")
+        raise RuntimeError(f"priority must be an integer, got {value!r}") from None
+    if parsed not in TICKET_PRIORITIES:
+        legal = ", ".join(f"{k} ({v})" for k, v in sorted(TICKET_PRIORITIES.items()))
+        raise RuntimeError(f"priority must be one of: {legal}; got {parsed}")
+    return parsed
+
+
+def _validated_status(value: Any) -> int | None:
+    """Bound-check a ticket status without closing the set.
+
+    A helpdesk can define custom statuses with instance-specific numeric
+    values above the four built-ins, so an unrecognized value is forwarded to
+    Freshdesk to accept or reject -- this connector has no way to know a given
+    tenant's legal set, and rejecting one would break every helpdesk that
+    defines one.
+
+    Values below the first real status are still refused: 0 and 1 are not
+    statuses on any tenant, and 1 in particular is the trap worth catching --
+    it is a legal *priority*, so an LLM reaches for it.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"status must be an integer, got {value!r}") from None
+    if parsed < MIN_TICKET_STATUS:
+        legal = ", ".join(f"{k} ({v})" for k, v in sorted(TICKET_STATUSES.items()))
+        raise RuntimeError(
+            f"status must be {MIN_TICKET_STATUS} or greater; got {parsed}. "
+            f"The built-in statuses are {legal}; a custom status uses a "
+            "higher, helpdesk-specific value."
+        )
     return parsed
 
 
@@ -391,6 +457,13 @@ def freshdesk_list_tickets(
     """
     List tickets in the Freshdesk helpdesk, newest first by default.
 
+    ONLY TICKETS CREATED IN THE PAST 30 DAYS ARE RETURNED unless you pass
+    updated_since. This is Freshdesk's own default, and nothing in the
+    response distinguishes "no older tickets exist" from "older tickets were
+    not looked at" -- has_more goes false at the end of the 30-day window. To
+    cover anything older, pass updated_since explicitly, or use
+    freshdesk_search_tickets, which is not windowed this way.
+
     This endpoint offers only Freshdesk's canned views, not arbitrary
     filtering: use freshdesk_search_tickets for conditions such as
     "open tickets assigned to X".
@@ -399,7 +472,8 @@ def freshdesk_list_tickets(
     "watching", "spam", "deleted". Omit for the default view, which excludes
     spam and deleted tickets.
     updated_since: ISO 8601 timestamp, e.g. "2026-09-01T00:00:00Z"; returns
-    only tickets updated at or after it.
+    only tickets updated at or after it, and lifts the 30-day default window
+    described above.
     include: comma-separated side-loads, e.g. "requester,stats". Each one
     enlarges every ticket in the page, which makes size truncation more
     likely -- pair it with a smaller per_page.
@@ -414,24 +488,21 @@ def freshdesk_list_tickets(
     next page -- re-run with a smaller per_page to see them.
     """
     try:
-        response = _send(
-            "GET",
+        return _paged_list(
             "/tickets",
-            params={
+            "tickets",
+            page=page,
+            per_page=per_page,
+            filters={
                 "filter": filter_name,
                 "updated_since": updated_since,
                 "include": include,
                 "order_by": order_by,
                 "order_type": order_type,
-                "page": max(1, int(page)),
-                "per_page": _clamp_per_page(per_page),
             },
         )
-        tickets = _validated_list(_body(response), "/tickets")
-        return _success_with_capped_list(
-            "tickets", {"tickets": tickets, "has_more": _has_next_page(response)}
-        )
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_list_tickets: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -448,12 +519,15 @@ def freshdesk_get_ticket(ticket_id: int, include: str | None = None) -> str:
     try:
         ticket = _validated_dict(
             _request(
-                "GET", f"/tickets/{_ticket_id(ticket_id)}", params={"include": include}
+                "GET",
+                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}",
+                params={"include": include},
             ),
             f"/tickets/{ticket_id}",
         )
         return success_with_capped_dict("ticket", ticket)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_get_ticket: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -510,11 +584,17 @@ def freshdesk_search_tickets(query: str, page: int = 1) -> str:
                 "results": results,
                 "total": payload.get("total"),
                 "page": page_number,
+                # Unlike the list endpoints, this one sends no Link header,
+                # so a full page is the only available "maybe more" signal --
+                # the inference _has_next_page exists to avoid, used here
+                # because there is nothing better. It can report one phantom
+                # page when the last page is exactly full.
                 "has_more": page_number < MAX_SEARCH_PAGE
                 and len(results) == SEARCH_PAGE_SIZE,
             },
         )
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_search_tickets: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -564,8 +644,8 @@ def freshdesk_create_ticket(
         payload: dict[str, Any] = {
             "subject": subject,
             "description": description,
-            "status": _validated_choice(status, TICKET_STATUSES, "status"),
-            "priority": _validated_choice(priority, TICKET_PRIORITIES, "priority"),
+            "status": _validated_status(status),
+            "priority": _validated_priority(priority),
         }
         optional = {
             "email": email,
@@ -581,7 +661,8 @@ def freshdesk_create_ticket(
             _request("POST", "/tickets", json_data=payload), "/tickets"
         )
         return success_with_capped_dict("ticket", ticket)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_create_ticket: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -611,10 +692,10 @@ def freshdesk_update_ticket(
     """
     try:
         payload: dict[str, Any] = {}
-        validated_status = _validated_choice(status, TICKET_STATUSES, "status")
+        validated_status = _validated_status(status)
         if validated_status is not None:
             payload["status"] = validated_status
-        validated_priority = _validated_choice(priority, TICKET_PRIORITIES, "priority")
+        validated_priority = _validated_priority(priority)
         if validated_priority is not None:
             payload["priority"] = validated_priority
         if responder_id is not None:
@@ -631,11 +712,16 @@ def freshdesk_update_ticket(
                 "or tags to update"
             )
         ticket = _validated_dict(
-            _request("PUT", f"/tickets/{_ticket_id(ticket_id)}", json_data=payload),
+            _request(
+                "PUT",
+                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}",
+                json_data=payload,
+            ),
             f"/tickets/{ticket_id}",
         )
         return success_with_capped_dict("ticket", ticket)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_update_ticket: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -661,22 +747,16 @@ def freshdesk_list_ticket_conversations(
     requester cannot see, false a reply that was sent to them.
     """
     try:
-        response = _send(
-            "GET",
-            f"/tickets/{_ticket_id(ticket_id)}/conversations",
-            params={
-                "page": max(1, int(page)),
-                "per_page": _clamp_per_page(per_page),
-            },
-        )
-        conversations = _validated_list(
-            _body(response), f"/tickets/{ticket_id}/conversations"
-        )
-        return _success_with_capped_list(
+        return _paged_list(
+            f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/conversations",
             "conversations",
-            {"conversations": conversations, "has_more": _has_next_page(response)},
+            page=page,
+            per_page=per_page,
         )
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error(
+            "Error in freshdesk_list_ticket_conversations: %s", exc, exc_info=True
+        )
         return _error(str(exc))
 
 
@@ -707,12 +787,15 @@ def freshdesk_reply_to_ticket(
             payload["bcc_emails"] = bcc_emails
         reply = _validated_dict(
             _request(
-                "POST", f"/tickets/{_ticket_id(ticket_id)}/reply", json_data=payload
+                "POST",
+                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/reply",
+                json_data=payload,
             ),
             f"/tickets/{ticket_id}/reply",
         )
         return success_with_capped_dict("reply", reply)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_reply_to_ticket: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -742,12 +825,15 @@ def freshdesk_add_note_to_ticket(
             payload["notify_emails"] = notify_emails
         note = _validated_dict(
             _request(
-                "POST", f"/tickets/{_ticket_id(ticket_id)}/notes", json_data=payload
+                "POST",
+                f"/tickets/{_positive_id(ticket_id, 'ticket_id')}/notes",
+                json_data=payload,
             ),
             f"/tickets/{ticket_id}/notes",
         )
         return success_with_capped_dict("note", note)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_add_note_to_ticket: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -766,11 +852,12 @@ def freshdesk_get_contact(contact_id: int) -> str:
     """
     try:
         contact = _validated_dict(
-            _request("GET", f"/contacts/{_ticket_id(contact_id)}"),
+            _request("GET", f"/contacts/{_positive_id(contact_id, 'contact_id')}"),
             f"/contacts/{contact_id}",
         )
         return success_with_capped_dict("contact", contact)
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_get_contact: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -787,11 +874,13 @@ def freshdesk_search_contacts(
     """
     Find contacts by name keyword or by an exact field match.
 
-    term: a name or email fragment; matches are ranked by Freshdesk's
-    autocomplete. Use this when you only know roughly who the person is.
-    email / phone / mobile / company_id: exact-match filters. Use these when
-    you have the precise value -- an exact filter is authoritative, whereas
-    term is a fuzzy match that can return near misses.
+    term: a name fragment, matched by Freshdesk's autocomplete. Use it only
+    when you do not have a precise value -- it returns a short ranked
+    shortlist whose objects carry little more than id and name, and it is not
+    a reliable way to look someone up by email address. For an email, use the
+    email filter below, which is exact and authoritative.
+    email / phone / mobile / company_id: exact-match filters, returning full
+    contact objects.
 
     term cannot be combined with the exact filters; pass either one term or
     any number of filters. With neither, this lists contacts in Freshdesk's
@@ -826,20 +915,15 @@ def freshdesk_search_contacts(
             return _success_with_capped_list(
                 "contacts", {"contacts": contacts, "has_more": False}
             )
-        response = _send(
-            "GET",
+        return _paged_list(
             "/contacts",
-            params={
-                **active_filters,
-                "page": max(1, int(page)),
-                "per_page": _clamp_per_page(per_page),
-            },
+            "contacts",
+            page=page,
+            per_page=per_page,
+            filters=active_filters,
         )
-        contacts = _validated_list(_body(response), "/contacts")
-        return _success_with_capped_list(
-            "contacts", {"contacts": contacts, "has_more": _has_next_page(response)}
-        )
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_search_contacts: %s", exc, exc_info=True)
         return _error(str(exc))
 
 
@@ -861,21 +945,15 @@ def freshdesk_list_agents(
     Each agent's `id` is what freshdesk_update_ticket takes as responder_id.
     """
     try:
-        response = _send(
-            "GET",
+        return _paged_list(
             "/agents",
-            params={
-                "email": email,
-                "state": state,
-                "page": max(1, int(page)),
-                "per_page": _clamp_per_page(per_page),
-            },
+            "agents",
+            page=page,
+            per_page=per_page,
+            filters={"email": email, "state": state},
         )
-        agents = _validated_list(_body(response), "/agents")
-        return _success_with_capped_list(
-            "agents", {"agents": agents, "has_more": _has_next_page(response)}
-        )
-    except Exception as exc:  # noqa: BLE001 - tool boundary
+    except Exception as exc:
+        logger.error("Error in freshdesk_list_agents: %s", exc, exc_info=True)
         return _error(str(exc))
 
 

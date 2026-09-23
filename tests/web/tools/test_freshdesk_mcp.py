@@ -1,10 +1,9 @@
-"""Tests for the Freshdesk MCP connector's scaffolding.
+"""Tests for the Freshdesk MCP connector.
 
-Scope note: this file currently covers the configuration, URL-composition and
-error-translation layer only. The per-tool response parsing is deliberately
-absent until the REST probe against a real tenant confirms the response
-envelopes -- writing assertions against a guessed shape would only prove the
-code matches the guess.
+Scope note: these are mocked against the REST contract published at
+developers.freshdesk.com/api. They pin the request this module builds and how
+it translates a response; they cannot show that the documented shape matches a
+live tenant, which is still outstanding on xorbitsai/xagent-saas#1409.
 """
 
 import json
@@ -753,11 +752,11 @@ def test_create_ticket_requires_a_requester_identifier(
 
 
 @pytest.mark.parametrize("field,value", [("status", 1), ("priority", 9)])
-def test_create_ticket_rejects_values_outside_the_vendor_enums(
+def test_create_ticket_rejects_values_below_or_outside_the_vendor_range(
     monkeypatch: pytest.MonkeyPatch, configured_env: None, field: str, value: int
 ):
     """status=1 is the trap: it is a legal *priority* and not a legal status,
-    so an LLM reaches for it. Naming the legal set beats "Validation failed".
+    so an LLM reaches for it. Naming the legal values beats "Validation failed".
     """
     recorder = _install(monkeypatch)
     result = _payload(
@@ -767,6 +766,36 @@ def test_create_ticket_rejects_values_outside_the_vendor_enums(
     )
     assert result["status"] == "error"
     assert field in result["message"]
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("custom_status", [6, 7, 42])
+def test_custom_ticket_statuses_are_forwarded_not_rejected(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, custom_status: int
+):
+    """A helpdesk can define custom statuses with instance-specific numeric
+    values above the four built-ins. This connector cannot know a tenant's
+    legal set, so closing the enum at 5 would make it narrower than the API it
+    fronts and break every helpdesk that defines one -- Freshdesk decides.
+    """
+    recorder = _install(monkeypatch, _json_response({"id": 3}))
+
+    result = _payload(freshdesk.freshdesk_update_ticket(3, status=custom_status))
+
+    assert result["status"] == "success"
+    assert recorder.call["json"] == {"status": custom_status}
+
+
+def test_priority_stays_a_closed_set(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """Priority, unlike status, is not customizable, so an out-of-range value
+    is a caller mistake worth catching locally.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_update_ticket(3, priority=7))
+    assert result["status"] == "error"
+    assert "priority" in result["message"]
     assert recorder.calls == []
 
 
@@ -903,6 +932,21 @@ def test_reply_and_note_reject_an_empty_body(
 
 
 # --- contacts and agents ---------------------------------------------------
+
+
+def test_bad_contact_id_names_the_contact_field_not_the_ticket_field(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    """The id validator is shared with the ticket tools; reporting
+    "ticket_id must be an integer" for a contact sends the caller to the wrong
+    argument.
+    """
+    recorder = _install(monkeypatch)
+    result = _payload(freshdesk.freshdesk_get_contact("abc"))
+    assert result["status"] == "error"
+    assert "contact_id" in result["message"]
+    assert "ticket_id" not in result["message"]
+    assert recorder.calls == []
 
 
 def test_get_contact_requests_the_id_path(
