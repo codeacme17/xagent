@@ -460,11 +460,13 @@ def get_default_vision_model() -> Optional[BaseLLM]:
             model_name = os.getenv("GEMINI_VISION_MODEL_NAME", "gemini-2.0-flash-exp")
             base_url = os.getenv("GEMINI_BASE_URL")
 
-            return GeminiLLM(
-                model_name=model_name,
-                api_key=gemini_key,
-                base_url=base_url,
-                abilities=["chat", "tool_calling", "vision"],
+            return attach_chat_retry_wrapper(
+                GeminiLLM(
+                    model_name=model_name,
+                    api_key=gemini_key,
+                    base_url=base_url,
+                    abilities=["chat", "tool_calling", "vision"],
+                )
             )
         except Exception as e:
             logger.warning(f"Failed to create Gemini vision model from env: {e}")
