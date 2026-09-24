@@ -15,9 +15,8 @@ from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEve
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import shared_channel_execution as shared
 from xagent.web.services import task_command_execution
-from xagent.web.services import task_orchestrator
-from xagent.web.services import task_start_consumer
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_orchestrator, task_start_consumer
 from xagent.web.services.channel_runtime import SelectedChannelTask
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 
