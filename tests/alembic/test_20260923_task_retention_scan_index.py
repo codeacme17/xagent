@@ -405,10 +405,20 @@ def _apply_migration(engine, migration, operation: str = "upgrade") -> list[str]
 
     try:
         with engine.connect() as connection:
-            operations = Operations(MigrationContext.configure(connection))
-            with Operations.context(operations.get_context()):
+            # Mirrors env.py's online run, including its own comment's reason:
+            # SQLAlchemy 2.0 autobegins a transaction on first use, and
+            # ``autocommit_block`` refuses to run inside a transaction Alembic
+            # did not open. So close any implicit one, then let Alembic own
+            # the boundary through ``begin_transaction()`` -- which is what
+            # lets the block commit it, switch to AUTOCOMMIT for the concurrent
+            # build, and start a fresh one after. The first version of this
+            # helper skipped both steps and failed inside ``autocommit_block``
+            # before the migration issued anything.
+            if connection.in_transaction():
+                connection.commit()
+            context = MigrationContext.configure(connection)
+            with Operations.context(context), context.begin_transaction():
                 getattr(migration, operation)()
-            connection.commit()
     finally:
         sa.event.remove(engine, "before_cursor_execute", record)
     return issued
@@ -510,9 +520,12 @@ def test_the_purge_scan_uses_this_index(postgres_engine) -> None:
     assert captured, "the scan query was not captured"
     statement, params = captured[-1]
     with postgres_engine.connect() as connection:
+        # ``exec_driver_sql``, not ``text()``: the captured statement is in the
+        # driver's own paramstyle (``%(name)s`` for psycopg2), which ``text()``
+        # does not parse -- it expects ``:name`` and passes the rest through,
+        # so the first version of this test sent a literal ``%`` to the server.
         plan = "\n".join(
-            row[0]
-            for row in connection.execute(sa.text(f"EXPLAIN {statement}"), params)
+            row[0] for row in connection.exec_driver_sql(f"EXPLAIN {statement}", params)
         )
 
     assert INDEX in plan, (
