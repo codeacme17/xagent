@@ -136,7 +136,10 @@ async def test_stopping_drains_a_loop_that_ignores_the_signal(
 
     await asyncio.wait_for(app_module.stop_retention_purge_task(app), timeout=5)
 
-    assert task.cancelled() or task.done()
+    # ``done()`` would also be true of a loop that simply returned, which is
+    # what this test must not accept: the point is that the grace period
+    # elapsed and the cancel happened.
+    assert task.cancelled()
 
 
 @pytest.mark.asyncio

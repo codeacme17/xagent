@@ -192,6 +192,93 @@ def test_a_command_arriving_after_the_purge_fails_instead_of_vanishing(
         producer.rollback()
 
 
+def test_the_purge_loses_to_a_producer_that_commits_while_it_waits(sessions) -> None:
+    """The "purge loses cleanly" ordering #2563 asks for, with real overlap.
+
+    The other race tests are sequential -- one session commits before the
+    other starts. Here the producer's insert is *uncommitted* while the purge
+    tries to assess, which is the ordering that actually happens under load:
+    the purge must not see a half-written command, must not delete the task,
+    and must not block forever waiting for a transaction it cannot influence.
+
+    ``SKIP LOCKED`` is what makes the last part true. The producer's insert
+    takes ``FOR KEY SHARE`` on the task row, so the purge's ``FOR UPDATE``
+    cannot be granted; without ``SKIP LOCKED`` it would wait for the
+    producer's transaction, and a sweep would stall behind any slow writer.
+    """
+    task_id = _seed_expired_task(sessions, days_old=400)
+
+    with sessions() as producer, sessions() as purger:
+        _insert_command(producer, task_id)  # held open, not committed
+
+        action = purge_task(
+            purger,
+            task_id,
+            now=NOW,
+            conversation_days=CONVERSATION_DAYS,
+            trace_days=TRACE_DAYS,
+        )
+        # Skipped rather than blocked: the row is locked by the producer, and
+        # a locked row reads back as absent, which is reported as not
+        # eligible.
+        assert action is RetentionPurgeAction.SKIPPED_BUSY
+
+        producer.commit()
+
+    with sessions() as db:
+        assert (
+            db.execute(
+                sa.select(Task.id).where(Task.id == task_id)
+            ).scalar_one_or_none()
+            is not None
+        ), "the task must survive a command that was in flight"
+        assert (
+            db.execute(
+                sa.select(sa.func.count())
+                .select_from(TaskExecutionCommand)
+                .where(TaskExecutionCommand.task_id == task_id)
+            ).scalar_one()
+            == 1
+        ), "the accepted command must survive too"
+
+
+def test_two_concurrent_purges_of_one_task_do_not_both_delete_it(sessions) -> None:
+    """What ``docs/deployment.md`` promises about multiple web replicas.
+
+    Each replica runs its own loop, so the same task can be selected twice.
+    The row lock is what makes that safe, and this is the test behind the
+    claim: one purge deletes, the other finds nothing and says so rather than
+    failing or double-counting.
+    """
+    task_id = _seed_expired_task(sessions, days_old=400)
+
+    with sessions() as first, sessions() as second:
+        first_action = purge_task(
+            first,
+            task_id,
+            now=NOW,
+            conversation_days=CONVERSATION_DAYS,
+            trace_days=TRACE_DAYS,
+        )
+        second_action = purge_task(
+            second,
+            task_id,
+            now=NOW,
+            conversation_days=CONVERSATION_DAYS,
+            trace_days=TRACE_DAYS,
+        )
+
+    assert first_action is RetentionPurgeAction.PURGED_CONVERSATION
+    assert second_action is RetentionPurgeAction.SKIPPED_BUSY
+    with sessions() as db:
+        assert (
+            db.execute(
+                sa.select(Task.id).where(Task.id == task_id)
+            ).scalar_one_or_none()
+            is None
+        )
+
+
 def test_trace_expiry_holds_the_lock_through_its_deletes(sessions) -> None:
     """The narrower path is fenced too, and through its writes, not just its read.
 

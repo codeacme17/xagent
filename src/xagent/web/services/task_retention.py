@@ -349,7 +349,7 @@ def assess_task_retention(
     """
     now = _utc(now)
     locked = db.execute(
-        select(Task.id).where(Task.id == task_id).with_for_update()
+        select(Task.id).where(Task.id == task_id).with_for_update(skip_locked=True)
     ).scalar_one_or_none()
     if locked is None:
         return RetentionAssessment(

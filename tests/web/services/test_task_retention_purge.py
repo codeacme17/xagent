@@ -60,6 +60,21 @@ CONVERSATION_DAYS = 365
 TRACE_DAYS = 90
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_retention_env(monkeypatch):
+    """Clear every retention variable for every test in this module.
+
+    ``tests/conftest.py`` loads a developer's ``.env`` with ``override=True``,
+    so a local ``XAGENT_RETENTION_DRY_RUN=true`` or
+    ``XAGENT_RETENTION_ENABLED=false`` would otherwise reach the batch and
+    loop tests here and fail them on that machine alone.
+    """
+    from xagent import config as _config
+
+    for name in _config.RETENTION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def sessions(engine) -> sessionmaker[Session]:
     """Sessions shaped like production's: ``autoflush=False``, per models/database.py."""
@@ -763,25 +778,47 @@ def test_the_audit_line_is_emitted_even_when_the_batch_raises(
 ) -> None:
     """Committed deletions must not go unrecorded because a later step failed."""
     monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
-    import xagent.web.services.task_retention_purge as purge_module
-
     with sessions() as db:
         _seed_full_task(db, username="audited", anchor=_age(400))
 
-    def explode(*_args, **_kwargs):
+    def explode() -> bool:
         raise RuntimeError("something after the per-task guard")
-
-    monkeypatch.setattr(purge_module, "get_retention_enabled", explode)
 
     with caplog.at_level(
         logging.INFO, logger="xagent.web.services.task_retention_purge"
     ):
         with pytest.raises(RuntimeError):
-            _run_batch(sessions, limit=10)
+            _run_batch(sessions, limit=10, should_continue=explode)
 
     assert any(
         record.getMessage().startswith("retention purge ") for record in caplog.records
     ), "the audit line must survive an exception escaping the loop"
+
+
+def test_a_dry_run_batch_reports_what_it_would_do_and_deletes_nothing(
+    sessions, monkeypatch
+) -> None:
+    """Dry-run driven through the batch, from the environment variable.
+
+    The other dry-run tests call ``purge_task(dry_run=True)`` directly, so a
+    regression that dropped ``dry_run`` on the way from the configuration to
+    the task would have left every one of them green while the documented
+    first step deleted for real.
+    """
+    monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
+    monkeypatch.setenv("XAGENT_TRACE_RETENTION_DAYS", str(TRACE_DAYS))
+    monkeypatch.setenv("XAGENT_RETENTION_DRY_RUN", "true")
+    with sessions() as db:
+        conversation = _seed_full_task(db, username="dry-c", anchor=_age(400))
+        traces = _seed_full_task(db, username="dry-t", anchor=_age(100))
+        before = (_counts(db, conversation), _counts(db, traces))
+
+    report = _run_batch(sessions, limit=10)
+
+    assert report.dry_run is True
+    assert (report.purged_conversations, report.purged_traces) == (1, 1)
+    with sessions() as db:
+        assert (_counts(db, conversation), _counts(db, traces)) == before
 
 
 def test_no_configured_period_selects_nothing(sessions) -> None:
@@ -830,32 +867,66 @@ def test_batch_purges_every_candidate_and_logs_one_audit_line(
         assert _counts(db, traces)["trace_events"] == 0
 
 
-def test_batch_stops_mid_batch_when_the_kill_switch_is_pulled(
-    sessions, monkeypatch
-) -> None:
-    """Already-purged tasks stay purged; the rest are simply not started."""
+def test_a_batch_stops_between_tasks_when_shutdown_asks(sessions, monkeypatch) -> None:
+    """The real mid-batch stop, which is shutdown rather than the kill switch.
+
+    An earlier version of this test pulled the kill switch per task. That
+    check could only ever fire under a monkeypatch -- retention settings are
+    read once per process -- so it proved nothing about production. What can
+    genuinely change under a running batch is ``should_continue``, which is
+    how shutdown reaches in, and stopping there must leave the tasks already
+    purged committed and the rest untouched.
+    """
     monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
     with sessions() as db:
         first = _seed_full_task(db, username="k1", anchor=_age(400))
         second = _seed_full_task(db, username="k2", anchor=_age(400))
 
-    import xagent.web.services.task_retention_purge as purge_module
-
     calls = {"n": 0}
-    real = purge_module.get_retention_enabled
 
-    def flip_after_one() -> bool:
+    def stop_after_one() -> bool:
         calls["n"] += 1
-        return calls["n"] <= 1 and real()
+        return calls["n"] <= 1
 
-    monkeypatch.setattr(purge_module, "get_retention_enabled", flip_after_one)
-
-    report = _run_batch(sessions)
+    report = _run_batch(sessions, limit=10, should_continue=stop_after_one)
 
     assert report.purged_conversations == 1
     with sessions() as db:
         remaining = _counts(db, first)["tasks"] + _counts(db, second)["tasks"]
     assert remaining == 1
+
+
+def test_the_kill_switch_keeps_the_loop_from_sweeping(sessions, monkeypatch) -> None:
+    """Where the kill switch actually acts: before the loop runs at all.
+
+    It is read once, with every other retention setting, because none of them
+    can change within a process. So what it stops is a restarted process from
+    resuming -- not a batch already in flight.
+    """
+    import xagent.web.services.task_retention_purge as purge_module
+
+    monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
+    monkeypatch.setenv("XAGENT_RETENTION_ENABLED", "false")
+    monkeypatch.setattr(
+        purge_module, "ensure_retention_purge_supported", lambda db: None
+    )
+    with sessions() as db:
+        task_id = _seed_full_task(db, username="killed", anchor=_age(400))
+
+    batches = {"n": 0}
+    real = purge_module.run_retention_purge_batch
+
+    def counting(*args, **kwargs):
+        batches["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(purge_module, "run_retention_purge_batch", counting)
+
+    asyncio.run(asyncio.wait_for(run_retention_purge_loop(sessions), timeout=5))
+
+    assert batches["n"] == 0, "the kill switch must stop the loop before any batch"
+    with sessions() as db:
+        assert _counts(db, task_id)["tasks"] == 1
 
 
 def test_batch_refuses_a_store_that_cannot_fence(sessions, engine) -> None:

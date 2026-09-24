@@ -414,7 +414,7 @@ What it costs is duplicated scanning, which is why there is no advisory lock her
 
 ### Verification and monitoring
 
-`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each sweep logs one line beginning `retention purge`, counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge` and `failed`.
+`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge` and `failed`.
 
 `scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
 

@@ -3743,14 +3743,6 @@ def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task
     ``max(trace_events.id)``, which the purge takes to 0, so a version compared
     loosely enough could serve the purged steps back.
     """
-    from datetime import timedelta
-
-    from xagent.web.models.task_command import TaskExecutionCommand
-    from xagent.web.services.task_retention_purge import (
-        RetentionPurgeAction,
-        purge_task,
-    )
-
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -3760,6 +3752,25 @@ def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task
         event_id="evt-expired-1",
         timestamp=base,
         data={"content": "before expiry"},
+    )
+
+    # A real backend, because the default is a no-op: without this the
+    # "warm the cache first" step below caches nothing and the versioned-read
+    # path this test exists for is never exercised.
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        _run_trace_expiry_steps_case(task_id, agent_id, full_key, base)
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
+    from datetime import timedelta
+
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
     )
 
     # Populate the cache first: a purge that only looked correct on a cold

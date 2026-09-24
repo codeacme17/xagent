@@ -759,9 +759,14 @@ async def stop_retention_purge_task(app_instance: FastAPI) -> None:
     reaches inside the batch, which checks it between tasks and returns.
 
     The grace window is bounded because between-tasks is not instant: one
-    task's purge has to finish first. Cancelling after it expires costs
-    nothing either way -- each task owns its transaction, so whatever was
-    committed stays and whatever was not rolls back.
+    task's purge has to finish first.
+
+    What cancelling does *not* do is stop that worker. ``task.cancel()`` ends
+    the awaiting coroutine; the thread ``asyncio.to_thread`` handed the batch
+    to keeps running and can still commit the task it is on. That is why the
+    stop event is set at the top of shutdown rather than here -- it is the
+    only thing that reaches inside the batch -- and why the cancel is a
+    backstop for the await, not a way to abort work in flight.
     """
 
     stop_event = getattr(app_instance.state, "retention_purge_stop", None)
@@ -2041,6 +2046,16 @@ async def shutdown_event() -> None:
     temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
     if temp_file_cleanup_stop is not None:
         temp_file_cleanup_stop.set()
+
+    # WHY: same shape and same reason as the flag above. The purge runs its
+    # batch in a to_thread worker, which a later task cancel cannot stop, so
+    # the signal has to be set before any step that can hang -- otherwise an
+    # unresponsive flush_langfuse leaves the sweep deleting while the process
+    # tries to exit. Setting it is unconditional and cannot hang; the draining
+    # happens later, in stop_retention_purge_task.
+    retention_purge_stop = getattr(app.state, "retention_purge_stop", None)
+    if retention_purge_stop is not None:
+        retention_purge_stop.set()
 
     flush_langfuse()
 

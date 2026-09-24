@@ -15,12 +15,37 @@ Two paths, both per whole task, never by age within a task:
   debugging data rather than a customer asset, so #2567 has a shorter period
   for them on the table.
 
-Why trace expiry is safe for a terminal task: a new turn rebuilds the model's
-conversation history from ``task_chat_messages``, not from traces
-(``_load_persisted_conversation_history``), so what a purged trace costs is
-mid-run resume state. A terminal task has no run to resume. Non-terminal
-tasks are refused by the predicate's status leg, which is what makes that
-reasoning hold rather than merely sound plausible.
+What trace expiry actually costs
+--------------------------------
+This module first claimed that a purged trace costs only mid-run resume
+state, because a new turn rebuilds the model's conversation from
+``task_chat_messages``. **That was wrong**, and the correction matters
+because the trace period is a #2567 decision that would have been taken
+against it.
+
+A new turn reads traces twice, on paths that start at the same
+``_load_persisted_conversation_history`` the old claim cited:
+
+* ``load_task_transcript_window`` -> ``_latest_compact_summary``
+  (``chat_history_service.py``) reads the ``action_end_compact`` row for the
+  compaction summary *and its watermark*, and the watermark is what filters
+  the stored messages. With the row gone there is no summary and no
+  watermark, so a compacted conversation replays **uncompacted** -- the
+  runner re-compacts at its threshold, so this degrades a turn rather than
+  breaking it, but the model's context for that turn is not what it was.
+* ``task_execution_context_service`` reads ``tool_execution_end`` and the
+  latest execution-failure summary, so the recovered tool and failure hints a
+  next turn would have been given are gone too.
+
+So trace expiry changes the next turn's context, not merely the ability to
+resume a run that is already over. Nothing here decides whether that trade is
+acceptable -- #2567 does, and #2655 records the option of keeping the
+compaction and skill rows on this path if it is not. What this module owes
+that decision is an accurate description of the cost, which is this one.
+
+Terminal-only still holds, and for its own reason: a non-terminal task has a
+run whose resume state the trace *is*, and the predicate's status leg refuses
+those.
 
 PostgreSQL only
 ---------------
@@ -201,12 +226,13 @@ class RetentionPurgeReport:
         )
 
     def audit_line(self) -> str:
-        """The single line one sweep logs.
+        """The single line one *batch* logs.
 
-        One line, not one per task: a sweep that expires a backlog of tens of
-        thousands of tasks must not be the reason a log budget is spent, and
-        the per-task detail that matters (*why* a task was skipped) is carried
-        by the counters rather than by prose.
+        One line per batch, not per task: a backlog of tens of thousands of
+        tasks must not be the reason a log budget is spent, and the per-task
+        detail that matters (*why* a task was skipped) is carried by the
+        counters rather than by prose. A sweep that drains a backlog walks it
+        a page at a time, so it emits one of these per page.
         """
         return (
             f"retention purge {'dry-run' if self.dry_run else 'run'}: "
@@ -476,6 +502,7 @@ def run_retention_purge_batch(
     after_task_id: int = 0,
     should_continue: Callable[[], bool] | None = None,
     periods: tuple[int | None, int | None] | None = None,
+    dry_run: bool | None = None,
 ) -> RetentionPurgeReport:
     """Purge one bounded batch and return what it did.
 
@@ -488,10 +515,11 @@ def run_retention_purge_batch(
     getting the configured period. Omitting the tuple entirely reads the
     configuration; passing one supplies it.
 
-    The loop passes a tuple it read once, because the values provably cannot
-    change within a process (see the retention section of ``config.py``) and
-    re-reading them per batch meant an invalid period logged its warning on
-    every batch -- once every few seconds while a backlog drains.
+    ``dry_run`` is passed the same way and for the same reason. Every
+    retention setting is read once, by the loop: they cannot change within a
+    process (see the retention section of ``config.py``), and re-reading them
+    per batch meant an unusable value logged its warning every few seconds
+    while a backlog drained.
 
     Configuration is read per batch rather than captured at import. That is
     not the same as being changeable at run time, and this module used to
@@ -500,17 +528,17 @@ def run_retention_purge_batch(
     change. Reading them per batch is about not caching a value across a
     restart boundary, not about live reconfiguration.
 
-    The kill switch is still checked per task for one reason: it decides
-    whether a *restarted* process resumes sweeping, and checking it in the
-    loop rather than only at startup keeps that decision in one place.
+    The kill switch is *not* re-read per task. It cannot change within a
+    process, so such a read could only ever fire under a monkeypatch -- which
+    made the "stops mid-batch safely" criterion pass synthetically. It is read
+    once per loop, with the periods and the dry-run flag; what actually stops
+    a batch mid-flight is shutdown, through ``should_continue``.
 
-    ``should_continue`` is the one that genuinely changes under the batch --
-    it is how shutdown reaches in -- and it is checked between tasks, the only
-    place stopping is free: each task's purge owns one transaction, so a batch
-    that stops there leaves committed work behind it and untouched tasks in
-    front of it, with nothing in between. That is also what keeps shutdown
-    quick, since this runs in a worker thread that cancelling the calling task
-    would detach rather than end.
+    Between tasks is the only place stopping is free: each task's purge owns
+    one transaction, so a batch that stops there leaves committed work behind
+    it and untouched tasks in front of it, with nothing in between. That is
+    also what keeps shutdown quick, since this runs in a worker thread that
+    cancelling the calling task would detach rather than end.
 
     Raises:
         RetentionPurgeUnsupported: If the store is not PostgreSQL.
@@ -522,7 +550,7 @@ def run_retention_purge_batch(
         else (get_conversation_retention_days(), get_trace_retention_days())
     )
     limit = limit if limit is not None else get_retention_batch_size()
-    dry_run = get_retention_dry_run()
+    dry_run = dry_run if dry_run is not None else get_retention_dry_run()
 
     with session_factory() as db:
         ensure_retention_purge_supported(db)
@@ -536,15 +564,12 @@ def run_retention_purge_batch(
         )
 
     report = RetentionPurgeReport(eligible=len(candidates), dry_run=dry_run)
+    processed = 0
     try:
         for task_id in candidates:
             if should_continue is not None and not should_continue():
-                logger.info("retention purge stopping after %d task(s)", report.purged)
-                break
-            if not get_retention_enabled():
                 logger.info(
-                    "retention purge stopped by kill switch after %d task(s)",
-                    report.purged,
+                    "retention purge stopping after %d task(s) processed", processed
                 )
                 break
             try:
@@ -571,6 +596,7 @@ def run_retention_purge_batch(
                 )
                 action = RetentionPurgeAction.FAILED
             report = replace(report, last_task_id=task_id).with_action(action)
+            processed += 1
     finally:
         # In ``finally`` so that work already committed is still reported. Each
         # task commits its own transaction, so an exception escaping this loop
@@ -624,6 +650,10 @@ async def run_retention_purge_loop(
     # Read once, not per batch: these cannot change within a process, and an
     # unusable one warns on every read.
     periods = (get_conversation_retention_days(), get_trace_retention_days())
+    dry_run = get_retention_dry_run()
+    if not get_retention_enabled():
+        logger.info("retention purge not started: disabled by the kill switch")
+        return
     while not stop.is_set():
         pause = get_retention_sweep_interval_seconds()
         try:
@@ -635,10 +665,20 @@ async def run_retention_purge_loop(
                 after_task_id=after_task_id,
                 should_continue=lambda: not stop.is_set(),
                 periods=periods,
+                dry_run=dry_run,
             )
             if report.eligible >= limit and report.last_task_id is not None:
                 after_task_id = report.last_task_id
-                pause = get_retention_batch_pause_seconds()
+                # A dry run deletes nothing, so its backlog never shrinks: the
+                # pages stay full forever and the short pause would walk the
+                # expired set, taking a row lock on every task in it, at the
+                # batch cadence with no end. It keeps the cursor -- reporting
+                # the whole backlog is the point -- but waits a full interval.
+                pause = (
+                    get_retention_sweep_interval_seconds()
+                    if report.dry_run
+                    else get_retention_batch_pause_seconds()
+                )
             else:
                 after_task_id = 0
         except RetentionPurgeUnsupported:
