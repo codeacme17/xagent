@@ -124,6 +124,7 @@ async def test_pause_settles_channel_start_stopped_before_admission(
             .all()
         }
         assert start.status == "failed"
+        assert start.error == "Task stopped before execution started."
         assert start.result == {"rejection_reason": "cancelled_before_admission"}
         assert pause.status == "completed"
         if queued.previous_run:
@@ -132,6 +133,12 @@ async def test_pause_settles_channel_start_stopped_before_admission(
                 queued.previous_run,
                 "Previous answer",
                 TaskStatus.COMPLETED,
+            )
+        else:
+            task = db.get(Task, queued.task_id)
+            assert (task.status, task.error_message) == (
+                TaskStatus.FAILED,
+                "Task stopped before execution started.",
             )
         assert events == {queued.start_id: "failed", queued.pause_id: "completed"}
 

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
+_STOPPED_BEFORE_START = "Task stopped before execution started."
 
 
 @dataclass(frozen=True)
@@ -421,6 +422,7 @@ def settle_queued_start_for_pause(
             )
             .values(
                 status="failed",
+                error=_STOPPED_BEFORE_START,
                 completed_at=func.now(),
                 result={"rejection_reason": "cancelled_before_admission"},
             )
@@ -459,6 +461,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         TerminalTaskEventDraft,
         stage_terminal_event,
     )
+    from .task_start_consumer import settle_failed_start_no_commit
 
     db.execute(
         delete(TaskAdmissionTicket).where(
@@ -483,6 +486,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .values(
             status="failed",
+            error="Task command stopped by a control request.",
             completed_at=func.now(),
             result={"rejection_reason": "cancelled_before_admission"},
         )
@@ -494,6 +498,8 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         scope = (
             command.payload.get("scope") if isinstance(command.payload, dict) else None
         )
+        if command.kind == "start":
+            settle_failed_start_no_commit(db, command)
         stage_terminal_event(
             db,
             command_db_id=cancelled_id,
