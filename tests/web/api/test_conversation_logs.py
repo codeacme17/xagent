@@ -908,6 +908,11 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     # Both rows are in the timeline before the purge; the compact one is also
     # read separately into the transcript, which is why it is seeded here.
     assert len(warm.json()["trace_events"]) == 2
+    assert any(
+        entry.get("message_type") == "compaction" for entry in warm.json()["transcript"]
+    ), (
+        "the compaction entry must be present before the purge for its absence to mean anything"
+    )
 
     db = _direct_db_session()
     try:
@@ -949,8 +954,10 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
         for entry in transcript
     ), transcript
     # And the compact row folded into the transcript is gone with the trace,
-    # rather than leaving a half-rendered entry behind.
-    assert all(entry.get("event_type") != "action_end_compact" for entry in transcript)
+    # rather than leaving a half-rendered entry behind. Transcript entries are
+    # distinguished by ``message_type``; they carry no ``event_type`` at all,
+    # so asserting on that field could never have failed.
+    assert all(entry.get("message_type") != "compaction" for entry in transcript)
 
 
 def test_detail_includes_delegated_agent_traces_but_not_builder_traces() -> None:

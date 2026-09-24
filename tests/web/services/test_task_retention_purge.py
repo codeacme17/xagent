@@ -156,6 +156,12 @@ def _seed_full_task(
         .values(
             last_checkpoint_event_id=f"evt-{task_id}-1",
             last_checkpoint_trace_event_id=trace_id,
+            # Explicitly old. This UPDATE fires ``onupdate`` and would
+            # otherwise leave ``updated_at`` at "now", which on SQLite's
+            # second resolution compares equal to a regression's new value --
+            # so the pin that the purge must not touch this column would pass
+            # either way.
+            updated_at=NOW - timedelta(days=500),
         )
     )
     db.commit()
@@ -639,6 +645,145 @@ def test_a_page_of_undeletable_tasks_does_not_starve_the_ones_behind_it(
         assert _counts(db, victim)["tasks"] == 0
 
 
+def test_a_trace_expired_task_is_not_re_selected_once_its_trace_is_gone(
+    sessions,
+) -> None:
+    """The regression that made every sweep re-purge the whole trace history.
+
+    Nothing moves a task out of the candidate set when its traces are deleted:
+    the anchor is deliberately not advanced, and the status stays terminal. So
+    the scan returned it forever, the lock was taken forever, and the pointer
+    UPDATE rewrote the row forever -- a dead tuple per task per pass, with
+    ``purged_traces`` reporting the whole history as freshly expired each time.
+    Worse, a candidate set that never shrinks keeps every page full, which
+    holds the loop at the batch pause instead of the sweep interval.
+    """
+    with sessions() as db:
+        task_id = _seed_full_task(db, username="reselect", anchor=_age(100))
+
+    assert _purge(sessions, task_id) is RetentionPurgeAction.PURGED_TRACES
+
+    with sessions() as db:
+        assert (
+            select_purge_candidates(
+                db,
+                now=NOW,
+                conversation_days=CONVERSATION_DAYS,
+                trace_days=TRACE_DAYS,
+                limit=10,
+            )
+            == []
+        )
+
+
+def test_a_conversation_expired_task_without_traces_is_still_selected(
+    sessions,
+) -> None:
+    """The trace leg's condition must not reach the conversation leg.
+
+    A task can be due for whole-conversation expiry and carry no trace rows at
+    all -- it still has its own row to delete, and filtering the scan on
+    "has traces" across both legs would strand it forever.
+    """
+    with sessions() as db:
+        user_id = _make_user(db, "traceless")
+        task_id = _make_task(db, user_id=user_id, anchor=_age(400))
+        db.commit()
+
+    with sessions() as db:
+        assert select_purge_candidates(
+            db,
+            now=NOW,
+            conversation_days=CONVERSATION_DAYS,
+            trace_days=TRACE_DAYS,
+            limit=10,
+        ) == [task_id]
+
+    assert _purge(sessions, task_id) is RetentionPurgeAction.PURGED_CONVERSATION
+
+
+def test_a_trace_already_gone_under_the_lock_is_not_counted_as_a_purge(
+    sessions,
+) -> None:
+    """What a second replica sees: the rows went between the scan and the lock.
+
+    The scan filters these out, so this is only reachable by racing -- but
+    calling it ``purged_traces`` would inflate the audit counter with work
+    that did not happen, which is the same defect one level down.
+    """
+    with sessions() as db:
+        task_id = _seed_full_task(db, username="raced", anchor=_age(100))
+
+    assert _purge(sessions, task_id) is RetentionPurgeAction.PURGED_TRACES
+    assert _purge(sessions, task_id) is RetentionPurgeAction.NOTHING_TO_PURGE
+
+
+def test_a_failing_task_is_counted_and_the_batch_carries_on(
+    sessions, monkeypatch
+) -> None:
+    """The regression that let one task stop every task behind it forever.
+
+    ``purge_task`` re-raising aborted the batch, so the cursor never advanced
+    and the audit line -- emitted after the loop -- never ran, discarding the
+    record of deletions that had already committed. The next sweep then began
+    at the same task and failed the same way.
+    """
+    monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
+    import xagent.web.services.task_retention_purge as purge_module
+
+    with sessions() as db:
+        first = _seed_full_task(db, username="ok-before", anchor=_age(400))
+        doomed = _seed_full_task(db, username="doomed", anchor=_age(400))
+        last = _seed_full_task(db, username="ok-after", anchor=_age(400))
+
+    real = purge_module.purge_task
+
+    def failing(db, task_id, **kwargs):
+        if task_id == doomed:
+            raise RuntimeError("deterministic per-task failure")
+        return real(db, task_id, **kwargs)
+
+    monkeypatch.setattr(purge_module, "purge_task", failing)
+
+    report = _run_batch(sessions, limit=10)
+
+    assert report.failed == 1
+    assert report.purged_conversations == 2
+    # The cursor reached the end, which is what unblocks the tasks behind the
+    # failure on the next sweep.
+    assert report.last_task_id == last
+    with sessions() as db:
+        assert _counts(db, first)["tasks"] == 0
+        assert _counts(db, doomed)["tasks"] == 1
+        assert _counts(db, last)["tasks"] == 0
+
+
+def test_the_audit_line_is_emitted_even_when_the_batch_raises(
+    sessions, monkeypatch, caplog
+) -> None:
+    """Committed deletions must not go unrecorded because a later step failed."""
+    monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", str(CONVERSATION_DAYS))
+    import xagent.web.services.task_retention_purge as purge_module
+
+    with sessions() as db:
+        _seed_full_task(db, username="audited", anchor=_age(400))
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("something after the per-task guard")
+
+    monkeypatch.setattr(purge_module, "get_retention_enabled", explode)
+
+    with caplog.at_level(
+        logging.INFO, logger="xagent.web.services.task_retention_purge"
+    ):
+        with pytest.raises(RuntimeError):
+            _run_batch(sessions, limit=10)
+
+    assert any(
+        record.getMessage().startswith("retention purge ") for record in caplog.records
+    ), "the audit line must survive an exception escaping the loop"
+
+
 def test_no_configured_period_selects_nothing(sessions) -> None:
     with sessions() as db:
         _seed_full_task(db, username="z1", anchor=_age(10_000))
@@ -740,8 +885,10 @@ def _run_batch(
 
     The gate belongs to the job, not to the row semantics (see the module
     docstring of ``task_retention_purge``), so every other batch test here
-    would otherwise only ever run on PostgreSQL. The PostgreSQL parameter of
-    the shared ``engine`` fixture runs these same tests through the real gate.
+    would otherwise only ever run on PostgreSQL. The bypass is unconditional:
+    the PostgreSQL parameter of the shared ``engine`` fixture exercises these
+    tests against a real server, but not through the gate.
+    ``test_batch_refuses_a_store_that_cannot_fence`` is what covers the gate.
     """
     if require_supported:
         return run_retention_purge_batch(sessions, now=NOW, **kwargs)  # type: ignore[arg-type]
@@ -772,6 +919,8 @@ def test_every_action_increments_exactly_one_counter() -> None:
                 "purged_traces",
                 "skipped_busy",
                 "skipped_active_interaction",
+                "nothing_to_purge",
+                "failed",
             )
             if getattr(after, name) != getattr(before, name)
         ]
@@ -912,26 +1061,36 @@ async def test_the_loop_carries_its_cursor_across_sweeps(sessions, monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_the_loop_survives_a_failing_batch(sessions, monkeypatch) -> None:
-    """An unattended sweep has no other surface: one bad batch must not end it."""
+    """An unattended sweep has no other surface: one bad batch must not end it.
+
+    The first batch raises and the second succeeds, and both must run. An
+    earlier version of this test set the stop event before raising, so it
+    proved only that the loop exited after a failure -- which is what a loop
+    that died on the exception would also do.
+    """
     import xagent.web.services.task_retention_purge as purge_module
 
     monkeypatch.setattr(
         purge_module, "ensure_retention_purge_supported", lambda db: None
     )
-    monkeypatch.setenv("XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS", "0.01")
 
     stop_event = asyncio.Event()
     calls = {"n": 0}
 
-    def failing_batch(*args, **kwargs):
+    def failing_then_succeeding_batch(*args, **kwargs):
         calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("batch exploded")
         stop_event.set()
-        raise RuntimeError("batch exploded")
+        return RetentionPurgeReport()
 
-    monkeypatch.setattr(purge_module, "run_retention_purge_batch", failing_batch)
+    monkeypatch.setattr(
+        purge_module, "run_retention_purge_batch", failing_then_succeeding_batch
+    )
 
     await asyncio.wait_for(
         run_retention_purge_loop(sessions, stop_event=stop_event), timeout=5
     )
 
-    assert calls["n"] == 1
+    assert calls["n"] == 2, "the loop stopped at the failing batch"

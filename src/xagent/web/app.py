@@ -700,9 +700,13 @@ def start_retention_purge_task(
     The loop itself refuses to run against anything but PostgreSQL, because the
     row lock its eligibility check depends on is a no-op elsewhere; it logs the
     refusal and returns rather than retrying something configuration cannot fix.
-    That refusal is also what makes this safe to leave unguarded under pytest,
-    unlike the sweeps either side of it: a test suite runs on SQLite, so a loop
-    started by one ends itself on its first batch.
+    Guarded under pytest like the five sibling loops. The dialect refusal was
+    argued as making the guard unnecessary -- a test suite runs on SQLite, so
+    the loop would end itself on its first batch -- but ``tests/conftest.py``
+    loads a developer's ``.env`` with ``override=True``, so a machine with
+    both a retention period and a PostgreSQL ``DATABASE_URL`` configured would
+    have run a real, deleting sweep against it. The guard costs one line and
+    removes the need for the argument.
     """
 
     from .models.database import get_session_local
@@ -729,6 +733,11 @@ def start_retention_purge_task(
         app_instance.state.retention_purge_task = None
 
     if not retention_purge_configured():
+        return None
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "retention_purge_allowed_in_tests", False
+    ):
+        logger.info("Skipping retention purge loop (test environment)")
         return None
 
     stop_event = asyncio.Event()

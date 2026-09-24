@@ -55,11 +55,13 @@ async def test_a_configured_period_starts_the_loop(
 ) -> None:
     """The positive path, which nothing else here exercises.
 
-    Left unguarded under pytest on purpose, unlike the sweeps either side of
-    it: the loop's first act is to check the dialect, and a test suite runs on
-    SQLite, so what this starts also stops itself. That is worth having as a
-    real task rather than a mock -- a starter that silently returned ``None``
-    in every test would be indistinguishable from one that was broken.
+    Opts past the ``PYTEST_CURRENT_TEST`` guard explicitly. The guard is there
+    because ``tests/conftest.py`` loads a developer's ``.env`` with
+    ``override=True``, so a machine configured with a retention period and a
+    PostgreSQL ``DATABASE_URL`` would otherwise run a real, deleting sweep
+    during its own test suite. Opting in here keeps that protection while
+    still exercising the starter for real -- one that returned ``None`` in
+    every test would be indistinguishable from one that was broken.
     """
     import sqlalchemy as sa
     from sqlalchemy.orm import sessionmaker
@@ -73,6 +75,7 @@ async def test_a_configured_period_starts_the_loop(
         lambda: sessionmaker(bind=sa.create_engine("sqlite://")),
     )
     app = FastAPI()
+    app.state.retention_purge_allowed_in_tests = True
 
     task = app_module.start_retention_purge_task(app)
 
@@ -140,3 +143,22 @@ async def test_stopping_drains_a_loop_that_ignores_the_signal(
 async def test_stopping_is_safe_when_nothing_was_started(app_module) -> None:
     """Shutdown runs unconditionally, including after a startup that never got here."""
     await app_module.stop_retention_purge_task(FastAPI())
+
+
+def test_the_pytest_guard_keeps_a_configured_period_from_sweeping(
+    app_module, no_retention_env, monkeypatch
+) -> None:
+    """A developer's own `.env` must not turn `pytest` into a purge.
+
+    `tests/conftest.py` loads it with `override=True`, so a period configured
+    there reaches every test process. Without this guard, a developer whose
+    `DATABASE_URL` also points at PostgreSQL would have had their own database
+    swept -- the dialect refusal that was argued as sufficient does not fire
+    in that case.
+    """
+    monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", "365")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_guard (call)")
+    app = FastAPI()
+
+    assert app_module.start_retention_purge_task(app) is None
+    assert getattr(app.state, "retention_purge_task", None) is None

@@ -81,7 +81,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...config import (
@@ -105,7 +105,8 @@ from .task_interaction_schema import interaction_requests_table_exists
 from .task_retention import (
     RetentionDisposition,
     assess_task_retention,
-    retention_candidate_condition,
+    retention_expiry_condition,
+    retention_quiescent_condition,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,21 +138,38 @@ class RetentionPurgeAction(enum.Enum):
     #: whose anchor the trace delete would try to NULL against
     #: ``ck_task_interaction_requests_active_anchor``.
     SKIPPED_ACTIVE_INTERACTION = "skipped_active_interaction"
+    #: Trace expiry only: the task is due, but its trace is already gone, so
+    #: there was nothing to delete. The scan filters these out, so reaching
+    #: here means the rows went between the scan and the lock -- normal with
+    #: more than one replica sweeping.
+    NOTHING_TO_PURGE = "nothing_to_purge"
+    #: The task's own purge raised. Counted rather than propagated, because a
+    #: task that fails deterministically would otherwise stop every task
+    #: behind it from ever being expired.
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
 class RetentionPurgeReport:
     """One sweep's outcome, in the shape the audit line prints."""
 
+    #: Candidates the scan returned. Named ``scanned`` in the audit line
+    #: because that is what it counts: the locked assessment can still refuse
+    #: any of them, so it is not a count of tasks that were eligible.
     eligible: int = 0
     purged_conversations: int = 0
     purged_traces: int = 0
     skipped_busy: int = 0
     skipped_active_interaction: int = 0
+    nothing_to_purge: int = 0
+    failed: int = 0
     dry_run: bool = False
-    #: Highest task id this batch considered, or ``None`` when it considered
-    #: none. The loop resumes after it rather than from the start of the
-    #: table, which is what stops an undeletable page being re-read forever.
+    #: Highest task id this batch actually processed, or ``None`` when it
+    #: processed none. The loop resumes after it rather than from the start of
+    #: the table, which is what stops an undeletable page being re-read
+    #: forever. Advanced per task rather than set from the candidate list up
+    #: front, so a batch that stops early -- shutdown, kill switch -- does not
+    #: carry the cursor past tasks it never looked at.
     last_task_id: int | None = None
 
     @property
@@ -177,6 +195,9 @@ class RetentionPurgeReport:
             + int(action is RetentionPurgeAction.SKIPPED_BUSY),
             skipped_active_interaction=self.skipped_active_interaction
             + int(action is RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION),
+            nothing_to_purge=self.nothing_to_purge
+            + int(action is RetentionPurgeAction.NOTHING_TO_PURGE),
+            failed=self.failed + int(action is RetentionPurgeAction.FAILED),
         )
 
     def audit_line(self) -> str:
@@ -189,11 +210,13 @@ class RetentionPurgeReport:
         """
         return (
             f"retention purge {'dry-run' if self.dry_run else 'run'}: "
-            f"eligible={self.eligible} "
+            f"scanned={self.eligible} "
             f"purged_conversations={self.purged_conversations} "
             f"purged_traces={self.purged_traces} "
             f"skipped_busy={self.skipped_busy} "
-            f"skipped_active_interaction={self.skipped_active_interaction}"
+            f"skipped_active_interaction={self.skipped_active_interaction} "
+            f"nothing_to_purge={self.nothing_to_purge} "
+            f"failed={self.failed}"
         )
 
 
@@ -241,36 +264,41 @@ def select_purge_candidates(
     top again -- the same cross-tick cursor ``orphan_upload_gc`` carries, for
     the same reason.
 
-    The shorter of the two periods decides candidacy, because it admits the
-    wider set: the trace path applies to tasks the conversation path is not
-    yet due to take.
+    The two periods are admitted separately rather than through the shorter of
+    them, because the trace leg carries a condition the conversation leg must
+    not: a task whose traces are already gone has nothing left for trace
+    expiry to do, and admitting it anyway is what made the sweep re-lock,
+    re-UPDATE and re-count the whole trace-expired history on every pass --
+    and, because a full page shortens the pause, do it at the batch cadence
+    rather than the sweep interval, forever. A conversation-expired task with
+    no traces still has its own row to delete, so the same condition on that
+    leg would strand it.
+
+    The ``EXISTS`` is spelled here rather than in
+    :func:`retention_candidate_condition`, which is shared with the counters
+    behind ``xagent retention preview``: adding it there would silently change
+    what that diagnostic reports, and it cannot be applied to both legs
+    anyway. ``ix_trace_events_task_id_event_type`` makes it a leading-column
+    lookup.
     """
-    days = _shortest_period(conversation_days, trace_days)
-    if days is None:
+    conversation_due = retention_expiry_condition(now=now, days=conversation_days)
+    trace_due = and_(
+        retention_expiry_condition(now=now, days=trace_days),
+        exists(select(1).where(TraceEvent.task_id == Task.id)),
+    )
+    if conversation_days is None and trace_days is None:
         return []
     rows = db.execute(
         select(Task.id)
         .where(
             Task.id > after_task_id,
-            retention_candidate_condition(now=now, days=days),
+            retention_quiescent_condition(now=now),
+            or_(conversation_due, trace_due),
         )
         .order_by(Task.id.asc())
         .limit(limit)
     ).scalars()
     return [int(row) for row in rows]
-
-
-def _shortest_period(
-    conversation_days: int | None, trace_days: int | None
-) -> int | None:
-    """The shorter of the two periods, which is the one that admits more tasks.
-
-    ``None`` means unlimited on either side, so it never narrows the other.
-    """
-    periods = [days for days in (conversation_days, trace_days) if days is not None]
-    if not periods:
-        return None
-    return min(periods)
 
 
 def _has_active_interaction(db: Session, task_id: int) -> bool:
@@ -294,8 +322,23 @@ def _has_active_interaction(db: Session, task_id: int) -> bool:
     )
 
 
-def _purge_trace_rows(db: Session, task_id: int) -> None:
+def _rowcount(result: object) -> int:
+    """Rows a DML statement touched, typed for mypy.
+
+    ``Session.execute`` is annotated as returning ``Result``, which has no
+    ``rowcount``; every DML execution actually returns ``CursorResult``, which
+    does. The repo spells this the same way in ``services/triggers.py``.
+    """
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _purge_trace_rows(db: Session, task_id: int) -> int:
     """Delete one task's trace, keeping the task and its conversation.
+
+    Returns the number of rows it actually changed, so the caller can tell a
+    real expiry from a task whose trace was already gone -- reporting the
+    second as ``purged_traces`` made the counter claim work that never
+    happened.
 
     Statement order matches ``purge_task_rows`` where it overlaps, and for the
     same reason: ``tasks.last_checkpoint_trace_event_id`` is a foreign key
@@ -318,27 +361,42 @@ def _purge_trace_rows(db: Session, task_id: int) -> None:
     side-effect review names maintenance writes that advance ``updated_at`` as
     a hazard in their own right.
     """
-    db.execute(
-        update(Task)
-        .where(Task.id == task_id)
-        .values(
-            last_checkpoint_event_id=None,
-            last_checkpoint_trace_event_id=None,
-            updated_at=Task.updated_at,
+    removed = 0
+    # Only when a pointer is actually set. An unconditional UPDATE matches the
+    # row every time, and PostgreSQL does not elide a no-op update -- it writes
+    # a new tuple and leaves a dead one. That is what made a re-purged task
+    # cost a dead tuple per sweep.
+    pointers_set = db.execute(
+        select(Task.id).where(
+            Task.id == task_id,
+            or_(
+                Task.last_checkpoint_event_id.is_not(None),
+                Task.last_checkpoint_trace_event_id.is_not(None),
+            ),
         )
-        .execution_options(synchronize_session=False)
-    )
-    for model in (TraceCheckpointBlob, TraceMessageBlob):
-        db.execute(
-            delete(model)
-            .where(model.task_id == task_id)
-            .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+    if pointers_set is not None:
+        removed += _rowcount(
+            db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    last_checkpoint_event_id=None,
+                    last_checkpoint_trace_event_id=None,
+                    updated_at=Task.updated_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
         )
-    db.execute(
-        delete(TraceEvent)
-        .where(TraceEvent.task_id == task_id)
-        .execution_options(synchronize_session=False)
-    )
+    for model in (TraceCheckpointBlob, TraceMessageBlob, TraceEvent):
+        removed += _rowcount(
+            db.execute(
+                delete(model)
+                .where(model.task_id == task_id)
+                .execution_options(synchronize_session=False)
+            )
+        )
+    return removed
 
 
 def purge_task(
@@ -391,8 +449,12 @@ def purge_task(
 
         if action is RetentionPurgeAction.PURGED_CONVERSATION:
             purge_task_rows(db, task_id=task_id)
-        else:
-            _purge_trace_rows(db, task_id)
+        elif _purge_trace_rows(db, task_id) == 0:
+            # The scan filters these out, so arriving here means the rows went
+            # between the scan and the lock. Committing an empty transaction
+            # is still right -- it releases the lock -- but calling it a purge
+            # is not.
+            action = RetentionPurgeAction.NOTHING_TO_PURGE
         db.commit()
         committed = True
         return action
@@ -413,17 +475,23 @@ def run_retention_purge_batch(
     limit: int | None = None,
     after_task_id: int = 0,
     should_continue: Callable[[], bool] | None = None,
+    periods: tuple[int | None, int | None] | None = None,
 ) -> RetentionPurgeReport:
     """Purge one bounded batch and return what it did.
 
-    The retention periods and the dry-run flag are read from configuration
-    here and are deliberately not overridable by argument. Elsewhere in this
-    module ``days=None`` means *unlimited retention*; a parameter that also
-    accepted ``None`` as "use the configured value" would give one value two
-    opposite meanings, and the dangerous reading -- a caller passing ``None``
-    for "expire nothing" and getting the configured period -- deletes
-    conversations. Tests that need specific periods call :func:`purge_task`,
-    where ``None`` keeps its one meaning.
+    ``periods`` is the pair ``(conversation_days, trace_days)``, already read.
+    It is a tuple rather than two arguments precisely so that ``None`` keeps
+    one meaning: elsewhere in this module ``days=None`` means *unlimited
+    retention*, and a pair of parameters that also accepted ``None`` as "use
+    the configured value" would give one value two opposite meanings -- the
+    dangerous reading being a caller passing ``None`` for "expire nothing" and
+    getting the configured period. Omitting the tuple entirely reads the
+    configuration; passing one supplies it.
+
+    The loop passes a tuple it read once, because the values provably cannot
+    change within a process (see the retention section of ``config.py``) and
+    re-reading them per batch meant an invalid period logged its warning on
+    every batch -- once every few seconds while a backlog drains.
 
     Configuration is read per batch rather than captured at import. That is
     not the same as being changeable at run time, and this module used to
@@ -448,8 +516,11 @@ def run_retention_purge_batch(
         RetentionPurgeUnsupported: If the store is not PostgreSQL.
     """
     now = now or datetime.now(timezone.utc)
-    conversation_days = get_conversation_retention_days()
-    trace_days = get_trace_retention_days()
+    conversation_days, trace_days = (
+        periods
+        if periods is not None
+        else (get_conversation_retention_days(), get_trace_retention_days())
+    )
     limit = limit if limit is not None else get_retention_batch_size()
     dry_run = get_retention_dry_run()
 
@@ -464,33 +535,47 @@ def run_retention_purge_batch(
             after_task_id=after_task_id,
         )
 
-    report = RetentionPurgeReport(
-        eligible=len(candidates),
-        dry_run=dry_run,
-        last_task_id=candidates[-1] if candidates else None,
-    )
-    for task_id in candidates:
-        if should_continue is not None and not should_continue():
-            logger.info("retention purge stopping after %d task(s)", report.purged)
-            break
-        if not get_retention_enabled():
-            logger.info(
-                "retention purge stopped by kill switch after %d task(s)",
-                report.purged,
-            )
-            break
-        with session_factory() as db:
-            action = purge_task(
-                db,
-                task_id,
-                now=now,
-                conversation_days=conversation_days,
-                trace_days=trace_days,
-                dry_run=dry_run,
-            )
-        report = report.with_action(action)
-
-    logger.info(report.audit_line())
+    report = RetentionPurgeReport(eligible=len(candidates), dry_run=dry_run)
+    try:
+        for task_id in candidates:
+            if should_continue is not None and not should_continue():
+                logger.info("retention purge stopping after %d task(s)", report.purged)
+                break
+            if not get_retention_enabled():
+                logger.info(
+                    "retention purge stopped by kill switch after %d task(s)",
+                    report.purged,
+                )
+                break
+            try:
+                with session_factory() as db:
+                    action = purge_task(
+                        db,
+                        task_id,
+                        now=now,
+                        conversation_days=conversation_days,
+                        trace_days=trace_days,
+                        dry_run=dry_run,
+                    )
+            except Exception:  # noqa: BLE001
+                # Counted and carried, not propagated. A task that fails the
+                # same way every time -- a foreign key this census missed, a
+                # constraint a deployment adds -- would otherwise abort the
+                # batch before the cursor advanced, so no task at or after its
+                # id would ever be expired again, with a daily warning as the
+                # only symptom.
+                logger.warning(
+                    "retention purge failed for task %s; continuing",
+                    task_id,
+                    exc_info=True,
+                )
+                action = RetentionPurgeAction.FAILED
+            report = replace(report, last_task_id=task_id).with_action(action)
+    finally:
+        # In ``finally`` so that work already committed is still reported. Each
+        # task commits its own transaction, so an exception escaping this loop
+        # would otherwise discard the record of deletions that did happen.
+        logger.info(report.audit_line())
     return report
 
 
@@ -536,6 +621,9 @@ async def run_retention_purge_loop(
     """
     stop = stop_event if stop_event is not None else asyncio.Event()
     after_task_id = 0
+    # Read once, not per batch: these cannot change within a process, and an
+    # unusable one warns on every read.
+    periods = (get_conversation_retention_days(), get_trace_retention_days())
     while not stop.is_set():
         pause = get_retention_sweep_interval_seconds()
         try:
@@ -546,6 +634,7 @@ async def run_retention_purge_loop(
                 limit=limit,
                 after_task_id=after_task_id,
                 should_continue=lambda: not stop.is_set(),
+                periods=periods,
             )
             if report.eligible >= limit and report.last_task_id is not None:
                 after_task_id = report.last_task_id

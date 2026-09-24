@@ -323,16 +323,24 @@ def assess_task_retention(
 ) -> RetentionAssessment:
     """Decide what may be expired for one task.
 
-    The task row is locked with ``SELECT ... FOR UPDATE`` before the legs are
-    evaluated, and the lock is held until the caller's transaction ends. Read
-    the module docstring before treating that as a deletion licence: it is
-    PostgreSQL-only, it covers the status and lease legs, and it does not
-    cover the command leg -- ``task_execution_commands`` is a separate table
-    that this lock never touches.
+    The task row is locked with ``SELECT ... FOR UPDATE SKIP LOCKED`` before
+    the legs are evaluated, and the lock is held until the caller's
+    transaction ends. Read the module docstring before treating that as a
+    deletion licence: it is PostgreSQL-only. It covers the status and lease
+    legs directly, and the command leg through the foreign key -- an insert
+    into ``task_execution_commands`` takes ``FOR KEY SHARE`` on this row,
+    which this lock conflicts with. ``test_task_retention_purge_postgresql``
+    establishes that rather than leaving it as a reading of the lock matrix.
+
+    ``SKIP LOCKED`` rather than a plain wait: a row another transaction holds
+    is, for this caller's purposes, a busy task -- and a purge that waited on
+    it would block its whole sweep behind one long-held lock, then be detached
+    mid-wait by shutdown. A skipped row reads back as missing, which callers
+    already report as not eligible.
 
     There is no unlocked variant. Callers that must scan without locking --
-    the preview, and whatever #2563 uses to choose a batch -- compose
-    :func:`retention_candidate_condition` into their own query instead.
+    the preview, and the purge's own batch selection -- compose the leaf
+    conditions into their own query instead.
 
     The legs are evaluated in SQL, not re-implemented in Python, so this shares
     one definition with the set-scanning path. Only the expiry comparison

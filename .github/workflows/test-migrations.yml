@@ -127,6 +127,8 @@ on:
       - 'src/xagent/web/services/task_retention_purge.py'
       - 'src/xagent/web/models/task.py'
       - 'tests/web/services/test_task_retention_purge.py'
+      - 'src/xagent/web/services/task_deletion.py'
+      - 'src/xagent/web/models/task_command.py'
       - 'tests/web/services/test_task_retention_purge_postgresql.py'
   pull_request:
     branches: [main]
@@ -291,6 +293,8 @@ jobs:
             src/xagent/web/services/task_retention_purge.py
             src/xagent/web/models/task.py
             tests/web/services/test_task_retention_purge.py
+            src/xagent/web/services/task_deletion.py
+            src/xagent/web/models/task_command.py
             tests/web/services/test_task_retention_purge_postgresql.py
           )
 
