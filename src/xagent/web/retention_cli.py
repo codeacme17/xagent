@@ -12,12 +12,12 @@ It deletes nothing and it locks nothing. The database is bound with
 property (a PostgreSQL ``READ ONLY`` transaction, a SQLite read-only URL)
 rather than a promise this module keeps.
 
-**Cost.** ``tasks.last_activity_at`` is deliberately unindexed in this
-revision (see the column comment in ``models/task.py``), so each period costs
-a sequential scan of ``tasks`` plus one over the matching ``trace_events``.
-That is affordable for a diagnostic an operator runs by hand a few times, and
-not affordable for a loop; the purge in #2563 adds the index along with the
-scan that needs it.
+**Cost.** ``ix_tasks_retention_scan`` covers the purge's own predicate, not
+this one: it indexes ``COALESCE(last_activity_at, created_at)`` behind a
+``status`` prefix, while the counts below also scan the matching
+``trace_events``. Treat each period as costing a pass over ``tasks`` and one
+over its traces -- affordable for a diagnostic an operator runs by hand a few
+times, and not affordable in a loop.
 """
 
 from __future__ import annotations
@@ -104,8 +104,8 @@ def run_preview(args: argparse.Namespace) -> int:
         return 2
 
     print(
-        "Scanning an unindexed column, one sequential pass per period; "
-        "prefer off-peak on a large deployment.",
+        "One pass over tasks and its traces per period; prefer off-peak on a "
+        "large deployment.",
         file=sys.stderr,
     )
     configure_db(args.database_url, read_only=True)

@@ -12,10 +12,30 @@ compared against a cutoff yields NULL, which every WHERE clause reads as "not
 eligible", so the COALESCE is what stops un-backfilled rows being immortal.
 
 A btree on the raw column cannot range-bound a COALESCE of it, so an index on
-``(status, last_activity_at, ...)`` would reduce to its ``status`` prefix --
-which ``ix_tasks_status_lease_expires_at`` already provides -- while adding
-write cost on a column every persisted message touches. The first version of
-this migration made exactly that mistake; it was caught in review on #2599.
+``(status, last_activity_at, ...)`` would reduce to its ``status`` prefix,
+which ``ix_tasks_status_lease_expires_at`` already provides. An earlier draft
+of this migration indexed the raw column and was caught in review on #2599.
+
+What this index costs, and why the raw-column argument did not distinguish it
+-----------------------------------------------------------------------------
+That earlier draft was also rejected here for "adding write cost on a column
+every persisted message touches". **This index pays exactly that cost**, and
+saying otherwise was the weaker half of the argument: the expression
+references ``last_activity_at`` too.
+
+Concretely, no index on ``tasks`` referenced that column before this
+migration, so the ``touch_task_last_activity`` UPDATE behind every persisted
+chat message was HOT-eligible -- the new tuple needed no index entry at all.
+With this index it is not: each of those UPDATEs now maintains *every* index
+on ``tasks``, not just this one, and leaves a dead tuple the same page-level
+cleanup has to reclaim.
+
+So the trade is not "cheaper than the raw-column index". It is: non-HOT anchor
+updates on the hottest write path in this table, in exchange for the only
+index shape that can range-bound the scan's predicate. Whether that trade pays
+depends entirely on the planner actually choosing it, which
+``test_the_purge_scan_uses_this_index`` now checks against a real server
+rather than leaving to reasoning.
 
 Column order follows the query's shape: ``status`` is the equality-shaped leg
 (an ``IN`` over two labels), so it leads and leaves the expression as the
@@ -27,14 +47,13 @@ Not partial. A ``WHERE status IN (...)`` predicate would shrink it, but the
 labels ``tasks.status`` stores are a deployment-visible contract, and an index
 predicate that stops matching the query's own silently stops being used.
 
-**Unverified:** this shape was derived from the predicate, not from an EXPLAIN
-against a populated table. No PostgreSQL was available when it was written.
-The open question an EXPLAIN would settle is not whether the expression is
-range-bounded -- it is -- but whether the planner prefers this index at all
-over the primary key, since the scan also carries ``id > :cursor`` and
-``ORDER BY id`` and can satisfy both from the PK alone. Whoever first runs
-this against real data should check that, and drop the index rather than keep
-a version of it that is never chosen.
+The shape was derived from the predicate, not from an EXPLAIN -- no
+PostgreSQL was available when it was written -- so the question it left open
+is whether the planner prefers this index over the primary key at all, since
+the scan also carries ``id > :cursor`` and ``ORDER BY id`` and can satisfy
+both from the PK alone. That question is now asked in CI. If the answer ever
+becomes "no", this index should be dropped rather than kept in a shape nothing
+chooses, because the write cost above is paid either way.
 
 CONCURRENTLY, and what a failed build leaves
 --------------------------------------------
@@ -80,6 +99,11 @@ REQUIRED_COLUMNS = ("status", "last_activity_at", "created_at")
 #: planner will not use this index for that query; the model contract test
 #: pins the pair that can be compared programmatically.
 ANCHOR_SQL = "coalesce(last_activity_at, created_at)"
+
+#: What a reflected index must match to be left alone. Consumed only by the
+#: PostgreSQL path: it is the one dialect whose reflection reports an
+#: expression index at all.
+EXPECTED_DEFINITION: tuple[str, ...] = ("status", ANCHOR_SQL)
 
 #: ``to_regclass`` resolves through ``search_path`` exactly as the DDL that
 #: created the index did, so this cannot match a same-named index in an
@@ -127,15 +151,6 @@ def _online_index_definition(index_name: str) -> tuple[str, ...] | None:
     return None
 
 
-def _expected_definition() -> tuple[str, ...]:
-    """The definition an existing index must match to be left alone.
-
-    Consumed only by the PostgreSQL path: it is the one dialect whose
-    reflection reports an expression index at all.
-    """
-    return ("status", ANCHOR_SQL)
-
-
 def _postgres_index_validity() -> bool | None:
     """Whether the current-schema index exists and is usable."""
     return (
@@ -151,14 +166,17 @@ def _upgrade_postgresql() -> None:
 
     validity = _postgres_index_validity()
     existing = _online_index_definition(INDEX)
-    if validity is True and existing == _expected_definition():
+    if validity is True and existing == EXPECTED_DEFINITION:
         return
 
     with op.get_context().autocommit_block():
         # Drops both leftovers this can meet: an invalid corpse from a failed
-        # concurrent build, and a valid index of the same name covering the
-        # wrong thing -- which is what an installation that ran the first
-        # version of this revision holds.
+        # concurrent build, and a valid index of this name covering something
+        # else. The second is defensive rather than observed -- an index of
+        # this name can only come from this revision, and a database that ran
+        # an earlier form of it is already stamped here, so upgrade() would
+        # not run again. It costs one comparison and removes a silent
+        # divergence if one is ever created by hand.
         if validity is not None or existing is not None:
             op.drop_index(
                 INDEX,
@@ -203,9 +221,9 @@ def upgrade() -> None:
     # indexes outright ("Skipped unsupported reflection of expression-based
     # index"), so _online_index_definition reports this index as absent even
     # when it exists -- and a bare create then fails with "already exists".
-    # Dropping by name first is idempotent, and it also replaces the
-    # wrong-shaped index an installation of this revision's first version
-    # holds. Affordable here in a way it would not be on PostgreSQL: this
+    # Dropping by name first is idempotent, and replaces any index of this
+    # name whose shape differs. Affordable here in a way it would not be on
+    # PostgreSQL: this
     # branch serves development databases, where the table is small and no
     # concurrent writer is waiting on the lock.
     op.drop_index(INDEX, table_name=TABLE, if_exists=True)

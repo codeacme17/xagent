@@ -362,8 +362,9 @@ class Task(Base):  # type: ignore
     # ``ALTER TABLE`` stamp every pre-existing row with the migration's own
     # clock, which is exactly the value the backfill exists to avoid.
     #
-    # Indexed by ``ix_tasks_retention_scan`` below, added with the purge that
-    # scans on it (#2563). Not by this column alone: the scan filters
+    # Indexed by ``ix_tasks_retention_scan`` in ``__table_args__`` above, added
+    # with the purge that scans on it (#2563). Not by this column alone: the
+    # scan filters
     # ``COALESCE(last_activity_at, created_at)``, so the index carries that
     # expression -- see the index's own comment.
     last_activity_at = Column(DateTime(timezone=True), nullable=True)

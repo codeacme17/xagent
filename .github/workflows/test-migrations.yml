@@ -706,16 +706,23 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # Only the PostgreSQL half here: the dialect-neutral cases in this file
+      # run in ci.yml's core leg, which covers tests/alembic. What needs a
+      # real server is the reflection comparison -- SQLite cannot reflect an
+      # expression index at all -- and the EXPLAIN that decides whether the
+      # planner uses this index, which is the whole justification for paying
+      # non-HOT anchor updates.
+      - name: Test retention scan index against a real catalog (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260923_task_retention_scan_index.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       # The purge's fence is a claim about PostgreSQL row locks -- that a
       # command insert's FOR KEY SHARE on tasks blocks against the purge's
       # FOR UPDATE. Nothing on SQLite can check it, so this step is the only
       # place that claim is ever tested.
-      # Dialect-neutral: real SQLite plus a mocked PostgreSQL context.
-      - name: Test retention scan index migration
-        if: needs.detect-migration-changes.outputs.should-test == 'true'
-        run: |
-          pytest tests/alembic/test_20260923_task_retention_scan_index.py -q
-
       - name: Test retention purge paths and locking (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

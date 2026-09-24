@@ -10,9 +10,11 @@ Three things here are specific to this one and are where the tests concentrate:
   rather than comparing first;
 * the offline rendering must put ``CONCURRENTLY`` *outside* the migration's
   transaction on PostgreSQL and must not emit it at all elsewhere. Both were
-  wrong in the first version of this migration and are pinned here;
-* a deployment may already hold a same-named index of the wrong shape, because
-  that first version shipped one.
+  wrong in an earlier draft of this migration and are pinned here;
+* an index of this name may exist with the wrong shape. No installation is
+  expected to hold one -- the name can only come from this revision, and a
+  database that ran an earlier draft is already stamped here -- so this is a
+  defensive path, pinned because it is cheap to pin.
 """
 
 import importlib.util
@@ -36,8 +38,8 @@ DOWN_REVISION = "20260924_hide_google_drive_until_picker"
 TABLE = "tasks"
 INDEX = "ix_tasks_retention_scan"
 
-#: The shape the first version of this migration shipped, which an early
-#: adopter's database may still hold under the same name.
+#: The shape an earlier draft of this migration built. Used to exercise the
+#: replace path, not because an installation is expected to hold it.
 SUPERSEDED_INDEX_SQL = (
     f"CREATE INDEX {INDEX} ON {TABLE} (status, last_activity_at, lease_expires_at)"
 )
@@ -232,7 +234,7 @@ def test_online_downgrade_drops_the_index() -> None:
 def test_postgresql_offline_puts_concurrent_ddl_outside_the_transaction(
     operation: str,
 ) -> None:
-    """The defect the first version of this migration shipped.
+    """The defect an earlier draft of this migration shipped.
 
     Rendered inside ``BEGIN``/``COMMIT``, PostgreSQL rejects the statement
     outright -- and because the rejection happens inside the transaction, the
@@ -369,3 +371,151 @@ def test_postgresql_online_upgrade_replaces_a_valid_wrong_shaped_index(
         migration.upgrade()
 
     assert calls == ["drop", "create"]
+
+
+# ---------------------------------------------------------------------------
+# Against a real PostgreSQL. Everything above either mocks the reflection or
+# runs on SQLite, which cannot reflect an expression index at all -- so the
+# comparison that decides between "leave alone" and "rebuild", and the
+# question of whether the planner uses this index, are only answerable here.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def postgres_engine():
+    from tests.shared.postgres_disposable import disposable_database_factory
+
+    with disposable_database_factory("retention_scan_index") as make:
+        yield make("index")
+
+
+def _apply_migration(engine, migration, operation: str = "upgrade") -> list[str]:
+    """Run one direction against a live database, returning the DDL it issued.
+
+    Statements are captured rather than inferred, because the property under
+    test is "the second run issues none" -- which no amount of reading the
+    final schema can distinguish from "it rebuilt the same thing".
+    """
+    issued: list[str] = []
+
+    @sa.event.listens_for(engine, "before_cursor_execute")
+    def record(_conn, _cursor, statement, _params, _context, _executemany):
+        if statement.strip().upper().startswith(("CREATE INDEX", "DROP INDEX")):
+            issued.append(" ".join(statement.split()))
+
+    try:
+        with engine.connect() as connection:
+            operations = Operations(MigrationContext.configure(connection))
+            with Operations.context(operations.get_context()):
+                getattr(migration, operation)()
+            connection.commit()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    return issued
+
+
+@pytest.mark.postgresql
+def test_postgresql_upgrade_is_idempotent_against_a_real_catalog(
+    postgres_engine,
+) -> None:
+    """The reflection and normalisation path, unmocked.
+
+    The three mocked tests above pin the decision *given* a definition; this
+    pins the definition itself. A mismatch between what `get_indexes` reports
+    and what `EXPECTED_DEFINITION` spells -- a different quoting, a case
+    difference, an extra space -- would make every run rebuild the index
+    concurrently, or never replace a wrong one, and no mocked test could tell.
+    """
+    from xagent.web.models.database import Base
+
+    migration = _load_migration_module()
+    Base.metadata.drop_all(postgres_engine)
+    Base.metadata.create_all(postgres_engine)
+    with postgres_engine.connect() as connection:
+        connection.execute(sa.text(f"DROP INDEX IF EXISTS {INDEX}"))
+        connection.commit()
+
+    first = _apply_migration(postgres_engine, migration)
+    second = _apply_migration(postgres_engine, migration)
+
+    assert any("CREATE INDEX" in statement for statement in first), first
+    assert second == [], (
+        "the second upgrade issued DDL, so the reflected definition does not "
+        f"match EXPECTED_DEFINITION: {second}"
+    )
+
+
+@pytest.mark.postgresql
+def test_the_purge_scan_uses_this_index(postgres_engine) -> None:
+    """The question this index exists to answer, asked of the planner.
+
+    Everything else about the shape was derived from the predicate. Whether
+    PostgreSQL actually prefers it over the primary key is not derivable --
+    the scan also carries ``id > :cursor`` and ``ORDER BY id``, which the PK
+    alone can satisfy. If this fails, the index is not earning the non-HOT
+    anchor updates it costs and should be dropped rather than kept.
+
+    The query is captured from ``select_purge_candidates`` rather than
+    rewritten here, so what is explained is what the purge runs.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from xagent.web.models.database import Base
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+    from xagent.web.services.task_retention_purge import select_purge_candidates
+
+    now = datetime.now(timezone.utc)
+    Base.metadata.drop_all(postgres_engine)
+    # ``create_all`` builds the index from the model declaration, which is the
+    # shape a fresh install gets -- so this also checks that the declaration
+    # and the migration describe the same thing well enough to be planned on.
+    Base.metadata.create_all(postgres_engine)
+
+    # Enough rows, and enough of them ineligible, that a sequential scan is
+    # not simply the cheaper plan. A planner choice on ten rows says nothing.
+    with sa.orm.Session(postgres_engine) as db:
+        user = User(username="scan-plan", password_hash="unused")
+        db.add(user)
+        db.flush()
+        db.add_all(
+            Task(
+                user_id=int(user.id),
+                title=f"task-{index}",
+                status=TaskStatus.COMPLETED if index % 2 else TaskStatus.RUNNING,
+                last_activity_at=now - timedelta(days=400 if index % 4 == 1 else 1),
+            )
+            for index in range(5000)
+        )
+        db.commit()
+    with postgres_engine.connect() as connection:
+        connection.execute(sa.text("ANALYZE tasks"))
+        connection.commit()
+
+    captured: list[tuple[str, object]] = []
+
+    @sa.event.listens_for(postgres_engine, "before_cursor_execute")
+    def record(_conn, _cursor, statement, params, _context, _executemany):
+        if "FROM tasks" in statement and "LIMIT" in statement.upper():
+            captured.append((statement, params))
+
+    try:
+        with sa.orm.Session(postgres_engine) as db:
+            select_purge_candidates(
+                db, now=now, conversation_days=365, trace_days=90, limit=100
+            )
+    finally:
+        sa.event.remove(postgres_engine, "before_cursor_execute", record)
+
+    assert captured, "the scan query was not captured"
+    statement, params = captured[-1]
+    with postgres_engine.connect() as connection:
+        plan = "\n".join(
+            row[0]
+            for row in connection.execute(sa.text(f"EXPLAIN {statement}"), params)
+        )
+
+    assert INDEX in plan, (
+        "the planner did not choose ix_tasks_retention_scan for the purge's "
+        "candidate scan, so the index is not earning its write cost:\n" + plan
+    )

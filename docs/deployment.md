@@ -438,6 +438,16 @@ The index the retention purge's candidate scan reads. Added separately from the 
 
 Migration `20260923_task_retention_scan_index` adds `ix_tasks_retention_scan` on `tasks (status, coalesce(last_activity_at, created_at))`. The second element is an expression, not a column: the purge filters `COALESCE(last_activity_at, created_at)` because the anchor column is nullable, and a plain btree on the raw column cannot range-bound that.
 
+### The write cost this adds
+
+Before this index, no index on `tasks` referenced `last_activity_at`. That column is updated once per persisted chat message, and those UPDATEs were therefore HOT-eligible — the new row version needed no index entry at all.
+
+They are not any more. Every anchor update now maintains **every** index on `tasks`, and leaves a dead tuple for the page-level cleanup to reclaim. On a deployment with a busy conversation load this is the index's real cost, and it is paid whether or not the planner ever chooses it for the purge's scan.
+
+Watch `n_dead_tup` and `n_tup_upd` on `tasks` after this migration, not only while a retention backlog drains. If the ratio worsens noticeably and the retention job is not yet enabled, this index is pure cost and can be dropped by downgrading the migration; nothing else reads it.
+
+CI asserts the planner does choose it (`test_the_purge_scan_uses_this_index`), which is what makes the trade defensible rather than assumed.
+
 Nothing else here is active by default. The purge job starts only when a retention period is configured, and no deployment configures one yet.
 
 On PostgreSQL the index is built with `CREATE INDEX CONCURRENTLY`, inside an Alembic `autocommit_block` — including in offline (`--sql`) rendering, where the statement is emitted between a `COMMIT` and a `BEGIN` so it lands outside the migration's transaction. The build does not block reads or writes on `tasks`, but it takes two passes over the table and can run for minutes on a large one. Other dialects get an ordinary index and no `CONCURRENTLY` keyword.
@@ -446,7 +456,7 @@ On PostgreSQL the index is built with `CREATE INDEX CONCURRENTLY`, inside an Ale
 
 A `CREATE INDEX CONCURRENTLY` that does not finish — cancelled session, deadlock, crashed backend — leaves an **invalid** index behind rather than nothing. PostgreSQL will not use it, and `CREATE INDEX ... IF NOT EXISTS` will not replace it, so an unattended retry would skip it forever and the purge would seq-scan `tasks` on every sweep.
 
-The migration handles this: it reads `pg_index.indisvalid` through `to_regclass` (so the lookup resolves by `search_path`, exactly as the DDL that created the index did) and drops an invalid leftover concurrently before rebuilding. Re-running `alembic upgrade head` after a failed build is therefore the correct recovery, and is safe. It also replaces a *valid* index of the same name whose definition does not match — which is what an installation that ran this revision's first version holds.
+The migration handles this: it reads `pg_index.indisvalid` through `to_regclass` (so the lookup resolves by `search_path`, exactly as the DDL that created the index did) and drops an invalid leftover concurrently before rebuilding. Re-running `alembic upgrade head` after a failed build is therefore the correct recovery, and is safe. It also replaces a *valid* index of this name whose definition does not match, which is defensive rather than expected: an index of this name can only come from this revision, and a database that ran an earlier form of it is already stamped here, so `upgrade()` would not run again.
 
 To check by hand:
 
