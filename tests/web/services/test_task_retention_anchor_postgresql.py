@@ -26,13 +26,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services.task_retention import (
     RetentionDisposition,
@@ -41,6 +41,7 @@ from xagent.web.services.task_retention import (
 from xagent.web.services.task_retention_purge import (
     RetentionPurgeAction,
     purge_task,
+    select_purge_candidates,
 )
 
 pytestmark = pytest.mark.postgresql
@@ -185,7 +186,7 @@ def test_the_assessment_lock_blocks_an_unanchored_message_insert(sessions) -> No
         )
 
         old_writer.execute(sa.text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
-        with pytest.raises((OperationalError, DBAPIError)) as excinfo:
+        with pytest.raises(DBAPIError) as excinfo:
             _insert_unanchored_message(
                 old_writer,
                 task_id=task_id,
@@ -195,3 +196,113 @@ def test_the_assessment_lock_blocks_an_unanchored_message_insert(sessions) -> No
         assert "lock timeout" in str(excinfo.value).lower()
         old_writer.rollback()
         purger.rollback()
+
+
+def _message_count(sessions: sessionmaker[Session], task_id: int) -> int:
+    with sessions() as db:
+        return db.execute(
+            sa.select(sa.func.count())
+            .select_from(TaskChatMessage)
+            .where(TaskChatMessage.task_id == task_id)
+        ).scalar_one()
+
+
+def test_an_unanchored_message_in_flight_makes_the_purge_skip_the_task(
+    sessions,
+) -> None:
+    """The other ordering: the insert is open when the purge tries to lock.
+
+    The insert's foreign-key check already holds ``FOR KEY SHARE`` on the task
+    row, so the assessment's ``FOR UPDATE SKIP LOCKED`` is not granted and the
+    task reads back as busy. The purge must neither wait on the writer nor
+    delete a conversation from a snapshot that cannot see its newest message.
+    """
+    task_id, user_id = _seed_backfilled_task(sessions)
+
+    with sessions() as old_writer, sessions() as purger:
+        _insert_unanchored_message(
+            old_writer,
+            task_id=task_id,
+            user_id=user_id,
+            created_at=NOW - timedelta(days=1),
+        )  # flushed, not committed
+
+        action = purge_task(
+            purger,
+            task_id,
+            now=NOW,
+            conversation_days=CONVERSATION_DAYS,
+            trace_days=TRACE_DAYS,
+        )
+        assert action is RetentionPurgeAction.SKIPPED_BUSY
+
+        old_writer.commit()
+
+    assert _message_count(sessions, task_id) == 2
+
+
+def test_a_drifted_task_keeps_its_conversation_across_sweeps(sessions) -> None:
+    """The downgrade end to end, and what every later sweep does with it.
+
+    By the stored anchor the task is 400 days old, so the scan admits it for
+    conversation expiry. By its newest message it is 200 days old, which only
+    the trace period has passed. The first sweep removes the trace and keeps
+    the task; the stored anchor is not repaired, so later sweeps select it
+    again and find nothing left to delete.
+    """
+    task_id, user_id = _seed_backfilled_task(sessions)
+    with sessions() as db:
+        _insert_unanchored_message(
+            db,
+            task_id=task_id,
+            user_id=user_id,
+            created_at=NOW - timedelta(days=200),
+        )
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id=f"evt-{task_id}",
+                event_type="agent_execution_checkpoint",
+                timestamp=NOW - timedelta(days=200),
+                data={},
+            )
+        )
+        db.commit()
+
+    actions = []
+    for _sweep in range(2):
+        with sessions() as db:
+            candidates = select_purge_candidates(
+                db,
+                now=NOW,
+                conversation_days=CONVERSATION_DAYS,
+                trace_days=TRACE_DAYS,
+                limit=10,
+            )
+        assert task_id in candidates
+        with sessions() as db:
+            actions.append(
+                purge_task(
+                    db,
+                    task_id,
+                    now=NOW,
+                    conversation_days=CONVERSATION_DAYS,
+                    trace_days=TRACE_DAYS,
+                )
+            )
+
+    assert actions == [
+        RetentionPurgeAction.PURGED_TRACES,
+        RetentionPurgeAction.NOTHING_TO_PURGE,
+    ]
+    assert _message_count(sessions, task_id) == 2
+    with sessions() as db:
+        assert db.get(Task, task_id) is not None
+        assert (
+            db.execute(
+                sa.select(sa.func.count())
+                .select_from(TraceEvent)
+                .where(TraceEvent.task_id == task_id)
+            ).scalar_one()
+            == 0
+        )
