@@ -36,9 +36,10 @@ from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
     _build_ingest_backup_path,
-    _compensate_new_web_ingest_files,
     _copy_upload_file_to_path,
+    _create_document_compensation,
     _create_file_compensation_restore,
+    _create_status_compensation,
     _create_web_uploaded_file_record,
     _delete_web_rag_side_effects_for_file_id,
     _get_file_sha256,
@@ -72,8 +73,8 @@ def run_web_file_rollback(
 ):
     """Roll back a file_handler result the way ``web_ingestion`` does.
 
-    Enters at ``_run_file_handler_compensation`` so the per-boundary vs legacy
-    routing is exercised too. ``page_operation`` is None, which is the
+    Enters at ``_run_file_handler_compensation`` so the routing into per-boundary
+    compensation is exercised too. ``page_operation`` is None, which is the
     degenerate branch, not the typical one: the ingest-web route opens an
     operation, so `web_page_operation` normally yields a real ``KBOperation``
     and the coordinator takes its saga path (covered by the coordinator's own
@@ -2225,53 +2226,6 @@ class TestWebFileRefreshHelpers:
 
         assert processed_urls["hash-key"] == "new-file-id"
 
-    def test_compensate_new_web_ingest_files_continues_after_commit_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        compensated_file_ids: list[str] = []
-
-        class _CleanupResult:
-            side_effects_may_remain = False
-            errors: tuple[str, ...] = ()
-
-        def fake_compensate(_db, *, file_id: str, user_id: int):
-            assert user_id == 1
-            compensated_file_ids.append(file_id)
-            return _CleanupResult()
-
-        class _DB:
-            def __init__(self) -> None:
-                self.commits = 0
-                self.rollbacks = 0
-
-            def commit(self) -> None:
-                self.commits += 1
-                if self.commits == 1:
-                    raise RuntimeError("commit unavailable")
-
-            def rollback(self) -> None:
-                self.rollbacks += 1
-
-        monkeypatch.setattr(
-            "xagent.web.api.kb._compensate_new_uploaded_file",
-            fake_compensate,
-        )
-        db = _DB()
-
-        cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
-            db,  # type: ignore[arg-type]
-            file_ids={"file-b", "file-a"},
-            user_id=1,
-        )
-
-        assert compensated_file_ids == ["file-a", "file-b"]
-        assert db.commits == 2
-        assert db.rollbacks == 1
-        assert cleanup_incomplete is True
-        assert cleanup_errors == [
-            "Database commit failed for file file-a: commit unavailable"
-        ]
-
     def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2485,3 +2439,108 @@ def test_reuse_handler_output_spares_the_persistent_file(tmp_path) -> None:
     # The facade is a mock, so the file is never actually unlinked here; the
     # registration call is what says whether the guard let the cleanup through.
     facade.record_web_page_file_side_effect.assert_not_called()
+
+
+def test_web_rollback_skips_status_clear_after_deleting_registered_doc() -> None:
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    result = IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        completed_steps=[
+            IngestionStepResult(name="register_document", metadata={"created": True})
+        ],
+        message="embedding failed",
+    )
+    with (
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        mock_delete_document.return_value = MagicMock(status="success")
+
+        _rollback_failed_web_document_ingestion(
+            collection_name="test_collection",
+            result=result,
+            user_id=1,
+            is_admin=False,
+            file_id="file-1",
+        )
+
+    mock_delete_document.assert_called_once_with("test_collection", "doc-1", 1, False)
+    mock_clear_status.assert_not_called()
+
+
+def test_web_document_rollback_keeps_its_failure_label() -> None:
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    result = IngestionResult(
+        status="partial",
+        doc_id="d",
+        completed_steps=[
+            IngestionStepResult(name="register_document", metadata={"created": True})
+        ],
+        message="partial failure",
+    )
+    with patch("xagent.web.api.kb.delete_document") as mock_delete_document:
+        mock_delete_document.return_value = MagicMock(status="error", message="boom")
+
+        with pytest.raises(RuntimeError) as info:
+            _rollback_failed_web_document_ingestion(
+                collection_name="coll",
+                result=result,
+                user_id=7,
+                is_admin=False,
+            )
+
+    assert str(info.value) == "delete document 'd' during web rollback failed: boom"
+
+
+def test_document_and_status_compensation_without_ingestion_result() -> None:
+    from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+        generate_deterministic_doc_id,
+    )
+
+    vector_store = MagicMock()
+    with (
+        patch(
+            "xagent.web.api.kb.get_session_local",
+            side_effect=RuntimeError("no DB session expected"),
+        ) as mock_session_local,
+        patch(
+            "xagent.web.api.kb._list_document_refs_for_uploaded_file",
+            return_value=[],
+        ),
+        patch("xagent.web.api.kb.get_vector_index_store", return_value=vector_store),
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        _create_document_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+            file_record_id="file-1",
+        )(None)()
+        doc_id = generate_deterministic_doc_id("test_collection", "file-1")
+        vector_store.delete_document_data.assert_called_once_with(
+            collection_name="test_collection",
+            doc_id=doc_id,
+            user_id=1,
+            is_admin=False,
+        )
+        mock_clear_status.assert_called_once_with(
+            "test_collection", doc_id, user_id=1, is_admin=False
+        )
+
+        _create_status_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+        )(None)()
+
+    mock_clear_status.assert_called_once()
+    mock_session_local.assert_not_called()

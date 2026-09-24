@@ -262,11 +262,146 @@ def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     return _truncation_marker_or_empty(value), True
 
 
+# Matches the spelling already used for the same "content was cut" signal
+# elsewhere in this connector (deputy.py's Deputy-error-detail truncation,
+# graphql_errors.py's truncate_error_text) rather than introducing a
+# second, differently-spelled marker for the same concept.
+_TRUNCATION_SUFFIX = "... [truncated]"
+
+
+def _envelope_with_critical(
+    critical: dict[str, Any], *, extra: dict[str, Any] | None = None
+) -> str:
+    return json.dumps(
+        {"status": "success", **(extra or {}), **critical, "truncated": True},
+        ensure_ascii=False,
+    )
+
+
+def _fit_critical_fields(
+    critical: dict[str, Any],
+    max_output_length: int,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Build the ``{"status": "success", **extra, **critical, "truncated":
+    true}`` envelope, shortening or dropping ``critical`` as needed until
+    the serialized result actually fits ``max_output_length`` -- the
+    guaranteed-fits counterpart to ``success_with_capped_dict``'s
+    last-resort call site, which needs critical_fields present but must
+    never hand back something this function can't promise is within
+    budget (see that call site for why).
+
+    ``extra`` carries the one piece of ``data`` this function otherwise
+    knows nothing about: the compact ``{field_name: {id_key: ...}}`` record
+    the caller had already isolated before falling back this far, kept
+    alongside ``critical`` rather than left behind -- shrinking or dropping
+    ``critical`` still leaves a record whose id can be looked up, which a
+    bare ``critical``-only envelope can't offer. ``extra`` itself is never
+    shrunk (an id is already about as small as a value gets); if ``critical``
+    fully dropped still doesn't leave room for it, ``extra`` is dropped too
+    rather than risk exceeding ``max_output_length``.
+
+    Even the bare ``{"status": "success", "truncated": true}`` skeleton
+    this function falls back to is not free -- ``max_output_length`` must
+    be at least its length (40 chars) for that fallback itself to fit.
+    This function has no floor of its own; it relies on its one caller
+    always passing ``max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())``
+    (``_MIN_OUTPUT_LENGTH`` is 64), never a raw, unclamped budget.
+
+    Two passes, each mirroring an existing pattern in this module rather
+    than inventing a new one:
+
+    1. Shrink the largest string value (by its own raw length, not a
+       json.dumps-serialized size -- unlike the drop pass below, this
+       doesn't need to account for quoting/escaping overhead since it's
+       choosing which value to shrink, not computing an exact byte
+       budget) toward ``_TRUNCATION_SUFFIX``. The target length for each
+       cut is derived from how much the *whole envelope* needs to shrink
+       by (not a fixed step), and is provably always smaller than the
+       field's current length whenever this loop body runs at all (the
+       loop only runs while the envelope is still oversized, so there's
+       always at least one byte of "how much shorter" to cut) -- so,
+       unlike a naive "replace with a fixed marker" approach, this can
+       never inflate a value that started out shorter than the marker
+       itself. A value that shrinks to "" is excluded from the next round
+       by the ``and value`` filter below, moving on to the next-largest
+       field.
+    2. If nothing is left to shrink (every string is now "", or
+       ``critical`` had no string to begin with -- nothing currently
+       passes a non-string critical field, but the type is
+       ``dict[str, Any]``, not ``dict[str, str]``, so nothing stops a
+       future caller from doing that) and the envelope is still oversized,
+       drop whole fields outright (largest serialized cost first) until it
+       fits. Losing a critical field entirely is a worse outcome than
+       shrinking it, but a response this function still can't guarantee
+       fits is worse still: a stdio MCP child's own budget is mirrored
+       into a *separate*, JSON-unaware truncation the parent applies to
+       this exact string (see ``success_with_capped_dict``), and that
+       blind slice corrupts an oversized response into invalid JSON rather
+       than merely truncating it.
+    """
+    working = dict(critical)
+    response = _envelope_with_critical(working, extra=extra)
+
+    while len(response) > max_output_length:
+        shrinkable = {
+            key: value
+            for key, value in working.items()
+            if isinstance(value, str) and value
+        }
+        if not shrinkable:
+            break
+        target_key = max(shrinkable, key=lambda key: len(shrinkable[key]))
+        current = shrinkable[target_key]
+        excess = len(response) - max_output_length
+        # How much shorter this value's raw content needs to be for the
+        # whole envelope to fit, with a small safety margin for
+        # JSON-escaping growth (e.g. a quote or backslash newly exposed at
+        # the cut point costs an extra backslash once re-escaped) -- an
+        # exact-excess target could otherwise still overshoot by a byte or
+        # two and force another round trip. Always strictly less than
+        # len(current) here (excess is at least 1 whenever this loop body
+        # runs), so this can never replace a value with something bigger.
+        target_len = max(0, len(current) - excess - 8)
+        if target_len >= len(_TRUNCATION_SUFFIX):
+            # Room for some real content plus the marker.
+            working[target_key] = (
+                current[: target_len - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+            )
+        else:
+            # Not even enough room left for the marker text -- keep
+            # whatever raw content still fits, unmarked (possibly ""). The
+            # envelope's own top-level "truncated" flag still signals that
+            # something, somewhere, was cut.
+            working[target_key] = current[:target_len]
+        response = _envelope_with_critical(working, extra=extra)
+
+    remaining = list(working.keys())
+    while len(response) > max_output_length and remaining:
+        drop_key = max(
+            remaining, key=lambda key: len(json.dumps(working[key], ensure_ascii=False))
+        )
+        del working[drop_key]
+        remaining.remove(drop_key)
+        response = _envelope_with_critical(working, extra=extra)
+    if len(response) > max_output_length:
+        if extra:
+            # `extra` (a bare id, typically a handful of bytes) doesn't fit
+            # even alongside every critical field fully dropped -- an
+            # extreme budget this function still must not exceed, so drop
+            # `extra` too rather than return something oversized.
+            return _fit_critical_fields(critical, max_output_length)
+        return json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
+    return response
+
+
 def success_with_capped_dict(
     field_name: str,
     data: Any,
     *,
     extra_fields: dict[str, Any] | None = None,
+    critical_fields: dict[str, Any] | None = None,
 ) -> str:
     """Build a ``{"status": "success", ...}`` payload, trimming a dict
     until it fits the platform's output limit.
@@ -317,26 +452,41 @@ def success_with_capped_dict(
     guarantee they won't be the ones to empty it needlessly.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
-    while trimming the dict, such as a calendar event's derived Meet link.
-    Reserved envelope keys cannot be overridden. If the payload is still too
-    large once ``data`` itself is fully truncated, the last resort walks a
-    ladder from most to least informative: the record's id (if it has one)
-    with the extras intact; then an empty record with the extras intact;
-    then the id with each extra field whose value is bigger than the
-    ``True`` placeholder degraded to ``True`` (largest first, same
-    size-gate as the field marker above); then the id alone; then an empty
-    record with those same degraded extras; and only then an empty record
-    with no extras at all. The id is given up for extras only while those
-    extras are intact: a real Meet link that fits beside an empty record
-    beats keeping only the id (that rung is what stops a long id from
-    crowding the link out entirely). Once the extras are degraded to an
-    uninformative ``True`` placeholder, though, the id is worth keeping
-    again over losing it for that placeholder: id-alone outranks a
-    degraded placeholder that dropped the id (an id you can look the
-    record up by beats a flag that says nothing). But the id still keeps
-    any degraded extra that fits beside it -- id with degraded extras
-    outranks id alone, since keeping both costs nothing once the id
-    already fits.
+    while trimming the dict, such as a calendar event's derived Meet link --
+    these can still be dropped by the last-resort fallback below if space
+    runs out. ``critical_fields`` are the same shape but survive even that
+    fallback, including every rung of the ladder described below: a signal
+    like "this create's record could not be confirmed" matters more than
+    the record data it's attached to, and silently dropping it under size
+    pressure would defeat the reason it exists. If the record data has
+    already been dropped entirely and critical_fields alone still don't
+    fit, their own string values get shortened (see ``_fit_critical_fields``)
+    rather than ever handing back a response wider than max_output_length --
+    that width is a real contract with the parent MCP process for a stdio
+    connector (see ``_apply_stdio_output_limit_env``), whose own blind,
+    JSON-unaware slice would otherwise cut an oversized response anywhere,
+    up to and including mid-string. Reserved envelope keys cannot be
+    overridden by either extra_fields or critical_fields, and the two must
+    not share a key.
+
+    If the payload is still too large once ``data`` itself is fully
+    truncated, the last resort walks a ladder from most to least
+    informative: the record's id (if it has one) with the extras intact;
+    then an empty record with the extras intact; then the id with each
+    extra field whose value is bigger than the ``True`` placeholder
+    degraded to ``True`` (largest first, same size-gate as the field
+    marker above); then the id alone; then an empty record with those same
+    degraded extras; and only then an empty record with no extras at all.
+    The id is given up for extras only while those extras are intact: a
+    real Meet link that fits beside an empty record beats keeping only the
+    id (that rung is what stops a long id from crowding the link out
+    entirely). Once the extras are degraded to an uninformative ``True``
+    placeholder, though, the id is worth keeping again over losing it for
+    that placeholder: id-alone outranks a degraded placeholder that
+    dropped the id (an id you can look the record up by beats a flag that
+    says nothing). But the id still keeps any degraded extra that fits
+    beside it -- id with degraded extras outranks id alone, since keeping
+    both costs nothing once the id already fits.
 
     With two or more ``extra_fields``, the degradation order (largest
     field first) is a fixed chain, not a search: it never tries "degrade
@@ -348,7 +498,9 @@ def success_with_capped_dict(
     only ever sets one ``extra_fields`` key at a time, so this doesn't
     arise in practice; a caller that starts passing several extras at
     once should be aware the ladder doesn't search for the best-fitting
-    combination, only degrades in size order.
+    combination, only degrades in size order. ``critical_fields`` never
+    enters this degradation ladder at all -- it's simply present in every
+    candidate the ladder produces, at full size, unconditionally.
     """
     if field_name in ("status", "truncated"):
         # Not just an extra_fields collision: `field_name: payload` would
@@ -361,11 +513,15 @@ def success_with_capped_dict(
             f"field_name must not be a reserved envelope key: {field_name!r}"
         )
     extras = extra_fields or {}
+    critical = critical_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
-    if reserved_fields.intersection(extras):
+    if reserved_fields.intersection(extras) or reserved_fields.intersection(critical):
         raise ValueError(
-            "extra_fields must not override status, the capped field, or truncated"
+            "extra_fields/critical_fields must not override status, the "
+            "capped field, or truncated"
         )
+    if set(extras) & set(critical):
+        raise ValueError("extra_fields and critical_fields must not share a key")
 
     max_output_length = max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())
 
@@ -380,6 +536,7 @@ def success_with_capped_dict(
                 "status": "success",
                 field_name: payload,
                 **(extras if extras_override is None else extras_override),
+                **critical,
                 "truncated": truncated,
             },
             ensure_ascii=False,
@@ -510,41 +667,57 @@ def success_with_capped_dict(
             degraded_extras[largest_key] = True
             extras_steps.append(dict(degraded_extras))
 
-        # Rungs, top to bottom: id + intact extras; empty record + intact
-        # extras; id + degraded extras; id alone; empty record + degraded
-        # extras; empty record alone. The id is given up for extras only
-        # while they are intact: a Meet link that fits beside {} beats
-        # keeping only the id (without that rung it vanished just because
-        # it didn't fit beside the id). Once the extras are degraded to a
-        # `True` placeholder, the id is worth keeping again over losing it
-        # for that placeholder -- id-alone outranks a degraded placeholder
-        # that dropped the id -- but the id still keeps any degraded extra
-        # that fits beside it, since keeping both costs nothing once the
-        # id already fits.
+        # Rungs, top to bottom -- see this function's docstring ("the last
+        # resort walks a ladder...") for the order and its rationale. Built
+        # here as plain (record, extras) pairs, in rank order, so "rung N
+        # before rung N+1" is a property of this list's order rather than
+        # of the statements that build it; the pairs are then rendered via
+        # `_build` in one pass below.
         full_extras, degraded_steps = extras_steps[0], extras_steps[1:]
-        candidates = [_build(compact_data, True, extras_override=full_extras)]
+        rungs: list[tuple[dict[str, Any], dict[str, Any]]] = [
+            (compact_data, full_extras)
+        ]
         if compact_data:
-            candidates.append(_build({}, True, extras_override=full_extras))
-        candidates.extend(
-            _build(compact_data, True, extras_override=step) for step in degraded_steps
-        )
-        candidates.append(_build(compact_data, True, extras_override={}))
+            rungs.append(({}, full_extras))
+        rungs.extend((compact_data, step) for step in degraded_steps)
+        rungs.append((compact_data, {}))
         if compact_data:
-            candidates.extend(
-                _build({}, True, extras_override=step) for step in degraded_steps
-            )
-        candidates.extend(
-            (
-                _build({}, True, extras_override={}),
-                json.dumps(
-                    {"status": "success", "truncated": True}, ensure_ascii=False
-                ),
-            )
-        )
+            rungs.extend(({}, step) for step in degraded_steps)
+        rungs.append(({}, {}))
+
+        candidates = [
+            _build(record, True, extras_override=step_extras)
+            for record, step_extras in rungs
+        ]
+        candidates.append(_envelope_with_critical(critical))
         for candidate in candidates:
             if len(candidate) <= max_output_length:
                 return candidate
-        return json.dumps({"status": "success"}, ensure_ascii=False)
+        # Even this absolute last resort keeps critical_fields -- dropping
+        # them here would mean the one guarantee this parameter exists to
+        # make ("this signal is never silently lost to truncation") holds
+        # everywhere except the single case it matters most: when nothing
+        # else fit at all. But the result must still fit max_output_length,
+        # not just be non-empty: a stdio MCP child's own budget is mirrored
+        # into a *separate*, JSON-unaware truncation the parent process
+        # applies to this exact string (OutputFilteredToolWrapper via
+        # _apply_stdio_output_limit_env's mirrored env var) -- an oversized
+        # response here would be blindly sliced mid-structure by that
+        # parent-side filter, producing invalid JSON instead of a
+        # valid-but-abbreviated one, right on the path meant to carry an
+        # "unconfirmed" safety signal. So once nothing else is left to
+        # drop, shorten critical_fields' own string values (longest first)
+        # until the envelope fits, rather than emitting something this
+        # function can't guarantee is parseable downstream. Still try to
+        # keep compact_data (the bare id) alongside the shrunk critical
+        # fields first -- every rung above already treated a bare id as
+        # worth keeping over a fuller payload, and this last resort
+        # shouldn't be the one place that guarantee quietly stops applying.
+        return _fit_critical_fields(
+            critical,
+            max_output_length,
+            extra={field_name: compact_data} if compact_data else None,
+        )
     return response
 
 
@@ -573,10 +746,37 @@ def normalize_addresses(addresses: list[str] | str) -> list[str]:
 def _halve_largest_list_fields_until_bounded(
     payload: dict[str, Any], field_names: tuple[str, ...], max_output_length: int
 ) -> str:
-    """Serialize ``payload``, halving its largest named list until bounded."""
+    """Serialize ``payload``, halving its largest named list until bounded.
+
+    Halving a list's element count works at any length above one, but
+    floor(1 / 2) is 0: unconditionally halving a single-item list the same
+    way would collapse a genuine last item (a real conflict, the one
+    remaining unchecked calendar) to ``[]`` in a single step, indistinguishable
+    from "none found" even though ``truncated`` is true. A field halved down
+    to its last item is floored to ``[]`` first instead -- never worse than
+    that old unconditional-halving behavior -- while other named fields
+    still have room to shrink. Only once nothing more can be squeezed out
+    of any field does a second pass spend whatever budget is left over
+    upgrading floored fields back to a one-item truncation marker (a dict
+    marker for a list of dicts like ``conflicts``, a sentinel string for a
+    list of strings like ``unchecked_attendees``, keeping the field a
+    well-formed list of its own element type), in the order they floored,
+    checked against the actual rebuilt response each time -- so installing
+    a marker can never cost a still-shrinking sibling field the bytes it
+    needed.
+    """
     response = json.dumps(payload, ensure_ascii=False)
+    # Fields floored to [] (their last item dropped), in the order it
+    # happened, together with the marker that would replace that item --
+    # captured now since the item itself is gone once the field is [].
+    floored_fields: list[str] = []
+    floor_markers: dict[str, Any] = {}
     while len(response) > max_output_length:
-        populated_fields = [name for name in field_names if payload.get(name)]
+        populated_fields = [
+            name
+            for name in field_names
+            if name not in floored_fields and payload.get(name)
+        ]
         if not populated_fields:
             break
         field_name = max(
@@ -584,9 +784,25 @@ def _halve_largest_list_fields_until_bounded(
             key=lambda name: len(json.dumps(payload[name], ensure_ascii=False)),
         )
         values = payload[field_name]
-        payload[field_name] = values[: len(values) // 2]
+        if len(values) > 1:
+            payload[field_name] = values[: len(values) // 2]
+        else:
+            sample = values[0]
+            floor_markers[field_name] = (
+                {"truncated": True} if isinstance(sample, dict) else "<truncated>"
+            )
+            payload[field_name] = []
+            floored_fields.append(field_name)
         payload["truncated"] = True
         response = json.dumps(payload, ensure_ascii=False)
+
+    for field_name in floored_fields:
+        payload[field_name] = [floor_markers[field_name]]
+        upgraded_response = json.dumps(payload, ensure_ascii=False)
+        if len(upgraded_response) <= max_output_length:
+            response = upgraded_response
+        else:
+            payload[field_name] = []
     return response
 
 
@@ -627,10 +843,15 @@ def conflict_response(
     single real conflict isn't fully dropped just to make room for a
     still-oversized `unchecked_attendees` list (unconditionally halving
     `conflicts` first would zero out a 1-item list in a single step,
-    regardless of whether that was actually necessary). If the fixed
-    envelope itself is too large, the response falls back to a compact,
-    valid JSON object instead of relying on the framework to truncate the
-    serialized JSON at an arbitrary character boundary.
+    regardless of whether that was actually necessary). A field halved
+    down to its last item is replaced with a one-item truncation marker
+    rather than emptied to `[]`, budget permitting (see
+    `_halve_largest_list_fields_until_bounded`), so a caller can tell "the
+    last conflict/unchecked calendar was truncated away" apart from "none
+    found". If the fixed envelope itself is too large, the response falls
+    back to a compact, valid JSON object instead of relying on the
+    framework to truncate the serialized JSON at an arbitrary character
+    boundary.
     """
     payload: dict[str, Any] = {
         "status": "conflict",

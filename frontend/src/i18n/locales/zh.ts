@@ -20,6 +20,7 @@ const zh = {
     authenticationRequired: "需要登录后才能发送此消息。",
     taskAccessDenied: "你无权访问此任务。",
     invalidMessage: "消息格式无效。",
+    messageOutcomeUnknown: "该消息是否已成功发送尚不确定，请先查看对话内容后再决定是否重新发送。",
     uploadTooLarge: "文件过大，请减小上传大小后重试。",
     uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
     uploadFailed: "上传失败，请重试。",
@@ -2846,6 +2847,7 @@ const zh = {
         placeholder: "选择工具类别",
         noData: "暂无可用工具",
         selectedCount: "已选择 {count} 个类别（共 {tools} 个工具）",
+        alwaysAvailable: "Agent 还可能用到这些内置工具：{tools}",
         selectAll: "全选",
         categories: {
           basic: "基础工具",
@@ -2866,7 +2868,7 @@ const zh = {
           ssh: "SSH",
         },
         categoryDescriptions: {
-          basic: "系统基础能力，包括数学计算、日期时间获取等核心功能。",
+          basic: "系统基础能力：执行 Python/JavaScript 代码和命令行命令、调用 HTTP API、翻译 JSON 字段。",
           webSearch: "网页搜索与网页内容抓取，用于查找资料并按需读取网页正文。",
           file: "文件系统操作，支持文件的读写、搜索、列表和管理。",
           vision: "计算机视觉能力，支持图像识别、分析和内容提取。",
@@ -3662,6 +3664,7 @@ const zh = {
     workerFailed: "Worker 执行失败",
     unknownWorker: "未知 Worker",
     viewAgentExecution: "查看 Agent 详情",
+    connectorUnavailable: "连接器 {connector} 不可用",
     toolNames: {
       web_search: "正在搜索网络",
       tavily_web_search: "正在搜索网络",

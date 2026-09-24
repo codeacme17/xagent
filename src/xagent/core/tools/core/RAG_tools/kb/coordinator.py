@@ -51,9 +51,9 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
     KBVectorStorageCleanupResult,
-    RollbackFailedCloudIngestionRequest,
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
+    RollbackFailedUploadIngestionRequest,
 )
 from .operation_compatibility import (
     KBOperationCompatibilityFacade,
@@ -2133,22 +2133,16 @@ class KBCoordinator:
             return self._rollback_boundaries_with_operation(request)
         return self._rollback_boundaries_callbacks_only(request)
 
-    async def rollback_failed_ingestion(
-        self, request: RollbackFailedIngestionRequest
+    async def rollback_failed_upload_ingestion(
+        self, request: RollbackFailedUploadIngestionRequest
     ) -> RollbackFailedIngestionResult:
-        """Async twin (coordinator convention; first awaited in #795)."""
-        return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
-
-    async def rollback_failed_cloud_ingestion(
-        self, request: RollbackFailedCloudIngestionRequest
-    ) -> RollbackFailedIngestionResult:
-        """Run cloud failed-ingest compensation DOCUMENT->FILE->COLLECTION.
+        """Run direct-upload failed-ingest compensation DOCUMENT->FILE->COLLECTION.
 
         Stops at the first failing callback and returns its exception in
         ``result.error``; never raises for a failing callback.
         """
-        # Not to_thread: callbacks use the caller's Session (not thread-safe;
-        # shared by gather siblings in /ingest-cloud).
+        # Not to_thread: callbacks use the caller's Session, which is not
+        # thread-safe (/ingest-cloud also shares it across gather siblings).
         attempted = False
         for boundary, callback in (
             ("DOCUMENT", request.document_compensation),

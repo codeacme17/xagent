@@ -47,11 +47,13 @@ from .connector_runtime import (
     RUNTIME_INPUT_CONTEXT,
     TARGET_MCP_META,
     TARGET_TOOL_ARGUMENTS,
+    ConnectorRef,
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .mcp_approval_gate import gate_mcp_tools
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
@@ -2169,6 +2171,9 @@ class _UnavailableMCPToolResult(BaseModel):
     reason: str | None = Field(
         default=None, description="Public-safe MCP unavailability reason"
     )
+    unavailable_server: str | None = Field(
+        default=None, description="Name of the unavailable MCP server"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -2183,13 +2188,13 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     The tool exists to explain an outage, so it always reports that outage to
     whoever invokes it: it carries no allow-list and performs no caller check.
-    Its result holds only a constant message plus a ``reason`` and a
-    ``failure_code``. ``failure_code`` is normalized against the public failure
-    allowlist here and dropped when it is not on it; ``reason`` is stored as
-    given, so an allowlisted value is a guarantee callers make, enforced where
-    the unavailable config is built. The server name it is built from is
-    already exposed in the tool listing, so there is nothing here to withhold
-    from a caller.
+    Its result holds only a constant message, the ``unavailable_server`` name,
+    a ``reason`` and a ``failure_code``. ``failure_code`` is normalized against
+    the public failure allowlist here and dropped when it is not on it;
+    ``reason`` is stored as given, so an allowlisted value is a guarantee
+    callers make, enforced where the unavailable config is built.
+    ``unavailable_server`` is the raw configured name, shown to anyone who can
+    see the trace, including anonymous share viewers (#1041).
     """
 
     read_only = True
@@ -2266,6 +2271,8 @@ class UnavailableMCPTool(AbstractBaseTool):
             result["reason"] = self._reason
         if self._failure_code is not None:
             result["failure_code"] = self._failure_code
+        # Output filtering truncates keys in insertion order; keep this after reason.
+        result["unavailable_server"] = self._server_name
         return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -2688,6 +2695,7 @@ async def _load_server_tools_bounded(
 async def load_mcp_tools_as_agent_tools(
     connection_map: Dict[str, Connection],
     *,
+    connector_refs: Mapping[str, ConnectorRef] | None = None,
     name_prefix: str = "mcp_",
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
@@ -2697,6 +2705,9 @@ async def load_mcp_tools_as_agent_tools(
 
     Args:
         connection_map: Map of server names to connection configurations
+        connector_refs: Trusted persisted connector identities keyed by server
+            name. These stay outside transport mappings so sandbox guests never
+            receive host authorization identity.
         name_prefix: Prefix for tool names (default: "mcp_")
         visibility: Tool visibility setting
         allow_users: List of allowed user IDs
@@ -2824,7 +2835,15 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # Both direct adapters and sandbox wrappers reach this host-side
+            # boundary before any connector dispatch.
+            agent_tools.extend(
+                gate_mcp_tools(
+                    server_tools,
+                    connection=connection,
+                    connector_ref=(connector_refs or {}).get(server_name),
+                )
+            )
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")
