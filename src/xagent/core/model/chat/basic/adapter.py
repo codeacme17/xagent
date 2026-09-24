@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Optional
+from typing import Callable, Optional, overload
 
 from ....model import ChatModelConfig, ModelConfig
 from ....retry import chat_retry_budget, create_retry_wrapper
@@ -23,6 +23,16 @@ from .openrouter import OpenRouterLLM
 from .router import RouterLLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
+
+
+@overload
+def attach_chat_retry_wrapper(
+    llm: BaseLLM, max_retries: Optional[int] = ...
+) -> BaseLLM: ...
+
+
+@overload
+def attach_chat_retry_wrapper(llm: None, max_retries: Optional[int] = ...) -> None: ...
 
 
 def attach_chat_retry_wrapper(
