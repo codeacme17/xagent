@@ -440,7 +440,12 @@ class TaskCoordinator:
                     )
                     if self.state != CoordinatorState.ACTIVE:
                         raise _CoordinatorClosed
-                if not self._children and self._execution_task is None:
+                # Control commands must not wait for admission cleanup's row lock.
+                if (
+                    command.kind.value in ("start", "resume", "resume_input", "message")
+                    and not self._children
+                    and self._execution_task is None
+                ):
                     await run_db_io_cancellation_safe(self._release_settled_admissions)
                 if not self._healthy:
                     from .task_command_transport import TaskCommandDeferred

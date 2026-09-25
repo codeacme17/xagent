@@ -38,7 +38,7 @@ async def host(engine, monkeypatch):
     monkeypatch.setattr(runtime, "_registry", registry)
     from xagent.web.models import database
 
-    monkeypatch.setattr(database, "_SessionLocal", sessions)
+    monkeypatch.setattr(database, "get_session_local", lambda: sessions)
     with sessions() as db:
         user = User(username="owner", password_hash="unused")
         db.add(user)

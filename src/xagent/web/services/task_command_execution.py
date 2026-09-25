@@ -70,6 +70,7 @@ from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
     UserMessageDeliveryClaim,
     claim_user_message_delivery_no_commit,
@@ -603,6 +604,7 @@ class _UserMessageDeliverySnapshot:
     payload_matches: bool
     failed: bool
     pending: bool
+    outcome_unknown: bool = False
 
 
 class _TaskCommandCommitOutcomeUnknown(RuntimeError):
@@ -617,6 +619,7 @@ def _snapshot_user_message_delivery(
         payload_matches=bool(claim.payload_matches),
         failed=bool(claim.failed),
         pending=bool(claim.pending),
+        outcome_unknown=bool(claim.outcome_unknown),
     )
 
 
@@ -832,6 +835,10 @@ class _TaskCommandRoutingSnapshot:
 
     task_id: int
     task_owner_user_id: int
+    # The task row's own ``source``. Server owned: it selects the MCP
+    # approval registration for every turn of this task, so it is read here
+    # from the row rather than accepted from the client's request context.
+    task_source: str | None
     status: TaskStatus
     control_state: str | None
     run_id: str | None
@@ -929,6 +936,7 @@ def _load_task_command_routing_snapshot(
         _TaskCommandRoutingSnapshot(
             task_id=int(task.id),
             task_owner_user_id=int(task.user_id),
+            task_source=str(task.source) if task.source is not None else None,
             status=status,
             control_state=_task_control_state_value(task),
             run_id=_task_run_id(task),
@@ -1340,7 +1348,11 @@ async def handle_task_message(
     suppress_delivery_ack = bool(message_data.get("_durable_ack_sent"))
     delivery_finished = False
     delivery_dispatched = False
+    # Confirmed injection only (POSTED_FRESH/POSTED_REPLAY): the turn is
+    # durably in the checkpoint, so a later failure must not mark it FAILED.
     delivery_injected = False
+    # Uncertainty must survive later error handling and same-ID retries.
+    delivery_outcome_unknown = False
     delivery_claimed = False
     delivery_failure_persist_attempted = False
     delivery_failure_pool_timeout = False
@@ -1393,12 +1405,18 @@ async def handle_task_message(
             # exception reaches another handler layer, that layer must not
             # issue the same write again against the exhausted pool.
             delivery_failure_persist_attempted = True
+            # Preserve uncertainty durably; neither failure nor success is proven.
+            failure_status = (
+                DELIVERY_OUTCOME_UNKNOWN
+                if delivery_outcome_unknown
+                else DELIVERY_FAILED
+            )
             try:
                 await run_db_io_cancellation_safe(
                     lambda: mark_user_message_delivery_sync(
                         task_id,
                         turn_id,
-                        DELIVERY_FAILED,
+                        failure_status,
                     )
                 )
             except Exception as delivery_error:
@@ -1414,6 +1432,13 @@ async def handle_task_message(
                 )
         if delivery_dispatched:
             await finish_delivery(True)
+        elif delivery_outcome_unknown:
+            await finish_delivery(
+                False,
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
+            )
         else:
             await finish_delivery(
                 False,
@@ -1498,6 +1523,13 @@ async def handle_task_message(
                 error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
+            )
+        elif claim.outcome_unknown:
+            await finish_delivery(
+                False,
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
             )
         elif claim.pending:
             await finish_delivery(
@@ -1857,6 +1889,18 @@ async def handle_task_message(
                                     ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
+                    if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+                        delivery_outcome_unknown = True
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        await finish_delivery_failure(
+                            client_error_message(
+                                ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                            ),
+                            error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                        )
+                        return
                     delivery_injected = bool(posted)
                     if not posted:
                         logger.warning(
@@ -1906,6 +1950,7 @@ async def handle_task_message(
                             # is what a resume wants: those pointers are the
                             # anchor it is resuming from.
                             expected_run_id=handoff_snapshot.run_id,
+                            trusted_task_source=routing.task_source,
                             previous_task=previous_task,
                             resolved_execution_scope=resolved_execution_scope,
                             pending_user_message=(
@@ -3259,6 +3304,7 @@ async def resume_task(
                         agent_service=agent_service,
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
+                        trusted_task_source=task_fields.source,
                         previous_task=previous_task,
                         # Not `resolved_execution_scope`: that value is the
                         # off-turn downgrade used above to obtain
@@ -3392,7 +3438,7 @@ def _load_command_actor(actor_user_id: int | None) -> _CommandActor:
 
 async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one DB-claimed command; personal replies use the host callback.
 
     A runner without an originating connection discards personal replies while
@@ -3438,6 +3484,14 @@ async def _execute_durable_task_command(
             lambda: _load_command_task_run_id(command.task_id)
         )
         if current_run_id != command.target_run_id:
+            if command.kind == TaskCommandKind.PAUSE:
+                from .task_execution_admission import settle_queued_start_for_pause
+
+                settled = await run_db_io_cancellation_safe(
+                    lambda: settle_queued_start_for_pause(command)
+                )
+                if settled is not None:
+                    return settled
             raise TaskCommandRejected(
                 f"Task run changed before {command.kind.value} command "
                 f"{command.command_id} was applied",
@@ -3499,6 +3553,38 @@ async def _execute_durable_task_command(
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
+        if delivery_status == DELIVERY_OUTCOME_UNKNOWN:
+            # The ingress ack only accepted the command into the inbox. Report
+            # the terminal delivery outcome before its personal route is retired.
+            await send_message_delivery(
+                reply,
+                client_message_id=command.command_id,
+                turn_id=command.command_id,
+                accepted=False,
+                message=client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
+            )
+            # Inbox acceptance has already resolved the browser's send promise.
+            # Its personal error channel still displays later delivery results.
+            await reply(
+                {
+                    "type": "error",
+                    "task_id": command.task_id,
+                    "client_message_id": command.command_id,
+                    "turn_id": command.command_id,
+                    "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                    "message": client_error_message(
+                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                    ),
+                }
+            )
+            return {
+                "task_id": command.task_id,
+                "command_id": command.command_id,
+                "kind": command.kind.value,
+                "delivery_outcome": DELIVERY_OUTCOME_UNKNOWN,
+            }
         if delivery_status == DELIVERY_FAILED:
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"
@@ -3828,7 +3914,7 @@ async def execute_durable_task_command(
 
 async def _execute_and_report_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one command and expose only terminal transport failures to clients."""
 
     try:

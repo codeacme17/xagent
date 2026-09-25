@@ -12,9 +12,9 @@ from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task_admission import TaskAdmissionBucket
 from xagent.web.models.task_admission_pacing import TaskAdmissionPacing
 
-
 engine = engine_fixture
 task_id = task_id_fixture
+
 
 def test_pacing_upgrade_and_downgrade_preserve_existing_bucket(engine, task_id):
     migration = load_migration_module(

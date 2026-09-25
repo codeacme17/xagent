@@ -14,6 +14,8 @@ reclassify it or consume another queue position. A classifier exception or
 `AdmissionQueueFull` must abort the caller's acceptance transaction. The host
 translates queue-full into its retryable public error. Local execution is not
 an admission topology: selecting a policy with shared execution disabled fails.
+Classifiers must be fast and free of external side effects: they run inside
+acceptance before the bucket-row write serializes acceptance, claim, and retry.
 
 ## Budget and ordering
 
@@ -37,6 +39,9 @@ Oldest waiting command ID wins within a bucket, including for prompt dispatch
 by ID. A busy earlier task or a business-retry deadline can therefore delay
 later work in that same bucket. Separate buckets remain independently eligible.
 The existing per-task ordering and command authorization still apply.
+Admission waiting has no automatic expiry. Waiting alone does not exhaust a
+retry budget; work leaves the queue through execution, terminal control/failure,
+or command/task deletion.
 
 Policy values are immutable for an existing bucket in this first foundation.
 Mismatched values fail acceptance rather than letting workers use conflicting
@@ -80,6 +85,14 @@ that old state and persist their terminal events before committing completion. A
 control does not discard queued work. Active execution cancellation retains its
 slot until its cleanup actually finishes.
 
+A PAUSE aimed at the future run of an unreserved START settles that exact START
+and the PAUSE atomically, before the START can schedule after capacity opens.
+It requires the live claim, current identities, unchanged run/version, and an
+unreserved ticket. The terminal START retains classification for explicit retry.
+A never-started task uses the existing non-resumable FAILED status with a
+user-stop reason; it has no execution checkpoint to resume as PAUSED. Stopping
+an appended turn preserves the previous run's status and answer.
+
 ## Matching and trust boundaries
 
 | Axis | Gate |
@@ -101,8 +114,12 @@ FIFO prompt dispatch, cancellation, continuation commands, cleanup, and owner
 recovery. Executors in these tests control completion timing; no live model is
 required. Existing start/resume/coordinator tests cover their execution wiring.
 
-Apply `20260923_task_admission` before enabling the host policy and run the same
-version on every executor. Old binaries do not enforce admission tickets;
+Upgrade to head (`20260925_merge_admission_pacing`) before enabling the host policy
+and run the same version on every executor. Resolve the known FIFO eligibility
+limits ([#2648](https://github.com/xorbitsai/xagent/issues/2648)) and recovered/
+attempted-command control classification
+([#2649](https://github.com/xorbitsai/xagent/issues/2649)) before activation.
+Old binaries do not enforce admission tickets;
 rolling activation with old executors is unsupported. Disable producers and
 drain admitted work before downgrade. The migration adds only admission tables
 and does not rewrite task or command state.

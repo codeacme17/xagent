@@ -85,11 +85,13 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
+from ....tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ...checkpoint import CheckpointPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -609,11 +611,21 @@ class ReActPattern(AgentPattern):
             ).to_dict()
 
         await runtime.on_pattern_start(context=context, pattern=self)
-        waiting_result = await self._resume_waiting_for_user_if_needed(
-            context=context,
-            runtime=runtime,
-            tools=tools,
-        )
+        try:
+            waiting_result = await self._resume_waiting_for_user_if_needed(
+                context=context,
+                runtime=runtime,
+                tools=tools,
+            )
+        except CheckpointPersistenceError as exc:
+            # This runs before the main try/except below, so without this
+            # handler a durability failure while checkpointing the received
+            # user response (see ``_resume_waiting_for_user_if_needed``'s
+            # ``"tool_interaction_response_received"`` checkpoint) would
+            # propagate straight past ``on_pattern_error``: no terminal
+            # ``trace_error`` would be recorded, even though the run aborts.
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
         if waiting_result is not None:
             await runtime.on_pattern_end(
                 context=context,
@@ -4854,12 +4866,23 @@ class ReActPattern(AgentPattern):
             # those at the top level, so drop them here — unconditionally,
             # not via the split helpers, whose scope validation could raise —
             # or they reach the model as noise nested inside the envelope.
+            # The spill report is one of them: add_tool_result registers it
+            # and keeps it out of the rendered body only at the top level,
+            # so nested here it would print its relative_path in the
+            # envelope's body with no notice. Dropping it loses nothing; the
+            # report was registered when the original call's result was
+            # added.
             prior_result = record.result
             if isinstance(prior_result, dict):
                 prior_result = {
                     key: value
                     for key, value in prior_result.items()
-                    if key not in (CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY)
+                    if key
+                    not in (
+                        CONTEXT_REFS_KEY,
+                        SUPERSEDES_SCOPE_KEY,
+                        SPILL_RESERVED_RESULT_KEY,
+                    )
                 }
             return build_suppression_envelope(
                 tool_name=tool_name,

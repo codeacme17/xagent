@@ -30,6 +30,7 @@ from ...config import (
     get_task_lease_ttl_seconds,
 )
 from ..models.task import Task, TaskStatus, task_status_predicate
+from ..models.task_admission import TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
@@ -43,7 +44,6 @@ from .task_admission_execution import (
     admission_execution,
     return_to_admission_queue,
 )
-from ..models.task_admission import TaskAdmissionTicket
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
     stage_terminal_event,
@@ -315,6 +315,40 @@ def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
         select(User.actor_subject).where(User.id == actor_user_id)
     ).scalar_one_or_none()
     return str(stored_subject) if stored_subject is not None else None
+
+
+def existing_task_command_payload_matches(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int | None,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> bool | None:
+    """Read an existing command's payload identity without staging any writes.
+
+    None means no command exists; False means its actor, kind or payload
+    conflicts. Missing actor identities are not created by this read path.
+    """
+    with db.no_autoflush:
+        existing = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == command_id,
+            )
+            .first()
+        )
+        if existing is None:
+            return None
+        return _matches_existing(
+            existing,
+            actor_user_id=actor_user_id,
+            actor_subject=_load_actor_subject(db, actor_user_id),
+            kind=kind,
+            payload=payload,
+        )
 
 
 def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
@@ -1542,12 +1576,17 @@ async def _dispatch_task_command(
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
-        with admission_execution(command.id, command.task_id, command.admission_required):
+        with admission_execution(
+            command.id, command.task_id, command.admission_required
+        ):
             result = await executor(command)
     except AdmissionWaiting:
         disposition_name = "return_to_admission_queue"
+
         def persist_admission_wait() -> bool:
-            return return_to_admission_queue(command.id, runner_id, command.attempt_count)
+            return return_to_admission_queue(
+                command.id, runner_id, command.attempt_count
+            )
 
         disposition_operation = persist_admission_wait
     except asyncio.CancelledError:

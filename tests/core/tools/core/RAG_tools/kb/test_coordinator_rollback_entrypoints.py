@@ -16,8 +16,8 @@ import pytest
 
 from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
 from xagent.core.tools.core.RAG_tools.kb.models import (
-    RollbackFailedCloudIngestionRequest,
     RollbackFailedIngestionRequest,
+    RollbackFailedUploadIngestionRequest,
 )
 from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
     KBOperation,
@@ -317,32 +317,19 @@ class TestCallbacksOnlyAsyncCompensationRejected:
         assert "DOCUMENT" in result.boundary_errors
 
 
-class TestAsyncTwin:
-    def test_async_form_offloads_to_sync(self) -> None:
-        coordinator = _make_coordinator()
-        order: list[str] = []
-        request = _make_request(_spy_callbacks(order), operation=None)
-
-        result = asyncio.run(coordinator.rollback_failed_ingestion(request))
-
-        assert order == ["document", "file", "status", "snapshot"]
-        assert result.status == "complete"
-        assert result.rollback_complete is True
-
-
-class TestCloudRollback:
-    """#795: the cloud entry awaits on the caller's loop and stops at the first failure."""
+class TestUploadRollback:
+    """#795: the upload entry awaits on the caller's loop and stops at the first failure."""
 
     @staticmethod
     def _request(
         order: list[str], *, file_raises: Optional[Exception] = None
-    ) -> RollbackFailedCloudIngestionRequest:
+    ) -> RollbackFailedUploadIngestionRequest:
         def _file() -> None:
             order.append("file")
             if file_raises is not None:
                 raise file_raises
 
-        return RollbackFailedCloudIngestionRequest(
+        return RollbackFailedUploadIngestionRequest(
             document_compensation=lambda: order.append("document"),
             file_compensation=_file,
             collection_compensation=lambda: order.append("collection"),
@@ -352,7 +339,7 @@ class TestCloudRollback:
         order: list[str] = []
 
         result = asyncio.run(
-            _make_coordinator().rollback_failed_cloud_ingestion(self._request(order))
+            _make_coordinator().rollback_failed_upload_ingestion(self._request(order))
         )
 
         assert order == ["document", "file", "collection"]
@@ -366,7 +353,7 @@ class TestCloudRollback:
         boom = ValueError("boom")
 
         result = asyncio.run(
-            _make_coordinator().rollback_failed_cloud_ingestion(
+            _make_coordinator().rollback_failed_upload_ingestion(
                 self._request(order, file_raises=boom)
             )
         )
@@ -388,12 +375,12 @@ class TestCloudRollback:
             await asyncio.sleep(0)
             order.append("collection")
 
-        request = RollbackFailedCloudIngestionRequest(
+        request = RollbackFailedUploadIngestionRequest(
             collection_compensation=_collection
         )
 
         result = asyncio.run(
-            _make_coordinator().rollback_failed_cloud_ingestion(request)
+            _make_coordinator().rollback_failed_upload_ingestion(request)
         )
 
         assert order == ["collection"]
@@ -401,18 +388,18 @@ class TestCloudRollback:
 
     def test_runs_callbacks_on_caller_thread(self) -> None:
         threads: list[int] = []
-        request = RollbackFailedCloudIngestionRequest(
+        request = RollbackFailedUploadIngestionRequest(
             document_compensation=lambda: threads.append(threading.get_ident())
         )
 
-        asyncio.run(_make_coordinator().rollback_failed_cloud_ingestion(request))
+        asyncio.run(_make_coordinator().rollback_failed_upload_ingestion(request))
 
         assert threads == [threading.get_ident()]
 
     def test_not_needed_without_callbacks(self) -> None:
         result = asyncio.run(
-            _make_coordinator().rollback_failed_cloud_ingestion(
-                RollbackFailedCloudIngestionRequest()
+            _make_coordinator().rollback_failed_upload_ingestion(
+                RollbackFailedUploadIngestionRequest()
             )
         )
 

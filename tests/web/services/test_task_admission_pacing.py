@@ -9,15 +9,16 @@ from sqlalchemy.engine import make_url
 
 from tests.web.services.test_task_execution_admission import (
     Execution,
-    enqueue,
     _dispatch_process,
 )
-from tests.web.services.test_task_execution_admission import host as host_fixture
 from tests.web.services.test_task_execution_admission import engine as engine_fixture
+from tests.web.services.test_task_execution_admission import (
+    enqueue,
+)
+from tests.web.services.test_task_execution_admission import host as host_fixture
+from xagent.web.services import task_admission_pacing as pacing
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_execution_admission as admission
-from xagent.web.services import task_admission_pacing as pacing
-
 
 host = host_fixture
 engine = engine_fixture
@@ -143,13 +144,17 @@ async def test_guidance_that_becomes_a_new_turn_waits_for_startup_allowance(
     host, monkeypatch
 ):
     from unittest.mock import AsyncMock
+
     from xagent.web.models.task_command import TaskExecutionCommand
-    from xagent.web.services.task_command_execution import execute_durable_task_command
     from xagent.web.services import task_command_execution
+    from xagent.web.services.task_command_execution import execute_durable_task_command
 
     now = [100.0]
     monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
     monkeypatch.setattr(task_command_execution, "publish_task_event", AsyncMock())
+    monkeypatch.setattr(
+        task_command_execution, "get_session_local", lambda: host.sessions
+    )
     admission.set_task_admission_hook(
         lambda db, command: admission.AdmissionPolicy(
             "guidance-race",
@@ -195,6 +200,7 @@ async def test_snapshot_distinguishes_pacing_from_capacity_and_bounds_scope(
     host, monkeypatch
 ):
     import pytest
+
     from xagent.web.services import task_admission_observation as observation
 
     monkeypatch.setattr(pacing, "database_time", lambda: literal(100.0))
@@ -235,6 +241,7 @@ async def test_metrics_count_committed_claims_and_refusals_without_tenant_labels
     import pytest
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
     from xagent.core.runtime_performance import RuntimePerformanceTelemetry
     from xagent.web.services import task_admission_observation as observation
 
@@ -262,6 +269,7 @@ async def test_metrics_count_committed_claims_and_refusals_without_tenant_labels
     event.listen(host.engine, "checkout", set_timezone)
     try:
         from datetime import timezone
+
         from xagent.web.models.task_command import TaskExecutionCommand
 
         accepted = enqueue(host)

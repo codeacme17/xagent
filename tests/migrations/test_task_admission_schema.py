@@ -36,6 +36,30 @@ def test_upgrade_preserves_tasks_and_matches_metadata_then_downgrades(engine, ta
             assert {c["name"]: c["nullable"] for c in actual} == {
                 c.name: c.nullable for c in expected
             }
+        inspector = sa.inspect(connection)
+        foreign_keys = inspector.get_foreign_keys("task_admission_tickets")
+        assert {
+            (
+                tuple(fk["constrained_columns"]),
+                fk["referred_table"],
+                tuple(fk["referred_columns"]),
+                fk["options"].get("ondelete"),
+            )
+            for fk in foreign_keys
+        } == {
+            (("command_id",), "task_execution_commands", ("id",), "CASCADE"),
+            (("task_id",), "tasks", ("id",), "CASCADE"),
+            (("bucket_key",), "task_admission_buckets", ("key",), None),
+        }
+        indexes = {
+            index["name"]: (tuple(index["column_names"]), bool(index["unique"]))
+            for index in inspector.get_indexes("task_admission_tickets")
+        }
+        assert indexes["ix_task_admission_bucket_command"] == (
+            ("bucket_key", "command_id"),
+            False,
+        )
+        assert indexes["ix_task_admission_tickets_task_id"] == (("task_id",), False)
         assert (
             connection.scalar(
                 sa.text("SELECT id FROM tasks WHERE id = :id"), {"id": task_id}

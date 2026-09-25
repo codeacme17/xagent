@@ -11,7 +11,7 @@ out that acquisition first.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session, aliased
@@ -22,17 +22,21 @@ from ...config import get_shared_task_execution_enabled
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
-from .task_coordinator_service import TaskLease
 from .task_admission_observation import record_queue_full
 from .task_admission_pacing import (
     StartupPacing,
+    reserve_startup,
     stage_startup_pacing,
     startup_eligible,
-    reserve_startup,
 )
+from .task_coordinator_service import TaskLease
 
-_EXECUTION_KINDS = {"start", "resume", "resume_input", "message"}
+if TYPE_CHECKING:
+    from .task_command_transport import ClaimedTaskCommand, SettledTaskCommand
+
+_EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
+_STOPPED_BEFORE_START = "Task stopped before execution started."
 
 
 @dataclass(frozen=True)
@@ -317,12 +321,161 @@ def waiting_admission(command_id: object) -> ColumnElement[bool]:
     )
 
 
+def settle_queued_start_for_pause(
+    command: ClaimedTaskCommand,
+) -> SettledTaskCommand | None:
+    """Atomically stop the exact unreserved START targeted by a claimed PAUSE.
+
+    The transaction proves the START, ticket, PAUSE claim, and live owner.
+    """
+    from ..models.database import get_session_local
+    from ..models.user import User
+    from .task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        stage_terminal_event,
+    )
+    from .task_command_transport import (
+        SettledTaskCommand,
+        command_identity_matches_task,
+        command_processing_predicates,
+        finish_task_command_no_commit,
+    )
+    from .task_coordinator_runtime import current_task_coordinator
+    from .task_start_consumer import settle_failed_start_no_commit
+    from .task_start_protocol import TaskStartPayload
+
+    if command.kind.value != "pause" or command.target_run_id is None:
+        return None
+    coordinator = current_task_coordinator(command.task_id)
+    lease = coordinator.lease if coordinator is not None else None
+    if lease is None or lease.task_id != command.task_id:
+        return None
+
+    with get_session_local()() as db, db.begin():
+        ownership = command_processing_predicates(
+            db,
+            command.id,
+            lease.runner_id,
+            expected_attempt_count=command.attempt_count,
+            require_live_claim=True,
+            owner_lease=lease,
+        )
+        pause = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                *ownership,
+                TaskExecutionCommand.task_id == command.task_id,
+                TaskExecutionCommand.actor_user_id == command.actor_user_id,
+                TaskExecutionCommand.command_id == command.command_id,
+                TaskExecutionCommand.kind == "pause",
+                TaskExecutionCommand.target_run_id == command.target_run_id,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        task = db.get(Task, command.task_id, populate_existing=True)
+        if task is None:
+            return None
+        if pause is None or not command_identity_matches_task(db, task, pause):
+            return None
+        actor = db.get(User, pause.actor_user_id)
+        if actor is None or not (actor.id == task.user_id or actor.is_admin):
+            return None
+        if (
+            pause.target_state_version != task.state_version
+            or task.run_id == command.target_run_id
+        ):
+            return None
+
+        candidates = (
+            db.query(TaskExecutionCommand, TaskAdmissionTicket)
+            .join(
+                TaskAdmissionTicket,
+                TaskAdmissionTicket.command_id == TaskExecutionCommand.id,
+            )
+            .filter(
+                TaskExecutionCommand.task_id == task.id,
+                TaskExecutionCommand.id < pause.id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status == "pending",
+                TaskExecutionCommand.target_run_id == command.target_run_id,
+                TaskExecutionCommand.target_state_version == task.state_version,
+                TaskAdmissionTicket.task_id == task.id,
+                TaskAdmissionTicket.runner_id.is_(None),
+                TaskAdmissionTicket.owner_attempt_id.is_(None),
+            )
+            .order_by(TaskExecutionCommand.id.desc())
+            .limit(2)
+            .with_for_update()
+            .all()
+        )
+        if len(candidates) != 1:
+            return None
+        start_row, _ticket = candidates[0]
+        if not command_identity_matches_task(db, task, start_row):
+            return None
+        try:
+            start = TaskStartPayload.model_validate(start_row.payload)
+        except ValueError:
+            return None
+        if (
+            start.run_id != command.target_run_id
+            or start.run_id != start_row.target_run_id
+            or start.turn_id != start_row.command_id
+            or start.expected_run_id != task.run_id
+            or start.state_version != task.state_version
+        ):
+            return None
+
+        cancelled = db.scalar(
+            update(TaskExecutionCommand)
+            .where(
+                TaskExecutionCommand.id == start_row.id,
+                TaskExecutionCommand.status == "pending",
+                waiting_admission(TaskExecutionCommand.id),
+            )
+            .values(
+                status="failed",
+                error=_STOPPED_BEFORE_START,
+                completed_at=func.now(),
+                result={"rejection_reason": "cancelled_before_admission"},
+            )
+            .returning(TaskExecutionCommand.id)
+        )
+        if cancelled is None:
+            return None
+        db.refresh(start_row)
+        settle_failed_start_no_commit(db, start_row)
+        stage_terminal_event(
+            db,
+            command_db_id=int(start_row.id),
+            draft=TerminalTaskEventDraft(message_code=None, resend_safe=False),
+        )
+        result = {
+            "task_id": command.task_id,
+            "command_id": command.command_id,
+            "kind": command.kind.value,
+        }
+        if not finish_task_command_no_commit(
+            db,
+            command.id,
+            lease.runner_id,
+            result=result,
+            expected_attempt_count=command.attempt_count,
+            require_live_claim=True,
+            owner_lease=lease,
+        ):
+            raise RuntimeError("PAUSE claim changed while settling queued START")
+        return SettledTaskCommand(result)
+
+
 def settle_cancelled_admissions(db: Session, command_id: int) -> None:
     """Settle unreserved completions and commands invalidated by a control."""
     from .task_command_terminal_events import (
         TerminalTaskEventDraft,
         stage_terminal_event,
     )
+    from .task_start_consumer import settle_failed_start_no_commit
 
     db.execute(
         delete(TaskAdmissionTicket).where(
@@ -347,6 +500,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .values(
             status="failed",
+            error="Task command stopped by a control request.",
             completed_at=func.now(),
             result={"rejection_reason": "cancelled_before_admission"},
         )
@@ -358,6 +512,8 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         scope = (
             command.payload.get("scope") if isinstance(command.payload, dict) else None
         )
+        if command.kind == "start":
+            settle_failed_start_no_commit(db, command)
         stage_terminal_event(
             db,
             command_db_id=cancelled_id,

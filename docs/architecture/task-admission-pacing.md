@@ -46,8 +46,9 @@ first-token latency is outside this contract. This is not the provider's
 Pacing values are explicit and positive; no numeric provider-safe default is
 inferred. To change an existing paced bucket, stop ingress, drain existing work,
 and update persisted policy and all host configuration together. Do not roll
-activation across old executors. Apply `20260923_admission_pacing` first; disable
-producers and drain before downgrade.
+activation across old executors. Upgrade to head
+(`20260925_merge_admission_pacing`) first; disable producers and drain before
+downgrade.
 
 ## Visibility and bounded attribution
 

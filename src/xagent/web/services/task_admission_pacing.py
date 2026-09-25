@@ -7,8 +7,8 @@ from typing import Any, Literal
 from sqlalchemy import Float, exists, select
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
-from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.compiler import SQLCompiler
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.functions import GenericFunction
 
 from ..models.task_admission import TaskAdmissionTicket

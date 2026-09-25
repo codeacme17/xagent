@@ -77,6 +77,7 @@ from ..services.assistant_question_replay import load_transcript_replay
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
 )
 from ..services.client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
@@ -123,6 +124,7 @@ from ..services.task_command_transport import (
     TaskCommandTaskMissing,
     dispatch_task_command_promptly,
     enqueue_task_command,
+    existing_task_command_payload_matches,
 )
 
 # The v1 SSE endpoint imports this shared predicate from this module.
@@ -1450,6 +1452,19 @@ async def handle_chat_message(
             rejection_outcome="not_accepted",
         )
         return
+    if enqueued.status == DELIVERY_OUTCOME_UNKNOWN:
+        await send_message_delivery(
+            websocket,
+            client_message_id=command_execution_service._client_message_id(
+                message_data.get("client_message_id")
+            ),
+            turn_id=enqueued.client_command_id,
+            accepted=False,
+            message=client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+            error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+            rejection_outcome="outcome_unknown",
+        )
+        return
     if enqueued.status == COMMAND_FAILED:
         await send_message_delivery(
             websocket,
@@ -1528,7 +1543,9 @@ def _enqueue_websocket_task_command_sync(
             existing_delivery = inspect_user_message_delivery(
                 db,
                 task_id,
-                str(payload.get("message") or ""),
+                command_execution_service._display_message_for_user(
+                    str(payload.get("message") or ""), bool(payload.get("files"))
+                ),
                 attachments=(
                     payload.get("files")
                     if isinstance(payload.get("files"), list)
@@ -1539,15 +1556,31 @@ def _enqueue_websocket_task_command_sync(
             if (
                 existing_delivery is not None
                 and not existing_delivery.pending
-                and not payload.get("files")
+                and (not payload.get("files") or existing_delivery.outcome_unknown)
             ):
+                payload_matches = existing_delivery.payload_matches
+                if existing_delivery.outcome_unknown:
+                    # Preparation can deduplicate or skip attachment IDs.
+                    # Compare with the original command when it still exists.
+                    original_matches = existing_task_command_payload_matches(
+                        db,
+                        task_id=task_id,
+                        command_id=command_id,
+                        actor_user_id=actor_user_id,
+                        kind=kind,
+                        payload=payload,
+                    )
+                    if original_matches is not None:
+                        payload_matches = original_matches
                 return EnqueuedTaskCommand(
                     command_id=0,
                     client_command_id=command_id,
                     created=False,
-                    payload_matches=existing_delivery.payload_matches,
+                    payload_matches=payload_matches,
                     status=(
-                        DELIVERY_FAILED
+                        DELIVERY_OUTCOME_UNKNOWN
+                        if existing_delivery.outcome_unknown
+                        else DELIVERY_FAILED
                         if existing_delivery.failed
                         else DELIVERY_COMPLETED
                     ),
@@ -2983,6 +3016,7 @@ async def handle_builder_chat(
     from ...core.agent.context.enrichment import build_skill_context
     from ...core.agent.service import AgentService
     from ...core.memory.in_memory import InMemoryMemoryStore
+    from ...core.tools.adapters.vibe.agent_tool import without_connector_categories
     from ...skills.utils import create_skill_manager
     from ..services.agent_prompt import apply_user_voice, voice_from_runtime_user
     from ..services.builder_chat_runtime import load_builder_chat_runtime_inputs
@@ -3030,7 +3064,9 @@ async def handle_builder_chat(
             "instructions": message_data.get("instructions", ""),
             "model": models.get("general"),
             "compact_model": models.get("compact"),
-            "tool_categories": message_data.get("tool_categories", []),
+            "tool_categories": without_connector_categories(
+                message_data.get("tool_categories", [])
+            ),
             "skills": message_data.get("selectedSkills", []),
             "knowledge_bases": message_data.get("selectedKbs", []),
             "execution_mode": message_data.get("executionMode", "balanced"),
