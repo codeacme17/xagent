@@ -24,6 +24,7 @@ from .task import DAGExecution, Task, TaskConnectorRuntimeContext
 from .task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from .task_admission_pacing import TaskAdmissionPacing
 from .task_channel_delivery import TaskChannelDelivery
+from .task_cleanup_obligation import TaskCleanupObligation
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_execution_event import TaskExecutionEvent
@@ -51,6 +52,7 @@ from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, Workf
 
 __all__ = [
     "TaskChannelDelivery",
+    "TaskCleanupObligation",
     "Base",
     "ActorOAuthFlowState",
     "ActorMCPServerConnection",
