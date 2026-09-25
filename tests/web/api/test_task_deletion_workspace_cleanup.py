@@ -244,6 +244,7 @@ async def test_user_delete_cleans_every_task_workspace(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert [workspace.exists() for workspace in workspaces] == [False] * 3
         assert db.query(User).filter(User.id == target_id).count() == 0
@@ -405,6 +406,7 @@ async def test_user_delete_reports_pending_when_a_workspace_cannot_be_removed(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": True,
+            "external_cleanup_pending": True,
         }
         assert db.query(User).filter(User.id == target_id).count() == 0
     finally:
@@ -495,6 +497,7 @@ async def test_user_delete_cleans_a_scoped_workspace(_workspace_root: Path) -> N
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert not workspace.exists()
     finally:
@@ -539,6 +542,7 @@ async def test_user_delete_reports_pending_when_a_capture_fails(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": True,
+            "external_cleanup_pending": True,
         }
         assert not workspace.exists()
         assert db.query(User).filter(User.id == target_id).count() == 0
