@@ -17,6 +17,9 @@ from ..models.task import Task
 from ..models.task_admission import TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 
+_GUIDANCE_RETRY_MAX_EXPONENT = 6
+_GUIDANCE_RETRY_MAX_SECONDS = 60
+
 
 class AdmissionWaiting(RuntimeError):
     """Guidance became a new execution and must pass admission again."""
@@ -88,6 +91,11 @@ def return_to_admission_queue(command_id: int, runner_id: str, attempt: int) -> 
     from ..models.database import get_session_local
     from .task_command_transport import command_processing_predicates
 
+    # Claims are monotonic even though this path spends no business retry budget.
+    # Back off as 1, 2, 4, ... seconds and clamp before exponentiation so a
+    # long-lived command cannot create an expensive or unbounded integer.
+    exponent = min(max(attempt - 1, 0), _GUIDANCE_RETRY_MAX_EXPONENT)
+    retry_delay = min(2**exponent, _GUIDANCE_RETRY_MAX_SECONDS)
     with get_session_local()() as db, db.begin():
         owned = command_processing_predicates(
             db, command_id, runner_id, expected_attempt_count=attempt
@@ -101,7 +109,7 @@ def return_to_admission_queue(command_id: int, runner_id: str, attempt: int) -> 
                     claimed_by=None,
                     claim_expires_at=None,
                     retry_available_at=datetime.now(timezone.utc)
-                    + timedelta(seconds=1),
+                    + timedelta(seconds=retry_delay),
                     error=None,
                 )
                 .returning(TaskExecutionCommand.id)

@@ -3,7 +3,7 @@
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
@@ -129,31 +129,38 @@ def record_queue_full(db: Session, bucket_key: str) -> None:
         logger.debug("Admission refusal telemetry failed", exc_info=True)
 
 
-def record_command_admission(db: Session, command: TaskExecutionCommand) -> None:
-    """Observe committed claims; IDs remain in scoped snapshots, never metric labels."""
+def record_command_admission(
+    command_id: int, attempt_count: int, created_at: datetime
+) -> None:
+    """Observe a committed claim in an isolated best-effort transaction."""
     try:
-        ticket = db.get(TaskAdmissionTicket, command.id)
-        if ticket is None or ticket.owner_attempt_id is None:
-            return
-        pace = db.get(TaskAdmissionPacing, ticket.bucket_key)
-        lane = str(pace.lane) if pace is not None else "default"
-        attributes = {
-            "operation": lane,
-            "outcome": "initial" if command.attempt_count == 1 else "retry_or_recovery",
-        }
-        runtime_performance.increment("task.admission.claims", attributes=attributes)
-        if command.attempt_count == 1:
-            now = float(db.execute(select(database_time())).scalar_one())
-            accepted_at = (
-                command.created_at
-                if command.created_at.tzinfo
-                else command.created_at.replace(tzinfo=timezone.utc)
-            ).timestamp()
-            runtime_performance.observe(
-                "task.admission.initial_wait",
-                max(0.0, now - accepted_at),
-                unit="s",
-                attributes={"operation": lane},
+        from ..models.database import get_session_local
+
+        with get_session_local()() as db:
+            ticket = db.get(TaskAdmissionTicket, command_id)
+            if ticket is None or ticket.owner_attempt_id is None:
+                return
+            pace = db.get(TaskAdmissionPacing, ticket.bucket_key)
+            lane = str(pace.lane) if pace is not None else "default"
+            attributes = {
+                "operation": lane,
+                "outcome": "initial" if attempt_count == 1 else "retry_or_recovery",
+            }
+            runtime_performance.increment(
+                "task.admission.claims", attributes=attributes
             )
+            if attempt_count == 1:
+                now = float(db.execute(select(database_time())).scalar_one())
+                accepted_at = (
+                    created_at
+                    if created_at.tzinfo
+                    else created_at.replace(tzinfo=timezone.utc)
+                ).timestamp()
+                runtime_performance.observe(
+                    "task.admission.initial_wait",
+                    max(0.0, now - accepted_at),
+                    unit="s",
+                    attributes={"operation": lane},
+                )
     except Exception:
         logger.debug("Admission claim telemetry failed", exc_info=True)

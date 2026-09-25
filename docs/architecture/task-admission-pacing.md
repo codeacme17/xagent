@@ -35,6 +35,8 @@ The first-party resume handoff makes this decision before spawning background
 work. Only a confirmed injection may continue its exact original run without a
 new start. A waiting command retains its delivery identity and monotonic claim
 counter (a write fence), while failure and deferral counters remain unchanged.
+Failed guidance joins retry after 1, 2, 4, 8, 16, 32, then at most 60 seconds.
+The backoff does not prevent queued cancellation or pause from overtaking them.
 
 Hosts reserve both concurrency and startup allowance by assigning separate
 batch and interactive buckets. Neither bucket consumes the other's allowance.
@@ -87,8 +89,9 @@ quota semantics belong to the SaaS integration, not this engine extension.
 
 ## Verification
 
-Tests drive durable ingress and dispatch on SQLite and PostgreSQL: burst edges,
-exact refill boundaries, long idle intervals, backwards clocks, independent
-interactive allowance, live guidance, persisted observation, bounded metric
-labels and three independent processes racing for one startup budget. Migration
+Tests drive durable ingress and dispatch on SQLite and PostgreSQL. Deterministic
+clock inputs verify burst edges, exact refill boundaries, long idle intervals,
+backwards clocks and independent interactive allowance. Tests also cover live
+guidance, persisted observation and bounded metric labels. Three independent
+processes race for one startup budget using the real database clock. Migration
 checks preserve existing tasks and capacity configuration on upgrade/downgrade.

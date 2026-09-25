@@ -18,7 +18,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from sqlalchemy import and_, exists, false, or_, select, true
 from sqlalchemy.exc import IntegrityError
@@ -929,18 +929,15 @@ def claim_task_command(
     if claimed != 1:
         db.rollback()
         return None
-    db.commit()
     fresh = (
         db.query(TaskExecutionCommand)
         .filter(TaskExecutionCommand.id == int(candidate.id))
         .populate_existing()
         .one()
     )
-    from .task_admission_observation import record_command_admission
-
-    record_command_admission(db, fresh)
+    admission_required = db.get(TaskAdmissionTicket, fresh.id) is not None
     payload: dict[str, Any] = fresh.payload if isinstance(fresh.payload, dict) else {}
-    return ClaimedTaskCommand(
+    command = ClaimedTaskCommand(
         id=int(fresh.id),
         task_id=int(fresh.task_id),
         actor_user_id=(
@@ -951,10 +948,17 @@ def claim_task_command(
         payload=payload,
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
-        admission_required=db.get(TaskAdmissionTicket, fresh.id) is not None,
+        admission_required=admission_required,
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )
+    accepted_at = cast(datetime, fresh.created_at)
+    db.commit()
+    if admission_required:
+        from .task_admission_observation import record_command_admission
+
+        record_command_admission(command.id, command.attempt_count, accepted_at)
+    return command
 
 
 def _claim_task_command_isolated(
