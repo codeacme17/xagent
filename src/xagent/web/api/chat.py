@@ -1704,27 +1704,27 @@ async def delete_task(
         # leak was accepted, so it is recorded for the reconciliation list but
         # never retried.
         registered = set(registered_task_extensions())
-        extensions_owed = [
-            extension_obligation(
-                task_id=task_id,
-                user_id=task_user_id,
-                source=task_source,
-                extension=name,
-            )
-            if name not in registered
-            else extension_obligation(
-                task_id=task_id,
-                user_id=task_user_id,
-                source=task_source,
-                extension=name,
-                status=CleanupObligationStatus.ABANDONED,
-                reason=(
+        extensions_owed = []
+        for name in unreleased:
+            if name in registered:
+                status = CleanupObligationStatus.ABANDONED
+                reason: str | None = (
                     "force delete accepted this runtime extension's state as "
                     "leaked; it was not released"
-                ),
+                )
+            else:
+                status = CleanupObligationStatus.PENDING
+                reason = None
+            extensions_owed.append(
+                extension_obligation(
+                    task_id=task_id,
+                    user_id=task_user_id,
+                    source=task_source,
+                    extension=name,
+                    status=status,
+                    reason=reason,
+                )
             )
-            for name in unreleased
-        ]
 
         recorded_workspace = await asyncio.to_thread(
             _delete_task_sync,

@@ -458,6 +458,11 @@ def _conversation_cleanup_owed(db: Session, task_id: int) -> list[CleanupObligat
     deadlock against this transaction's lock. It does mean one purge holds a
     second pooled connection for the length of that read; the purge works one
     task at a time, so that is one connection per sweeping process.
+
+    Resolution also runs whatever scope resolver is registered, which is code
+    this module does not own, while the row is held ``FOR UPDATE``. It
+    touches no workspace or provider, but it holds the lock for as long as
+    it takes, so a registered resolver must be bounded.
     """
     row = db.execute(
         select(Task.user_id, Task.source, Task.agent_config).where(Task.id == task_id)
@@ -519,9 +524,9 @@ def _purge_task(
     ``dry_run`` computes the same action against the same locked assessment
     and then rolls back, so what it reports is what a real run would do rather
     than a separately-derived estimate. It records no cleanup obligation and
-    performs no external call.
+    performs no *release* call.
 
-    No run performs an external call either. Expiring a conversation owes the
+    No run performs a release call either. Expiring a conversation owes the
     task's workspace directory and any runtime-extension state it was bound
     to; those are *recorded* here, in the same transaction as the row delete,
     and released afterwards by the cleanup retry driver
@@ -529,6 +534,10 @@ def _purge_task(
     row lock across a filesystem walk and a provider's network round trip, and
     releasing them before the lock would release a task the assessment might
     still refuse.
+
+    "No release call" is narrower than "no external call": recording resolves
+    the task's execution scope, which runs any registered scope resolver under
+    the lock (see :func:`_conversation_cleanup_owed`).
 
     Every exit rolls back or commits, so the ``FOR UPDATE`` the assessment
     took is never held past this call -- a sweep that left one open per task

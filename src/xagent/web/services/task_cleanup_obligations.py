@@ -77,11 +77,23 @@ logger = logging.getLogger(__name__)
 CLAIM_LEASE = timedelta(minutes=15)
 
 #: Delay before the second attempt; each later one doubles it, up to
-#: :data:`MAX_RETRY_BACKOFF`. With the default budget of eight attempts an
-#: obligation keeps being retried for most of a day, which rides out a
-#: provider outage without retrying a permanently broken one forever.
+#: :data:`MAX_RETRY_BACKOFF`. With the default budget of eight attempts the
+#: delays are 5, 10, 20, ..., 320 minutes -- roughly ten and a half hours of
+#: retrying in total, never reaching :data:`MAX_RETRY_BACKOFF` itself within
+#: the default budget -- which rides out a provider outage without retrying a
+#: permanently broken one forever.
 BASE_RETRY_BACKOFF = timedelta(minutes=5)
 MAX_RETRY_BACKOFF = timedelta(hours=6)
+
+#: How long a runtime-extension obligation whose provider is not registered
+#: here is left before this driver looks at it again. ``delete_task_extensions``
+#: logs an ``ERROR`` for every unregistered binding it is asked about, so a
+#: short interval would flood the log on every batch until some process
+#: registers the provider; a long one would instead stall a replica that
+#: *does* have it registered, since that replica also waits out this interval
+#: before its first attempt. An hour is a compromise between the two, not a
+#: measured value.
+PROVIDER_RECHECK_INTERVAL = timedelta(hours=1)
 
 #: Obligations one driver batch looks at. Each is claimed only when its turn
 #: comes, so a slow release early in the batch cannot run the later ones'
@@ -239,6 +251,22 @@ def extension_obligation(
     )
 
 
+class CleanupProviderNotRegistered(LookupError):
+    """Raised by :func:`_release` when a runtime extension is not registered
+    in this process.
+
+    This is not this obligation's failure: nothing here is broken, and there
+    is nothing wrong to retry away -- the provider simply is not loaded in
+    *this* process, and may be in another replica, or in this one after a
+    future deploy. :func:`_attempt_claimed` catches it specially and refunds
+    the attempt the claim spent, so the obligation stays pending without
+    counting against the budget a genuine release failure would spend. See
+    module docstring and the callers in ``chat.py``/``admin_users.py`` for the
+    design this preserves: a binding whose provider is not registered stays
+    owed until one that can release it is.
+    """
+
+
 def describe_cleanup_failure(exc: BaseException) -> str:
     """The ``last_error`` text for a release that raised."""
 
@@ -348,12 +376,6 @@ def _outcome_values(
     values: dict[str, Any] = {"last_error": _truncate(error), "updated_at": now}
     if attempts >= max_attempts:
         values["status"] = CleanupObligationStatus.EXHAUSTED.value
-        logger.error(
-            "Task cleanup obligation gave up after %d attempt(s) and needs "
-            "manual reconciliation: %s",
-            attempts,
-            error,
-        )
     else:
         values["next_attempt_at"] = now + _retry_backoff(attempts)
     return values
@@ -370,6 +392,9 @@ def _write_outcome(
     When the fence misses -- the row moved past this attempt, or was never
     pending -- nothing is written and the row's current status is returned,
     so a caller reporting "pending" never reports a newer claim as done.
+
+    The "gave up" line is logged here, once the fence confirms an EXHAUSTED
+    write landed, so it is never printed for an outcome a newer claim beat.
     """
 
     fence = (
@@ -386,9 +411,20 @@ def _write_outcome(
     if getattr(result, "rowcount", 0) == 1:
         if values is None:
             return None
-        return CleanupObligationStatus(
+        written_status = CleanupObligationStatus(
             values.get("status", CleanupObligationStatus.PENDING.value)
         )
+        if written_status is CleanupObligationStatus.EXHAUSTED:
+            logger.error(
+                "Task cleanup obligation %s (task %s, %s) gave up after %d "
+                "attempt(s) and needs manual reconciliation: %s",
+                obligation.id,
+                obligation.task_id,
+                obligation.kind.value,
+                values.get("attempts", obligation.attempts),
+                values.get("last_error", ""),
+            )
+        return written_status
     current = db.execute(
         select(TaskCleanupObligation.status).where(
             TaskCleanupObligation.id == obligation.id
@@ -519,6 +555,13 @@ def count_cleanup_obligations(db: Session) -> dict[CleanupObligationStatus, int]
 class CleanupRetryReport:
     """One driver batch's outcome, in the shape its log line prints."""
 
+    #: How many due candidates the batch fetched, before any claim was
+    #: attempted. This is what "is there a backlog" has to be measured
+    #: against -- see :func:`run_cleanup_obligation_loop`. ``claimed`` is not
+    #: a substitute: several replicas can split one due page between them, so
+    #: each replica's ``claimed`` can stay well under ``batch_size`` even
+    #: while the page it read was full and another page is waiting behind it.
+    due: int = 0
     claimed: int = 0
     completed: int = 0
     retrying: int = 0
@@ -539,7 +582,7 @@ class CleanupRetryReport:
     def log_line(self) -> str:
         return (
             "task cleanup retry: "
-            f"claimed={self.claimed} completed={self.completed} "
+            f"due={self.due} claimed={self.claimed} completed={self.completed} "
             f"retrying={self.retrying} exhausted={self.exhausted} "
             f"abandoned={self.abandoned}"
         )
@@ -571,19 +614,67 @@ def _claim_sync(
     candidate: RecordedCleanupObligation,
     *,
     now: datetime,
-) -> RecordedCleanupObligation | None:
-    """Take one due obligation for this driver, or ``None`` if someone else has.
+    max_attempts: int,
+) -> RecordedCleanupObligation | CleanupObligationStatus | None:
+    """Take one due obligation for this driver, refuse it, or report why not.
 
-    A claim increments ``attempts`` and pushes the due time out by
-    :data:`CLAIM_LEASE`, conditional on the ``attempts`` value the candidate
-    was read with -- the same compare-and-set shape as the upload GC's claim.
-    So two drivers (two web replicas) cannot both claim one row, and a driver
-    that died holding a claim loses it once the lease expires. The attempt is
-    counted at the claim rather than at the outcome, so a process that dies
-    every time it tries still spends its budget.
+    Three outcomes:
+
+    * The candidate's budget is already spent (``attempts >= max_attempts``):
+      it is moved straight to EXHAUSTED, under the same fence, and never
+      handed to a release. This has to happen here rather than only at the
+      outcome (:func:`_outcome_values`), because that check only runs once an
+      attempt *finishes*. A release that hangs forever, or a process that
+      dies on every attempt before it can write an outcome, would otherwise
+      have this row reclaimed every :data:`CLAIM_LEASE` forever -- attempts
+      keeps incrementing on each claim, but nothing ever reads it against the
+      budget, so it never stops. Checking here closes that gap: a lease that
+      lapsed one too many times ends the row rather than reclaiming it again.
+    * A normal claim: ``attempts`` increments and the due time is pushed out
+      by :data:`CLAIM_LEASE`, conditional on the ``attempts`` value the
+      candidate was read with -- the same compare-and-set shape as the upload
+      GC's claim. So two drivers (two web replicas) cannot both claim one
+      row, and a driver that died holding a claim loses it once the lease
+      expires. The attempt is counted at the claim rather than at the
+      outcome, so a process that dies every time it tries still spends its
+      budget.
+    * ``None``: the compare-and-set missed -- someone else (another replica,
+      or this same check from a previous call) already moved the row past the
+      ``attempts``/status/due snapshot this candidate was read with.
     """
 
     with session_factory() as db:
+        if candidate.attempts >= max_attempts:
+            error_message = (
+                f"claimed {candidate.attempts} time(s) without a recorded "
+                "outcome; the release may hang or crash the process"
+            )
+            result = db.execute(
+                update(TaskCleanupObligation)
+                .where(
+                    TaskCleanupObligation.id == candidate.id,
+                    TaskCleanupObligation.status
+                    == CleanupObligationStatus.PENDING.value,
+                    TaskCleanupObligation.attempts == candidate.attempts,
+                    TaskCleanupObligation.next_attempt_at <= now,
+                )
+                .values(
+                    status=CleanupObligationStatus.EXHAUSTED.value,
+                    last_error=_truncate(error_message),
+                    updated_at=now,
+                )
+            )
+            db.commit()
+            if getattr(result, "rowcount", 0) != 1:
+                return None
+            logger.error(
+                "Task cleanup obligation %s (task %s, %s) %s",
+                candidate.id,
+                candidate.task_id,
+                candidate.kind.value,
+                error_message,
+            )
+            return CleanupObligationStatus.EXHAUSTED
         result = db.execute(
             update(TaskCleanupObligation)
             .where(
@@ -634,7 +725,9 @@ async def _release(
             context, bound_extensions=(obligation.key,), force=False
         )
         if unreleased:
-            raise LookupError(f"runtime extension {obligation.key!r} is not registered")
+            raise CleanupProviderNotRegistered(
+                f"runtime extension {obligation.key!r} is not registered"
+            )
         return
     raise ValueError(f"unknown cleanup resource kind {obligation.kind!r}")
 
@@ -650,6 +743,38 @@ def _settle_claim_sync(
         return status
 
 
+async def _warn_if_task_revived_during_release(
+    session_factory: Callable[[], Session],
+    claimed: RecordedCleanupObligation,
+) -> None:
+    """Log, but do not act, if ``claimed.task_id`` went live while its release
+    was in flight.
+
+    ``_attempt_claimed`` already checks liveness once, before the release
+    starts, and that check is a real fence: finding a live task there
+    aborts the release outright. This second check cannot be a fence the same
+    way -- the release (an ``rmtree``, a provider round trip) has already run
+    by the time this is called, so there is nothing left to abort. What it
+    can do is tell an operator that the window was not empty: a task was
+    created with this id while this obligation's release was still running,
+    so that release may have touched resources that, by the time it finished,
+    belonged to the new task rather than to the one this obligation was
+    recorded for. The recorded outcome is unaffected either way -- this is
+    purely an observability backstop for a window this module does not hold
+    a lock across.
+    """
+
+    if await asyncio.to_thread(_task_id_is_live_sync, session_factory, claimed.task_id):
+        logger.error(
+            "Task cleanup obligation %s (task %s, %s) was released while its "
+            "task id became live again; the release may have touched the new "
+            "task's resources",
+            claimed.id,
+            claimed.task_id,
+            claimed.kind.value,
+        )
+
+
 async def _attempt_claimed(
     session_factory: Callable[[], Session],
     claimed: RecordedCleanupObligation,
@@ -662,9 +787,11 @@ async def _attempt_claimed(
     if await asyncio.to_thread(_task_id_is_live_sync, session_factory, claimed.task_id):
         # A live task holds this id again -- SQLite reuses the highest rowid
         # once it is deleted. Whatever sits at this locator now belongs to that
-        # task, so releasing it would destroy live data. (A task created in the
-        # instant between this check and the release is not fenced; the window
-        # is one query wide.)
+        # task, so releasing it would destroy live data. (A task created in
+        # the window between this check and the release returning is not
+        # fenced by it -- that window is the whole release, not "one query":
+        # see the re-check after the release below, which is what actually
+        # covers it, as a log rather than a fence.)
         values: dict[str, Any] | None = {
             "status": CleanupObligationStatus.ABANDONED.value,
             "last_error": (
@@ -679,6 +806,34 @@ async def _attempt_claimed(
             await _release(claimed, session_factory)
         except asyncio.CancelledError:
             raise
+        except CleanupProviderNotRegistered as exc:
+            # Not this obligation's failure: nothing was actually attempted
+            # against the resource, so it must not spend from the attempt
+            # budget or it could go EXHAUSTED purely because this process
+            # never had the provider loaded -- contradicting the documented
+            # design that such a binding stays owed until a process that can
+            # release it claims it. The claim already incremented ``attempts``
+            # (see :func:`_claim_sync`); this refunds exactly that increment
+            # rather than leaving the fence's ``attempts`` column ahead of
+            # what was genuinely attempted.
+            #
+            # The refund is only safe because ids are unique for the whole
+            # life of this table (see the ``sqlite_autoincrement`` guard on
+            # the model/migration): the fence below still checks
+            # ``claimed.id`` and ``claimed.attempts`` (the post-claim value),
+            # so only an actor that itself claimed this exact obligation --
+            # not some unrelated obligation that later reused the id -- can
+            # hold that fence value and win the write.
+            values = {
+                "attempts": claimed.attempts - 1,
+                "next_attempt_at": now + PROVIDER_RECHECK_INTERVAL,
+                "last_error": _truncate(describe_cleanup_failure(exc)),
+                "updated_at": now,
+            }
+            await _warn_if_task_revived_during_release(session_factory, claimed)
+            return await asyncio.to_thread(
+                _settle_claim_sync, session_factory, claimed, values
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Task cleanup obligation %s (task %s, %s) failed attempt %d",
@@ -689,6 +844,7 @@ async def _attempt_claimed(
                 exc_info=True,
             )
             error = describe_cleanup_failure(exc)
+        await _warn_if_task_revived_during_release(session_factory, claimed)
         values = _outcome_values(
             locator=claimed.locator,
             attempts=claimed.attempts,
@@ -721,13 +877,23 @@ async def run_cleanup_obligation_batch(
     candidates = await asyncio.to_thread(
         _due_candidates_sync, session_factory, now=now or _utcnow(), limit=limit
     )
-    report = CleanupRetryReport()
+    report = CleanupRetryReport(due=len(candidates))
     for candidate in candidates:
         try:
             claimed = await asyncio.to_thread(
-                _claim_sync, session_factory, candidate, now=now or _utcnow()
+                _claim_sync,
+                session_factory,
+                candidate,
+                now=now or _utcnow(),
+                max_attempts=max_attempts,
             )
             if claimed is None:
+                continue
+            if isinstance(claimed, CleanupObligationStatus):
+                # The candidate's budget was already spent, so the claim step
+                # moved it to EXHAUSTED instead of claiming it: nothing was
+                # claimed and there is no release to run.
+                report = replace(report, exhausted=report.exhausted + 1)
                 continue
             status = await _attempt_claimed(
                 session_factory,
@@ -765,10 +931,18 @@ async def run_cleanup_obligation_loop(
     the driver cannot be tied to the purge's opt-in or to its dialect. Several
     replicas running it at once is safe -- the claim is a compare-and-set.
 
-    A full batch means more may be due, so the next one follows after a short
-    pause; otherwise the loop waits the poll interval. A failed batch is
-    logged and retried after the interval: an unattended driver that stopped
-    on its first error would look exactly like one with nothing to do.
+    A full due page means more may be due right now, so the next batch follows
+    after a short pause; otherwise the loop waits the poll interval. This is
+    measured against ``report.due`` -- how many candidates the batch fetched
+    -- rather than ``report.claimed``: several replicas can split one due page
+    between them, so one replica's ``claimed`` can stay small even when the
+    page it read was full and another page is waiting right behind it. The
+    ``claimed > 0`` guard exists so a due page nothing could actually claim
+    (a claim-step outage, say) does not spin the loop at
+    ``backlog_pause_seconds`` forever with every attempt failing. A failed
+    batch is logged and retried after the interval: an unattended driver that
+    stopped on its first error would look exactly like one with nothing to
+    do.
 
     Cancellation is the stop signal. Each database step and each release runs
     in a worker thread that cancelling detaches rather than ends, so a release
@@ -783,7 +957,7 @@ async def run_cleanup_obligation_loop(
             report = await run_cleanup_obligation_batch(
                 session_factory, limit=batch_size
             )
-            backlog = report.claimed >= batch_size
+            backlog = report.due >= batch_size and report.claimed > 0
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -795,8 +969,10 @@ __all__ = [
     "CLAIM_LEASE",
     "CleanupObligation",
     "CleanupObligationStatus",
+    "CleanupProviderNotRegistered",
     "CleanupResourceKind",
     "CleanupRetryReport",
+    "PROVIDER_RECHECK_INTERVAL",
     "RecordedCleanupObligation",
     "SCOPE_UNRESOLVED_REASON",
     "TERMINAL_STATUSES",

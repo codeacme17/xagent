@@ -36,6 +36,11 @@ class TaskCleanupObligation(Base):  # type: ignore
             "status",
             "next_attempt_at",
         ),
+        # Every outcome is fenced on (id, attempts). Without AUTOINCREMENT,
+        # SQLite hands a discharged obligation's id to the next insert, which
+        # starts at attempts=0 -- and a late outcome for the old row would
+        # then match the new one. PostgreSQL sequences never reuse an id.
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

@@ -19,8 +19,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.models.database import Base
 from xagent.web.services.task_cleanup_obligations import (
+    CLAIM_LEASE,
     CleanupObligationStatus,
     CleanupResourceKind,
+    CleanupRetryReport,
+    _claim_sync,
+    _due_candidates_sync,
     extension_obligation,
     list_cleanup_obligations,
     record_cleanup_obligations_no_commit,
@@ -58,6 +62,21 @@ def _workspace_target(
     return WorkspaceCleanupTarget(
         task_id=task_id, owner_id=owner_id, base_dirs=(str(base),)
     )
+
+
+def test_retry_backoff_doubles_then_caps_without_overflowing() -> None:
+    """Five minutes, doubling: the default budget's delays add up to about ten
+    and a half hours without reaching the six-hour cap, which the ninth
+    attempt is the first to hit. A huge attempt count returns the cap rather
+    than overflowing."""
+    from xagent.web.services.task_cleanup_obligations import _retry_backoff
+
+    expected_minutes = [5, 10, 20, 40, 80, 160, 320]
+    for attempts, minutes in enumerate(expected_minutes, start=1):
+        assert _retry_backoff(attempts) == timedelta(minutes=minutes)
+
+    assert _retry_backoff(9) == timedelta(hours=6)
+    assert _retry_backoff(100) == timedelta(hours=6)
 
 
 def test_a_recorded_obligation_is_listed_until_it_is_completed(
@@ -284,6 +303,55 @@ async def test_a_transient_failure_is_retried_later_and_then_completes(
 
 
 @pytest.mark.asyncio
+async def test_a_candidate_already_at_the_attempt_budget_is_exhausted_without_a_release(
+    sessions, tmp_path, monkeypatch
+) -> None:
+    """A release that hangs, or a process that dies on every attempt before it
+    can write an outcome, would otherwise be reclaimed every ``CLAIM_LEASE``
+    forever: the outcome-side budget check never runs for an attempt that
+    never finishes. The claim step itself must refuse to hand out a claim
+    once the budget is already spent."""
+    from xagent.web.services import task_cleanup_obligations as module
+
+    base = tmp_path / "user_7"
+    _make_workspace(base, 65)
+    with sessions() as db:
+        [recorded] = record_cleanup_obligations_no_commit(
+            db, [workspace_obligation(_workspace_target(base, 65))], now=NOW
+        )
+        db.commit()
+    # Simulate two prior claims that never reported back: attempts sits at 2
+    # already, with a due (lapsed-lease) next_attempt_at.
+    with sessions() as db:
+        db.execute(
+            sa.update(module.TaskCleanupObligation)
+            .where(module.TaskCleanupObligation.id == recorded.id)
+            .values(attempts=2, next_attempt_at=NOW)
+        )
+        db.commit()
+
+    calls = {"n": 0}
+    real_remove = module.remove_task_workspace
+
+    def _counting_remove(target):
+        calls["n"] += 1
+        real_remove(target)
+
+    monkeypatch.setattr(module, "remove_task_workspace", _counting_remove)
+
+    report = await run_cleanup_obligation_batch(sessions, now=NOW, max_attempts=2)
+
+    assert calls["n"] == 0
+    assert report.exhausted == 1
+    with sessions() as db:
+        [terminal] = list_cleanup_obligations(
+            db, statuses=[CleanupObligationStatus.EXHAUSTED]
+        )
+        assert terminal.attempts == 2
+        assert "without a recorded outcome" in (terminal.last_error or "")
+
+
+@pytest.mark.asyncio
 async def test_an_obligation_that_keeps_failing_ends_on_the_reconciliation_list(
     sessions, tmp_path, failing_workspace_removal
 ) -> None:
@@ -341,6 +409,101 @@ async def test_a_reused_task_id_is_never_cleaned_up_under_its_new_owner(
     with sessions() as db:
         [abandoned] = list_cleanup_obligations(db)
         assert abandoned.status is CleanupObligationStatus.ABANDONED
+
+
+@pytest.mark.asyncio
+async def test_a_task_id_reused_during_the_release_itself_is_logged_not_fenced(
+    sessions, tmp_path, caplog, monkeypatch
+) -> None:
+    """The live-task check races only the release itself (``rmtree``, the
+    provider round trip), not "one query" -- a task can be created any time
+    between the pre-release check and the release returning. That window is
+    not fenced (doing so would need a lock this module does not take), but a
+    task created inside it deserves an operator's attention: log it, with
+    ids, rather than silently letting the release's own outcome stand as if
+    nothing had happened. The recorded outcome itself is unchanged -- this is
+    an observability addition, not a new abandonment path."""
+    import logging
+
+    from xagent.web.services import task_cleanup_obligations as module
+
+    base = tmp_path / "user_7"
+    workspace = _make_workspace(base, 67)
+    _record(sessions, workspace_obligation(_workspace_target(base, 67)))
+
+    live_calls = {"n": 0}
+
+    def _goes_live_during_the_release(session_factory, task_id):
+        live_calls["n"] += 1
+        if live_calls["n"] == 1:
+            return False  # pre-release check: no live task yet.
+        return True  # post-release check: a task now owns this id.
+
+    monkeypatch.setattr(module, "_task_id_is_live_sync", _goes_live_during_the_release)
+    with caplog.at_level(
+        logging.ERROR, logger="xagent.web.services.task_cleanup_obligations"
+    ):
+        report = await run_cleanup_obligation_batch(sessions, now=NOW)
+
+    # The release still ran and completed normally -- outcome unchanged.
+    assert not workspace.exists()
+    assert report.completed == 1
+    with sessions() as db:
+        assert list_cleanup_obligations(db) == []
+
+    reused = [r for r in caplog.records if "may have touched" in r.message]
+    assert len(reused) == 1
+    assert "67" in reused[0].message
+
+
+def test_claim_sync_is_a_compare_and_set(sessions, tmp_path) -> None:
+    """The same due-candidate snapshot must be able to win the claim exactly
+    once. This is the primitive ``run_cleanup_obligation_batch`` relies on to
+    let two web replicas race a claim safely; exercise it directly rather
+    than only through the batch, which hides whether the second call was
+    refused by the CAS or simply never attempted."""
+    _record(sessions, workspace_obligation(_workspace_target(tmp_path, 94)))
+
+    [candidate] = _due_candidates_sync(sessions, now=NOW, limit=10)
+
+    first = _claim_sync(sessions, candidate, now=NOW, max_attempts=8)
+    second = _claim_sync(sessions, candidate, now=NOW, max_attempts=8)
+
+    assert first is not None
+    assert first.attempts == candidate.attempts + 1
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_a_claim_that_never_settles_is_reclaimed_once_its_lease_lapses(
+    sessions, tmp_path, failing_workspace_removal
+) -> None:
+    """A process that claims an obligation and then dies (or hangs) before it
+    can write any outcome must not strand the obligation forever: once
+    ``CLAIM_LEASE`` has passed, the row is due again and a fresh batch can
+    reclaim it, with ``attempts`` reflecting both the abandoned claim and the
+    new one."""
+    base = tmp_path / "user_7"
+    _make_workspace(base, 95)
+    _record(sessions, workspace_obligation(_workspace_target(base, 95)))
+
+    [candidate] = _due_candidates_sync(sessions, now=NOW, limit=10)
+    claimed = _claim_sync(sessions, candidate, now=NOW, max_attempts=8)
+    assert claimed is not None
+    assert claimed.attempts == 1
+    # No settle follows -- this simulates a process that died mid-release.
+
+    # The next release also fails, so the row stays pending afterwards and
+    # ``attempts`` can be observed rather than the row being discharged.
+    failing_workspace_removal["failures"] = 1
+    later = NOW + CLAIM_LEASE
+    report = await run_cleanup_obligation_batch(sessions, now=later, max_attempts=8)
+
+    assert report.retrying == 1
+    with sessions() as db:
+        [pending] = list_cleanup_obligations(db)
+        assert pending.status is CleanupObligationStatus.PENDING
+        assert pending.attempts == 2
 
 
 @pytest.mark.asyncio
@@ -455,6 +618,36 @@ async def test_an_extension_that_is_no_longer_registered_stays_owed(
         assert "not registered" in (owed.last_error or "")
 
 
+@pytest.mark.asyncio
+async def test_an_unregistered_extension_never_exhausts_its_budget(sessions) -> None:
+    """A provider that is not registered here is not a failure of *this*
+    obligation -- it is a fact about this process, which may not be the one
+    that eventually has the provider loaded. Contradicting the design (a
+    binding whose provider is not registered stays owed until one that can
+    release it is), spending the attempt budget on it would let it go
+    EXHAUSTED before the right process ever gets a turn. A small
+    ``max_attempts`` here means a normal failure would exhaust in a batch or
+    two; this must not, no matter how many batches run."""
+    _record(
+        sessions,
+        extension_obligation(
+            task_id=74, user_id=7, source=None, extension="never_loaded_here"
+        ),
+    )
+
+    when = NOW
+    for _ in range(6):
+        report = await run_cleanup_obligation_batch(sessions, now=when, max_attempts=2)
+        assert report.retrying == 1
+        when += timedelta(hours=1, minutes=1)
+
+    with sessions() as db:
+        [owed] = list_cleanup_obligations(db)
+        assert owed.status is CleanupObligationStatus.PENDING
+        assert owed.attempts == 0
+        assert "not registered" in (owed.last_error or "")
+
+
 def test_an_abandoned_extension_is_listed_but_never_retried(sessions) -> None:
     """What an admin's force delete leaves behind: on the list, off the queue."""
     _record(
@@ -500,6 +693,50 @@ def test_a_failed_inline_attempt_hands_the_obligation_to_the_driver(
         [pending] = list_cleanup_obligations(db)
         assert pending.attempts == 1
         assert pending.last_error == "OSError: busy"
+
+
+def test_exhaustion_is_logged_with_ids_only_once_the_write_actually_lands(
+    sessions, tmp_path, caplog
+) -> None:
+    """The "gave up" line names the obligation, and fires only for a write
+    the fence let through -- a stale outcome for a row that has moved on logs
+    nothing."""
+    import logging
+
+    [obligation] = _record(
+        sessions, workspace_obligation(_workspace_target(tmp_path, 66))
+    )
+
+    with caplog.at_level(
+        logging.ERROR, logger="xagent.web.services.task_cleanup_obligations"
+    ):
+        with sessions() as db:
+            status = settle_cleanup_attempt_no_commit(
+                db, obligation, error="OSError: still busy", now=NOW, max_attempts=1
+            )
+            db.commit()
+
+    assert status is CleanupObligationStatus.EXHAUSTED
+    gave_up = [r for r in caplog.records if "gave up" in r.message]
+    assert len(gave_up) == 1
+    message = gave_up[0].message
+    assert str(obligation.id) in message
+    assert str(obligation.task_id) in message
+    assert obligation.kind.value in message
+    assert "1 attempt" in message
+
+    caplog.clear()
+    # A second, stale settle for the same (already-terminal) obligation must
+    # not write anything -- and therefore must not log "gave up" again either.
+    with caplog.at_level(
+        logging.ERROR, logger="xagent.web.services.task_cleanup_obligations"
+    ):
+        with sessions() as db:
+            settle_cleanup_attempt_no_commit(
+                db, obligation, error="OSError: still busy", now=NOW, max_attempts=1
+            )
+            db.commit()
+    assert not [r for r in caplog.records if "gave up" in r.message]
 
 
 def test_an_unresolved_scope_is_never_reported_as_cleaned(sessions, tmp_path) -> None:
@@ -602,3 +839,82 @@ async def test_a_failing_batch_does_not_stop_the_loop(
         with pytest.raises(_asyncio.CancelledError):
             await loop
     assert calls["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_the_loop_treats_a_full_due_page_as_backlog_even_when_claims_lag(
+    monkeypatch,
+) -> None:
+    """Several replicas can split one due page: each claims only some of it,
+    so ``claimed`` alone never reaches ``batch_size`` even though there is
+    plainly more work due right now. ``due`` -- how many candidates the batch
+    fetched -- is what should decide the pause, not how many this replica
+    happened to win."""
+    import asyncio as _asyncio
+
+    from xagent.web.services import task_cleanup_obligations as module
+
+    batch_size = 5
+    sleeps: list[float] = []
+
+    async def _mostly_claimed_elsewhere(*args, **kwargs):
+        return CleanupRetryReport(due=batch_size, claimed=1, completed=1)
+
+    async def _recording_sleep(seconds, *args, **kwargs):
+        sleeps.append(seconds)
+        raise _asyncio.CancelledError
+
+    monkeypatch.setattr(
+        module, "run_cleanup_obligation_batch", _mostly_claimed_elsewhere
+    )
+    monkeypatch.setattr(module.asyncio, "sleep", _recording_sleep)
+
+    # ``poll_interval_seconds`` is deliberately huge: if the loop mistakenly
+    # fell back to it instead of ``backlog_pause_seconds``, the recorded sleep
+    # would be 1000.0 rather than the short backlog pause.
+    with pytest.raises(_asyncio.CancelledError):
+        await run_cleanup_obligation_loop(
+            lambda: None,  # never used: the batch is replaced above
+            poll_interval_seconds=1000.0,
+            batch_size=batch_size,
+            backlog_pause_seconds=0.01,
+        )
+
+    assert sleeps == [0.01]
+
+
+@pytest.mark.asyncio
+async def test_the_loop_does_not_hot_loop_when_every_claim_fails(
+    monkeypatch,
+) -> None:
+    """A full due page with nothing actually claimed (e.g. a DB outage on the
+    claim step) must not spin the loop at ``backlog_pause_seconds`` forever --
+    ``claimed > 0`` guards the backlog path for exactly this case."""
+    import asyncio as _asyncio
+
+    from xagent.web.services import task_cleanup_obligations as module
+
+    batch_size = 5
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    async def _nothing_claimed(*args, **kwargs):
+        calls["n"] += 1
+        return CleanupRetryReport(due=batch_size, claimed=0)
+
+    async def _recording_sleep(seconds, *args, **kwargs):
+        sleeps.append(seconds)
+        raise _asyncio.CancelledError
+
+    monkeypatch.setattr(module, "run_cleanup_obligation_batch", _nothing_claimed)
+    monkeypatch.setattr(module.asyncio, "sleep", _recording_sleep)
+
+    with pytest.raises(_asyncio.CancelledError):
+        await run_cleanup_obligation_loop(
+            lambda: None,  # never used: the batch is replaced above
+            poll_interval_seconds=1000.0,
+            batch_size=batch_size,
+            backlog_pause_seconds=0.01,
+        )
+
+    assert sleeps == [1000.0]

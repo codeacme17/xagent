@@ -464,7 +464,7 @@ Task deletion commits its rows before it releases what those rows located — th
 
 **Workspace directories must be visible to every replica.** The driver on one replica may retry a removal recorded on another. A replica that cannot see the directory finds nothing, and finding nothing counts as success. A deployment that keeps workspaces on per-node local disks would therefore report leaked directories as removed. Such a deployment needs a host-affinity change before it relies on this record.
 
-`XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS` (default 300) sets how often an idle driver looks for due obligations. `XAGENT_TASK_CLEANUP_MAX_ATTEMPTS` (default 8) sets the attempt budget. Retries back off exponentially from five minutes up to a six-hour cap, so the default budget keeps retrying for most of a day.
+`XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS` (default 300) sets how often an idle driver looks for due obligations. `XAGENT_TASK_CLEANUP_MAX_ATTEMPTS` (default 8) sets the attempt budget. Retries back off exponentially from five minutes, doubling each time (5, 10, 20, ..., 320 minutes for the default eight attempts) up to a six-hour cap the default budget never actually reaches, so it keeps retrying for roughly ten and a half hours in total.
 
 ### Verification and monitoring
 
@@ -476,6 +476,8 @@ A batch that claimed anything logs one line beginning `task cleanup retry`, coun
 - **`abandoned`** — deliberately not retried. This covers three cases: an admin's force delete, a workspace whose execution scope could not be resolved before its rows were deleted (the unscoped candidates were cleared, but a scoped workspace cannot be located), and a task id that belongs to a live task again. SQLite reuses the highest deleted id, so an old obligation must not remove the new task's directory.
 
 Add `--all` to include the obligations that are still pending. Reconcile each listed row by hand, then delete it from the table.
+
+A runtime-extension obligation whose provider is not registered in this process is not listed as `exhausted` or `abandoned`: it stays `pending` and is rechecked hourly, without spending its attempt budget, until a process that has the provider registered claims it. Such rows show under `--all`, not in the default list.
 
 ### Rollback
 

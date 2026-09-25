@@ -43,6 +43,8 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        # Never reuse an id on SQLite; see the model for why.
+        sqlite_autoincrement=True,
     )
     op.create_index("ix_task_cleanup_obligations_task_id", TABLE, ["task_id"])
     op.create_index(
