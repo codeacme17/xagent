@@ -178,9 +178,20 @@ async def test_stale_guidance_disposition_cannot_requeue_a_new_claim_owner(
             row.error = "successor owns this attempt"
         raise task_admission_execution.AdmissionWaiting("retry admission")
 
-    assert await transport.dispatch_one_task_command(
-        lose_claim, command_db_id=command.command_id
+    (dispatch_result,) = await asyncio.gather(
+        transport.dispatch_one_task_command(
+            lose_claim, command_db_id=command.command_id
+        ),
+        return_exceptions=True,
     )
+    if stale_fence == "owner":
+        # Owner loss may cancel the dispatcher after its cancellation-safe
+        # disposition has completed; both outcomes preserve the successor.
+        assert dispatch_result is True or isinstance(
+            dispatch_result, asyncio.CancelledError
+        )
+    else:
+        assert dispatch_result is True
 
     with host.sessions() as db:
         row = db.get(TaskExecutionCommand, command.command_id)
