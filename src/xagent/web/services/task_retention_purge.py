@@ -429,7 +429,7 @@ def _purge_trace_rows(db: Session, task_id: int, *, now: datetime) -> int:
         select(
             or_(
                 *(
-                    exists().where(model.task_id == task_id)
+                    exists(select(1).where(model.task_id == task_id))
                     for model in (TraceCheckpointBlob, TraceMessageBlob, TraceEvent)
                 )
             )
