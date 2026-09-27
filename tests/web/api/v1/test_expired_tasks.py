@@ -16,6 +16,7 @@ without depending on the purge's eligibility rules; one test per key type
 runs the real purge end to end.
 """
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +32,8 @@ from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     set_cache_backend_for_testing,
 )
+from xagent.web.services.task_deletion import purge_task_rows
+from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_retention_purge import (
     RetentionPurgeAction,
     purge_task,
@@ -45,6 +48,7 @@ from ..conftest import (
 from .test_workforces import (
     _create_active_workforce,
     _create_workforce_key,
+    _manager_agent_id,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -271,7 +275,9 @@ def test_a_task_deleted_by_its_owner_stays_404():
     task_id = _create_task(full_key, agent_id)
     db = _direct_db_session()
     try:
-        db.query(Task).filter(Task.id == task_id).delete()
+        # The real owner-deletion path, not a raw row delete: it exercises
+        # the same non-cascading cleanup an actual delete would.
+        assert purge_task_rows(db, task_id=task_id) is True
         db.commit()
     finally:
         db.close()
@@ -351,16 +357,153 @@ def test_workforce_key_gets_410_after_the_real_purge_clears_the_run_pointer():
     )
 
 
-def test_a_tombstone_of_another_workforce_stays_404():
+@pytest.mark.parametrize("route", TASK_ROUTES)
+def test_a_tombstone_of_another_workforce_stays_404(route):
     headers = _admin_headers()
     wf_a = _create_active_workforce(headers, name="Expired WF A")
     wf_b = _create_active_workforce(headers, name="Expired WF B")
     key_b = _create_workforce_key(headers, wf_b)
     _insert_tombstone(UNUSED_TASK_ID, workforce_id=wf_a)
 
-    _assert_not_found(
-        client.get(f"/v1/chat/tasks/{UNUSED_TASK_ID}", headers=_bearer(key_b))
+    resp = _call(route, UNUSED_TASK_ID, key_b, {})
+
+    _assert_not_found(resp)
+
+
+@pytest.mark.parametrize("route", TASK_ROUTES)
+def test_a_web_sourced_tombstone_of_the_keys_own_workforce_stays_404(route):
+    """``source == "web"`` fails ``resolve_sdk_task``'s own predicate no
+    matter whose ``workforce_id`` the tombstone carries -- the SDK-source
+    filter, not the owner match, is what keeps this 404."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Web-Sourced WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+    _insert_tombstone(UNUSED_TASK_ID, workforce_id=workforce_id, source="web")
+
+    resp = _call(route, UNUSED_TASK_ID, full_key, {})
+
+    _assert_not_found(resp)
+
+
+@pytest.mark.parametrize("route", TASK_ROUTES)
+def test_an_agent_tombstone_stays_404_for_a_workforce_key(route):
+    """A tombstone with ``workforce_id=None`` (an agent-owned task) never
+    matches a workforce-bound key's ``tombstone.workforce_id !=
+    scope.workforce_id`` leg -- ``None`` is never equal to a real workforce
+    id, so it 404s the same as a tombstone bound to a different workforce."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers, name="Agent-Only WF")
+    full_key = _create_workforce_key(headers, workforce_id)
+    owner_agent_id, _owner_key = _create_agent_with_key()
+    _insert_tombstone(UNUSED_TASK_ID, agent_id=owner_agent_id)
+
+    resp = _call(route, UNUSED_TASK_ID, full_key, {})
+
+    _assert_not_found(resp)
+
+
+# ===== resolve_sdk_task: live query and tombstone predicate must agree =====
+
+
+def _create_web_sourced_task(*, agent_id: int) -> int:
+    """A ``source="web"`` task owned by ``agent_id``, inserted directly since
+    no v1 route creates one -- same pattern as
+    ``test_task_reply.test_reply_to_non_sdk_source_task_returns_404``."""
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=_admin_user_id(),
+            title="web ui task",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            run_id=f"run-web-{uuid.uuid4()}",
+            agent_id=agent_id,
+            source="web",
+            is_visible=True,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
+    """Matrix over key type x task, driven by the real purge: whichever way
+    a key's live GET resolves a task -- 200 or 404 -- its GET after the
+    purge must be 410 iff it was 200, else 404. ``resolve_sdk_task``'s live
+    query and ``_raise_if_expired_for_scope``'s tombstone read are two
+    separate predicates over the same columns; this is what would catch
+    them drifting apart.
+
+    Agent A's key is bound to workforce W's own manager agent -- not a
+    workforce-bound key -- so it can see W's run task live through
+    ``Task.agent_id`` alone. Whether that live agent-id match should also
+    survive the purge is exactly the interesting case the two predicates
+    could disagree on; the assertions below check agreement, not a
+    hardcoded expectation for that cell of the matrix.
+    """
+    headers = _admin_headers()
+
+    workforce_w = _create_active_workforce(headers, name="Matrix WF W")
+    workforce_w2 = _create_active_workforce(headers, name="Matrix WF W2")
+    manager_agent_a = _manager_agent_id(workforce_w)
+    agent_a_key_resp = client.post(
+        f"/api/agents/{manager_agent_a}/api-key", headers=headers
     )
+    assert agent_a_key_resp.status_code == 200, agent_a_key_resp.text
+    agent_a_key = agent_a_key_resp.json()["full_key"]
+    _agent_b_id, agent_b_key = _create_agent_with_key()
+    workforce_w_key = _create_workforce_key(headers, workforce_w)
+    workforce_w2_key = _create_workforce_key(headers, workforce_w2)
+
+    keys: dict[str, str] = {
+        "agent_a": agent_a_key,
+        "agent_b": agent_b_key,
+        "workforce_w": workforce_w_key,
+        "workforce_w2": workforce_w2_key,
+    }
+
+    def _make_sdk_task_of_agent_a() -> int:
+        return _create_task(agent_a_key, manager_agent_a)
+
+    def _make_sdk_run_task_of_workforce_w() -> int:
+        run = client.post(
+            f"/v1/workforces/{workforce_w}/runs",
+            headers=_bearer(workforce_w_key),
+            json={"message": {"role": "user", "content": "go"}},
+        )
+        assert run.status_code == 202, run.text
+        return run.json()["task_id"]
+
+    def _make_web_task_of_agent_a() -> int:
+        return _create_web_sourced_task(agent_id=manager_agent_a)
+
+    task_factories = {
+        "sdk_agent_a": _make_sdk_task_of_agent_a,
+        "sdk_run_workforce_w": _make_sdk_run_task_of_workforce_w,
+        "web_agent_a": _make_web_task_of_agent_a,
+    }
+
+    for task_label, make_task in task_factories.items():
+        for key_label, full_key in keys.items():
+            task_id = make_task()
+            case = f"{key_label} x {task_label} (task {task_id})"
+
+            live = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+            assert live.status_code in (200, 404), f"{case}: {live.text}"
+            was_live = live.status_code == 200
+
+            _purge_conversation(task_id)
+
+            after = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+            if was_live:
+                assert after.status_code == 410, f"{case}: {after.text}"
+                assert after.json()["error"]["code"] == "task_expired"
+            else:
+                assert after.status_code == 404, f"{case}: {after.text}"
+                assert after.json()["error"]["code"] == "task_not_found"
 
 
 # ===== /steps: trace-only expiry =====
@@ -506,3 +649,80 @@ def test_steps_cache_entry_without_the_expiry_key_still_serves_untouched_tasks()
         assert body["steps_expired_at"] is None
     finally:
         set_cache_backend_for_testing(None)
+
+
+def test_steps_cache_entry_without_the_expiry_key_is_a_miss_once_traces_expire():
+    """The legacy-entry hit above only holds for a task retention never
+    touched. Once ``traces_expired_at`` is set on the task, an entry missing
+    that key can no longer prove it matches the current version --
+    ``cached.get("traces_expired_at") == cache_version_token(...)`` compares
+    ``None`` against a real token and fails -- so it must be treated as a
+    miss and re-read, not served as if nothing changed."""
+    from xagent.web.api.v1 import tasks as v1_tasks
+    from xagent.web.services.hot_path_cache import cache_get, cache_set, task_steps_key
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _insert_trace_event(task_id, "evt-legacy", "legacy")
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        warm = client.get(
+            f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+        ).json()
+        entry = dict(cache_get(task_steps_key(task_id)))
+        entry.pop("traces_expired_at")
+        entry["response"] = {
+            k: v
+            for k, v in entry["response"].items()
+            if k not in ("steps_expired", "steps_expired_at")
+        }
+        cache_set(task_steps_key(task_id), entry, ttl_seconds=60)
+
+        _set_traces_expired_at(task_id, EXPIRED_AT)
+
+        with patch.object(
+            v1_tasks,
+            "map_trace_events_to_public_steps",
+            wraps=v1_tasks.map_trace_events_to_public_steps,
+        ) as mapper:
+            body = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            ).json()
+            assert mapper.called, "expected a cache miss to re-read the steps"
+
+        assert body["steps_expired"] is True
+        assert _as_utc(body["steps_expired_at"]) == EXPIRED_AT
+        assert body["steps"] == warm["steps"]
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+# ===== 410 details.expired_at vs /steps steps_expired_at: identical bytes =====
+
+
+def test_the_410_expired_at_string_matches_the_steps_expired_at_string():
+    """Both fields go out through the same pydantic ``datetime`` serializer
+    (``_DATETIME_JSON`` in ``tasks.py`` for the 410, the ``StepsResponse``
+    model for ``/steps``); for the same instant they must render as the
+    exact same string -- no lenient normalization on either side -- or a
+    client comparing them by ``==`` would see a spurious mismatch. A
+    plain ``isoformat()`` would fail this: it renders a UTC offset as
+    ``+00:00`` where pydantic's JSON mode renders ``Z``."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _set_traces_expired_at(task_id, EXPIRED_AT)
+    _insert_tombstone(UNUSED_TASK_ID, agent_id=agent_id)
+
+    steps_body = client.get(
+        f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+    ).json()
+    expired_resp = client.get(
+        f"/v1/chat/tasks/{UNUSED_TASK_ID}", headers=_bearer(full_key)
+    )
+
+    assert expired_resp.status_code == 410, expired_resp.text
+    steps_expired_at = steps_body["steps_expired_at"]
+    details_expired_at = expired_resp.json()["error"]["details"]["expired_at"]
+    assert steps_expired_at is not None
+    assert steps_expired_at == details_expired_at

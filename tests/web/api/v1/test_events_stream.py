@@ -4061,18 +4061,32 @@ async def test_fast_path_steps_cursor_baseline_is_captured_before_the_steps_read
         ),
     ],
 )
+@pytest.mark.parametrize(
+    ("gone_code", "gone_status", "expected_frame_code"),
+    [
+        pytest.param(V1ErrorCode.TASK_NOT_FOUND, 404, "task_deleted", id="deleted"),
+        pytest.param(V1ErrorCode.TASK_EXPIRED, 410, "task_expired", id="expired"),
+    ],
+)
 async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_steps_read(
-    stream_fn, status, conclusion_event, extra_snapshot
+    stream_fn,
+    status,
+    conclusion_event,
+    extra_snapshot,
+    gone_code,
+    gone_status,
+    expected_frame_code,
 ):
     """The cursor baseline read can fail the same way any other DB read
     in this module can, and it fails before the steps read is ever
     reached (see the call site in ``_fast_path_snapshot_stream``) -- so
     the steps reader must never run, and the failure is classified
     exactly like a failed steps read
-    (``_fast_path_steps_read_error_frame``): a task deleted in the gap
-    gets ``task_deleted``, everything else gets ``resync_required``. The
-    conclusion frame (already known-good from ``snapshot``) goes out
-    first either way.
+    (``_fast_path_steps_read_error_frame``): a task gone in the gap gets
+    ``task_deleted`` or ``task_expired`` depending on why (see
+    ``_task_gone_error_frame``), everything else gets
+    ``resync_required``. The conclusion frame (already known-good from
+    ``snapshot``) goes out first either way.
     """
 
     def _unreachable_read_task_steps_response(task_id_, principal_):
@@ -4113,8 +4127,8 @@ async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_st
     assert "resync_required" in body
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 
-    def _deleted_read_task_steps_version(task_id_, principal_):
-        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+    def _gone_read_task_steps_version(task_id_, principal_):
+        raise V1ApiError(gone_code, gone_status)
 
     frames = [
         chunk
@@ -4123,12 +4137,12 @@ async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_st
             principal=None,
             read_task_steps_response=_unreachable_read_task_steps_response,
             read_task_snapshot=_unreachable_read_task_snapshot,
-            read_task_steps_version=_deleted_read_task_steps_version,
+            read_task_steps_version=_gone_read_task_steps_version,
         )
     ]
     body = "".join(frames)
     assert body.count(f"event: {conclusion_event}") == 1
-    assert "task_deleted" in body
+    assert expected_frame_code in body
     assert "resync_required" not in body
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 
@@ -4152,8 +4166,21 @@ async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_st
         ),
     ],
 )
+@pytest.mark.parametrize(
+    ("gone_code", "gone_status", "expected_frame_code"),
+    [
+        pytest.param(V1ErrorCode.TASK_NOT_FOUND, 404, "task_deleted", id="deleted"),
+        pytest.param(V1ErrorCode.TASK_EXPIRED, 410, "task_expired", id="expired"),
+    ],
+)
 async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_deleted(
-    stream_fn, status, conclusion_event, extra_snapshot
+    stream_fn,
+    status,
+    conclusion_event,
+    extra_snapshot,
+    gone_code,
+    gone_status,
+    expected_frame_code,
 ):
     """The cursor recheck (``read_task_steps_version``'s second call,
     which only runs once the run_id/state_version reread has already
@@ -4162,7 +4189,10 @@ async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_delet
     run_id/state_version reread's own failure -- by the time this call
     raises, the generation was already confirmed unchanged, only the
     cursor wasn't, which is exactly why that shared frame builder's
-    wording no longer names "generation" specifically.
+    wording no longer names "generation" specifically. The resync case
+    below is a plain transient failure; the gone case is parametrized
+    over ``task_deleted``/``task_expired`` the same way the baseline-read
+    failure test above is.
     """
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     step = es.PublicStep(
@@ -4215,11 +4245,11 @@ async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_delet
 
     calls2 = {"n": 0}
 
-    def _flaky_read_task_steps_version_deleted(task_id_, principal_):
+    def _flaky_read_task_steps_version_gone(task_id_, principal_):
         calls2["n"] += 1
         if calls2["n"] == 1:
             return SimpleNamespace(max_event_id=100)
-        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+        raise V1ApiError(gone_code, gone_status)
 
     frames = [
         chunk
@@ -4228,12 +4258,12 @@ async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_delet
             principal=None,
             read_task_steps_response=_read_task_steps_response,
             read_task_snapshot=_unchanged_read_task_snapshot,
-            read_task_steps_version=_flaky_read_task_steps_version_deleted,
+            read_task_steps_version=_flaky_read_task_steps_version_gone,
         )
     ]
     body = "".join(frames)
     assert body.count(f"event: {conclusion_event}") == 1
-    assert "task_deleted" in body
+    assert expected_frame_code in body
     assert "resync_required" not in body
     assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
 

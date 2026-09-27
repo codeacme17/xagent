@@ -25,6 +25,7 @@ from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import TypeAdapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -75,6 +76,12 @@ from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 router = APIRouter()
 
 _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
+
+# ``datetime.isoformat()`` renders a UTC offset as ``+00:00``; pydantic's own
+# JSON mode renders it as ``Z``. ``StepsResponse.steps_expired_at`` goes out
+# through pydantic, so the 410 body's ``details.expired_at`` has to be
+# serialized the same way to be byte-identical for the same instant.
+_DATETIME_JSON: TypeAdapter[datetime] = TypeAdapter(datetime)
 
 
 def _resolve_upload_owner_user_id_isolated(
@@ -206,7 +213,7 @@ def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoRetur
             410,
             details={
                 "task_id": exc.task_id,
-                "expired_at": exc.expired_at.isoformat(),
+                "expired_at": _DATETIME_JSON.dump_python(exc.expired_at, mode="json"),
             },
         ) from exc
     code, status = {
@@ -1147,7 +1154,8 @@ async def stream_chat_task_events(
         and a reread that fails outright is treated like the steps-read
         failure above -- no step content goes out, but the conclusion
         (already known-good, independent of this reread) still does,
-        followed by ``stream.error`` naming why -- ``task_deleted`` or
+        followed by ``stream.error`` naming why -- ``task_deleted``
+        (``task_expired`` when retention expired the task) or
         ``resync_required`` by the same rule. A failure while
         serializing an individual step is handled the same way: the
         conclusion frame goes out, followed by

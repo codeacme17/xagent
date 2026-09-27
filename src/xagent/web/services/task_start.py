@@ -526,6 +526,14 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
             ``task_expired`` (with ``task_id`` and ``expired_at``) when
             retention expired a task the calling key could have seen.
     """
+    # This predicate (source == "sdk", plus the key's agent or workforce)
+    # must stay column-for-column identical to the tombstone predicate in
+    # _raise_if_expired_for_scope below -- otherwise a key could see a task
+    # live that its tombstone would hide, or vice versa, after retention
+    # deletes the row. tests/web/api/v1/test_expired_tasks.py's
+    # test_resolve_sdk_task_live_and_tombstone_predicates_agree checks the
+    # two predicates against each other across agent/workforce keys and
+    # task sources; update it alongside either predicate.
     query = db.query(Task).filter(
         Task.id == task_id,
         Task.source == "sdk",
