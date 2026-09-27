@@ -8,6 +8,7 @@ behaviours worth seeing on both.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -30,6 +31,7 @@ from xagent.web.services.task_retention_purge import (
 )
 from xagent.web.services.task_runtime import (
     MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
+    mcp_runtime_authorization_policy_required_clause,
 )
 
 engine = engine_fixture
@@ -70,8 +72,13 @@ def _make_user(db: Session, username: str = "owner") -> int:
     return int(user.id)
 
 
+#: ``agents.(user_id, name)`` is unique; a test that makes more than one agent
+#: for the same user needs distinct names.
+_agent_name_seq = itertools.count()
+
+
 def _make_agent(db: Session, user_id: int) -> int:
-    agent = Agent(user_id=user_id, name=f"agent-{user_id}")
+    agent = Agent(user_id=user_id, name=f"agent-{user_id}-{next(_agent_name_seq)}")
     db.add(agent)
     db.flush()
     return int(agent.id)
@@ -142,12 +149,18 @@ def _make_workforce_run(db: Session, *, user_id: int, task_id: int) -> tuple[int
 
 
 def _make_trigger_run(
-    db: Session, *, user_id: int, agent_id: int, task_id: int, key: str = "run-1"
+    db: Session,
+    *,
+    user_id: int,
+    agent_id: int,
+    task_id: int,
+    key: str = "run-1",
+    trigger_type: str = TriggerType.SCHEDULED.value,
 ) -> int:
     trigger = AgentTrigger(
         user_id=user_id,
         agent_id=agent_id,
-        type=TriggerType.SCHEDULED.value,
+        type=trigger_type,
         name="expiry trigger",
         config={"interval_seconds": 60},
     )
@@ -199,6 +212,7 @@ def test_conversation_expiry_leaves_a_content_free_tombstone(sessions) -> None:
         assert tombstone.agent_id == agent_id
         assert tombstone.workforce_id is None
         assert tombstone.source == "sdk"
+        assert tombstone.trigger_type is None
         assert tombstone.is_visible is False
         assert tombstone.is_channel_plumbing is False
         assert _as_utc(tombstone.task_created_at) == _as_utc(created_at)
@@ -211,6 +225,7 @@ def test_conversation_expiry_leaves_a_content_free_tombstone(sessions) -> None:
             "agent_id",
             "workforce_id",
             "source",
+            "trigger_type",
             "is_visible",
             "is_channel_plumbing",
             "task_created_at",
@@ -218,13 +233,18 @@ def test_conversation_expiry_leaves_a_content_free_tombstone(sessions) -> None:
         }
 
 
-@pytest.mark.parametrize(
-    ("marker", "expected"),
-    [(True, True), (False, False), ("true", False), (1, False), (None, False)],
-)
-def test_only_a_literal_true_marker_is_channel_plumbing(
-    sessions, marker, expected
-) -> None:
+@pytest.mark.parametrize("marker", [True, False, "true", 1, None])
+def test_only_a_literal_true_marker_is_channel_plumbing(sessions, marker) -> None:
+    """The stored flag equals whatever the live Conversation Logs predicate says.
+
+    ``True``, ``False`` and a missing key have a known answer -- only a
+    literal ``True`` counts -- so those are pinned directly. ``"true"`` and
+    ``1`` are not literal booleans, and ``as_boolean()``'s reading of a
+    non-boolean JSON value is dialect-specific; asserting a hardcoded answer
+    for those would pin one dialect's behaviour rather than the invariant
+    that actually matters: the tombstone's flag and the live predicate must
+    agree, whatever a given dialect makes of the value.
+    """
     config = (
         {}
         if marker is None
@@ -234,10 +254,18 @@ def test_only_a_literal_true_marker_is_channel_plumbing(
         user_id = _make_user(db)
         task_id = _make_task(db, user_id=user_id, days_old=400, agent_config=config)
         db.commit()
+        live_predicate = db.execute(
+            sa.select(mcp_runtime_authorization_policy_required_clause().is_(True))
+            .select_from(Task)
+            .where(Task.id == task_id)
+        ).scalar_one()
+        if marker is True or marker is False or marker is None:
+            assert live_predicate is (marker is True)
         _purge(db, task_id)
 
     with sessions() as db:
-        assert db.get(ExpiredTaskTombstone, task_id).is_channel_plumbing is expected
+        tombstone = db.get(ExpiredTaskTombstone, task_id)
+        assert tombstone.is_channel_plumbing is live_predicate
 
 
 def test_the_workforce_is_read_before_the_delete_clears_the_run_pointer(
@@ -303,6 +331,102 @@ def test_runs_of_other_tasks_are_not_marked(sessions) -> None:
         assert run.task_expired_at is None
 
 
+# --- trigger_type ---------------------------------------------------------------
+
+
+def test_trigger_type_reads_the_agent_config_key_first(sessions) -> None:
+    with sessions() as db:
+        user_id = _make_user(db)
+        agent_id = _make_agent(db, user_id)
+        task_id = _make_task(
+            db,
+            user_id=user_id,
+            days_old=400,
+            agent_id=agent_id,
+            source="trigger",
+            agent_config={"trigger_type": "webhook"},
+        )
+        # A run of a different type is also present; the config key wins.
+        _make_trigger_run(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type=TriggerType.SCHEDULED.value,
+        )
+        db.commit()
+        _purge(db, task_id)
+
+    with sessions() as db:
+        assert db.get(ExpiredTaskTombstone, task_id).trigger_type == "webhook"
+
+
+def test_trigger_type_falls_back_to_the_trigger_run(sessions) -> None:
+    """No ``agent_config`` key: the run's own trigger supplies the type."""
+    with sessions() as db:
+        user_id = _make_user(db)
+        agent_id = _make_agent(db, user_id)
+        task_id = _make_task(
+            db, user_id=user_id, days_old=400, agent_id=agent_id, source="trigger"
+        )
+        _make_trigger_run(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type=TriggerType.GMAIL.value,
+        )
+        db.commit()
+        _purge(db, task_id)
+
+    with sessions() as db:
+        assert db.get(ExpiredTaskTombstone, task_id).trigger_type == "gmail"
+
+
+def test_trigger_type_uses_the_highest_id_run_when_two_point_at_the_task(
+    sessions,
+) -> None:
+    """``trigger_runs.task_id`` is not unique; the newest run's trigger wins."""
+    with sessions() as db:
+        user_id = _make_user(db)
+        agent_id = _make_agent(db, user_id)
+        task_id = _make_task(
+            db, user_id=user_id, days_old=400, agent_id=agent_id, source="trigger"
+        )
+        _make_trigger_run(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            key="first",
+            trigger_type=TriggerType.SCHEDULED.value,
+        )
+        _make_trigger_run(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            key="second",
+            trigger_type=TriggerType.WEBHOOK.value,
+        )
+        db.commit()
+        _purge(db, task_id)
+
+    with sessions() as db:
+        assert db.get(ExpiredTaskTombstone, task_id).trigger_type == "webhook"
+
+
+def test_trigger_type_is_null_for_a_non_trigger_task(sessions) -> None:
+    with sessions() as db:
+        user_id = _make_user(db)
+        task_id = _make_task(db, user_id=user_id, days_old=400)
+        db.commit()
+        _purge(db, task_id)
+
+    with sessions() as db:
+        assert db.get(ExpiredTaskTombstone, task_id).trigger_type is None
+
+
 def test_a_dry_run_records_nothing(sessions) -> None:
     with sessions() as db:
         user_id = _make_user(db)
@@ -310,6 +434,9 @@ def test_a_dry_run_records_nothing(sessions) -> None:
         task_id = _make_task(db, user_id=user_id, days_old=400, agent_id=agent_id)
         run_id = _make_trigger_run(
             db, user_id=user_id, agent_id=agent_id, task_id=task_id
+        )
+        _workforce_id, workforce_run_id = _make_workforce_run(
+            db, user_id=user_id, task_id=task_id
         )
         db.commit()
 
@@ -322,6 +449,7 @@ def test_a_dry_run_records_nothing(sessions) -> None:
         assert db.get(Task, task_id) is not None
         assert db.get(ExpiredTaskTombstone, task_id) is None
         assert db.get(TriggerRun, run_id).task_expired_at is None
+        assert db.get(WorkforceRun, workforce_run_id).task_expired_at is None
 
 
 def test_a_refused_task_records_nothing(sessions) -> None:
@@ -429,7 +557,7 @@ def test_the_account_deletion_path_removes_the_tombstone(
         task_id = _make_task(db, user_id=user_id, days_old=400)
         db.commit()
         _purge(db, task_id)
-    assert find_expired_task_exists(sessions, task_id)
+    assert _find_expired_task_exists(sessions, task_id)
 
     assert admin_users._delete_user_rows_sync(user_id=user_id) is not None
 
@@ -438,7 +566,7 @@ def test_the_account_deletion_path_removes_the_tombstone(
         assert db.get(ExpiredTaskTombstone, task_id) is None
 
 
-def find_expired_task_exists(sessions, task_id: int) -> bool:
+def _find_expired_task_exists(sessions, task_id: int) -> bool:
     with sessions() as db:
         return find_expired_task(db, task_id) is not None
 
@@ -499,6 +627,47 @@ def test_find_expired_task_is_none_for_an_unknown_id(sessions) -> None:
         assert find_expired_task(db, 424242) is None
 
 
+def test_a_reused_id_is_expired_again_without_colliding(sessions) -> None:
+    """SQLite reuses a deleted id; the writer must replace, not conflict.
+
+    Only SQLite reuses the highest deleted id -- PostgreSQL never does -- but
+    this writer runs on both, and any SQLite caller of it, this test suite
+    included, can expire a task, insert a new one at the same id, and expire
+    that one too. Without the replace, that second expiry would hit the
+    tombstone's own primary key.
+    """
+    user_id, _agent_id, task_id = _expire_one(sessions)
+    with sessions() as db:
+        second_agent_id = _make_agent(db, user_id)
+        db.add(
+            Task(
+                id=task_id,
+                user_id=user_id,
+                title="second task at the reused id",
+                status=TaskStatus.COMPLETED,
+                agent_id=second_agent_id,
+                last_activity_at=NOW - timedelta(days=400),
+                created_at=NOW - timedelta(days=401),
+            )
+        )
+        db.commit()
+
+        assert _purge(db, task_id) is RetentionPurgeAction.PURGED_CONVERSATION
+
+    with sessions() as db:
+        assert (
+            db.execute(
+                sa.select(sa.func.count())
+                .select_from(ExpiredTaskTombstone)
+                .where(ExpiredTaskTombstone.task_id == task_id)
+            ).scalar_one()
+            == 1
+        )
+        tombstone = db.get(ExpiredTaskTombstone, task_id)
+        # Describes the task that just expired, not the first one.
+        assert tombstone.agent_id == second_agent_id
+
+
 # --- trace expiry --------------------------------------------------------------
 
 
@@ -507,6 +676,11 @@ def test_trace_expiry_stamps_traces_expired_at(sessions) -> None:
         user_id = _make_user(db)
         task_id = _make_task(db, user_id=user_id, days_old=100)
         _make_trace(db, task_id)
+        # Explicitly old, the same way ``_seed_full_task`` pins it in
+        # ``test_task_retention_purge.py``: this UPDATE fires ``onupdate``,
+        # so leaving it at "now" would make the pin below pass whether or not
+        # the purge actually left the column alone.
+        db.execute(sa.update(Task).where(Task.id == task_id).values(updated_at=EARLIER))
         db.commit()
 
         assert _purge(db, task_id) is RetentionPurgeAction.PURGED_TRACES
@@ -514,6 +688,7 @@ def test_trace_expiry_stamps_traces_expired_at(sessions) -> None:
     with sessions() as db:
         task = db.get(Task, task_id)
         assert _as_utc(task.traces_expired_at) == NOW
+        assert _as_utc(task.updated_at) == EARLIER
         # Trace expiry keeps the task, so it leaves no tombstone.
         assert db.get(ExpiredTaskTombstone, task_id) is None
 

@@ -62,6 +62,16 @@ class ExpiredTaskTombstone(Base):  # type: ignore
     #: ``Task.source``: v1 serves only ``sdk``; Conversation Logs selects on
     #: the external sources.
     source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    #: ``AgentTrigger.type`` (raw value: webhook/scheduled/gmail -- not the
+    #: derived UI source). Conversation Logs' detail and list predicates read
+    #: it as ``coalesce(Task.agent_config["trigger_type"], <trigger type of
+    #: the highest-id TriggerRun for the task>)`` -- only webhook triggers are
+    #: visible live (see ``_trigger_type_for_task`` ~line 106 and
+    #: ``_conversation_source_query`` ~line 375 in
+    #: ``api/conversation_logs.py``). Live, that trigger type is reached
+    #: through ``TriggerRun.task_id``, which the purge SETs NULL, so -- like
+    #: ``workforce_id`` -- it must be captured before the delete.
+    trigger_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     #: ``Task.is_visible``: Conversation Logs' hidden-external scope.
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False)
     #: Whether the task carried the MCP runtime-authorization marker. Those

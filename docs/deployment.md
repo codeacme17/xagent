@@ -490,7 +490,7 @@ When the retention purge expires a conversation it now leaves a record, so that 
 ### Deployment impact
 
 - Migration `20260926_expired_task_tombstones` adds the `expired_task_tombstones` table and three nullable columns: `tasks.traces_expired_at`, `trigger_runs.task_expired_at` and `workforce_runs.task_expired_at`. The columns have no server default, so on PostgreSQL each `ADD COLUMN` is catalog-only: no table rewrite and no backfill on `tasks`.
-- Conversation expiry writes one tombstone per expired task, in the purge's own transaction. It holds no conversation content — only the owner, agent, workforce, source, visibility and MCP channel-plumbing marker that the read surfaces' access checks need, plus the task's creation and expiry times. Expect roughly 150–200 bytes per expired task including indexes.
+- Conversation expiry writes one tombstone per expired task, in the purge's own transaction. It holds no conversation content — only the owner, agent, workforce, source, trigger type, visibility and MCP channel-plumbing marker that the read surfaces' access checks need, plus the task's creation and expiry times. Expect roughly 150–200 bytes per expired task including indexes.
 - The same transaction sets `task_expired_at` on every trigger and workforce run that pointed at the task, without changing the run's status and without advancing `trigger_runs.updated_at` or `workforce_runs.last_activity_at`.
 - Trace expiry stamps `tasks.traces_expired_at` each time it removes a trace.
 - User-initiated task deletion is unchanged and writes no record.

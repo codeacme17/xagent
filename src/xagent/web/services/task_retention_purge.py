@@ -104,7 +104,7 @@ import enum
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -406,10 +406,14 @@ def _purge_trace_rows(db: Session, task_id: int, *, now: datetime) -> int:
     side-effect review names maintenance writes that advance ``updated_at`` as
     a hazard in their own right.
 
-    The same UPDATE stamps ``traces_expired_at`` (#2565), so a steps read can
-    say its history was removed rather than presenting an empty or partial
-    list as complete. It is re-stamped on every real expiry: a trace-expired
-    task can take new turns, whose trace can expire in turn.
+    The same UPDATE stamps ``traces_expired_at`` (#2565), but only when there
+    was a trace row to remove. A checkpoint pointer can go dangling with no
+    trace row behind it -- the row went between the scan and the lock, or the
+    stored pointer already lagged what existed (#2580) -- and clearing such a
+    pointer removes nothing, so stamping the column there would claim a trace
+    history was expired that never existed to begin with. It is re-stamped on
+    every real expiry: a trace-expired task can take new turns, whose trace
+    can expire in turn.
     """
     removed = 0
     # Only when there is something to remove. An unconditional UPDATE matches
@@ -437,16 +441,18 @@ def _purge_trace_rows(db: Session, task_id: int, *, now: datetime) -> int:
     ).scalar_one()
     if pointers_set is None and not trace_rows_exist:
         return 0
+    values: dict[str, Any] = {
+        "last_checkpoint_event_id": None,
+        "last_checkpoint_trace_event_id": None,
+        "updated_at": Task.updated_at,
+    }
+    if trace_rows_exist:
+        values["traces_expired_at"] = now
     removed += _rowcount(
         db.execute(
             update(Task)
             .where(Task.id == task_id)
-            .values(
-                last_checkpoint_event_id=None,
-                last_checkpoint_trace_event_id=None,
-                traces_expired_at=now,
-                updated_at=Task.updated_at,
-            )
+            .values(**values)
             .execution_options(synchronize_session=False)
         )
     )

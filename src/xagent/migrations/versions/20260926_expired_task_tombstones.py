@@ -13,8 +13,8 @@ row, since nothing has been expired before this revision.
 
 The tombstone table references ``users``, ``agents`` and ``workforces``, so it
 waits for all three the way the other task-adjacent revisions wait for their
-parents; a database that has not got them yet gets the table from a later
-upgrade or from ``create_all``.
+parents; a database that has not got them yet gets the table only from
+``create_all``.
 """
 
 import sqlalchemy as sa
@@ -80,6 +80,7 @@ def upgrade() -> None:
             nullable=True,
         ),
         sa.Column("source", sa.String(20), nullable=True),
+        sa.Column("trigger_type", sa.String(32), nullable=True),
         sa.Column("is_visible", sa.Boolean(), nullable=False),
         sa.Column("is_channel_plumbing", sa.Boolean(), nullable=False),
         sa.Column("task_created_at", sa.DateTime(timezone=True), nullable=True),
