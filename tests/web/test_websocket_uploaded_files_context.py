@@ -682,7 +682,7 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
     assert payload_calls == []
 
 
-def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
+def test_build_uploaded_files_context_never_orders_knowledge_base_creation():
     context = _build_uploaded_files_context(
         [
             {
@@ -690,23 +690,22 @@ def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
                 "name": "faq.docx",
                 "original_name": "FAQ.docx",
             }
-        ],
-        is_agent_builder=True,
+        ]
     )
 
     assert "FAQ.docx: file_id=file-123" in context
     assert "## FILE REFERENCES" in context
     assert "Treat file_id as the canonical file handle" in context
     assert "call prepare_html_asset(file_id, html_path, alias) first" in context
-    assert "create_knowledge_base_from_file" in context
-    assert 'file_ids = ["file-123"]' in context
-    assert "Do NOT ask the user to upload again" in context
+    # Task-path agents no longer mount the knowledge-base authoring tools
+    # (#2219), so the uploaded-files context must not tell the model to
+    # call one.
+    assert "create_knowledge_base_from_file" not in context
 
 
 def test_append_uploaded_files_context_to_message_is_idempotent():
     context = _build_uploaded_files_context(
         [{"file_id": "file-123", "name": "faq.docx"}],
-        is_agent_builder=False,
     )
 
     message = _append_uploaded_files_context_to_message("Upload File", context)
