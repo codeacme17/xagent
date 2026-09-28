@@ -41,10 +41,12 @@ transaction does not allow.
 
 Failing closed
 --------------
-Every failure keeps data rather than deleting it. A resolver that raises or
-returns something malformed resolves to ``None``: the scan selects nothing and
-the assessment skips the task. A single user's unusable value -- ``None``,
-zero, negative, over the cap, not an ``int`` -- refuses that user's tasks. None
+Every failure keeps data rather than deleting it. A resolver that raises, or
+returns a result that is not a mapping or carries a user id that is not an
+``int``, resolves to ``None``: the scan selects nothing and the assessment
+skips the task. A single user's unusable entry -- a value that is not a
+:class:`RetentionOverride`, or a period that is ``None``, zero, negative, over
+the cap or not an ``int`` -- refuses only that user's tasks. None
 of these fall back to the global period, because for a team that extended its
 period the global period is the premature-deletion direction, the one that
 cannot be undone. An over-cap value is refused rather than clamped for the
@@ -207,7 +209,10 @@ def _apply(
     equality is the only trace of it left. Without this, a team extending its
     conversation to 730 days would still lose its traces at 365. An operator
     who set the two equal explicitly gets the same reading, which can only
-    keep traces longer, never shorter.
+    keep traces longer, never shorter: a team that *shortens* its
+    conversation shortens the trace with it, but conversation expiry removes
+    the whole task, traces included, at that same moment, so no trace goes
+    earlier than it would have anyway.
     """
     legs: list[int | None] = []
     for default, value in (
@@ -232,12 +237,20 @@ def _apply(
 
 
 def load_retention_overrides(
-    db: Session, defaults: RetentionPeriods, *, report_refused: bool = True
+    db: Session, defaults: RetentionPeriods, *, per_task: bool = False
 ) -> RetentionOverrideSnapshot | None:
     """Read the resolver once, or ``None`` when it failed (fail closed).
 
-    ``report_refused`` logs how many users were refused. The batch scan does;
-    the per-task read does not, or one bad team would log once per task.
+    ``per_task`` marks the locked assessment's own read (via
+    :func:`resolve_task_retention_periods`), as opposed to the batch scan's.
+    A per-task read skips the refused-users summary, and logs a resolver
+    failure at DEBUG instead of WARNING (still with ``exc_info=True``) --
+    otherwise one bad team, or one resolver outage, would log once per task
+    in the sweep instead of once per batch. Neither silences the failure: a
+    per-task failure is counted as ``skipped_override_unresolved``, and the
+    batch logs one WARNING whenever that count is non-zero -- which matters
+    for a resolver that fails only on the per-task reads, since its scan read
+    then never warns.
     """
     resolver = _resolver
     if resolver is None:
@@ -261,12 +274,13 @@ def load_retention_overrides(
             elif periods != defaults:
                 periods_by_user[user_id] = periods
     except Exception:  # noqa: BLE001
-        logger.warning(
+        logger.log(
+            logging.DEBUG if per_task else logging.WARNING,
             "retention override resolver failed; purging nothing it governs",
             exc_info=True,
         )
         return None
-    if refused and report_refused:
+    if refused and not per_task:
         logger.warning(
             "retention overrides refused for %d user(s): unusable period "
             "(must be 1..%d days or inherit); their tasks are kept; "
@@ -291,10 +305,15 @@ def resolve_task_retention_periods(
     Unregistered, this returns ``defaults`` without touching the database.
     A task that no longer exists also gets ``defaults``: the assessment that
     follows reports it missing.
+
+    Reads the resolver with ``per_task=True``: a failure here is counted as
+    ``skipped_override_unresolved``, and the batch logs one WARNING for that
+    count, so logging each one at WARNING here would only repeat it once per
+    task. The traceback is kept at DEBUG.
     """
     if _resolver is None:
         return defaults
-    snapshot = load_retention_overrides(db, defaults, report_refused=False)
+    snapshot = load_retention_overrides(db, defaults, per_task=True)
     if snapshot is None:
         return None
     user_id = db.execute(

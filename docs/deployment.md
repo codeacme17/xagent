@@ -549,15 +549,15 @@ The two retention variables are deployment-wide. A deployment layer that lets a 
 A deployment layer registers a resolver with `xagent.web.services.task_retention_overrides.set_retention_override_resolver`. It maps each `user_id` whose team has an override to its conversation and trace periods, either of which may be left to inherit the deployment's value.
 
 - An override may set 1 to 730 days. Any other value, including `None`, is refused rather than clamped, and that user's tasks are kept. An unusable value refuses the user even on a leg the deployment left off.
-- A resolver that raises or returns something malformed keeps everything: the batch selects nothing, and a task already selected is counted as `skipped_override_unresolved`. Nothing falls back to the global periods, which would expire a team that extended its period early.
+- A resolver that raises, returns something that is not a mapping, or returns a non-`int` user id keeps everything: the batch selects nothing, and a task already selected is counted as `skipped_override_unresolved`. A single user's value that is not a `RetentionOverride` (or an override with an unusable period) refuses only that user, and the batch proceeds for everyone else. Nothing falls back to the global periods, which would expire a team that extended its period early.
 - An override never enables a leg the deployment left off, and never starts a purge the variables leave disabled.
-- An inherited trace period follows the team's conversation period when the deployment's trace period equals its conversation period — which is what leaving `XAGENT_TRACE_RETENTION_DAYS` unset produces. Otherwise it stays the deployment's trace period.
+- An inherited trace period follows the team's conversation period when the deployment's trace period equals its conversation period — which is what leaving `XAGENT_TRACE_RETENTION_DAYS` unset produces, but also what an operator gets by setting it explicitly equal to the conversation period. Either way, a team extending its conversation period also extends its trace period past the value the operator set. A team shortening its conversation shortens the trace with it, which deletes nothing earlier: conversation expiry removes the whole task, traces included, at that point anyway. Otherwise the trace period stays the deployment's own.
 - Overrides are read once per batch for the scan and again per task inside the task's own transaction, just before its row is locked, so a settings change committed before then applies to that task. The resolver therefore runs inside the purge's transaction and must be a read with no side effects, dry run included.
 
 ### Verification and monitoring
 
 - A failed resolver read shows in the audit line only as `scanned=0`, which is indistinguishable from an idle batch. The warning `retention override resolver failed` in the log is the signal, and the cursor restarts from the top of the table on the next sweep.
-- Refused users are logged once per batch with up to 20 of their ids. A persistently non-zero `skipped_override_unresolved` means the resolver is failing between the scan and the lock.
+- Refused users are logged once per batch with up to 20 of their ids. A non-zero `skipped_override_unresolved` is also logged as one WARNING per batch (`retention purge kept N task(s) ...`). It has two possible sources: the resolver failing on the per-task reads (the traceback for each task is logged at DEBUG by `xagent.web.services.task_retention_overrides`), or a user whose value became unusable after the scan.
 - `xagent retention preview` still counts against the global periods only; it does not apply overrides.
 
 ### Rollback

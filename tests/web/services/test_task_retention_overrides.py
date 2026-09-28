@@ -207,6 +207,26 @@ def test_an_unusable_value_refuses_that_user_only(sessions, value) -> None:
     assert snapshot.periods_for(8) == RetentionPeriods(30, 90)
 
 
+def test_an_unusable_value_refuses_the_user_even_on_a_leg_the_deployment_left_off(
+    sessions,
+) -> None:
+    """``_apply`` must check usability before it checks whether the leg is on.
+
+    The deployment here has no trace period at all (``trace_days=None``); a
+    resolver that sets ``trace_days=0`` is unusable regardless. Checking
+    ``default is None`` first would treat the off leg as nothing to validate
+    and let the unusable ``0`` pass silently as "leg stays off", refusing
+    nobody -- exactly the leak "on a leg the deployment left off" exists to
+    close.
+    """
+    defaults = RetentionPeriods(conversation_days=365, trace_days=None)
+    set_retention_override_resolver(lambda db: {7: RetentionOverride(trace_days=0)})
+    with sessions() as db:
+        snapshot = load_retention_overrides(db, defaults)
+    assert snapshot is not None
+    assert snapshot.periods_for(7) is None
+
+
 @pytest.mark.parametrize(
     ("defaults", "override", "expected"),
     [
@@ -408,6 +428,44 @@ def test_a_resolver_failing_at_the_lock_skips_the_task(sessions) -> None:
     assert _state(sessions, task_id) == "intact"
 
 
+def test_a_per_task_failure_warns_once_per_batch_not_once_per_task(
+    sessions, caplog
+) -> None:
+    """A resolver that fails only after the scan -- a rate-limited settings
+    service that answers the scan and refuses the per-task reads -- must
+    still reach WARNING, but once per batch, not once per task. The per-task
+    reads log at DEBUG with the traceback; the batch logs one WARNING
+    naming the count. The scan succeeds here, so nothing else would warn.
+    """
+    with sessions() as db:
+        for index in range(3):
+            _seed(db, username=f"persistent-fail-{index}", age_days=400)
+    calls = {"n": 0}
+
+    def fails_after_the_scan(db: Session) -> dict[int, RetentionOverride]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("down")
+        return {}
+
+    set_retention_override_resolver(fails_after_the_scan)
+
+    with caplog.at_level(logging.DEBUG, logger=overrides_module.__name__):
+        report = _batch(sessions)
+
+    assert report.skipped_override_unresolved == 3
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [r.name for r in warnings] == ["xagent.web.services.task_retention_purge"]
+    assert "3 task(s)" in warnings[0].getMessage()
+    debug_failures = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "resolver failed" in r.getMessage()
+    ]
+    assert len(debug_failures) == 3
+    assert all(r.exc_info for r in debug_failures)
+
+
 def test_an_out_of_cap_value_keeps_that_teams_tasks_out_of_the_purge(
     sessions,
 ) -> None:
@@ -428,6 +486,52 @@ def test_an_out_of_cap_value_keeps_that_teams_tasks_out_of_the_purge(
         action = purge_task(db, refused, now=NOW, conversation_days=365, trace_days=90)
     assert action is RetentionPurgeAction.SKIPPED_OVERRIDE_UNRESOLVED
     assert _state(sessions, refused) == "intact"
+
+
+def test_a_missing_task_is_skipped_busy_not_unresolved(sessions) -> None:
+    """A registered resolver with nothing to say about the task must not
+    turn a row that vanished before the lock into ``skipped_override_unresolved``.
+
+    ``resolve_task_retention_periods`` looks the task's ``user_id`` up to key
+    the resolver's mapping; a task deleted between the scan and this call has
+    none, and it must fall back to ``defaults`` rather than refuse (returning
+    ``None``) -- the assessment that follows is what correctly reports a
+    missing row, as ``skipped_busy``. A regression that returned ``None`` for
+    the missing-task branch would instead report
+    ``skipped_override_unresolved``, which is what this pins.
+    """
+    set_retention_override_resolver(lambda db: {})
+    with sessions() as db:
+        task_id = _seed(db, username="vanished", age_days=1, trace=False)
+        db.execute(sa.delete(Task).where(Task.id == task_id))
+        db.commit()
+
+    with sessions() as db:
+        action = purge_task(db, task_id, now=NOW, conversation_days=365, trace_days=90)
+    assert action is RetentionPurgeAction.SKIPPED_BUSY
+
+
+def test_a_quiescent_task_with_no_anchor_is_skipped_busy(sessions) -> None:
+    """A COMPLETED task with no ``last_activity_at``, no ``created_at`` and no
+    message has nothing to measure a period against, so it must be skipped as
+    busy rather than reported not-due. This pins the ``assessment.anchor is
+    not None`` half of the ``NOT_ELIGIBLE`` branch in ``_purge_task``: without
+    it, a quiescent task with no anchor would be misreported as
+    ``skipped_not_due`` -- "not due yet" implies a period that simply has not
+    elapsed, which is false when there is nothing to measure at all.
+    """
+    with sessions() as db:
+        task_id = _seed(db, username="no-anchor", age_days=1, trace=False)
+        db.execute(
+            sa.update(Task)
+            .where(Task.id == task_id)
+            .values(created_at=None, last_activity_at=None)
+        )
+        db.commit()
+
+    with sessions() as db:
+        action = purge_task(db, task_id, now=NOW, conversation_days=365, trace_days=90)
+    assert action is RetentionPurgeAction.SKIPPED_BUSY
 
 
 def test_an_override_on_a_leg_the_deployment_left_off_deletes_nothing(

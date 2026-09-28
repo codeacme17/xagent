@@ -794,6 +794,16 @@ def run_retention_purge_batch(
         # task commits its own transaction, so an exception escaping this loop
         # would otherwise discard the record of deletions that did happen.
         logger.info(report.audit_line())
+        # One line per batch, not per task: the per-task override reads log
+        # their cause at DEBUG, and a resolver that fails only on those reads
+        # would otherwise never reach WARNING at all (#2600).
+        if report.skipped_override_unresolved:
+            logger.warning(
+                "retention purge kept %d task(s) whose team retention period "
+                "could not be resolved or was unusable; the cause is logged "
+                "at DEBUG by xagent.web.services.task_retention_overrides",
+                report.skipped_override_unresolved,
+            )
     return report
 
 
