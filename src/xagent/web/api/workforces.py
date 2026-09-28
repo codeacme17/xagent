@@ -79,6 +79,7 @@ from ..services.workforce_snapshot import (
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
+from ..utils.db_timezone import format_datetime_for_api
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
 logger = logging.getLogger(__name__)
@@ -180,7 +181,16 @@ def _agent_status_value(agent: Agent) -> str:
 
 
 def _serialize_datetime(value: Any) -> str | None:
-    return value.isoformat() if value else None
+    """Format a workforce/run timestamp for the API response.
+
+    Delegates to ``format_datetime_for_api`` rather than a bare
+    ``value.isoformat()``: for a tz-aware UTC datetime (the PostgreSQL case)
+    the two produce the identical string, but for SQLite's naive-UTC storage
+    ``format_datetime_for_api`` adds the ``+00:00`` offset a bare
+    ``isoformat()`` omits. Applying it here fixes every field this function
+    serializes, not only the new ``task_expired_at`` (#2565).
+    """
+    return format_datetime_for_api(value)
 
 
 def _serialize_agent(

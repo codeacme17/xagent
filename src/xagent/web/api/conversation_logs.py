@@ -313,6 +313,12 @@ def _external_ui_source_for_task(db: Session, task: Task) -> str:
 
 
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
+    """The second live gate: ``None`` here is a 404 even for an in-scope task.
+
+    Mirrored by ``_tombstone_has_ui_source`` below for a task retention
+    purged; see ``test_live_and_tombstone_predicates_agree`` in
+    ``tests/web/api/test_conversation_logs.py`` -- change the two together.
+    """
     source = str(task.source or "")
     if source == EXTERNAL_TASK_SOURCE:
         return _external_ui_source_for_task(db, task)
@@ -328,7 +334,15 @@ def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
 
 
 def _apply_external_task_scope(query: Any, user: User) -> Any:
-    """Admins can inspect hidden external conversation logs across all users."""
+    """Admins can inspect hidden external conversation logs across all users.
+
+    Mirrored by ``_tombstone_in_external_task_scope`` below for a task
+    retention purged; ``tests/web/api/test_conversation_logs.py``'s
+    ``test_live_and_tombstone_predicates_agree`` runs both live and
+    post-purge over the same task shapes and checks they agree, so a term
+    changed here without changing there fails that test rather than silently
+    disclosing (or hiding) an expired task. Change the two together.
+    """
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
@@ -357,6 +371,10 @@ def _tombstone_in_external_task_scope(
     plumbing, and the caller's own unless the caller is an admin. Keep the two
     in step -- a term added there and not here would let an expired task be
     disclosed to a caller who could never have seen it live.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_apply_external_task_scope``.
     """
     if tombstone.is_visible:
         return False
@@ -379,6 +397,10 @@ def _tombstone_has_ui_source(tombstone: ExpiredTaskTombstone) -> bool:
     always resolves to a UI source -- it falls back to the REST API default
     when no deployment branch matches -- so an external tombstone always
     passes too.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_ui_source_for_task``.
     """
     source = str(tombstone.source or "")
     if source == EXTERNAL_TASK_SOURCE:

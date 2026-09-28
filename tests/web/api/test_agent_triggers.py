@@ -4591,10 +4591,11 @@ def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() 
     expired = runs[expired_run_id]
     assert expired["task_id"] is None
     assert expired["status"] == "completed"
-    assert (
-        datetime.fromisoformat(expired["task_expired_at"]).replace(tzinfo=timezone.utc)
-        == expired_at
-    )
+    # SQLite stores this naive; the field must still carry an explicit UTC
+    # offset on the wire rather than leaving the client to guess one (#2565).
+    parsed_expired_at = datetime.fromisoformat(expired["task_expired_at"])
+    assert parsed_expired_at.utcoffset() == timedelta(0)
+    assert parsed_expired_at == expired_at
     assert runs[deleted_run_id]["task_id"] is None
     assert runs[deleted_run_id]["status"] == "failed"
     assert runs[deleted_run_id]["task_expired_at"] is None

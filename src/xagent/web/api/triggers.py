@@ -48,6 +48,7 @@ from ..services.triggers import (
     verify_webhook_secret,
 )
 from ..services.workforce_access import ensure_workforce_access
+from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,16 @@ class TriggerFireResponse(BaseModel):
 
 
 def _dt(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    """Format a trigger/run timestamp for the API response.
+
+    Delegates to ``format_datetime_for_api`` rather than a bare
+    ``value.isoformat()``: for a tz-aware UTC datetime (the PostgreSQL case)
+    the two produce the identical string, but for SQLite's naive-UTC storage
+    ``format_datetime_for_api`` adds the ``+00:00`` offset a bare
+    ``isoformat()`` omits. Applying it here fixes every field this function
+    serializes, not only the new ``task_expired_at`` (#2565).
+    """
+    return format_datetime_for_api(value)
 
 
 def _serialize_trigger(

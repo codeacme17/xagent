@@ -44,6 +44,10 @@ vi.mock("@/contexts/i18n-context", () => ({
       // TraceEventRenderer labels the tool button via t(key, { tool }); mirror
       // the interpolation so the tool name is assertable.
       if (vars?.tool) return `${key}:${vars.tool}`
+      // The expired-detail and expired-traceEvents notes interpolate a
+      // formatted date via t(key, { date }); mirror it so the rendered date
+      // string is assertable instead of being swallowed by the key fallback.
+      if (vars?.date) return `${key}:${vars.date}`
       const labels: Record<string, string> = {
         "conversationLogs.title": "Conversation Logs",
         "conversationLogs.searchPlaceholder": "Search conversations",
@@ -351,6 +355,7 @@ describe("ConversationLogsPage", () => {
   }
 
   it("says a log expired when retention removed it after it was listed", async () => {
+    const expiredAt = "2026-09-01T12:00:00+00:00"
     mockDetailResponse(
       () =>
         new Response(
@@ -359,7 +364,7 @@ describe("ConversationLogsPage", () => {
               code: "task_expired",
               message: "Conversation log expired under the retention policy",
               task_id: 101,
-              expired_at: "2026-09-01T08:30:00+00:00",
+              expired_at: expiredAt,
             },
           }),
           { status: 410 }
@@ -368,8 +373,62 @@ describe("ConversationLogsPage", () => {
 
     render(<ConversationLogsPage />)
 
-    expect(await screen.findByText("conversationLogs.expired.detail")).toBeInTheDocument()
+    const expectedDate = new Date(expiredAt).toLocaleDateString()
+    expect(
+      await screen.findByText(`conversationLogs.expired.detail:${expectedDate}`)
+    ).toBeInTheDocument()
     expect(screen.queryByText("Failed to load conversation detail")).not.toBeInTheDocument()
+  })
+
+  it("clears the expired note once a different log is selected", async () => {
+    const expiredAt = "2026-09-01T12:00:00+00:00"
+    apiRequestMock.mockImplementation((url: string) => {
+      const parsed = new URL(url)
+      if (parsed.pathname === "/api/conversation-logs/101") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              detail: {
+                code: "task_expired",
+                message: "Conversation log expired under the retention policy",
+                task_id: 101,
+                expired_at: expiredAt,
+              },
+            }),
+            { status: 410 }
+          )
+        )
+      }
+      if (parsed.pathname === "/api/conversation-logs/202") {
+        return Promise.resolve(
+          new Response(JSON.stringify(webhookDetailPayload), { status: 200 })
+        )
+      }
+      if (parsed.pathname === "/api/conversation-logs") {
+        return Promise.resolve(
+          new Response(JSON.stringify(listPayload), { status: 200 })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<ConversationLogsPage />)
+
+    const expectedDate = new Date(expiredAt).toLocaleDateString()
+    expect(
+      await screen.findByText(`conversationLogs.expired.detail:${expectedDate}`)
+    ).toBeInTheDocument()
+
+    // Copies the selection pattern from "ignores stale detail responses
+    // after a newer log is selected": pick the other listed log (source
+    // "webhook", task 202) and confirm its detail replaces the expired note
+    // instead of the note lingering from the previous selection.
+    fireEvent.click(screen.getByText("Webhook"))
+
+    expect(await screen.findByText("Handle webhook event")).toBeInTheDocument()
+    expect(
+      screen.queryByText(`conversationLogs.expired.detail:${expectedDate}`)
+    ).not.toBeInTheDocument()
   })
 
   it("treats a 410 without the task_expired code as an ordinary failure", async () => {
@@ -384,13 +443,14 @@ describe("ConversationLogsPage", () => {
   })
 
   it("notes when retention removed earlier execution steps", async () => {
+    const expiredAt = "2026-09-01T12:00:00+00:00"
     mockDetailResponse(
       () =>
         new Response(
           JSON.stringify({
             ...detailPayload,
             trace_events: [],
-            trace_events_expired_at: "2026-09-01T08:30:00+00:00",
+            trace_events_expired_at: expiredAt,
           }),
           { status: 200 }
         )
@@ -398,8 +458,11 @@ describe("ConversationLogsPage", () => {
 
     render(<ConversationLogsPage />)
 
+    const expectedDate = new Date(expiredAt).toLocaleDateString()
     expect(await screen.findByText("Qualify this lead")).toBeInTheDocument()
-    expect(screen.getByText("conversationLogs.expired.traceEvents")).toBeInTheDocument()
+    expect(
+      screen.getByText(`conversationLogs.expired.traceEvents:${expectedDate}`)
+    ).toBeInTheDocument()
   })
 
   it("shows no retention note for a complete trace", async () => {
