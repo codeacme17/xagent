@@ -751,6 +751,7 @@ class TestOpenAILLM:
             "type": "text",
             "content": "Hello World",
             "raw": mock_chat_completion.model_dump(),
+            "finish_reason": "stop",
         }
         assert mock_client.chat.completions.create.await_count == 2
         retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
@@ -2473,3 +2474,128 @@ class TestSequentiallyRejectedParameters:
         final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
         assert final_kwargs["max_completion_tokens"] == 5000
         assert "response_format" not in final_kwargs
+
+
+class TestFinishReasonOnResponse:
+    """#2786: non-streaming responses carry the provider's ``finish_reason``
+    so ``llm_call_end`` can record it."""
+
+    @staticmethod
+    def _text_response(finish_reason):
+        message = SimpleNamespace(content="Hello", tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": finish_reason}]},
+        )
+
+    @staticmethod
+    def _tool_call_response():
+        tool_call = SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="search", arguments='{"q":"x"}'),
+        )
+        message = SimpleNamespace(content=None, tool_calls=[tool_call])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="tool_calls", message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "tool_calls"}]},
+        )
+
+    @staticmethod
+    def _patch_client(mocker, response):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_text_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("length"))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_chat_tool_call_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._tool_call_response())
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Search"}], tools=[{}])
+
+        assert result["type"] == "tool_call"
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", [None, ""])
+    async def test_chat_omits_finish_reason_when_provider_sends_none(
+        self, openai_llm_config, mocker, finish_reason
+    ):
+        self._patch_client(mocker, self._text_response(finish_reason))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert "finish_reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("stop"))
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat([{"role": "user", "content": "Describe"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_carries_finish_reason_on_final_content_delta(
+        self, openai_llm_config, mocker
+    ):
+        """An endpoint that reports ``finish_reason`` on the same chunk as the
+        last content delta must not lose it: the runtime reads the reason from
+        whichever chunk carries it."""
+
+        async def stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="Hello", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=" world", tool_calls=None),
+                        finish_reason="length",
+                    )
+                ]
+            )
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        chunks = [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+        tokens = [c for c in chunks if c.is_token()]
+        assert [c.delta for c in tokens] == ["Hello", " world"]
+        assert [c.finish_reason for c in tokens] == ["", "length"]
