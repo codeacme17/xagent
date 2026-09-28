@@ -1801,6 +1801,7 @@ def _insert_tombstone(
     task_id: int,
     user_id: int,
     source: str | None = "sdk",
+    trigger_type: str | None = None,
     is_visible: bool = False,
     is_channel_plumbing: bool = False,
     agent_id: int | None = None,
@@ -1813,6 +1814,7 @@ def _insert_tombstone(
                 user_id=user_id,
                 agent_id=agent_id,
                 source=source,
+                trigger_type=trigger_type,
                 is_visible=is_visible,
                 is_channel_plumbing=is_channel_plumbing,
                 task_created_at=_EXPIRED_AT,
@@ -1934,8 +1936,17 @@ def test_expired_log_detail_is_disclosed_to_the_owner_and_admins_only() -> None:
             "a task without a source is outside the external-source scope",
         ),
         (
-            {"source": "trigger"},
-            "the tombstone cannot prove a trigger task was a webhook log",
+            {"source": "trigger", "trigger_type": "scheduled"},
+            "a scheduled trigger task was never a Conversation Logs webhook entry",
+        ),
+        (
+            {"source": "trigger", "trigger_type": "gmail"},
+            "a Gmail trigger task was never a Conversation Logs webhook entry",
+        ),
+        (
+            {"source": "trigger", "trigger_type": None},
+            "a trigger task with no recorded trigger type cannot be told apart "
+            "from a scheduled or Gmail one",
         ),
     ],
 )
@@ -1961,6 +1972,99 @@ def test_expired_direct_and_external_sources_are_in_scope() -> None:
         _assert_expired(
             client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
         )
+
+
+def test_expired_webhook_trigger_source_is_in_scope() -> None:
+    """The stored ``trigger_type`` (#2565 follow-up) lets a webhook trigger
+    tombstone answer 410 like every other in-scope source, instead of every
+    ``trigger``-sourced tombstone falling back to 404.
+    """
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    task_id = _UNUSED_TASK_ID + 20
+    _insert_tombstone(
+        task_id=task_id, user_id=admin_id, source="trigger", trigger_type="webhook"
+    )
+
+    _assert_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+    )
+
+
+def test_expired_webhook_trigger_conversation_log_is_reported_end_to_end() -> None:
+    """A real purge of a webhook trigger task's conversation reports 410.
+
+    Unlike ``test_expired_webhook_trigger_source_is_in_scope``, which inserts
+    a tombstone directly, this drives the actual ``purge_task`` path so the
+    trigger type it captures before nulling ``TriggerRun.task_id`` is what the
+    detail route reads back.
+    """
+    from datetime import timedelta
+
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Webhook Retention Agent")
+
+    def _purge(*, trigger_type: str, source_event_id: str) -> tuple[int, datetime]:
+        task_id = _create_task_row(
+            user_id=admin_id,
+            title=f"{trigger_type} trigger conversation",
+            source="trigger",
+            is_visible=False,
+            agent_id=agent_id,
+        )
+        _attach_trigger_run(
+            user_id=admin_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type=trigger_type,
+            source_event_id=source_event_id,
+        )
+        base = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = base + timedelta(days=400)
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            task.last_activity_at = base
+            task.lease_expires_at = None
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.commit()
+            assert (
+                purge_task(db, task_id, now=now, conversation_days=365, trace_days=90)
+                is RetentionPurgeAction.PURGED_CONVERSATION
+            )
+        finally:
+            db.close()
+        return task_id, now
+
+    webhook_task_id, webhook_expired_at = _purge(
+        trigger_type="webhook", source_event_id="evt-purge-webhook"
+    )
+    webhook_detail = client.get(
+        f"/api/conversation-logs/{webhook_task_id}", headers=admin
+    )
+    assert webhook_detail.status_code == 410, webhook_detail.text
+    webhook_error = webhook_detail.json()["detail"]
+    assert webhook_error["code"] == "task_expired"
+    assert webhook_error["task_id"] == webhook_task_id
+    assert datetime.fromisoformat(webhook_error["expired_at"]) == webhook_expired_at
+
+    # Cheap to pin alongside: a scheduled trigger's purged conversation stays
+    # not-found, since this page never served it live either.
+    scheduled_task_id, _ = _purge(
+        trigger_type="scheduled", source_event_id="evt-purge-scheduled"
+    )
+    _assert_not_found(
+        client.get(f"/api/conversation-logs/{scheduled_task_id}", headers=admin)
+    )
 
 
 def test_live_log_wins_over_a_tombstone_with_the_same_id() -> None:

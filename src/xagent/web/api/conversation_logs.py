@@ -370,18 +370,20 @@ def _tombstone_in_external_task_scope(
 def _tombstone_has_ui_source(tombstone: ExpiredTaskTombstone) -> bool:
     """The detail route's second gate, ``_ui_source_for_task``, on a tombstone.
 
-    Direct sources map to a UI source unconditionally, and ``external`` rows
-    fall back to the REST API default when no deployment branch matches, so
-    both always pass. ``trigger`` rows pass only for a webhook trigger, and
-    the trigger type lived in ``agent_config`` and on the ``TriggerRun`` whose
-    ``task_id`` the purge nulled -- the tombstone does not record it. Without
-    it a scheduled or Gmail trigger task, which this page never showed, cannot
-    be told apart from a webhook one, so every trigger tombstone answers
-    not-found: failing to say "expired" is the safe side of that trade,
-    saying it for a task the page never served is not.
+    Mirrors ``_ui_source_for_task`` by running the tombstone's stored
+    ``source`` and ``trigger_type`` through the same ``_ui_source_from_values``
+    mapping the live task uses: direct sources map to a UI source
+    unconditionally, and a ``trigger`` row passes only for a webhook trigger
+    type, exactly like the live task's ``AgentTrigger.type``. ``external`` rows
+    are handled separately here because live, ``_external_ui_source_for_task``
+    always resolves to a UI source -- it falls back to the REST API default
+    when no deployment branch matches -- so an external tombstone always
+    passes too.
     """
     source = str(tombstone.source or "")
-    return source in DIRECT_SOURCE_TO_UI_SOURCE or source == EXTERNAL_TASK_SOURCE
+    if source == EXTERNAL_TASK_SOURCE:
+        return True
+    return _ui_source_from_values(source, tombstone.trigger_type) is not None
 
 
 def _missing_conversation_log_error(
