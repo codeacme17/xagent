@@ -234,6 +234,8 @@ def test_upsert_already_durable_allows_explicit_same_owner_task_rebind():
     db = _session()
     user = _user(db)
     user_id = int(user.id)
+    db.add(Task(id=24, user_id=user_id, title="rebind target"))
+    db.commit()
     record = UploadedFile(
         file_id="file-task-rebind",
         user_id=user_id,

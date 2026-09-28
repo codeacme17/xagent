@@ -310,6 +310,10 @@ def bind_turn_files_no_commit(
     if not ids:
         return []
     ids = list(dict.fromkeys(ids))
+    from .task_file_lifecycle import lock_attachment_task
+
+    if lock_attachment_task(db, task_id, owner_user_id=owner_user_id) is None:
+        return ids
     # Claim every currently-unbound row first. On PostgreSQL the conditional
     # UPDATE waits for a concurrent writer and then re-evaluates its predicate;
     # on SQLite the serialized writer lock provides the same winner/loser
@@ -320,7 +324,14 @@ def bind_turn_files_no_commit(
         UploadedFile.user_id == owner_user_id,
         UploadedFile.task_id.is_(None),
         UploadedFile.storage_status != "compensating",
-    ).update({UploadedFile.task_id: task_id}, synchronize_session=False)
+    ).update(
+        {
+            UploadedFile.task_id: task_id,
+            UploadedFile.detached_reason: None,
+            UploadedFile.detached_at: None,
+        },
+        synchronize_session=False,
+    )
     bound_rows = (
         db.query(UploadedFile.file_id)
         .filter(
