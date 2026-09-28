@@ -49,6 +49,12 @@ def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
     )
 
 
+async def _empty_stream():
+    """A stream that ends without yielding any chunk."""
+    if False:
+        yield None
+
+
 def _response_format_bad_request(message: str) -> openai.BadRequestError:
     """A 400 whose text matches the response_format fallback's trigger check."""
     return openai.BadRequestError(
@@ -217,12 +223,8 @@ class TestOpenAILLM:
     ):
         """Thinking intent should not add unsupported OpenAI chat parameters."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -610,12 +612,8 @@ class TestOpenAILLM:
     async def test_stream_chat_uses_default_max_tokens(self, openai_llm_config, mocker):
         """stream_chat falls back to the configured default_max_tokens."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -636,10 +634,6 @@ class TestOpenAILLM:
     ):
         """An explicit max_tokens (e.g. the compaction budget) wins over the default."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
@@ -647,7 +641,7 @@ class TestOpenAILLM:
         )
         llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
 
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         _ = [
             chunk
             async for chunk in llm.stream_chat(
@@ -666,10 +660,6 @@ class TestOpenAILLM:
     ):
         """Without a configured default the request keeps the API's own default."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
@@ -682,7 +672,7 @@ class TestOpenAILLM:
         mock_client.chat.completions.create.return_value = mock_chat_completion
         await llm.chat(messages)
         await llm.vision_chat(messages)
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         _ = [chunk async for chunk in llm.stream_chat(messages)]
 
         calls = mock_client.chat.completions.create.call_args_list
@@ -1911,6 +1901,37 @@ class TestRejectedParameterDegrade:
         response = await llm.chat([{"role": "user", "content": "Summarize."}])
 
         assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_default_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """Main agent turns stream with no explicit budget, so the
+        default-sourced one must ride the same rename on that path."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            _empty_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}]
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
         first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
         retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert first_kwargs["max_tokens"] == 1024
