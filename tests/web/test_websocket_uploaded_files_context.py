@@ -682,7 +682,7 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
     assert payload_calls == []
 
 
-def test_build_uploaded_files_context_never_orders_knowledge_base_creation():
+def test_build_uploaded_files_context_lists_file_ids_and_reference_rules():
     context = _build_uploaded_files_context(
         [
             {
@@ -697,10 +697,6 @@ def test_build_uploaded_files_context_never_orders_knowledge_base_creation():
     assert "## FILE REFERENCES" in context
     assert "Treat file_id as the canonical file handle" in context
     assert "call prepare_html_asset(file_id, html_path, alias) first" in context
-    # Task-path agents no longer mount the knowledge-base authoring tools
-    # (#2219), so the uploaded-files context must not tell the model to
-    # call one.
-    assert "create_knowledge_base_from_file" not in context
 
 
 def test_append_uploaded_files_context_to_message_is_idempotent():

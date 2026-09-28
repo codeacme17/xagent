@@ -52,7 +52,9 @@ def test_kb_search_creator_stays_registered() -> None:
 @pytest.mark.parametrize(
     "tool_cls", [CreateKnowledgeBaseFromFileTool, CreateKnowledgeBaseFromUrlTool]
 )
-def test_builder_chat_can_still_instantiate_the_authoring_tools(tool_cls) -> None:
+def test_authoring_tool_classes_keep_their_names_and_sync_contract(tool_cls) -> None:
+    # The builder-chat mounting itself is pinned by
+    # tests/web/api/test_websocket_builder_chat.py.
     tool = tool_cls(user_id=1)
     assert tool.name in KB_AUTHORING_TOOL_NAMES
     with pytest.raises(NotImplementedError, match="Only supports async execution."):
