@@ -10,8 +10,8 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
-from .task_interaction_schema import interaction_requests_table_exists
 from .task_file_lifecycle import detach_task_files, lock_attachment_task
+from .task_interaction_schema import interaction_requests_table_exists
 
 
 def purge_task_rows(
