@@ -183,6 +183,35 @@ Stopping a newly selected task or closing it after failed acceptance leaves it
 paused with its uploaded files, so it can be continued. Cleanup applies only to
 the original unaccepted selection; it cannot modify a newer replacement run.
 
+## Admission-queued SDK replies
+
+When a host installs an execution admission policy, an SDK or A2A reply is
+committed as a durable RESUME_INPUT command together with its admission ticket.
+If that ticket is provably waiting for capacity when ingress checks it (the
+bucket is full, an older waiter precedes it, or startup pacing has not yet
+released it), the V1 reply endpoint answers `202` with `status: "queued"`
+immediately instead of holding the request for
+`XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS` and returning `504 reply_outcome_unknown`. The response carries the accepted
+`command_id`, the `run_id` the task is waiting on, the acceptance
+`state_version`, and the task's current `control_state`; the task stays
+`waiting_for_user` until a worker reserves capacity and resumes it. Nothing has been validated at that
+point: checkpoint readability, state fences, and model availability are still
+checked by the worker, so `queued` is not a running result. Repeat the same
+`command_id` with the identical reply body to observe the outcome without
+injecting the answer again (a different body under the same ID is `409
+task_busy`); the replay stays `queued` while capacity is unavailable and
+reports the stored outcome (`running`, or the existing reply errors) once the
+worker has run it. A queued reply that a cancel or pause control stops before
+it runs replays as `409 task_busy` with `retry_with_new_id`: nothing was
+injected, and a new attempt needs a new `command_id`.
+
+Waiting consumes no attempt or defer budget. Replies that are not governed by an
+admission policy, and governed replies whose worker is merely slow, keep the
+existing wait and `reply_outcome_unknown` semantics. A2A ingress has no queued
+projection: a governed A2A reply now returns the task's current A2A snapshot
+(still `input-required`) instead of the former 504, and the durable reply runs
+when capacity opens.
+
 ## Runtime credential lifetime
 
 Run-scoped credentials remain encrypted while a task is paused or waiting for

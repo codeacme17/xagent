@@ -16,6 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
+from tests.web.services.admission_capacity_shared import (
+    release_bucket,
+    saturate_bucket,
+)
 from xagent.core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
@@ -27,6 +31,7 @@ from xagent.web.api.v1 import task_reply as task_reply_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.schemas.v1 import ReplyRequest
 from xagent.web.services import task_execution as task_execution_service
@@ -1334,3 +1339,134 @@ def test_reply_proven_absent_write_asks_for_a_new_command_id(mock_start_task):
             db.close()
     finally:
         manager.remove_context(str(task_id))
+
+
+@pytest.mark.asyncio
+async def test_reply_queued_behind_capacity_is_acknowledged_promptly(
+    monkeypatch, request
+):
+    """A saturated bucket answers 202 queued now; the worker resumes later."""
+    import time
+
+    from xagent.web.services import task_coordinator_runtime, task_event_bridge
+    from xagent.web.services import task_execution_admission as admission
+    from xagent.web.services import task_resume_command
+    from xagent.web.services.task_command_execution import (
+        execute_durable_task_command,
+    )
+    from xagent.web.services.task_command_transport import (
+        dispatch_one_task_command,
+    )
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        # A released waiting task carries no owner attempt; the seed helper
+        # only clears the runner, and a shared worker cannot own a task
+        # whose attempt is still stamped.
+        task.lease_attempt_id = None
+        owner_id = task.user_id
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", MagicMock())
+    # Keep the production wait: a regression to waiting would only answer
+    # after the full timeout, which the elapsed bound below rejects.
+    monkeypatch.setattr(
+        task_resume_command, "get_task_reply_wait_timeout_seconds", lambda: 30
+    )
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("tenant:batch", 1, 20)
+    )
+    request.addfinalizer(lambda: admission.set_task_admission_hook(None))
+    holding = saturate_bucket(owner_id, agent_id)
+    body = {**_reply_body(agent_id), "command_id": "queued-reply"}
+    try:
+        started = time.monotonic()
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert time.monotonic() - started < 10
+        assert response.status_code == 202, response.text
+        payload = response.json()
+        assert payload["status"] == "queued"
+        assert payload["command_id"] == "queued-reply"
+        assert payload["task_id"] == task_id
+        assert payload["run_id"] == "run-original"
+        assert payload["control_state"] == "waiting_for_user"
+
+        # Same-ID replay converges on the one durable command and stays queued.
+        replay = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["status"] == "queued"
+        # The same ID with a different answer is a conflict, not a new reply.
+        conflict = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json={**body, "message": {"role": "user", "content": "no, stop"}},
+        )
+        assert conflict.status_code == 409, conflict.text
+        assert conflict.json()["error"]["code"] == "task_busy"
+        db = _direct_db_session()
+        try:
+            rows = (
+                db.query(TaskExecutionCommand)
+                .filter(TaskExecutionCommand.task_id == task_id)
+                .all()
+            )
+            assert [
+                (r.command_id, r.status, r.attempt_count, r.defer_count) for r in rows
+            ] == [("queued-reply", "pending", 0, 0)]
+            command_db_id = rows[0].id
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task.status == TaskStatus.WAITING_FOR_USER
+            assert task.control_state == "waiting_for_user"
+        finally:
+            db.close()
+
+        prepare = AsyncMock()
+        # The worker resumes through the same service the route calls, so
+        # scope the deterministic executor to the worker steps only.
+        with patch.object(task_resume, "resume_task_reply", prepare):
+            # The real dispatcher skips the queued reply while capacity stays
+            # occupied, without spending its attempt or defer budget.
+            for _ in range(2):
+                assert not await dispatch_one_task_command(
+                    execute_durable_task_command, command_db_id=command_db_id
+                )
+            db = _direct_db_session()
+            try:
+                row = db.get(TaskExecutionCommand, command_db_id)
+                assert (row.status, row.attempt_count, row.defer_count) == (
+                    "pending",
+                    0,
+                    0,
+                )
+            finally:
+                db.close()
+            prepare.assert_not_awaited()
+
+            release_bucket(holding)
+            # Opening capacity lets the worker run the exact continuation.
+            async with asyncio.timeout(5):
+                while not await dispatch_one_task_command(
+                    execute_durable_task_command, command_db_id=command_db_id
+                ):
+                    await asyncio.sleep(0.05)
+        prepare.assert_awaited_once()
+        assert prepare.await_args.kwargs["turn_id"] == "queued-reply"
+
+        # After execution the same ID replays the accepted outcome, not queued.
+        final = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert final.status_code == 202, final.text
+        assert final.json()["status"] == "running"
+        assert final.json()["command_id"] == "queued-reply"
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()

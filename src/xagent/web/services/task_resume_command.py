@@ -26,6 +26,7 @@ from .llm_utils import AutoModelUnavailableError
 from .task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
+    COMMAND_PENDING,
     COMMAND_PROCESSING,
     ClaimedTaskCommand,
     SettledTaskCommand,
@@ -200,6 +201,11 @@ def _read_reply_outcome(command_db_id: int) -> dict | None:
         if result.get("outcome"):
             return result
         if row.status == COMMAND_FAILED:
+            if result.get("rejection_reason"):
+                # The handoff or a control rejected the command before any
+                # injection, so nothing was written: the same ID replays this
+                # answer and a new attempt needs a new ID.
+                return _outcome_fields("busy", True)
             return {"outcome": "unavailable"}
         if row.status == COMMAND_COMPLETED:
             task = db.get(Task, row.task_id)
@@ -225,6 +231,29 @@ def _read_reply_outcome(command_db_id: int) -> dict | None:
         return None
 
 
+def _read_capacity_wait(command_db_id: int) -> dict | None:
+    """The acceptance snapshot of a reply provably waiting for admission."""
+    from .task_execution_admission import waiting_for_capacity
+
+    with get_session_local()() as db:
+        row = db.get(TaskExecutionCommand, command_db_id)
+        if (
+            row is None
+            or row.status != COMMAND_PENDING
+            or row.target_run_id is None
+            or not waiting_for_capacity(db, command_db_id)
+        ):
+            return None
+        task = db.get(Task, row.task_id)
+        if task is None:
+            return None
+        return {
+            "run_id": str(row.target_run_id),
+            "state_version": int(row.target_state_version),
+            "control_state": str(task.control_state),
+        }
+
+
 async def enqueue_resume_input(
     ctx: TaskReplyInput,
     *,
@@ -248,6 +277,19 @@ async def enqueue_resume_input(
             lambda: _read_reply_outcome(command_db_id)
         )
     ) is None:
+        # Capacity waiting is durable acceptance, not an unknown outcome:
+        # acknowledge it now rather than holding the request for a slot.
+        queued = await run_db_io_cancellation_safe(
+            lambda: _read_capacity_wait(command_db_id)
+        )
+        if queued is not None:
+            return TaskReplyResumeResult(
+                run_id=queued["run_id"],
+                state_version=queued["state_version"],
+                control_state=queued["control_state"],
+                command_id=command_id,
+                queued=True,
+            )
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise TaskResumeOutcomeUnknownError(command_id)

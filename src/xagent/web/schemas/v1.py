@@ -428,14 +428,22 @@ class ReplyRequest(BaseModel):
     )
 
 
+REPLY_STATUS_QUEUED = "queued"
+"""``ReplyResponse.status`` while a durable reply waits for execution capacity."""
+
+
 class ReplyResponse(BaseModel):
     """``POST /v1/chat/tasks/{task_id}/reply`` -> 202 Accepted response.
 
     Same fields and semantics as :class:`AppendMessageResponse`, except:
-    ``status`` is always ``'running'`` (a reply always resumes
-    execution), and ``run_id`` is the *same* run the task was waiting
+    ``status`` is ``'running'`` (the reply resumed execution) or
+    ``'queued'`` (shared execution accepted the reply durably, but it is
+    still waiting for execution capacity and has not been validated or
+    resumed yet), and ``run_id`` is the *same* run the task was waiting
     on -- the reply resumes the paused execution rather than starting a
-    new one.
+    new one. A ``'queued'`` reply keeps the task ``waiting_for_user``
+    until a worker resumes it; repeat the same ``command_id`` with the
+    identical body to observe its outcome without injecting the answer again.
     """
 
     command_id: str | None = Field(
@@ -457,7 +465,11 @@ class ReplyResponse(BaseModel):
         ),
     )
     status: str = Field(
-        ..., description="Always 'running': a reply always resumes execution."
+        ...,
+        description=(
+            "'running' once the reply resumed execution; 'queued' while the "
+            "durable reply still waits for execution capacity."
+        ),
     )
     accepted_at: datetime = Field(
         ...,

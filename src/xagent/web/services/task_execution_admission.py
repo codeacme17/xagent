@@ -252,6 +252,28 @@ def _older_waiter() -> ColumnElement[bool]:
     )
 
 
+def waiting_for_capacity(db: Session, command_id: int) -> bool:
+    """A pending command the claim scan would skip right now for admission.
+
+    Ingress uses this to acknowledge durable acceptance instead of holding a
+    request until capacity opens; it never predicts the later execution. A
+    host without a classifier staged no ticket, so it has nothing to check.
+    """
+    if _hook is None:
+        return False
+    return bool(
+        db.scalar(
+            select(~admission_eligible())
+            .select_from(TaskExecutionCommand)
+            .join(Task, Task.id == TaskExecutionCommand.task_id)
+            .where(
+                TaskExecutionCommand.id == command_id,
+                TaskExecutionCommand.status == "pending",
+            )
+        )
+    )
+
+
 def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bool:
     """Reserve with the command claim; caller already holds the exact task owner."""
     ticket = db.get(TaskAdmissionTicket, command_id)
