@@ -33,6 +33,7 @@ from xagent.core.agent.runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
@@ -3012,12 +3013,14 @@ async def test_runtime_no_payload_fallback_carries_abort_reason_and_stream_usage
     )
     context = ExecutionContext(execution_id="task-123")
 
-    aborted = StreamingNoPayloadThenChatLLM(end_raw={"stream_aborted": "empty_deltas"})
+    aborted = StreamingNoPayloadThenChatLLM(
+        end_raw={STREAM_ABORTED_KEY: "empty_deltas"}
+    )
     result = await runtime.run_streaming_llm_call(aborted, messages=[])
-    assert result["stream_aborted"] == "empty_deltas"
+    assert result[STREAM_ABORTED_KEY] == "empty_deltas"
     assert "stream_usage" not in result
     await runtime.on_llm_end(context=context, response=result)
-    assert events[-1]["data"]["stream_aborted"] == "empty_deltas"
+    assert events[-1]["data"][STREAM_ABORTED_KEY] == "empty_deltas"
     assert "stream_usage" not in events[-1]["data"]
 
     cap_cut = StreamingNoPayloadThenChatLLM(
@@ -3027,7 +3030,7 @@ async def test_runtime_no_payload_fallback_carries_abort_reason_and_stream_usage
     result = await runtime.run_streaming_llm_call(cap_cut, messages=[])
     assert result["stream_finish_reason"] == "length"
     assert result["stream_usage"]["completion_tokens"] == 8192
-    assert "stream_aborted" not in result
+    assert STREAM_ABORTED_KEY not in result
     assert "usage" not in result  # the retry's own usage, not the stream's
     await runtime.on_llm_end(context=context, response=result)
     data = events[-1]["data"]
@@ -3051,7 +3054,7 @@ class StreamingToolCallAbortedLLM:
             type=ChunkType.TOOL_CALL,
             tool_calls=[tool_call],
             finish_reason="no_progress",
-            raw={"stream_aborted": "tool_call_trailing_whitespace"},
+            raw={STREAM_ABORTED_KEY: "tool_call_trailing_whitespace"},
         )
 
 
@@ -3071,15 +3074,15 @@ async def test_runtime_aborted_tool_call_stream_lifts_abort_reason() -> None:
 
     assert result["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
     assert result["finish_reason"] == "no_progress"
-    assert result["stream_aborted"] == "tool_call_trailing_whitespace"
+    assert result[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
     assert result["usage_missing"] is True
     assert "stream_fallback" not in result
 
     await runtime.on_llm_end(context=context, response=result)
     data = events[-1]["data"]
-    assert data["stream_aborted"] == "tool_call_trailing_whitespace"
+    assert data[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
     assert data["finish_reason"] == "no_progress"
-    assert "stream_aborted" not in data["response"]
+    assert STREAM_ABORTED_KEY not in data["response"]
 
 
 @pytest.mark.asyncio
@@ -3135,7 +3138,7 @@ async def test_on_llm_end_ignores_non_string_fallback_markers() -> None:
             "content": "x",
             "stream_fallback": True,
             "stream_finish_reason": 3,
-            "stream_aborted": ["empty_deltas"],
+            STREAM_ABORTED_KEY: ["empty_deltas"],
             "stream_usage": "8192",
         },
     )
@@ -3143,5 +3146,5 @@ async def test_on_llm_end_ignores_non_string_fallback_markers() -> None:
     data = events[-1]["data"]
     assert "stream_fallback" not in data
     assert "stream_finish_reason" not in data
-    assert "stream_aborted" not in data
+    assert STREAM_ABORTED_KEY not in data
     assert "stream_usage" not in data

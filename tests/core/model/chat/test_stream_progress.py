@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 
 from xagent.core.model.chat.stream_progress import (
+    NO_PAYLOAD_STREAM_FALLBACK,
+    NO_PROGRESS_FINISH_REASON,
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
@@ -479,3 +481,16 @@ class TestConfigFromEnv:
             degenerate_max_period=64,
             no_payload_timeout=None,
         )
+
+
+class TestWireVocabulary:
+    """The values below are written into ``llm_call_end`` trace rows and read
+    by external analysis, so the constants are pinned to their literal wire
+    values here: renaming a constant must fail a test, not silently change
+    what the trace records. Other tests may assert either spelling."""
+
+    def test_finish_reason_value_is_pinned(self) -> None:
+        assert NO_PROGRESS_FINISH_REASON == "no_progress"
+
+    def test_stream_fallback_value_is_pinned(self) -> None:
+        assert NO_PAYLOAD_STREAM_FALLBACK == "no_payload"

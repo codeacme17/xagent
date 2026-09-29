@@ -22,6 +22,7 @@ from xagent.core.model.chat.basic.openai import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
@@ -2755,7 +2756,7 @@ class TestStreamNoProgressAbort:
 
         assert [c.type for c in result] == [ChunkType.END]
         assert result[0].finish_reason == "no_progress"
-        assert result[0].raw["stream_aborted"] == "reasoning_repetition"
+        assert result[0].raw[STREAM_ABORTED_KEY] == "reasoning_repetition"
         assert stream.closed is True
         assert stream.consumed < 40  # cut at the window, not at the cap
         abort_logs = [r for r in caplog.records if "Aborting" in r.getMessage()]
@@ -2831,7 +2832,7 @@ class TestStreamNoProgressAbort:
         final = result[-1]
         assert final.is_tool_call()
         assert final.finish_reason == "no_progress"
-        assert final.raw["stream_aborted"] == "tool_call_trailing_whitespace"
+        assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
         final_arguments = final.tool_calls[0]["function"]["arguments"]
         assert json.loads(final_arguments) == {"q": "x"}
         assert len(final_arguments) < len('{"q": "x"}') + 32
