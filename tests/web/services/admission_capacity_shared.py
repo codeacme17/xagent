@@ -10,8 +10,12 @@ from xagent.web.services.task_command_transport import (
 )
 
 
-def saturate_bucket(owner_user_id, agent_id, bucket="tenant:batch"):
-    """Hold the bucket's only slot with another task's live execution."""
+def saturate_bucket(owner_user_id, agent_id, bucket="tenant:batch", *, held=True):
+    """Hold the bucket's only slot with another task's live execution.
+
+    With ``held=False`` the other task's START only waits, so a later command
+    in the bucket is blocked by an older waiter while no slot is occupied.
+    """
     with get_session_local()() as db:
         holder = Task(
             user_id=owner_user_id,
@@ -36,8 +40,9 @@ def saturate_bucket(owner_user_id, agent_id, bucket="tenant:batch"):
         )
         ticket = db.get(TaskAdmissionTicket, staged.staged_db_id)
         assert ticket is not None and ticket.bucket_key == bucket
-        ticket.runner_id = "worker-9"
-        ticket.owner_attempt_id = "attempt-9"
+        if held:
+            ticket.runner_id = "worker-9"
+            ticket.owner_attempt_id = "attempt-9"
         db.commit()
         return staged.staged_db_id
 

@@ -428,7 +428,9 @@ class ReplyRequest(BaseModel):
     )
 
 
-REPLY_STATUS_QUEUED = "queued"
+ReplyStatus = Literal["running", "queued"]
+REPLY_STATUS_RUNNING: ReplyStatus = "running"
+REPLY_STATUS_QUEUED: ReplyStatus = "queued"
 """``ReplyResponse.status`` while a durable reply waits for execution capacity."""
 
 
@@ -464,7 +466,7 @@ class ReplyResponse(BaseModel):
             "null for agent-bound keys."
         ),
     )
-    status: str = Field(
+    status: ReplyStatus = Field(
         ...,
         description=(
             "'running' once the reply resumed execution; 'queued' while the "

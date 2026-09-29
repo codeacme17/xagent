@@ -69,6 +69,11 @@ def set_task_admission_hook(hook: AdmissionHook | None) -> None:
     _hook = hook
 
 
+def admission_enabled() -> bool:
+    """Whether this host installed a classifier; without one it stages no ticket."""
+    return _hook is not None
+
+
 def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
     """Stage a new command's ticket in its acceptance transaction, exactly once."""
     if _hook is None or command.kind not in _EXECUTION_KINDS:
@@ -259,7 +264,7 @@ def waiting_for_capacity(db: Session, command_id: int) -> bool:
     request until capacity opens; it never predicts the later execution. A
     host without a classifier staged no ticket, so it has nothing to check.
     """
-    if _hook is None:
+    if not admission_enabled():
         return False
     return bool(
         db.scalar(

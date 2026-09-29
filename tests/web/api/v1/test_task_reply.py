@@ -1422,6 +1422,7 @@ async def test_reply_queued_behind_capacity_is_acknowledged_promptly(
             assert [
                 (r.command_id, r.status, r.attempt_count, r.defer_count) for r in rows
             ] == [("queued-reply", "pending", 0, 0)]
+            assert payload["state_version"] == rows[0].target_state_version
             command_db_id = rows[0].id
             task = db.query(Task).filter(Task.id == task_id).one()
             assert task.status == TaskStatus.WAITING_FOR_USER
@@ -1468,5 +1469,83 @@ async def test_reply_queued_behind_capacity_is_acknowledged_promptly(
         assert final.status_code == 202, final.text
         assert final.json()["status"] == "running"
         assert final.json()["command_id"] == "queued-reply"
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()
+
+
+@pytest.mark.asyncio
+async def test_reply_rejected_by_the_worker_handoff_replays_as_not_accepted(
+    monkeypatch,
+):
+    """Any shared-execution host: a fenced-out reply is definite, not unknown."""
+    from xagent.web.services import (
+        task_coordinator_runtime,
+        task_event_bridge,
+        task_resume_command,
+    )
+    from xagent.web.services.task_command_execution import (
+        execute_durable_task_command,
+    )
+    from xagent.web.services.task_command_transport import (
+        dispatch_one_task_command,
+    )
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).one().lease_attempt_id = None
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", MagicMock())
+    monkeypatch.setattr(
+        task_resume_command, "get_task_reply_wait_timeout_seconds", lambda: 0.05
+    )
+    body = {**_reply_body(agent_id), "command_id": "fenced-reply"}
+    try:
+        # No worker ran yet: the outcome is genuinely unknown.
+        first = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert first.status_code == 504, first.text
+        assert first.json()["error"]["details"]["accepted"] is True
+
+        # The task moved on before the worker's handoff: state_changed.
+        db = _direct_db_session()
+        try:
+            db.query(Task).filter(Task.id == task_id).one().state_version += 1
+            db.commit()
+        finally:
+            db.close()
+        prepare = AsyncMock()
+        with patch.object(task_resume, "resume_task_reply", prepare):
+            async with asyncio.timeout(5):
+                while not await dispatch_one_task_command(execute_durable_task_command):
+                    await asyncio.sleep(0.05)
+        prepare.assert_not_awaited()
+        db = _direct_db_session()
+        try:
+            row = (
+                db.query(TaskExecutionCommand)
+                .filter(TaskExecutionCommand.command_id == "fenced-reply")
+                .one()
+            )
+            assert row.status == "failed"
+            assert row.result == {"rejection_reason": "state_changed"}
+        finally:
+            db.close()
+
+        replay = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert replay.status_code == 409, replay.text
+        assert replay.json()["error"]["code"] == "task_busy"
+        assert replay.json()["error"]["details"] == {
+            "accepted": False,
+            "task_id": task_id,
+            "retry_with_new_id": True,
+        }
     finally:
         await task_coordinator_runtime.close_task_coordinators()

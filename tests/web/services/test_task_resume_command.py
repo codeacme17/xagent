@@ -701,10 +701,10 @@ async def test_fenced_reply_rejection_settles_busy_without_resuming(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["sdk", "a2a"])
 async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
-    reply, monkeypatch, request, source
+    reply, monkeypatch, request
 ):
+    source = "sdk"
     from unittest.mock import Mock
 
     from xagent.web.services import task_event_bridge
@@ -715,9 +715,6 @@ async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
         lambda db, command: admission.AdmissionPolicy("tenant:batch", 1, 20)
     )
     request.addfinalizer(lambda: admission.set_task_admission_hook(None))
-    with get_session_local()() as db:
-        db.get(Task, reply.task_id).source = source
-        db.commit()
     holding = saturate_bucket(reply.task_owner_user_id, reply.agent_id)
 
     async def submit():
@@ -725,7 +722,7 @@ async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
             module.enqueue_resume_input(
                 reply, source=source, message_id="message", command_id="queued"
             ),
-            2,
+            10,
         )
 
     queued = await submit()
@@ -735,6 +732,8 @@ async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
     with get_session_local()() as db:
         row = db.query(TaskExecutionCommand).filter_by(command_id="queued").one()
         assert (row.status, row.attempt_count, row.defer_count) == ("pending", 0, 0)
+        # The snapshot reports the acceptance version, which is the task's.
+        assert queued.state_version == row.target_state_version == 1
         assert db.get(Task, reply.task_id).control_state == "waiting_for_user"
         command_id = row.id
     # Same-ID replay converges on the same durable command and stays queued.
@@ -808,7 +807,7 @@ async def test_reply_stopped_by_a_control_while_queued_replays_as_not_accepted(
         module.enqueue_resume_input(
             reply, source="sdk", message_id="", command_id="stopped"
         ),
-        2,
+        10,
     )
     assert queued.queued is True
     # A cancel control invalidates the waiting reply before it ever ran.
@@ -834,5 +833,91 @@ async def test_reply_stopped_by_a_control_while_queued_replays_as_not_accepted(
             module.enqueue_resume_input(
                 reply, source="sdk", message_id="", command_id="stopped"
             ),
-            2,
+            10,
         )
+
+
+def governed(request, policy=None):
+    from xagent.web.services import task_execution_admission as admission
+
+    admission.set_task_admission_hook(
+        lambda db, command: policy or admission.AdmissionPolicy("tenant:batch", 1, 20)
+    )
+    request.addfinalizer(lambda: admission.set_task_admission_hook(None))
+
+
+@pytest.mark.asyncio
+async def test_governed_reply_with_free_capacity_waits_for_its_outcome(
+    reply, monkeypatch, request
+):
+    """An installed policy alone is not a reason to answer queued."""
+    from unittest.mock import Mock
+
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
+    monkeypatch.setattr(module, "get_task_reply_wait_timeout_seconds", lambda: 0.05)
+    governed(request)
+    with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
+        await module.enqueue_resume_input(
+            reply, source="sdk", message_id="", command_id="free"
+        )
+    with get_session_local()() as db:
+        row = db.query(TaskExecutionCommand).filter_by(command_id="free").one()
+        assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_governed_a2a_reply_keeps_waiting_while_capacity_is_occupied(
+    reply, monkeypatch, request
+):
+    """A2A has no queued projection, so its reply keeps the outcome wait."""
+    from unittest.mock import Mock
+
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
+    monkeypatch.setattr(module, "get_task_reply_wait_timeout_seconds", lambda: 0.05)
+    governed(request)
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = "a2a"
+        db.commit()
+    saturate_bucket(reply.task_owner_user_id, reply.agent_id)
+    with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
+        await module.enqueue_resume_input(
+            reply, source="a2a", message_id="message", command_id="a2a-queued"
+        )
+    with get_session_local()() as db:
+        row = db.query(TaskExecutionCommand).filter_by(command_id="a2a-queued").one()
+        assert (row.status, row.attempt_count, row.defer_count) == ("pending", 0, 0)
+
+
+def test_older_unheld_waiter_blocks_a_newer_reply(reply, request):
+    from xagent.web.services import task_execution_admission as admission
+
+    governed(request)
+    saturate_bucket(reply.task_owner_user_id, reply.agent_id, held=False)
+    command_id = module._admit_reply(reply, "sdk", "", "behind")
+    with get_session_local()() as db:
+        # No slot is occupied; FIFO order alone keeps the reply waiting.
+        assert admission.waiting_for_capacity(db, command_id) is True
+
+
+def test_startup_pacing_blocks_a_reply_until_its_next_start(reply, request):
+    from xagent.web.services import task_execution_admission as admission
+    from xagent.web.services.task_admission_pacing import (
+        StartupPacing,
+        reserve_startup,
+    )
+
+    governed(
+        request,
+        admission.AdmissionPolicy("tenant:batch", 1, 20, pacing=StartupPacing(3600, 1)),
+    )
+    command_id = module._admit_reply(reply, "sdk", "", "paced")
+    with get_session_local()() as db:
+        assert admission.waiting_for_capacity(db, command_id) is False
+        # Another start consumed the only burst; the next one is an hour away.
+        assert reserve_startup(db, "tenant:batch")
+        db.commit()
+        assert admission.waiting_for_capacity(db, command_id) is True

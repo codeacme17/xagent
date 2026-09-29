@@ -202,15 +202,25 @@ injecting the answer again (a different body under the same ID is `409
 task_busy`); the replay stays `queued` while capacity is unavailable and
 reports the stored outcome (`running`, or the existing reply errors) once the
 worker has run it. A queued reply that a cancel or pause control stops before
-it runs replays as `409 task_busy` with `retry_with_new_id`: nothing was
-injected, and a new attempt needs a new `command_id`.
+it runs replays as `409 task_busy` with `retry_with_new_id`: the reply was not
+applied. Resend under a new `command_id` only if the task is still
+`waiting_for_user`; after a cancel or pause it is not, and a new ID receives
+`409 no_pending_interaction`.
+
+That rejected-command mapping applies on every shared-execution host, governed
+or not: a reply the worker's handoff rejected before injection (`state_changed`,
+`stale_owner`, `stale_claim`, `identity_changed`, `invalid_payload`) also
+replays as `409 task_busy` with `retry_with_new_id`, where it previously
+replayed as `504 reply_outcome_unknown`. Only failures without a recorded
+rejection reason remain unknown outcomes.
 
 Waiting consumes no attempt or defer budget. Replies that are not governed by an
 admission policy, and governed replies whose worker is merely slow, keep the
-existing wait and `reply_outcome_unknown` semantics. A2A ingress has no queued
-projection: a governed A2A reply now returns the task's current A2A snapshot
-(still `input-required`) instead of the former 504, and the durable reply runs
-when capacity opens.
+existing wait and `reply_outcome_unknown` semantics. Only SDK replies receive the
+queued acknowledgment: A2A ingress has no projection for a queued reply, so a
+governed A2A reply keeps the existing wait and `504 reply_outcome_unknown`
+(with `accepted: true` and its `commandId`) until an A2A projection is designed,
+and the durable reply still runs when capacity opens.
 
 ## Runtime credential lifetime
 

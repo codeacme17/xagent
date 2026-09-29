@@ -262,6 +262,7 @@ async def enqueue_resume_input(
     command_id: str | None = None,
 ) -> TaskReplyResumeResult:
     from .task_event_bridge import get_task_event_bridge
+    from .task_execution_admission import admission_enabled
 
     get_task_event_bridge().require_ready()
     command_id = command_id or ctx.command_id or uuid4().hex
@@ -269,6 +270,9 @@ async def enqueue_resume_input(
         lambda: _admit_reply(ctx, source, message_id, command_id)
     )
     notify_task_command_dispatcher()
+    # Only SDK ingress projects a queued reply; A2A has no projection for it
+    # and keeps waiting, and a host without a classifier staged no ticket.
+    acknowledge_queued = source == "sdk" and admission_enabled()
     # These APIs already wait for checkpoint validation and local scheduling.
     # Preserve that response boundary while preparation now runs on a worker.
     deadline = asyncio.get_running_loop().time() + get_task_reply_wait_timeout_seconds()
@@ -279,8 +283,12 @@ async def enqueue_resume_input(
     ) is None:
         # Capacity waiting is durable acceptance, not an unknown outcome:
         # acknowledge it now rather than holding the request for a slot.
-        queued = await run_db_io_cancellation_safe(
-            lambda: _read_capacity_wait(command_db_id)
+        queued = (
+            await run_db_io_cancellation_safe(
+                lambda: _read_capacity_wait(command_db_id)
+            )
+            if acknowledge_queued
+            else None
         )
         if queued is not None:
             return TaskReplyResumeResult(
