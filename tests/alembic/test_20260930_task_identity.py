@@ -384,6 +384,39 @@ def test_upgrade_preserves_constraints_indexes_triggers_and_children(sqlite_engi
         assert connection.exec_driver_sql("SELECT owner FROM tasks").scalar() is None
 
 
+def test_upgrade_preserves_inline_checks_for_older_downgrades(sqlite_engine):
+    seed_legacy(sqlite_engine)
+    events = load_migration_module(
+        MIGRATION.with_name("20260905_add_task_execution_events.py")
+    )
+    writers = load_migration_module(
+        MIGRATION.with_name("20260905_enable_task_execution_event_writers.py")
+    )
+    with _migration_connection(sqlite_engine) as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            events.upgrade()
+            writers.upgrade()
+    migrate(sqlite_engine)
+    migrate(sqlite_engine)
+    for statement in [
+        "UPDATE tasks SET conversation_storage_version=3",
+        "UPDATE tasks SET conversation_event_sequence=-1",
+    ]:
+        with sqlite_engine.begin() as connection, pytest.raises(sa.exc.IntegrityError):
+            connection.exec_driver_sql(statement)
+    with _migration_connection(sqlite_engine) as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            writers.downgrade()
+            events.downgrade()
+    with sqlite_engine.begin() as connection:
+        assert connection.exec_driver_sql("SELECT * FROM tasks").all() == [(7, "live")]
+        connection.exec_driver_sql("DELETE FROM tasks")
+        assert (
+            connection.exec_driver_sql("INSERT INTO tasks DEFAULT VALUES").lastrowid
+            == 8
+        )
+
+
 def test_interrupted_rebuild_rolls_back_and_can_retry(sqlite_engine):
     seed_legacy(sqlite_engine)
     with sqlite_engine.begin() as connection:

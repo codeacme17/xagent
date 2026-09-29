@@ -119,6 +119,16 @@ def _task_table(connection):
     table = sa.Table(
         "tasks", sa.MetaData(), autoload_with=connection, resolve_fks=False
     )
+    # Reflection promotes inline CHECKs to table constraints. These two must
+    # stay on their columns: older event migrations drop the columns directly.
+    for column in ("conversation_storage_version", "conversation_event_sequence"):
+        for constraint in list(table.constraints):
+            if (
+                isinstance(constraint, sa.CheckConstraint)
+                and constraint.name == f"ck_tasks_{column}"
+            ):
+                table.constraints.remove(constraint)
+                table.c[column].constraints.add(constraint)
     # Recover referential actions and compact-DDL uniqueness directly from
     # SQLite's catalog, which is more complete than SQLAlchemy's DDL parser.
     foreign_keys = {}
