@@ -1,5 +1,6 @@
 """Prospective attachment retention at the task and file service boundaries."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -254,8 +255,6 @@ def test_failed_create_compensation_marks_only_committed_attachments(sessions):
 
 @pytest.mark.parametrize("rebind", [False, True])
 def test_durable_replacement_preserves_or_cancels_detachment(sessions, rebind):
-    from dataclasses import replace
-
     from xagent.web.services.uploaded_file_store import (
         StagedUploadedFile,
         UploadedFileStore,
@@ -283,6 +282,60 @@ def test_durable_replacement_preserves_or_cancels_detachment(sessions, rebind):
         assert receipt.snapshot == snapshot_uploaded_file_version(row)
         assert row.detached_reason == (None if rebind else "task_deleted")
         assert row.detached_at == (None if rebind else old.detached_at)
+
+
+@pytest.mark.parametrize("operation", ["insert", "update", "restore"])
+@pytest.mark.parametrize("target", ["missing", "foreign"])
+def test_metadata_write_rejects_missing_or_foreign_attachment_task(
+    sessions, operation, target
+):
+    from xagent.web.services.uploaded_file_store import (
+        StagedUploadedFile,
+        UploadedFileStore,
+        UploadedFileVersionConflict,
+        snapshot_uploaded_file_version,
+    )
+
+    with sessions() as db:
+        foreign = User(username="foreign", password_hash="unused")
+        db.add(foreign)
+        db.flush()
+        db.add(Task(id=3, user_id=foreign.id, title="foreign"))
+        row = db.query(UploadedFile).filter_by(file_id="draft").one()
+        row.storage_status = "available"
+        row.storage_backend = "file"
+        row.storage_key = "users/1/uploads/draft/draft.txt"
+        row.checksum = "draft"
+        db.commit()
+        expected = snapshot_uploaded_file_version(row)
+        task_id = 999 if target == "missing" else 3
+        staged = replace(StagedUploadedFile.from_record(row), task_id=task_id)
+        if operation == "insert":
+            staged = replace(
+                staged,
+                file_id=f"new-{target}",
+                storage_key=f"users/1/uploads/new-{target}/file.txt",
+            )
+
+        store = UploadedFileStore(db)
+        with pytest.raises(
+            UploadedFileVersionConflict, match="Attachment task no longer exists"
+        ):
+            if operation == "restore":
+                store.restore_metadata_version_no_commit(
+                    expected=expected,
+                    replacement=replace(expected, task_id=task_id),
+                )
+            else:
+                store.upsert_already_durable(
+                    staged,
+                    expected=None if operation == "insert" else expected,
+                    allow_task_rebind=operation == "update",
+                )
+
+        db.expire_all()
+        assert db.query(UploadedFile).filter_by(file_id=f"new-{target}").first() is None
+        assert db.query(UploadedFile).filter_by(file_id="draft").one().task_id is None
 
 
 @pytest.mark.parametrize(

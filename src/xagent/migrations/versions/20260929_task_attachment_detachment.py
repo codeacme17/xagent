@@ -20,6 +20,7 @@ depends_on = None
 TABLE = "uploaded_files"
 FK = "fk_uploaded_files_task_id_tasks"
 NAMING = {"fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s"}
+ORPHAN_SAMPLE_LIMIT = 10
 
 
 def _inspect():
@@ -44,6 +45,37 @@ def _task_foreign_key(inspector):
     if len(matches) != 1 or matches[0]["referred_table"] != "tasks":
         raise RuntimeError("Expected one uploaded_files.task_id foreign key to tasks")
     return matches[0]
+
+
+def _raise_for_dangling_task_references(inspector):
+    if not inspector.has_table("tasks"):
+        return
+    rows = inspector.bind.execute(
+        sa.text(
+            "SELECT uploaded.id, uploaded.task_id "
+            "FROM uploaded_files AS uploaded "
+            "LEFT JOIN tasks AS task ON task.id = uploaded.task_id "
+            "WHERE uploaded.task_id IS NOT NULL AND task.id IS NULL "
+            "ORDER BY uploaded.id LIMIT :limit"
+        ),
+        {"limit": ORPHAN_SAMPLE_LIMIT + 1},
+    ).all()
+    if not rows:
+        return
+
+    sample = rows[:ORPHAN_SAMPLE_LIMIT]
+    uploaded_file_ids = [row[0] for row in sample]
+    missing_task_ids = list(dict.fromkeys(row[1] for row in sample))
+    sample_note = " (sample)" if len(rows) > ORPHAN_SAMPLE_LIMIT else ""
+    raise RuntimeError(
+        "Attachment detachment migration found uploaded_files.task_id references "
+        "to missing tasks. Reconcile these references while preserving the uploaded "
+        "file IDs and rows, then rerun the migration. Restore the missing task rows "
+        "from an authoritative source or correct each task_id to its verified task; "
+        "do not set task_id to NULL or invent detachment markers. "
+        f"Affected uploaded file IDs{sample_note}: {uploaded_file_ids}; "
+        f"missing task IDs{sample_note}: {missing_task_ids}"
+    )
 
 
 def _sqlite_table():
@@ -138,6 +170,7 @@ def upgrade():
     inspector = _inspect()
     if not inspector.has_table(TABLE):
         return  # Fresh installs use Base.metadata.create_all after stamping.
+    _raise_for_dangling_task_references(inspector)
     columns = {c["name"] for c in inspector.get_columns(TABLE)}
     for column in (
         sa.Column("detached_reason", sa.String(32), nullable=True),

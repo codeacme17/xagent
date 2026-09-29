@@ -29,6 +29,13 @@ start a detached-file sweep or promise that retained bytes have been erased.**
    Offline SQL generation fails explicitly. PostgreSQL adds the replacement
    foreign key as `NOT VALID`, commits the DDL, then validates it. If interrupted,
    rerun the migration; existing columns and an unvalidated FK are supported.
+   The migration stops before changing the schema when an upload references a
+   missing task and reports the affected upload and task IDs. Restore missing
+   task rows from an authoritative backup, or correct each `task_id` only when
+   its intended task is established, then rerun the migration. Preserve the
+   upload IDs and rows while reconciling them. Do not clear `task_id` or invent
+   detachment markers: that would turn ambiguous history into apparent drafts
+   or claim a deletion provenance the database does not establish.
    SQLite rebuilds the upload table and requires a maintenance window.
    Historical migration-only schemas without the metadata-owned `tasks` table
    keep their absent task FK. This preserves partial-schema migration behavior;

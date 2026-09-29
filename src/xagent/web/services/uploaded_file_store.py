@@ -1396,6 +1396,14 @@ class UploadedFileStore:
         """
 
         if expected is None:
+            if (
+                staged.task_id is not None
+                and lock_attachment_task(
+                    self.db, staged.task_id, owner_user_id=staged.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
             file_record = staged.to_record()
             try:
                 self.add_already_durable(file_record)
@@ -1413,7 +1421,7 @@ class UploadedFileStore:
             raise ValueError("Cannot replace an uploaded file owned by another user")
         if expected.task_id != staged.task_id and not allow_task_rebind:
             raise ValueError("Cannot replace an uploaded file bound to another task")
-        if staged.task_id is not None and staged.task_id != expected.task_id:
+        if staged.task_id is not None:
             if (
                 lock_attachment_task(
                     self.db, staged.task_id, owner_user_id=staged.user_id
@@ -1422,6 +1430,10 @@ class UploadedFileStore:
             ):
                 raise UploadedFileVersionConflict("Attachment task no longer exists")
 
+        detached_reason = (
+            None if staged.task_id is not None else expected.detached_reason
+        )
+        detached_at = None if staged.task_id is not None else expected.detached_at
         statement = (
             update(UploadedFile)
             .where(
@@ -1432,12 +1444,8 @@ class UploadedFileStore:
                 file_id=staged.file_id,
                 user_id=staged.user_id,
                 task_id=staged.task_id,
-                detached_reason=None
-                if staged.task_id is not None
-                else expected.detached_reason,
-                detached_at=None
-                if staged.task_id is not None
-                else expected.detached_at,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
                 filename=staged.filename,
                 storage_path=staged.storage_path,
                 storage_backend=staged.storage_backend,
@@ -1471,12 +1479,8 @@ class UploadedFileStore:
             snapshot=_snapshot_staged_uploaded_file_version(
                 staged,
                 row_id=expected.row_id,
-                detached_reason=None
-                if staged.task_id is not None
-                else expected.detached_reason,
-                detached_at=None
-                if staged.task_id is not None
-                else expected.detached_at,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
             ),
             superseded_cleanup_claim=cleanup_claim,
         )
@@ -1503,15 +1507,14 @@ class UploadedFileStore:
             raise ValueError("Metadata rollback must preserve uploaded-file identity")
         if replacement.storage_status not in {"available", "legacy"}:
             raise ValueError("Metadata rollback target must be a stable file state")
-        if (
-            replacement.task_id != expected.task_id
-            and replacement.task_id is not None
-            and lock_attachment_task(
-                self.db, replacement.task_id, owner_user_id=replacement.user_id
-            )
-            is None
-        ):
-            raise UploadedFileVersionConflict("Attachment task no longer exists")
+        if replacement.task_id is not None:
+            if (
+                lock_attachment_task(
+                    self.db, replacement.task_id, owner_user_id=replacement.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
         statement = (
             update(UploadedFile)
             .where(

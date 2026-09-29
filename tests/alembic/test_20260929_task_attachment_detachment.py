@@ -11,6 +11,7 @@ from tests.shared.postgres_disposable import (
     disposable_database_factory,
     load_migration_module,
 )
+from xagent.db.migration import _migration_connection
 
 MIGRATION = (
     Path(__file__).parents[2]
@@ -21,19 +22,31 @@ MIGRATION = (
 @pytest.fixture(
     params=["sqlite", pytest.param("postgresql", marks=pytest.mark.postgresql)]
 )
-def engine(request, tmp_path):
+def engine_factory(request, tmp_path):
     if request.param == "postgresql":
         with disposable_database_factory("detach_migration") as make:
-            yield make("upgrade")
+            yield make
     else:
-        engine = sa.create_engine(f"sqlite:///{tmp_path / 'migration.db'}")
+        engines = []
 
-        @sa.event.listens_for(engine, "connect")
-        def fk_on(connection, _record):
-            connection.execute("PRAGMA foreign_keys=ON")
+        def make(tag):
+            engine = sa.create_engine(f"sqlite:///{tmp_path / f'{tag}.db'}")
 
-        yield engine
-        engine.dispose()
+            @sa.event.listens_for(engine, "connect")
+            def fk_on(connection, _record):
+                connection.execute("PRAGMA foreign_keys=ON")
+
+            engines.append(engine)
+            return engine
+
+        yield make
+        for engine in engines:
+            engine.dispose()
+
+
+@pytest.fixture
+def engine(engine_factory):
+    return engine_factory("upgrade")
 
 
 def seed(engine, *, task_foreign_key=True):
@@ -60,11 +73,39 @@ def seed(engine, *, task_foreign_key=True):
 
 def migrate(engine, operation):
     migration = load_migration_module(MIGRATION)
-    with engine.connect() as conn:
+    connection_manager = (
+        _migration_connection(engine)
+        if engine.dialect.name == "sqlite"
+        else engine.connect()
+    )
+    with connection_manager as conn:
         context = MigrationContext.configure(conn)
         with context.begin_transaction(), Operations.context(context):
             getattr(migration, operation)()
-        conn.commit()
+        if engine.dialect.name != "sqlite":
+            # The direct Operations harness must own the transaction so its
+            # PostgreSQL autocommit block can commit before validation.
+            conn.commit()
+
+
+def attachment_schema(engine):
+    inspector = sa.inspect(engine)
+    markers = {
+        column["name"]: (str(column["type"]), column["nullable"])
+        for column in inspector.get_columns("uploaded_files")
+        if column["name"] in {"detached_at", "detached_reason"}
+    }
+    task_foreign_keys = {
+        (
+            tuple(foreign_key["constrained_columns"]),
+            foreign_key["referred_table"],
+            tuple(foreign_key["referred_columns"]),
+            foreign_key["options"].get("ondelete"),
+        )
+        for foreign_key in inspector.get_foreign_keys("uploaded_files")
+        if foreign_key["constrained_columns"] == ["task_id"]
+    }
+    return markers, task_foreign_keys
 
 
 def test_upgrade_preserves_data_uniqueness_indexes_and_reruns(engine):
@@ -146,22 +187,66 @@ def test_offline_migration_refuses_to_emit_incomplete_schema(dialect):
         migration.upgrade()
 
 
-def test_fresh_install_schema_matches_upgraded_foreign_key(engine):
-    from xagent.web.models.database import Base
-    from xagent.web.models.uploaded_file import UploadedFile
+def test_populated_upgrade_markers_and_task_fk_match_fresh_install(
+    engine, engine_factory
+):
+    from xagent.web.models import Base
 
+    seed(engine)
     migrate(engine, "upgrade")
-    Base.metadata.create_all(engine)
+    fresh_engine = engine_factory("fresh")
+    Base.metadata.create_all(fresh_engine)
+
+    assert attachment_schema(engine) == attachment_schema(fresh_engine)
+
+
+@pytest.mark.parametrize("existing_not_valid", [False, True])
+def test_upgrade_rejects_dangling_task_references_before_schema_changes(
+    engine, existing_not_valid
+):
+    if existing_not_valid and engine.dialect.name != "postgresql":
+        pytest.skip("NOT VALID constraints are PostgreSQL-specific")
+    seed(engine, task_foreign_key=False)
+    with engine.begin() as conn:
+        conn.execute(sa.text("UPDATE uploaded_files SET task_id=999 WHERE id=1"))
+        if existing_not_valid:
+            conn.execute(
+                sa.text(
+                    "ALTER TABLE uploaded_files ADD CONSTRAINT "
+                    "fk_uploaded_files_task_id_tasks FOREIGN KEY (task_id) "
+                    "REFERENCES tasks(id) ON DELETE SET NULL NOT VALID"
+                )
+            )
     inspector = sa.inspect(engine)
-    assert {"detached_at", "detached_reason"} <= {
-        c["name"] for c in inspector.get_columns(UploadedFile.__tablename__)
-    }
-    task_fk = next(
-        fk
-        for fk in inspector.get_foreign_keys("uploaded_files")
-        if fk["constrained_columns"] == ["task_id"]
-    )
-    assert task_fk["options"]["ondelete"] == "SET NULL"
+    columns_before = [c["name"] for c in inspector.get_columns("uploaded_files")]
+    foreign_keys_before = inspector.get_foreign_keys("uploaded_files")
+
+    with pytest.raises(
+        RuntimeError, match="missing tasks.*preserving.*IDs and rows"
+    ) as exc:
+        migrate(engine, "upgrade")
+
+    assert "uploaded file IDs: [1]" in str(exc.value)
+    assert "missing task IDs: [999]" in str(exc.value)
+    inspector = sa.inspect(engine)
+    assert [
+        c["name"] for c in inspector.get_columns("uploaded_files")
+    ] == columns_before
+    assert inspector.get_foreign_keys("uploaded_files") == foreign_keys_before
+    with engine.connect() as conn:
+        assert conn.execute(
+            sa.text("SELECT id, task_id FROM uploaded_files ORDER BY id")
+        ).all() == [(1, 999), (2, None)]
+        if existing_not_valid:
+            assert (
+                conn.execute(
+                    sa.text(
+                        "SELECT convalidated FROM pg_constraint "
+                        "WHERE conname='fk_uploaded_files_task_id_tasks'"
+                    )
+                ).scalar_one()
+                is False
+            )
 
 
 @pytest.mark.postgresql

@@ -2,6 +2,7 @@
 
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event
 
@@ -16,6 +17,11 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.file_turn import bind_turn_files_no_commit
 from xagent.web.services.task_deletion import purge_task_rows
+from xagent.web.services.uploaded_file_store import (
+    StagedUploadedFile,
+    UploadedFileStore,
+    snapshot_uploaded_file_version,
+)
 
 pytestmark = pytest.mark.postgresql
 
@@ -167,3 +173,78 @@ def test_delete_fences_new_upload_publication_before_detachment_scan(sessions):
             uploader.flush()
         uploader.rollback()
         deleter.commit()
+
+
+def test_upsert_batch_locks_task_before_same_task_upload_update(sessions):
+    with sessions.begin() as db:
+        first = db.query(UploadedFile).filter_by(file_id="file").one()
+        first.task_id = 1
+        first.storage_backend = "file"
+        first.storage_key = "users/1/tasks/1/outputs/file/first.txt"
+        first.checksum = "first"
+        second = UploadedFile(
+            file_id="second",
+            user_id=1,
+            task_id=2,
+            filename="second.txt",
+            storage_path="/unused/second.txt",
+            storage_backend="file",
+            storage_key="users/1/tasks/2/outputs/second/second.txt",
+            checksum="second",
+            storage_status="available",
+        )
+        db.add(second)
+        db.flush()
+        first_expected = snapshot_uploaded_file_version(first)
+        second_expected = snapshot_uploaded_file_version(second)
+        first_staged = replace(
+            StagedUploadedFile.from_record(first),
+            storage_key="users/1/tasks/1/outputs/file/replacement.txt",
+            checksum="first-replacement",
+        )
+        second_staged = replace(
+            StagedUploadedFile.from_record(second),
+            task_id=1,
+            storage_key="users/1/tasks/1/outputs/second/replacement.txt",
+            checksum="second-replacement",
+        )
+
+    ready = Event()
+    pid = []
+
+    def purge():
+        with sessions() as db:
+            db.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+            db.execute(sa.text("SET LOCAL statement_timeout = '5s'"))
+            pid.append(db.execute(sa.text("SELECT pg_backend_pid()")).scalar())
+            ready.set()
+            result = delete(db)
+            db.commit()
+            return result
+
+    with sessions() as updater, ThreadPoolExecutor(max_workers=1) as executor:
+        updater.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+        updater.execute(sa.text("SET LOCAL statement_timeout = '5s'"))
+        store = UploadedFileStore(updater)
+        store.upsert_already_durable(first_staged, expected=first_expected)
+        future = executor.submit(purge)
+        try:
+            assert ready.wait(3)
+            wait_for_block(sessions, pid[0])
+            store.upsert_already_durable(
+                second_staged,
+                expected=second_expected,
+                allow_task_rebind=True,
+            )
+            updater.commit()
+        finally:
+            updater.rollback()
+        assert future.result(timeout=6) is True
+
+    with sessions() as db:
+        rows = db.query(UploadedFile).order_by(UploadedFile.file_id).all()
+        assert [row.task_id for row in rows] == [None, None]
+        assert [row.detached_reason for row in rows] == [
+            "task_deleted",
+            "task_deleted",
+        ]

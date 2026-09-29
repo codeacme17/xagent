@@ -1,11 +1,14 @@
 """Task attachment provenance inside the caller's database transaction."""
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
+
+DetachmentReason = Literal["task_deleted", "task_create_failed"]
 
 
 def lock_attachment_task(
@@ -27,7 +30,7 @@ def lock_attachment_task(
     return query.with_for_update(key_share=not deleting).first()
 
 
-def detach_task_files(db: Session, *, task_id: int, reason: str) -> None:
+def detach_task_files(db: Session, *, task_id: int, reason: DetachmentReason) -> None:
     """Mark only this task's attachments; never turn drafts into expiring files."""
     if reason not in {"task_deleted", "task_create_failed"}:
         raise ValueError(f"Unsupported attachment detachment reason: {reason}")

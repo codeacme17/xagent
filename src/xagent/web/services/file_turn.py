@@ -38,6 +38,7 @@ from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ensure_uploaded_file_local_path
+from .task_file_lifecycle import lock_attachment_task
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +311,6 @@ def bind_turn_files_no_commit(
     if not ids:
         return []
     ids = list(dict.fromkeys(ids))
-    from .task_file_lifecycle import lock_attachment_task
-
     if lock_attachment_task(db, task_id, owner_user_id=owner_user_id) is None:
         return ids
     # Claim every currently-unbound row first. On PostgreSQL the conditional
