@@ -343,6 +343,10 @@ class TaskCoordinator:
         self._command_lock = asyncio.Lock()
         self._command_tasks: set[asyncio.Task[Any]] = set()
         self._children: set[asyncio.Task[Any]] = set()
+        # The governed command whose ticket each tracked handle's execution
+        # holds, released when that handle finishes (#2777).
+        self._child_admissions: dict[asyncio.Task[Any], int] = {}
+        self._admission_releases: set[asyncio.Task[None]] = set()
         self._idle_task: asyncio.Task[None] | None = None
         self._startup = asyncio.create_task(self._start())
 
@@ -415,12 +419,52 @@ class TaskCoordinator:
             raise RuntimeError("Task coordinator is closing")
         if handle in self._children:
             return
+        from .task_admission_execution import current_admission_command
+
+        command_id = current_admission_command(self.task_id)
+        if command_id is not None:
+            self._child_admissions[handle] = command_id
         self._children.add(handle)
         handle.add_done_callback(self._child_done)
 
     def _child_done(self, handle: asyncio.Task[Any]) -> None:
         self._children.discard(handle)
+        command_id = self._child_admissions.pop(handle, None)
+        # A closing owner drains its handles and either releases every ticket
+        # with the lease or leaves them for recovery; only a live owner frees
+        # the finished execution's slot on its own.
+        if command_id is not None and self.state == CoordinatorState.ACTIVE:
+            release = asyncio.create_task(self._release_drained_admission(command_id))
+            self._admission_releases.add(release)
+            release.add_done_callback(self._admission_releases.discard)
         self._ensure_idle_check()
+
+    async def _release_drained_admission(self, command_id: int) -> None:
+        """Free the finished execution's slot even while a successor runs.
+
+        A handle that ended before settling its row leaves the task RUNNING
+        with no execution; its slot is freed here all the same, and the idle
+        check then hands that row to lease recovery as before.
+        """
+        from .task_execution_admission import release_task_admission
+
+        assert self.lease is not None
+        lease = self.lease
+
+        def release() -> None:
+            with self._registry.session_factory() as db, db.begin():
+                if lock_task_lease_no_commit(db, lease):
+                    release_task_admission(db, lease, command_id)
+
+        try:
+            await run_db_io_cancellation_safe(release)
+        except Exception:
+            # The settled and idle releases still cover this ticket later.
+            logger.exception(
+                "Task %s could not release admission for command %s",
+                self.task_id,
+                command_id,
+            )
 
     async def execute_command(
         self, command: Any, execute: Callable[[], Awaitable[_T]]
@@ -675,6 +719,15 @@ class TaskCoordinator:
             )
             await asyncio.gather(
                 *(cancel_and_drain_async_task(t) for t in tuple(self._children)),
+                return_exceptions=True,
+            )
+            # Drained handles may still be freeing their slots; let those
+            # commits land before this owner's lease is released.
+            await asyncio.gather(
+                *(
+                    drain_async_task_cancellation_safe(t)
+                    for t in tuple(self._admission_releases)
+                ),
                 return_exceptions=True,
             )
             if self._execution_task is not None:

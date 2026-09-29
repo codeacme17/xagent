@@ -48,6 +48,14 @@ def admission_execution(
         _current.reset(token)
 
 
+def current_admission_command(task_id: int) -> int | None:
+    """The governed command whose execution the current context is scheduling."""
+    context = _current.get()
+    if context is None or context.task_id != task_id:
+        return None
+    return context.command_id
+
+
 def allow_injected_guidance(task_id: int, run_id: str | None) -> None:
     """Only a confirmed injection may continue the exact original execution."""
     context = _current.get()
