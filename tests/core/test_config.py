@@ -2577,6 +2577,30 @@ class TestLlmStreamProgressConfig:
         assert result == frozenset()
         assert isinstance(result, frozenset)
 
+    def test_no_payload_timeout_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+        assert any("falling back to 30.0" in r.getMessage() for r in caplog.records)
+
+    def test_retry_deadline_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_retry_deadline_seconds() == 300.0
+        assert any("falling back to 300.0" in r.getMessage() for r in caplog.records)
+
     def test_no_payload_timeout_default(self, monkeypatch):
         from xagent.config import get_llm_stream_no_payload_timeout_seconds
 

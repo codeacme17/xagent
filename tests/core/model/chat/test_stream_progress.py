@@ -240,6 +240,26 @@ class TestDegenerateReasoning:
         text = "abcdefghijklmnoa"  # text[15] == text[0]; period 15 would match
         assert guard.observe(reasoning_texts=(text,)) is None
 
+    def test_mirrored_reasoning_text_counts_once(self) -> None:
+        """A provider sending the same text under ``reasoning_content`` and
+        ``reasoning`` must not double it: the loop's true period is what the
+        periodicity check has to see."""
+        guard = StreamProgressGuard(
+            _config(degenerate_window=32, degenerate_max_period=8)
+        )
+        assert (
+            guard.observe(reasoning_texts=("Some genuine reasoning first. ",) * 2)
+            is None
+        )
+        verdict = None
+        for _ in range(10):
+            verdict = guard.observe(reasoning_texts=("verify ", "verify "))
+            if verdict is not None:
+                break
+        assert verdict is not None
+        assert verdict.reason == "reasoning_repetition"
+        assert "period=7" in verdict.detail
+
     def test_zero_window_disables_reasoning_checks(self) -> None:
         guard = StreamProgressGuard(_config(degenerate_window=0))
         for _ in range(50):
@@ -304,10 +324,9 @@ class TestToolCallTrailingBytes:
         assert verdict.tool_call_id == "call_1"
         assert verdict.keep_length == len('{"q": "x"}' + "\n" * 7)
 
-    def test_trailing_whitespace_inside_the_same_delta_as_the_brace_is_fine(
-        self,
-    ) -> None:
-        """``}\\n`` arriving together is a normal provider tail."""
+    def test_trailing_whitespace_below_the_window_is_fine(self) -> None:
+        """``}\\n`` arriving together is a normal provider tail, and whitespace
+        may keep growing right up to ``window - 1`` characters."""
         guard = StreamProgressGuard(_config(degenerate_window=8))
         assert (
             guard.observe(
@@ -317,10 +336,69 @@ class TestToolCallTrailingBytes:
         )
         assert (
             guard.observe(
-                accumulated_tool_calls=_tool_calls(("call_1", '{"q": "x"}\n'))
+                accumulated_tool_calls=_tool_calls(("call_1", '{"q": "x"}' + "\n" * 7))
             )
             is None
         )
+        verdict = guard.observe(
+            accumulated_tool_calls=_tool_calls(("call_1", '{"q": "x"}' + "\n" * 8))
+        )
+        assert verdict is not None
+        assert verdict.reason == "tool_call_trailing_whitespace"
+        assert verdict.keep_length == len('{"q": "x"}' + "\n" * 7)
+
+    def test_closing_and_opening_brace_in_one_delta_is_caught(self) -> None:
+        """``}{`` is a single BPE token on several models, so the repeated
+        object arrives as ``{"q": "x"}{`` in one delta: the object is complete
+        and the extra byte is garbage, in the same observation."""
+        guard = StreamProgressGuard(_config())
+        assert (
+            guard.observe(accumulated_tool_calls=_tool_calls(("call_1", '{"q": "x"')))
+            is None
+        )
+        verdict = guard.observe(
+            accumulated_tool_calls=_tool_calls(("call_1", '{"q": "x"}{'))
+        )
+        assert verdict is not None
+        assert verdict.reason == "tool_call_trailing_bytes"
+        assert verdict.keep_length == len('{"q": "x"')
+
+    def test_leading_whitespace_before_the_object_is_allowed(self) -> None:
+        guard = StreamProgressGuard(_config())
+        assert (
+            guard.observe(
+                accumulated_tool_calls=_tool_calls(("call_1", '\n{"q": "x"}'))
+            )
+            is None
+        )
+        verdict = guard.observe(
+            accumulated_tool_calls=_tool_calls(("call_1", '\n{"q": "x"}x'))
+        )
+        assert verdict is not None
+        assert verdict.reason == "tool_call_trailing_bytes"
+
+    def test_open_object_is_not_reparsed_without_a_closing_brace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A large open object must not be JSON-parsed on every delta."""
+        from xagent.core.model.chat import stream_progress
+
+        calls = {"n": 0}
+        original = stream_progress._complete_object_length
+
+        def counting(arguments: str) -> int | None:
+            calls["n"] += 1
+            return original(arguments)
+
+        monkeypatch.setattr(stream_progress, "_complete_object_length", counting)
+        guard = StreamProgressGuard(_config(empty_delta_limit=0))
+        arguments = '{"staff_ids": ['
+        for i in range(50):
+            arguments += f"{i},"
+            guard.observe(accumulated_tool_calls=_tool_calls(("call_1", arguments)))
+        assert calls["n"] == 0
+        guard.observe(accumulated_tool_calls=_tool_calls(("call_1", arguments + "1]}")))
+        assert calls["n"] == 1
 
     def test_new_parallel_tool_call_after_a_complete_one_does_not_abort(self) -> None:
         guard = StreamProgressGuard(_config())

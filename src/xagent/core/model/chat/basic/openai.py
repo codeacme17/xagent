@@ -1603,9 +1603,11 @@ class OpenAICompatibleLLM(BaseLLM):
 
         With tool calls accumulated it is a final ``TOOL_CALL`` snapshot with
         the rejected delta undone: the call the guard named is cut back to
-        ``abort.keep_length``, its length before that delta, which is the
-        snapshot the runtime already holds (a shorter snapshot would be
-        merged as a delta there). Otherwise an ``END``. Either way
+        ``abort.keep_length``, its length before that delta, which equals or
+        extends the snapshot the runtime holds (a wrapper such as the
+        DeepSeek tool-protocol adapter may have streamed a shorter prefix; a
+        snapshot shorter than the runtime's would be merged as a delta
+        there). Otherwise an ``END``. Either way
         ``finish_reason`` is ``no_progress`` so the runtime's #2786 markers
         record the abort.
         """

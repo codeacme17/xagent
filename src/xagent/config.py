@@ -2926,7 +2926,7 @@ def get_llm_retry_deadline_seconds() -> float:
         values fall back to the default, because an unbounded loop is the
         defect this exists to prevent.
     """
-    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, None)
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, 300.0)
     return 300.0 if deadline is None else deadline
 
 
@@ -2981,7 +2981,9 @@ def get_llm_stream_degenerate_window() -> int:
         2. 256
 
     Returns:
-        Trailing characters inspected; 0 disables the check. Invalid or
+        Trailing characters inspected; 0 disables the whitespace and
+        periodicity checks (non-whitespace after a complete tool-call object
+        is still rejected: it can never parse). Invalid or
         negative values fall back to the default.
     """
     return _get_positive_int_env(LLM_STREAM_DEGENERATE_WINDOW, 256, minimum=0)
@@ -3045,7 +3047,7 @@ def get_llm_stream_no_payload_timeout_seconds() -> float:
         Seconds allowed with no payload before the stream is abandoned;
         invalid or non-positive values fall back to the default.
     """
-    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, None)
+    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, 30.0)
     return 30.0 if timeout is None else timeout
 
 

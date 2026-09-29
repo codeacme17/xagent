@@ -9,7 +9,10 @@ provider's raw stream loop feeds it one observation per delta and it answers
 "abort, and why" or "keep going". Closing the stream and shaping what is
 returned stays with the provider.
 
-Three predicates, each independently switchable:
+Three predicates. The thresholds are configurable; a value of ``0``
+switches off the empty-delta count and the whitespace/periodicity checks.
+The one rule without a knob is non-whitespace after a complete tool-call
+object: that input can never parse, so there is nothing to tune.
 
 * **empty deltas** -- N consecutive raw deltas with no content, no tool-call
   bytes, no reasoning text and no finish reason. This is what an
@@ -20,9 +23,10 @@ Three predicates, each independently switchable:
   reasons for minutes stays live; a loop of one phrase does not.
 * **bytes after a complete tool-call object** -- once a call's arguments
   parse as a JSON object, anything further appended to *that* call is
-  garbage by construction: non-whitespace can never parse, whitespace is
-  noise. A new call at a new index is unaffected, and an object that is
-  still open (the runaway-list shape) is deliberately left to ``max_tokens``.
+  garbage by construction: non-whitespace can never parse (aborted at once,
+  no knob), whitespace is noise (aborted once it fills the window). A new
+  call at a new index is unaffected, and an object that is still open (the
+  runaway-list shape) is deliberately left to ``max_tokens``.
 
 A fourth, opt-in trigger aborts after T seconds without any content or
 tool-call chunk, for models listed by name. It exists as an escape hatch for
@@ -110,8 +114,9 @@ class StreamAbort:
     human-readable explanation. For the tool-call predicates,
     ``tool_call_id`` names the call whose arguments received the extra bytes
     and ``keep_length`` is that call's argument length before the rejected
-    delta: the provider cuts the call back to it, so what it returns is
-    exactly the last snapshot it already streamed.
+    delta: the provider cuts the call back to it, so what it returns equals
+    or extends the last snapshot the runtime holds (a wrapper such as the
+    DeepSeek tool-protocol adapter may have streamed a shorter prefix).
     """
 
     reason: AbortReason
@@ -174,7 +179,14 @@ class StreamProgressGuard:
         if self._first_delta_at is None:
             self._first_delta_at = now
 
-        reasoning_delta = "".join(text for text in reasoning_texts if text)
+        # A provider that mirrors the same text under two ``reasoning*``
+        # spellings must not count twice: doubled text halves the apparent
+        # period and fills the window at twice the true rate.
+        unique_texts: list[str] = []
+        for text in reasoning_texts:
+            if text and text not in unique_texts:
+                unique_texts.append(text)
+        reasoning_delta = "".join(unique_texts)
         tool_progress, tool_verdict = self._observe_tool_calls(
             accumulated_tool_calls or {}
         )
@@ -294,10 +306,17 @@ class StreamProgressGuard:
 
             complete_len = self._complete_len.get(call_id)
             if complete_len is None:
-                complete_len = _complete_object_length(arguments)
-                if complete_len is not None:
-                    self._complete_len[call_id] = complete_len
-                continue
+                # Only a delta that brought a closing brace can have completed
+                # the object; skip the parse otherwise so a large open object
+                # is not re-parsed on every delta.
+                if "}" in arguments[previous or 0 :]:
+                    complete_len = _complete_object_length(arguments)
+                    if complete_len is not None:
+                        self._complete_len[call_id] = complete_len
+                        # Bytes after the object may have arrived in this same
+                        # delta (``}{`` is one BPE token); fall through.
+                if complete_len is None:
+                    continue
 
             extra = arguments[complete_len:]
             if extra.strip():
@@ -328,22 +347,29 @@ class StreamProgressGuard:
 # ------------------------------------------------------------------ helpers
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
 def _complete_object_length(arguments: str) -> int | None:
-    """Length of ``arguments`` r-stripped if it parses as a JSON object.
+    """Offset just past the first complete JSON object in ``arguments``.
 
     Only a top-level object counts: a bare number or string prefix can still
     legitimately grow (``12`` -> ``123``), an object that closed cannot.
+    Leading whitespace is allowed, and anything after the object (``}{``
+    arriving as one delta) is left for the caller to judge, so the result
+    is the object's end, not the string's length.
     """
-    stripped = arguments.rstrip()
-    if not stripped.startswith("{") or not stripped.endswith("}"):
+    leading = len(arguments) - len(arguments.lstrip())
+    body = arguments[leading:]
+    if not body.startswith("{"):
         return None
     try:
-        parsed = json.loads(stripped)
+        parsed, end = _JSON_DECODER.raw_decode(body)
     except ValueError:
         return None
     if not isinstance(parsed, dict):
         return None
-    return len(stripped)
+    return leading + end
 
 
 def _shortest_period(text: str, max_period: int) -> int | None:
