@@ -1742,6 +1742,33 @@ async def test_runtime_stream_protocol_error_response_carries_markers() -> None:
     assert result["usage_missing"] is True
 
 
+class StreamingTextWithReasoningNoUsageLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            delta="hello",
+            raw={"reasoning_content": "thinking"},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="length")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_provider_payload_without_usage_carries_markers() -> None:
+    """A stream that never emits a usage chunk but does carry provider payload
+    (e.g. ``reasoning_content``) must still surface ``finish_reason`` and
+    ``usage_missing`` on the reconstructed response, not just the payload."""
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingTextWithReasoningNoUsageLLM(), messages=[]
+    )
+
+    assert result["content"] == "hello"
+    assert result["reasoning_content"] == "thinking"
+    assert result["finish_reason"] == "length"
+    assert result["usage_missing"] is True
+
+
 class StreamingTextWithUsageAndStopLLM:
     async def stream_chat(self, **_: Any) -> Any:
         yield StreamChunk(type=ChunkType.TOKEN, delta="hello")

@@ -1029,6 +1029,54 @@ class TestOpenAILLM:
         assert result["content"] == "Here"
         assert result["reasoning_content"] == "Here"
         assert result["reasoning"] == "Here"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_falls_back_to_reasoning_content_with_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        """The vision_chat path must surface finish_reason the same way
+        chat() does when content is empty and reasoning_content is used
+        as a fallback (see
+        test_empty_content_falls_back_to_reasoning_content above)."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "length"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "Here"
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.model_dump.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Here",
+                    },
+                }
+            ]
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image"}]
+        )
+
+        assert result["content"] == "Here"
+        assert result["finish_reason"] == "length"
 
     @pytest.mark.asyncio
     async def test_whitespace_only_reasoning_content_still_raises(
@@ -1458,6 +1506,7 @@ class TestOpenAILLM:
 
         assert response["type"] == "tool_call"
         assert response["tool_calls"][0]["function"]["arguments"] == expected
+        assert response["finish_reason"] == "tool_calls"
 
     @pytest.mark.parametrize(
         ("empty_arguments", "expected"),
@@ -2599,3 +2648,25 @@ class TestFinishReasonOnResponse:
         tokens = [c for c in chunks if c.is_token()]
         assert [c.delta for c in tokens] == ["Hello", " world"]
         assert [c.finish_reason for c in tokens] == ["", "length"]
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_chunk_tool_call_delta_carries_finish_reason(
+        self, openai_llm_config
+    ):
+        """A tool-call delta chunk that also carries ``finish_reason`` (some
+        OpenAI-compatible endpoints put it on the same chunk as the final
+        delta, see ``_parse_stream_chunk`` above) must surface that reason on
+        the returned ``StreamChunk`` rather than dropping it."""
+        llm = OpenAILLM(**openai_llm_config)
+
+        chunk = llm._parse_stream_chunk(
+            _stream_chunk(
+                [_tool_call_delta(0, "call_1", "search", '{"q":1}')],
+                finish_reason="length",
+            ),
+            {},
+        )
+
+        assert chunk is not None
+        assert chunk.is_tool_call()
+        assert chunk.finish_reason == "length"
