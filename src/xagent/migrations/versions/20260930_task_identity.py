@@ -103,8 +103,9 @@ def _historical_floor(connection, inspector):
         columns = {column["name"] for column in inspector.get_columns("uploaded_files")}
         paths = sorted(columns & {"storage_path", "storage_key", "storage_uri"})
         if paths:
+            candidate = " OR ".join(f"instr({path}, 'task_') > 0" for path in paths)
             rows = connection.exec_driver_sql(
-                f"SELECT {', '.join(paths)} FROM uploaded_files"
+                f"SELECT {', '.join(paths)} FROM uploaded_files WHERE {candidate}"
             )
             for row in rows:
                 floor = max(floor, *(_path_floor(value) for value in row))

@@ -41,12 +41,15 @@ cannot be inventoried: mount it before upgrading. History with no remaining
 database record or directory cannot be reconstructed by this migration.
 
 SQLite locks writers for the inventory and rebuild. Plan the maintenance window
-for the number of upload directories and task rows. The revision preserves task
-IDs, rows, constraints, explicit indexes (including expression/partial indexes),
-task-table triggers, and inbound relationships. A real write transaction starts
-before DDL, so interrupted rebuilds roll back; a retry retains any already
-consumed sequence value. A historical ID at SQLite's signed 64-bit limit fails
-before changing the schema rather than exhausting the allocator silently.
+for the number of upload directories, uploaded-file rows, and task rows. SQLite
+scans the uploaded-file table, but only rows containing `task_` in a supported
+path column are decoded in Python. The revision rebuilds the tasks table while
+preserving task IDs, rows, constraints, explicit indexes (including
+expression/partial indexes), task-table triggers, and inbound relationships. A
+real write transaction starts before DDL, so interrupted rebuilds roll back; a
+retry retains any already consumed sequence value. A historical ID at SQLite's
+signed 64-bit limit fails before changing the schema rather than exhausting the
+allocator silently.
 
 ## Contract and rollback
 

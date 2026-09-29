@@ -1,20 +1,21 @@
 """Task deletion must never give retained workspace paths to a new task."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import (
     disposable_database_factory,
     load_migration_module,
 )
-from xagent.db.migration import _migration_connection
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.workspace import TaskWorkspace
+from xagent.db.migration import _migration_connection
 from xagent.web.models import Base, Task, UploadedFile, User
 from xagent.web.services.task_deletion import purge_task_rows
 
@@ -139,6 +140,77 @@ def seed_legacy(engine):
             "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT)"
         )
         connection.exec_driver_sql("INSERT INTO tasks VALUES (7, 'live')")
+
+
+def test_upgrade_decodes_only_uploaded_file_candidates(tmp_path):
+    fetched = []
+
+    class RecordingCursor(sqlite3.Cursor):
+        recording = False
+
+        def execute(self, statement, parameters=()):
+            self.recording = (
+                statement.startswith("SELECT storage_")
+                and "FROM uploaded_files" in statement
+            )
+            return super().execute(statement, parameters)
+
+        def fetchone(self):
+            row = super().fetchone()
+            if self.recording and row is not None:
+                fetched.append(row)
+            return row
+
+        def fetchmany(self, size=None):
+            rows = super().fetchmany(size) if size is not None else super().fetchmany()
+            if self.recording:
+                fetched.extend(rows)
+            return rows
+
+        def fetchall(self):
+            rows = super().fetchall()
+            if self.recording:
+                fetched.extend(rows)
+            return rows
+
+    class RecordingConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            kwargs["factory"] = RecordingCursor
+            return super().cursor(*args, **kwargs)
+
+    database = tmp_path / "recording.db"
+    engine = sa.create_engine(
+        "sqlite://",
+        creator=lambda: sqlite3.connect(database, factory=RecordingConnection),
+    )
+    try:
+        seed_legacy(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE uploaded_files "
+                "(storage_path TEXT, storage_key TEXT, storage_uri TEXT)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO uploaded_files VALUES (?, ?, ?)",
+                [
+                    (f"/ordinary/{index}/report.txt", None, "s3://bucket/report.txt")
+                    for index in range(40)
+                ]
+                + [
+                    ("/archive/web_task_701/output/a.txt", None, None),
+                    (None, "tenant/task_702/output/b.txt", None),
+                    (None, None, "s3://archive/web_task_703/output/c.txt"),
+                ],
+            )
+        migrate(engine)
+        with engine.begin() as connection:
+            new_id = connection.exec_driver_sql(
+                "INSERT INTO tasks DEFAULT VALUES"
+            ).lastrowid
+        assert new_id == 704
+        assert len(fetched) == 3
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize(
