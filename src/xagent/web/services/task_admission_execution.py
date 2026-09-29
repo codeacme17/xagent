@@ -56,6 +56,21 @@ def current_admission_command(task_id: int) -> int | None:
     return context.command_id
 
 
+def current_admission_joins_execution(task_id: int) -> bool:
+    """Whether the current context is a confirmed injection into a live run.
+
+    Only a run ``allow_injected_guidance`` actually confirmed counts: this is
+    what tells the coordinator a new handle continues an existing execution
+    rather than starting one of its own.
+    """
+    context = _current.get()
+    return (
+        context is not None
+        and context.task_id == task_id
+        and context.injected_run_id is not None
+    )
+
+
 def allow_injected_guidance(task_id: int, run_id: str | None) -> None:
     """Only a confirmed injection may continue the exact original execution."""
     context = _current.get()

@@ -9,6 +9,8 @@ the execution handle that finished, keeping the idle release as the backstop.
 """
 
 import asyncio
+import logging
+import threading
 
 from tests.web.services.test_task_admission_execution_slots import (
     RunExecution,
@@ -19,10 +21,13 @@ from tests.web.services.test_task_admission_execution_slots import (
 from tests.web.services.test_task_execution_admission import engine as engine_fixture
 from tests.web.services.test_task_execution_admission import host as host_fixture
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.services import task_admission_execution
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_coordinator_runtime as runtime
 from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_execution_admission as admission
 from xagent.web.services.task_admission_observation import read_admission_snapshot
+from xagent.web.services.task_execution_controller import task_control_snapshot
 
 engine = engine_fixture
 host = host_fixture
@@ -68,6 +73,85 @@ async def pause_then_resume_across_buckets(host):
     assert stamped_tickets(host, task_id) == [first.command_id, resume.command_id]
     assert (active(host, "batch"), active(host, "interactive")) == (1, 1)
     return paused, resumed
+
+
+async def test_joined_guidance_continuation_keeps_the_original_ticket_charged(host):
+    """A MESSAGE that joins the running execution rides the joined ticket.
+
+    C2 (the message) never stamps its own ticket: it joins H1's running
+    execution. The resume handle H2 it creates while H1 is still live must
+    inherit H1's ticket, not C2's (unstamped) one, and that ticket must stay
+    charged until every handle of the continued execution has finished.
+    """
+    admission.set_task_admission_hook(classify_by_kind)
+    first = enqueue(host)
+    task_id = task_of(host, first)
+    original = RunExecution(host, settled=TaskStatus.PAUSED)
+    assert await transport.dispatch_one_task_command(original)
+
+    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    h2_finish = asyncio.Event()
+    h2s: list[asyncio.Task] = []
+
+    async def join(command):
+        with host.sessions() as db:
+            run_id = db.get(Task, task_id).run_id
+        task_admission_execution.allow_injected_guidance(task_id, run_id)
+        owner = runtime.current_task_coordinator(command.task_id)
+
+        async def continue_run():
+            await asyncio.gather(original.handles[0], return_exceptions=True)
+            await original.terminal.wait()
+            with host.sessions() as db, db.begin():
+                task = db.get(Task, task_id)
+                ownership.begin_task_execution_no_commit(
+                    db,
+                    owner.lease,
+                    expected=task_control_snapshot(task),
+                    new_run=False,
+                )
+            try:
+                await h2_finish.wait()
+            finally:
+                with host.sessions() as db, db.begin():
+                    task = db.get(Task, task_id)
+                    task.status = TaskStatus.COMPLETED
+                    task.control_state = TaskStatus.COMPLETED.value
+
+        h2 = asyncio.create_task(continue_run())
+        h2s.append(h2)
+        owner.track_execution(h2)
+        return {}
+
+    assert await transport.dispatch_one_task_command(
+        join, command_db_id=message.command_id
+    )
+    # The joined MESSAGE never stamped its own ticket.
+    assert stamped_tickets(host, task_id) == [first.command_id]
+
+    original.finish.set()
+    await asyncio.wait_for(original.terminal.wait(), 5)
+    original.cleanup.set()
+    await asyncio.wait_for(original.handles[0], 5)
+
+    # Any release H1's drain scheduled has landed once these are awaited.
+    await asyncio.gather(*original.owner._admission_releases, return_exceptions=True)
+    assert active(host, "batch") == 1
+    assert stamped_tickets(host, task_id) == [first.command_id]
+    other = enqueue(host)
+    other_execution = RunExecution(host)
+    assert not await transport.dispatch_one_task_command(
+        other_execution, command_db_id=other.command_id
+    )
+
+    h2_finish.set()
+    await asyncio.wait_for(h2s[0], 5)
+    await eventually_active(host, "batch", 0)
+    assert await transport.dispatch_one_task_command(
+        other_execution, command_db_id=other.command_id
+    )
+    other_execution.finish.set()
+    other_execution.cleanup.set()
 
 
 async def test_previous_bucket_slot_is_released_once_its_incarnation_drains(host):
@@ -185,9 +269,152 @@ async def test_drained_handle_of_a_superseded_owner_releases_nothing(host):
 
     paused.cleanup.set()
     await asyncio.gather(paused.handles[0], return_exceptions=True)
-    await asyncio.sleep(0.2)
+    # `_close` drains pending admission releases before finishing, so waiting
+    # for the superseded owner to fully close makes the assertion deterministic.
+    async with asyncio.timeout(5):
+        while paused.owner.state is not runtime.CoordinatorState.CLOSED:
+            await asyncio.sleep(0.01)
     assert stamped_tickets(host, task_id) == [first.command_id, resume.command_id]
     assert active(host, "interactive") == 1
+
+
+class _EndsWithoutSettling:
+    """Begins execution, then tracks a handle that returns without settling.
+
+    The task row stays RUNNING; only the ticket's release, not a status flip,
+    frees its slot.
+    """
+
+    def __init__(self, host):
+        self.host = host
+        self.owner = None
+
+    async def __call__(self, command):
+        owner = runtime.current_task_coordinator(command.task_id)
+        self.owner = owner
+        with self.host.sessions() as db, db.begin():
+            ownership.begin_task_execution_no_commit(
+                db,
+                owner.lease,
+                expected=task_control_snapshot(db.get(Task, command.task_id)),
+                new_run=True,
+            )
+
+        async def run() -> None:
+            return
+
+        owner.track_execution(asyncio.create_task(run()))
+        return {}
+
+
+async def test_handle_that_ends_without_settling_frees_its_slot(host):
+    admission.set_task_admission_hook(classify_by_kind)
+    first = enqueue(host)
+    task_id = task_of(host, first)
+    execute = _EndsWithoutSettling(host)
+    assert await transport.dispatch_one_task_command(execute)
+
+    await eventually_active(host, "batch", 0)
+    assert stamped_tickets(host, task_id) == []
+    # The row never settled, so the owner ends in recovery, not a clean release.
+    async with asyncio.timeout(5):
+        while execute.owner.state is not runtime.CoordinatorState.CLOSED:
+            await asyncio.sleep(0.01)
+
+
+async def test_failed_release_keeps_the_ticket_for_the_idle_backstop(
+    host, monkeypatch, caplog
+):
+    paused, resumed = await pause_then_resume_across_buckets(host)
+
+    def raise_release(db, lease, command_id):
+        raise RuntimeError("simulated release failure")
+
+    monkeypatch.setattr(admission, "release_task_admission", raise_release)
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_coordinator_runtime"
+    )
+
+    paused.cleanup.set()
+    await asyncio.gather(paused.handles[0], return_exceptions=True)
+    async with asyncio.timeout(5):
+        while not any(
+            "could not release admission" in record.getMessage()
+            for record in caplog.records
+        ):
+            await asyncio.sleep(0.01)
+    assert active(host, "batch") == 1
+
+    # The idle backstop still clears both buckets once the task fully settles.
+    resumed.finish.set()
+    resumed.cleanup.set()
+    await eventually_active(host, "interactive", 0)
+    await eventually_active(host, "batch", 0)
+
+
+async def test_close_waits_for_a_pending_release(host, monkeypatch):
+    paused, resumed = await pause_then_resume_across_buckets(host)
+    real_release = admission.release_task_admission
+    gate = threading.Event()
+    close_done_when_released: list[bool] = []
+    closing: list[asyncio.Task] = []
+
+    def blocking_release(db, lease, command_id):
+        gate.wait(5)
+        close_done_when_released.append(closing[0].done())
+        return real_release(db, lease, command_id)
+
+    monkeypatch.setattr(admission, "release_task_admission", blocking_release)
+
+    paused.cleanup.set()
+    await asyncio.gather(paused.handles[0], return_exceptions=True)
+
+    closing.append(asyncio.create_task(paused.owner.close()))
+    await asyncio.sleep(0)
+    gate.set()
+    await asyncio.wait_for(closing[0], 5)
+    # The release committed while close() was still pending on it.
+    assert close_done_when_released == [False]
+    assert active(host, "batch") == 0
+
+    # close() cancels the still-running resumed child; settle it regardless.
+    resumed.finish.set()
+    resumed.cleanup.set()
+
+
+async def test_handle_tracked_outside_an_admission_context_is_not_mapped(host):
+    """An ungoverned handle neither holds nor releases any ticket."""
+    admission.set_task_admission_hook(classify_by_kind)
+    first = enqueue(host)
+    task_id = task_of(host, first)
+    execute = RunExecution(host, settled=TaskStatus.PAUSED)
+    extra_finish = asyncio.Event()
+    extras: list[asyncio.Task] = []
+
+    async def start(command):
+        result = await execute(command)
+        owner = runtime.current_task_coordinator(command.task_id)
+        with task_admission_execution.admission_execution(
+            command.id, command.task_id, governed=False
+        ):
+            extras.append(asyncio.create_task(extra_finish.wait()))
+            owner.track_execution(extras[0])
+        return result
+
+    assert await transport.dispatch_one_task_command(start)
+    assert stamped_tickets(host, task_id) == [first.command_id]
+    assert active(host, "batch") == 1
+
+    # The governed handle's drain frees its slot although the ungoverned
+    # handle is still live: that handle holds nothing.
+    execute.finish.set()
+    execute.cleanup.set()
+    await asyncio.wait_for(execute.handles[0], 5)
+    await eventually_active(host, "batch", 0)
+    assert not extras[0].done()
+    extra_finish.set()
+    await asyncio.wait_for(extras[0], 5)
+    assert stamped_tickets(host, task_id) == []
 
 
 def test_stale_owner_cannot_release_the_successor_ticket(host):

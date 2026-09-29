@@ -343,9 +343,13 @@ class TaskCoordinator:
         self._command_lock = asyncio.Lock()
         self._command_tasks: set[asyncio.Task[Any]] = set()
         self._children: set[asyncio.Task[Any]] = set()
-        # The governed command whose ticket each tracked handle's execution
-        # holds, released when that handle finishes (#2777).
-        self._child_admissions: dict[asyncio.Task[Any], int] = {}
+        # The governed command ids whose tickets each tracked handle's
+        # execution holds, released once every handle of that execution has
+        # finished (#2777). A joined guidance continuation inherits the
+        # ticket(s) of the execution it continues -- rather than its own,
+        # unstamped one -- so that ticket stays charged until every handle of
+        # that execution has finished.
+        self._child_admissions: dict[asyncio.Task[Any], frozenset[int]] = {}
         self._admission_releases: set[asyncio.Task[None]] = set()
         self._idle_task: asyncio.Task[None] | None = None
         self._startup = asyncio.create_task(self._start())
@@ -419,27 +423,46 @@ class TaskCoordinator:
             raise RuntimeError("Task coordinator is closing")
         if handle in self._children:
             return
-        from .task_admission_execution import current_admission_command
+        from .task_admission_execution import (
+            current_admission_command,
+            current_admission_joins_execution,
+        )
 
         command_id = current_admission_command(self.task_id)
         if command_id is not None:
-            self._child_admissions[handle] = command_id
+            live_owned: frozenset[int] = frozenset()
+            for child, owned in self._child_admissions.items():
+                if child in self._children and not child.done():
+                    live_owned |= owned
+            if current_admission_joins_execution(self.task_id) and live_owned:
+                # A joined continuation rides on the execution it continues,
+                # not on its own (unstamped) ticket.
+                self._child_admissions[handle] = live_owned
+            else:
+                self._child_admissions[handle] = frozenset({command_id})
         self._children.add(handle)
         handle.add_done_callback(self._child_done)
 
     def _child_done(self, handle: asyncio.Task[Any]) -> None:
         self._children.discard(handle)
-        command_id = self._child_admissions.pop(handle, None)
+        owned = self._child_admissions.pop(handle, None)
         # A closing owner drains its handles and either releases every ticket
         # with the lease or leaves them for recovery; only a live owner frees
         # the finished execution's slot on its own.
-        if command_id is not None and self.state == CoordinatorState.ACTIVE:
-            release = asyncio.create_task(self._release_drained_admission(command_id))
-            self._admission_releases.add(release)
-            release.add_done_callback(self._admission_releases.discard)
+        if owned and self.state == CoordinatorState.ACTIVE:
+            still_held: frozenset[int] = frozenset()
+            for remaining in self._child_admissions.values():
+                still_held |= remaining
+            to_release = owned - still_held
+            if to_release:
+                release = asyncio.create_task(
+                    self._release_drained_admission(to_release)
+                )
+                self._admission_releases.add(release)
+                release.add_done_callback(self._admission_releases.discard)
         self._ensure_idle_check()
 
-    async def _release_drained_admission(self, command_id: int) -> None:
+    async def _release_drained_admission(self, command_ids: frozenset[int]) -> None:
         """Free the finished execution's slot even while a successor runs.
 
         A handle that ended before settling its row leaves the task RUNNING
@@ -454,16 +477,17 @@ class TaskCoordinator:
         def release() -> None:
             with self._registry.session_factory() as db, db.begin():
                 if lock_task_lease_no_commit(db, lease):
-                    release_task_admission(db, lease, command_id)
+                    for command_id in command_ids:
+                        release_task_admission(db, lease, command_id)
 
         try:
             await run_db_io_cancellation_safe(release)
         except Exception:
-            # The settled and idle releases still cover this ticket later.
+            # The settled and idle releases still cover these tickets later.
             logger.exception(
-                "Task %s could not release admission for command %s",
+                "Task %s could not release admission for commands %s",
                 self.task_id,
-                command_id,
+                command_ids,
             )
 
     async def execute_command(
