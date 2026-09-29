@@ -18,7 +18,6 @@ from tests.web.services.test_task_execution_admission import host as host_fixtur
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_admission import TaskAdmissionTicket
 from xagent.web.models.task_command import TaskExecutionCommand
-from xagent.web.services import task_admission_execution
 from xagent.web.services import task_admission_observation as observation
 from xagent.web.services import task_admission_pacing as pacing
 from xagent.web.services import task_command_transport as transport
@@ -176,9 +175,20 @@ async def test_cross_lane_guidance_joins_running_execution_without_a_slot(host):
 async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
     host, monkeypatch
 ):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import task_command_execution
+    from xagent.web.services.task_command_execution import (
+        execute_durable_task_command,
+    )
+
     now = [100.0]
     monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
     monkeypatch.setattr(observation, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(task_command_execution, "publish_task_event", AsyncMock())
+    monkeypatch.setattr(
+        task_command_execution, "get_session_local", lambda: host.sessions
+    )
     first = enqueue(host)
     original = RunExecution(host)
     assert await transport.dispatch_one_task_command(original)
@@ -194,23 +204,40 @@ async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
     occupying = enqueue(host)
     occupied = RunExecution(host)
     assert await transport.dispatch_one_task_command(occupied)
-    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    with host.sessions() as db:
+        message = transport.enqueue_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=host.user,
+            command_id="next-message",
+            kind=transport.TaskCommandKind.MESSAGE,
+            payload={"message": "Continue", "client_message_id": "next-message"},
+        )
     attempts = []
 
-    async def inject(command):
+    async def settle_then_route(command):
+        # The original run ends between the claim and the production message
+        # handler; its new-turn path must then refuse without a held ticket.
         attempts.append(command.id)
-        # The original run ended between the claim and the injection.
         original.finish.set()
         await asyncio.wait_for(original.terminal.wait(), 5)
         original.cleanup.set()
-        task_admission_execution.require_execution_admission_isolated(command.task_id)
+        return await execute_durable_task_command(command)
+
+    async def inject(command):
+        attempts.append(command.id)
         return {}
 
     assert await transport.dispatch_one_task_command(
-        inject, command_db_id=message.command_id
+        settle_then_route, command_db_id=message.command_id
     )
     row = transport.load_task_command(message.command_id)
-    assert (row.status, row.attempt_count, row.failure_count) == ("pending", 1, 0)
+    assert (row.status, row.attempt_count, row.failure_count, row.defer_count) == (
+        "pending",
+        1,
+        0,
+        0,
+    )
     assert attempts == [message.command_id]
     with host.sessions() as db, db.begin():
         db.get(TaskExecutionCommand, message.command_id).retry_available_at = (
@@ -239,3 +266,44 @@ async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
     assert attempts == [message.command_id, message.command_id]
     assert transport.load_task_command(message.command_id).status == "completed"
     assert occupied.started == [occupying.command_id]
+
+
+@pytest.mark.parametrize("control_state", ["pause_requested", "resume_requested"])
+async def test_cross_lane_message_joins_only_a_running_control_state(
+    host, control_state
+):
+    first = enqueue(host)
+    original = RunExecution(host)
+    assert await transport.dispatch_one_task_command(original)
+    task_id = task_of(host, first)
+    with host.sessions() as db, db.begin():
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.RUNNING
+        task.control_state = control_state
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("other-lane", 1, 20)
+    )
+    occupying = enqueue(host)
+    occupied = RunExecution(host)
+    assert await transport.dispatch_one_task_command(occupied)
+    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    delivered = []
+
+    async def inject(command):
+        delivered.append(command.id)
+        return {}
+
+    # Not live guidance: it waits for its own lane instead of joining.
+    assert not await transport.dispatch_one_task_command(
+        inject, command_db_id=message.command_id
+    )
+    assert transport.load_task_command(message.command_id).attempt_count == 0
+    assert delivered == []
+    assert snapshot(host, "other-lane").pending == 1
+    occupied.finish.set()
+    occupied.cleanup.set()
+    await dispatch_next(inject)
+    assert delivered == [message.command_id]
+    assert occupied.started == [occupying.command_id]
+    original.finish.set()
+    original.cleanup.set()

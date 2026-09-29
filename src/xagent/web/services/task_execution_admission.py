@@ -10,17 +10,20 @@ out that acquisition first.
 Capacity is charged per active execution, not per stamped ticket row. Every
 ticket the task's current owner holds in one bucket is the same execution: a
 RESUME admitted while the previous incarnation's cleanup still holds its ticket
-does not take a second slot, because every new incarnation drains the previous
-one before it runs. Live guidance joins the running execution without a slot
-from its own bucket, because the bucket classified a queue position and the
-execution it joins already paid for its slot; it must reserve one only if it
-becomes a new turn. Tickets carry no execution identity, so an incarnation
-classified into another bucket keeps the previous bucket's slot until this
-owner's next settled or idle release, not merely through cleanup. Counting
-distinct tasks is serialized by the bucket row lock taken before every stamp
-and by the exclusive owner stamp per task. The scan, claim, and snapshot
-predicates below must agree on this contract, so every executor must run the
-same revision before a host enables a policy.
+does not take a second slot. That relies on every new incarnation draining
+the previous one before it runs; a timed-out cancellation currently breaks that
+precondition (#2778), which is an activation gate. Live guidance joins the
+running execution without a slot from its own bucket, because the bucket
+classified a queue position and the execution it joins already paid for its
+slot; it must reserve one only if it becomes a new turn. Tickets carry no
+execution identity, so an incarnation classified into another bucket keeps the
+previous bucket's slot until this owner's next settled or idle release, not
+merely through cleanup (#2777). Counting distinct tasks is serialized by the
+bucket row lock taken before every stamp and by the exclusive owner stamp per
+task. The scan and claim predicates below must agree on this contract, so every
+executor must run the same revision before a host enables a policy. The
+snapshot counts every held task, including the waiter's own; it is display
+only (#2700).
 """
 
 from __future__ import annotations
