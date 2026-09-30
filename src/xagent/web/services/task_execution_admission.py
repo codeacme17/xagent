@@ -366,11 +366,13 @@ def release_task_admissions(db: Session, lease: TaskLease) -> None:
     _release_tickets(db, *_owned_tickets(lease))
 
 
-def release_task_admission(db: Session, lease: TaskLease, command_id: int) -> None:
-    """Release one drained execution's ticket; the owner may still run another.
+def release_command_admission(db: Session, lease: TaskLease, command_id: int) -> None:
+    """Release one command's ticket, versus every ticket the lease holds.
 
-    Fenced by the ticket's current owner, so a stale owner never frees a slot
-    a successor acquisition stamped.
+    Compare ``release_task_admissions``, which releases every ticket of the
+    lease; this releases only the one drained execution's ticket, since the
+    owner may still run another. Fenced by the ticket's current owner, so a
+    stale owner never frees a slot a successor acquisition stamped.
     """
     _release_tickets(
         db, TaskAdmissionTicket.command_id == command_id, *_owned_tickets(lease)
