@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import (
@@ -15,7 +17,9 @@ from tests.shared.postgres_disposable import (
 )
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.workspace import TaskWorkspace
+from xagent.db.config import create_alembic_config
 from xagent.db.migration import _migration_connection
+from xagent.web.config import get_upload_path
 from xagent.web.models import Base, Task, UploadedFile, User
 from xagent.web.services.task_deletion import purge_task_rows
 
@@ -226,15 +230,25 @@ def test_upgrade_decodes_only_uploaded_file_candidates(tmp_path):
         "directory",
         "external",
         "symlink",
+        "legacy_symlink",
+        "legacy_user_symlink",
+        "escaped_symlink",
         "workspace_named_scope",
+        "uploaded_task_id",
+        "legacy_custom_metadata",
+        "legacy_custom_directory",
+        "legacy_unscoped_metadata",
+        "reattached_metadata",
     ],
 )
 def test_upgrade_reserves_historical_ids(sqlite_engine, tmp_path, monkeypatch, source):
     seed_legacy(sqlite_engine)
     with sqlite_engine.begin() as connection:
-        if source in {"cleanup", "tombstone"}:
+        if source in {"cleanup", "tombstone", "uploaded_task_id"}:
             table = (
-                "task_cleanup_obligations"
+                "uploaded_files"
+                if source == "uploaded_task_id"
+                else "task_cleanup_obligations"
                 if source == "cleanup"
                 else "expired_task_tombstones"
             )
@@ -253,23 +267,67 @@ def test_upgrade_reserves_historical_ids(sqlite_engine, tmp_path, monkeypatch, s
             connection.exec_driver_sql(
                 "INSERT INTO uploaded_files VALUES (?)", (paths[source],)
             )
+        elif source.startswith("legacy_") and source.endswith(
+            ("metadata", "directory")
+        ):
+            path = get_upload_path(
+                "report.txt",
+                task_id="701",
+                folder="custom",
+                user_id=None if source.startswith("legacy_unscoped") else 4,
+                create_if_not_exists=source.endswith("directory"),
+            )
+            if source.endswith("metadata"):
+                connection.exec_driver_sql(
+                    "CREATE TABLE uploaded_files(storage_path TEXT)"
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO uploaded_files VALUES (?)", (str(path),)
+                )
+        elif source == "reattached_metadata":
+            connection.exec_driver_sql(
+                "CREATE TABLE uploaded_files(task_id INTEGER, storage_path TEXT)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO uploaded_files VALUES (2, '/archive/web_task_701/output/report.txt')"
+            )
         else:
             root = tmp_path / "uploads"
             if source == "external":
                 root = tmp_path / "external"
                 root.mkdir()
                 monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(root))
-            if source == "symlink":
+            if source in {
+                "symlink",
+                "legacy_symlink",
+                "legacy_user_symlink",
+                "escaped_symlink",
+            }:
                 target = tmp_path / "scope-target"
                 target.mkdir()
-                root.mkdir()
-                (root / "scope").symlink_to(target, target_is_directory=True)
+                alias_parent = (
+                    root / "user_4" if source == "legacy_user_symlink" else root
+                )
+                alias_parent.mkdir(parents=True)
+                legacy_alias = source in {"legacy_symlink", "legacy_user_symlink"}
+                alias = "task_701" if legacy_alias else "web_task_701"
+                (alias_parent / alias).symlink_to(target, target_is_directory=True)
                 # A symlink loop must not stop the finite inventory.
                 (target / "loop").symlink_to(root, target_is_directory=True)
-                root = root / "scope"
+                if source != "escaped_symlink":
+                    monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(target))
             if source == "workspace_named_scope":
                 root = root / "user_4" / "web_task_9"
-            (root / "web_task_701" / "output").mkdir(parents=True)
+            subdir = "custom" if source.startswith("legacy_") else "output"
+            (
+                alias_parent / alias
+                if source in {"legacy_symlink", "legacy_user_symlink"}
+                else root / "web_task_701"
+            ).joinpath(subdir).mkdir(parents=True)
+    if source == "escaped_symlink":
+        with pytest.raises(RuntimeError, match="outside configured upload roots"):
+            migrate(sqlite_engine)
+        return
     migrate(sqlite_engine)
     migrate(sqlite_engine)
     with sqlite_engine.begin() as connection:
@@ -417,7 +475,9 @@ def test_upgrade_preserves_inline_checks_for_older_downgrades(sqlite_engine):
         )
 
 
-def test_interrupted_rebuild_rolls_back_and_can_retry(sqlite_engine):
+def test_interrupted_rebuild_rolls_back_and_can_retry(
+    sqlite_engine, tmp_path, monkeypatch
+):
     seed_legacy(sqlite_engine)
     with sqlite_engine.begin() as connection:
         connection.exec_driver_sql(
@@ -427,6 +487,22 @@ def test_interrupted_rebuild_rolls_back_and_can_retry(sqlite_engine):
         before = connection.exec_driver_sql(
             "SELECT sql FROM sqlite_master WHERE name='tasks'"
         ).scalar()
+    root = tmp_path / "uploads"
+    root.mkdir(exist_ok=True)
+    migration = load_migration_module(MIGRATION)
+    original_scandir = migration.os.scandir
+
+    def fail_scan(path):
+        if Path(path) == root:
+            raise OSError(f"simulated I/O failure at {path}")
+        return original_scandir(path)
+
+    monkeypatch.setattr(migration.os, "scandir", fail_scan)
+    with pytest.raises(OSError, match=str(root)):
+        with _migration_connection(sqlite_engine) as connection:
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+    monkeypatch.setattr(migration.os, "scandir", original_scandir)
 
     def interrupt(connection, cursor, statement, parameters, context, executemany):
         if statement.startswith("INSERT INTO sqlite_sequence"):
@@ -465,37 +541,78 @@ def test_interrupted_rebuild_rolls_back_and_can_retry(sqlite_engine):
 
 @pytest.mark.parametrize(
     "path",
-    ["web_task_888.txt", "web_task_999suffix/output/report.txt", "output/web_task_999"],
+    [
+        "web_task_888.txt",
+        "web_task_999suffix/output/report.txt",
+        "output/web_task_999",
+        "web_task_9/output/web_task_999/output/report.txt",
+    ],
 )
-def test_file_names_do_not_reserve_task_ids(sqlite_engine, tmp_path, path):
+def test_non_workspace_names_do_not_raise_floor_beyond_real_workspace(
+    sqlite_engine, tmp_path, path
+):
     seed_legacy(sqlite_engine)
     with sqlite_engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE uploaded_files(storage_path TEXT)")
         connection.exec_driver_sql(
-            "INSERT INTO uploaded_files VALUES (?)", (str(tmp_path / path),)
+            "INSERT INTO uploaded_files VALUES (?)",
+            [
+                (str(tmp_path / path),),
+                (
+                    str(
+                        get_upload_path(
+                            "document.txt",
+                            user_id=1,
+                            collection="task_9223372036854775806",
+                        )
+                    ),
+                ),
+            ],
         )
     root = tmp_path / "uploads"
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     (root / "web_task_999").write_text("a file, not a workspace")
+    (root / "web_task_9" / "output" / "web_task_999" / "output").mkdir(parents=True)
     migrate(sqlite_engine)
     with sqlite_engine.begin() as connection:
         assert (
             connection.exec_driver_sql("INSERT INTO tasks DEFAULT VALUES").lastrowid
-            == 8
+            == 10
         )
 
 
-def test_exhausted_historical_id_fails_before_schema_changes(sqlite_engine):
+@pytest.mark.parametrize(
+    ("value", "succeeds"),
+    [
+        ((1 << 53) - 2, True),
+        ((1 << 53) - 1, False),
+        (1 << 53, False),
+        ((1 << 63) - 2, False),
+        ((1 << 63) - 1, False),
+    ],
+)
+def test_historical_ids_leave_the_next_javascript_id_safe(
+    sqlite_engine, value, succeeds
+):
     seed_legacy(sqlite_engine)
     with sqlite_engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE uploaded_files(storage_path TEXT)")
         connection.exec_driver_sql(
-            "INSERT INTO uploaded_files VALUES ('/web_task_9223372036854775807/output/report.txt')"
+            "INSERT INTO uploaded_files VALUES (?)",
+            (f"/web_task_{value}/output/report.txt",),
         )
         before = connection.exec_driver_sql(
             "SELECT sql FROM sqlite_master WHERE name='tasks'"
         ).scalar()
-    with pytest.raises(RuntimeError, match="exhausts SQLite"):
+    if succeeds:
+        migrate(sqlite_engine)
+        with sqlite_engine.begin() as connection:
+            assert (
+                connection.exec_driver_sql("INSERT INTO tasks DEFAULT VALUES").lastrowid
+                == (1 << 53) - 1
+            )
+        return
+    with pytest.raises(RuntimeError, match=rf"{value}.*uploaded-file path.*not safe"):
         migrate(sqlite_engine)
     with sqlite_engine.connect() as connection:
         assert (
@@ -542,6 +659,36 @@ def test_empty_database_upgrade_defers_to_create_all(sqlite_engine):
         )
 
 
+def test_full_chain_preserves_absent_workspace_identity(sqlite_engine, tmp_path):
+    metadata = sa.MetaData()
+    for table in Base.metadata.tables.values():
+        table.to_metadata(metadata)
+    metadata.tables["tasks"].dialect_options["sqlite"]["autoincrement"] = False
+    metadata.create_all(sqlite_engine)
+    (tmp_path / "uploads" / "web_task_701" / "output").mkdir(parents=True)
+    config = create_alembic_config(sqlite_engine)
+    command.upgrade(config, "head")
+    with sqlite_engine.begin() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar()
+            == ScriptDirectory.from_config(config).get_current_head()
+        )
+        assert (
+            "AUTOINCREMENT"
+            in connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='tasks'"
+            ).scalar()
+        )
+        assert (
+            connection.exec_driver_sql(
+                "SELECT seq FROM sqlite_sequence WHERE name='tasks'"
+            ).scalar()
+            == 701
+        )
+
+
 def test_startup_upgrade_preserves_populated_model_and_circular_foreign_keys(
     sqlite_engine,
 ):
@@ -582,6 +729,16 @@ def test_startup_upgrade_preserves_populated_model_and_circular_foreign_keys(
         )
         before_task = connection.exec_driver_sql("SELECT * FROM tasks").all()
         before_trace = connection.exec_driver_sql("SELECT * FROM trace_events").all()
+        inspector = sa.inspect(connection)
+        before_schema = (
+            [
+                tuple(row[1:6])
+                for row in connection.exec_driver_sql("PRAGMA table_info('tasks')")
+            ],
+            inspector.get_check_constraints("tasks"),
+            inspector.get_indexes("tasks"),
+            inspector.get_unique_constraints("tasks"),
+        )
         before_fks = {
             name: sorted(
                 connection.exec_driver_sql(f"PRAGMA foreign_key_list('{name}')").all(),
@@ -606,6 +763,16 @@ def test_startup_upgrade_preserves_populated_model_and_circular_foreign_keys(
             # SQLite can reorder the task's outbound FK constraint IDs.
             assert [row[1:] for row in after] == [row[1:] for row in foreign_keys]
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        inspector = sa.inspect(connection)
+        assert before_schema == (
+            [
+                tuple(row[1:6])
+                for row in connection.exec_driver_sql("PRAGMA table_info('tasks')")
+            ],
+            inspector.get_check_constraints("tasks"),
+            inspector.get_indexes("tasks"),
+            inspector.get_unique_constraints("tasks"),
+        )
         assert (
             connection.exec_driver_sql(
                 "SELECT seq FROM sqlite_sequence WHERE name='tasks'"

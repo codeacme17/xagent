@@ -464,10 +464,6 @@ jobs:
         run: |
           python tests/migrations/test_migration_integration.py --db sqlite downgrade
 
-      - name: Test SQLite task identity migration and retained workspaces
-        if: needs.detect-migration-changes.outputs.should-test == 'true'
-        run: pytest tests/alembic/test_20260930_task_identity.py -m 'not postgresql' -q
-
   test-postgresql-migrations:
     name: Test PostgreSQL Migrations
     needs: detect-migration-changes

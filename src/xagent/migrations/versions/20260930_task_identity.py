@@ -7,6 +7,7 @@ Run online with writers stopped and the deployment's upload roots mounted.
 PostgreSQL already allocates task IDs from a sequence and is unchanged.
 """
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from alembic import op
 
+# Alembic loads revisions via spec_from_file_location, outside xagent's package.
 from xagent.config import get_external_upload_dirs, get_uploads_dir
 
 revision = "20260930_task_identity"
@@ -22,30 +24,86 @@ branch_labels = None
 depends_on = None
 
 WORKSPACE_NAME = re.compile(r"(?:web_task_|task_)([0-9]+)\Z")
-MAX_ID = (1 << 63) - 1
+LEGACY_WORKSPACE_NAME = re.compile(r"task_([0-9]+)\Z")
+USER_NAME = re.compile(r"user_[0-9]+\Z")
+WORKSPACE_SUBDIRS = {"input", "output", "temp"}
+MAX_SAFE_ID = (1 << 53) - 1
+logger = logging.getLogger(__name__)
 
 
-def _workspace_id(name):
+def _safe_id(value, source):
+    digits = str(value or 0).lstrip("0") or "0"
+    if len(digits) > 16 or int(digits) >= MAX_SAFE_ID:
+        raise RuntimeError(
+            f"Historical task identity {value!r} from {source} is not safe for "
+            "JavaScript clients; inspect and reconcile this history before retrying"
+        )
+    return int(digits)
+
+
+def _workspace_id(name, source):
     match = WORKSPACE_NAME.fullmatch(name)
     if match is None:
         return 0
     digits = match[1].lstrip("0") or "0"
-    if len(digits) > 19 or int(digits) >= MAX_ID:
-        raise RuntimeError("Historical workspace identity exhausts SQLite task IDs")
-    return int(digits)
+    return _safe_id(digits, source)
 
 
-def _path_floor(value):
-    # Only directory components count: a file named web_task_123 is not a
-    # workspace. Both separators support metadata from relocated databases.
-    return max(
-        (_workspace_id(part) for part in re.split(r"[/\\]", value or "")[:-1]),
-        default=0,
-    )
+def _path_floor(value, roots):
+    # Both separators support metadata from relocated databases. A workspace
+    # needs a category directory and a filename after its identity component.
+    parts = re.split(r"[/\\]", value or "")
+    path = Path(value or "")
+    if path.is_absolute():
+        resolved = path.resolve(strict=False)
+        for root in roots:
+            try:
+                parts = list(resolved.relative_to(root.resolve(strict=False)).parts)
+                break
+            except ValueError:
+                continue
+    candidates = [
+        (index, part)
+        for index, part in enumerate(parts[:-2])
+        if WORKSPACE_NAME.fullmatch(part)
+    ]
+    structural = [
+        (index, part)
+        for index, part in candidates
+        if parts[index + 1] in WORKSPACE_SUBDIRS
+    ]
+    legacy = [
+        (index, part)
+        for index, part in candidates
+        if LEGACY_WORKSPACE_NAME.fullmatch(part)
+        and (index == 0 or USER_NAME.fullmatch(parts[index - 1]))
+    ]
+    if structural and legacy and legacy[0][0] < structural[0][0]:
+        raise RuntimeError(
+            f"Uploaded-file path {value!r} has ambiguous nested task history; "
+            "reconcile the path before retrying"
+        )
+    if structural:
+        return _workspace_id(structural[0][1], f"uploaded-file path {value!r}")
+    if legacy:
+        return _workspace_id(legacy[0][1], f"uploaded-file path {value!r}")
+    if candidates:
+        raise RuntimeError(
+            f"Uploaded-file path {value!r} has an ambiguous task-like directory; reconcile it before retrying"
+        )
+    return 0
 
 
-def _directory_floor():
-    pending = [get_uploads_dir(), *get_external_upload_dirs()]
+def _directory_floor(configured):
+    roots = []
+    for root in configured:
+        try:
+            roots.append(root.resolve(strict=True))
+        except FileNotFoundError:
+            logger.warning(
+                "Upload root does not exist; skipping identity scan: %s", root
+            )
+    pending = list(configured)
     visited = set()
     floor = 0
     while pending:
@@ -53,38 +111,65 @@ def _directory_floor():
         try:
             stat = directory.stat()
         except FileNotFoundError:
-            # An unused root is valid on an installation with no uploads.
             continue
-        floor = max(floor, _workspace_id(directory.name))
+        resolved = directory.resolve(strict=True)
+        if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+            raise RuntimeError(
+                f"Upload directory link {directory} resolves outside configured upload "
+                "roots; configure its target as an external upload root and retry"
+            )
+        with os.scandir(directory) as entries:
+            children = list(entries)
+        child_dirs = {
+            entry.name for entry in children if entry.is_dir(follow_symlinks=False)
+        }
+        position = directory.parent.resolve(strict=True) / directory.name
+        relative_depths = [
+            len(position.relative_to(root).parts)
+            for root in roots
+            if position == root or position.is_relative_to(root)
+        ]
+        structural = bool(child_dirs & WORKSPACE_SUBDIRS)
+        legacy_position = (
+            bool(LEGACY_WORKSPACE_NAME.fullmatch(directory.name))
+            and bool(child_dirs)
+            and (
+                1 in relative_depths
+                or (2 in relative_depths and USER_NAME.fullmatch(position.parent.name))
+            )
+        )
+        if structural or legacy_position:
+            candidate_id = _workspace_id(directory.name, f"directory {directory}")
+            floor = max(floor, candidate_id)
+            if candidate_id:
+                continue
         identity = (stat.st_dev, stat.st_ino)
         if identity in visited:
             continue
         visited.add(identity)
-        # Follow scope-directory symlinks, but visit each physical directory
-        # once. Scope names can themselves look like workspace names, so keep
-        # walking. Read directory entries only, never file contents. Permission
-        # and I/O errors abort rather than hiding identities.
-        with os.scandir(directory) as entries:
-            pending.extend(Path(entry.path) for entry in entries if entry.is_dir())
+        pending.extend(Path(entry.path) for entry in children if entry.is_dir())
+    logger.info(
+        "Scanned upload roots %s; historical directory floor is %d", roots, floor
+    )
     return floor
 
 
 def _historical_floor(connection, inspector):
-    floor = int(connection.exec_driver_sql("SELECT max(id) FROM tasks").scalar() or 0)
+    roots = [get_uploads_dir(), *get_external_upload_dirs()]
+    floor = _safe_id(
+        connection.exec_driver_sql("SELECT max(id) FROM tasks").scalar(), "tasks.id"
+    )
     tables = set(inspector.get_table_names())
-    if (
-        "sqlite_sequence" in tables
-        or connection.exec_driver_sql(
-            "SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'"
-        ).first()
-    ):
+    if connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'"
+    ).first():
         floor = max(
             floor,
-            int(
+            _safe_id(
                 connection.exec_driver_sql(
                     "SELECT max(seq) FROM sqlite_sequence WHERE name='tasks'"
-                ).scalar()
-                or 0
+                ).scalar(),
+                "sqlite_sequence.tasks",
             ),
         )
     # These rows intentionally survive deletion, without a task FK.
@@ -92,15 +177,25 @@ def _historical_floor(connection, inspector):
         if table in tables:
             floor = max(
                 floor,
-                int(
+                _safe_id(
                     connection.exec_driver_sql(
                         f"SELECT max(task_id) FROM {table}"
-                    ).scalar()
-                    or 0
+                    ).scalar(),
+                    f"{table}.task_id",
                 ),
             )
     if "uploaded_files" in tables:
         columns = {column["name"] for column in inspector.get_columns("uploaded_files")}
+        if "task_id" in columns:
+            floor = max(
+                floor,
+                _safe_id(
+                    connection.exec_driver_sql(
+                        "SELECT max(task_id) FROM uploaded_files"
+                    ).scalar(),
+                    "uploaded_files.task_id",
+                ),
+            )
         paths = sorted(columns & {"storage_path", "storage_key", "storage_uri"})
         if paths:
             candidate = " OR ".join(f"instr({path}, 'task_') > 0" for path in paths)
@@ -108,10 +203,9 @@ def _historical_floor(connection, inspector):
                 f"SELECT {', '.join(paths)} FROM uploaded_files WHERE {candidate}"
             )
             for row in rows:
-                floor = max(floor, *(_path_floor(value) for value in row))
-    floor = max(floor, _directory_floor())
-    if floor >= MAX_ID:
-        raise RuntimeError("Historical workspace identity exhausts SQLite task IDs")
+                floor = max(floor, *(_path_floor(value, roots) for value in row))
+    floor = max(floor, _directory_floor(roots))
+    logger.info("Historical SQLite task identity floor is %d", floor)
     return floor
 
 

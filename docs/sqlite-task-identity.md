@@ -25,20 +25,20 @@ PostgreSQL keeps its existing task sequence and schema.
 The initial sequence floor is the maximum of:
 
 - Current task IDs and the existing `tasks` entry in `sqlite_sequence`.
-- Task IDs in cleanup obligations and expired-task tombstones.
-- `web_task_<id>` and legacy `task_<id>` directory components in uploaded-file
-  `storage_path`, `storage_key`, and `storage_uri`, including detached and
-  unmarked historical rows. No file row is reclassified or removed.
-- Directory names under the configured upload roots, including owner/scope
-  subdirectories and symlinked directories. Physical directories are visited
-  once to break symlink cycles. File contents are never read or modified.
+- Task IDs in cleanup obligations, expired-task tombstones, and `uploaded_files`.
+- Uploaded-file paths with a `web_task_<id>` or `task_<id>` component followed
+  by `input`, `output`, or `temp`; recognized legacy `task_<id>/<folder>/<file>`
+  paths also count. Ambiguous nested task-like paths abort with the offending path.
+- Structurally confirmed workspaces under configured roots. Flat knowledge-base
+  collections such as `task_123/document.pdf` do not count. Once a workspace is
+  found, its payload is not scanned for more task-like names.
 
-The scan is conservative: a directory component that looks like a task identity
-reserves that number globally, regardless of owner or scope. Filename-only
-matches do not count. Filesystem permission/I/O failures abort the upgrade;
-uncreated roots are allowed. An unavailable old mount with no surviving metadata
-cannot be inventoried: mount it before upgrading. History with no remaining
-database record or directory cannot be reconstructed by this migration.
+Configured roots are canonical scan boundaries. A symlinked root and a link into
+another explicitly configured root are allowed; other escaping links abort with
+the offending path. Descent is deduplicated by physical identity to break cycles,
+while each alias is still classified for a workspace identity.
+Missing roots are logged and skipped. Permission and I/O failures abort the
+upgrade. Mount unavailable historical roots before upgrading.
 
 SQLite locks writers for the inventory and rebuild. Plan the maintenance window
 for the number of upload directories, uploaded-file rows, and task rows. SQLite
@@ -49,7 +49,8 @@ expression/partial indexes), task-table triggers, and inbound relationships. A
 real write transaction starts before DDL, so interrupted rebuilds roll back; a
 retry retains any already consumed sequence value. A historical ID at SQLite's
 signed 64-bit limit fails before changing the schema rather than exhausting the
-allocator silently.
+allocator silently. IDs at or above JavaScript's maximum safe integer also fail
+with their source before schema changes, leaving the next allocated ID safe.
 
 ## Contract and rollback
 
