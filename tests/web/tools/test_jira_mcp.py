@@ -1382,10 +1382,12 @@ def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow
 # Wording fragments of the continuation note's structural sentences. The
 # positive and the negative assertions share them, so rewording the note
 # fails a test instead of silently turning a "not in" check into a vacuous
-# one. Everything else is asserted through numbers and field names only.
+# one. Everything else is asserted through numbers and field names only,
+# except one regression literal in the later-page test, which pins the old
+# "this page is enough" sentence because that sentence is the regression.
 _NOTE_SHRUNK = "shrunk from"
 _NOTE_CAME_BACK = "Fewer issues came back"
-_NOTE_ENOUGH = "this page is enough"
+_NOTE_STOP_EARLY = "stop early only if the issues fetched so far"
 
 
 def _search_page(count: int, *, next_token: str | None, summary_length: int = 1):
@@ -1407,8 +1409,9 @@ def test_continuation_note_for_a_full_page_says_how_much_was_returned():
     assert "30 of ~177" in note
     assert "next_page_token" in note
     assert "truncated" in note
-    # The page holds everything that was asked for, so stopping can be right.
-    assert _NOTE_ENOUGH in note
+    # The page holds everything that was asked for, so stopping can be right,
+    # but only if what has been fetched so far already answers the question.
+    assert _NOTE_STOP_EARLY in note
     assert _NOTE_SHRUNK not in note
     assert _NOTE_CAME_BACK not in note
 
@@ -1440,7 +1443,7 @@ def test_continuation_note_says_the_tool_shrank_the_page_and_is_never_enough():
     assert f"{_NOTE_SHRUNK} 100 to 10" in note
     assert _NOTE_CAME_BACK not in note
     # 10 of the 100 requested: stopping here is the failure #2829 is about.
-    assert _NOTE_ENOUGH not in note
+    assert _NOTE_STOP_EARLY not in note
     assert "next_page_token" in note
 
 
@@ -1452,7 +1455,7 @@ def test_continuation_note_says_fewer_came_back_and_is_never_enough():
     assert _NOTE_CAME_BACK in note
     assert "(3 of 50)" in note
     assert _NOTE_SHRUNK not in note
-    assert _NOTE_ENOUGH not in note
+    assert _NOTE_STOP_EARLY not in note
 
 
 def test_continuation_note_gives_both_reasons_when_both_apply():
@@ -1463,14 +1466,14 @@ def test_continuation_note_gives_both_reasons_when_both_apply():
     assert f"{_NOTE_SHRUNK} 100 to 10" in note
     assert _NOTE_CAME_BACK in note
     assert "(7 of 10)" in note
-    assert _NOTE_ENOUGH not in note
+    assert _NOTE_STOP_EARLY not in note
 
 
 def test_continuation_note_for_an_empty_page_with_a_token_is_never_enough():
     note = jira._continuation_note(returned_count=0, limit=50, page_size=50)
 
     assert "(0 of 50)" in note
-    assert _NOTE_ENOUGH not in note
+    assert _NOTE_STOP_EARLY not in note
 
 
 def test_build_search_response_builds_the_note_from_the_count_it_carries():
@@ -1530,9 +1533,13 @@ def test_search_issues_later_page_carries_a_count_free_note(monkeypatch):
         )
     )
 
-    assert result["note"] == jira._continuation_note(
-        returned_count=30, limit=30, page_size=30
-    )
+    note = result["note"]
+    assert note == jira._continuation_note(returned_count=30, limit=30, page_size=30)
+    # A later page holds results past the first ones, so the note must not
+    # tell the model that this page alone is enough (review of #2841). The
+    # old wording is pinned literally on purpose: it is the regression.
+    assert _NOTE_STOP_EARLY in note
+    assert "this page is enough" not in note
 
 
 def test_search_issues_note_says_when_the_page_was_shrunk_to_fit_the_output_limit(

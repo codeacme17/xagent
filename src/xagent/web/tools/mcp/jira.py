@@ -753,9 +753,11 @@ def _continuation_note(
     malformed entry was dropped -- the note does not say which). Each reason
     is only stated when it is true of this page.
 
-    A page shorter than `limit` never tells the model it is enough: the
+    A page shorter than `limit` never tells the model it may stop: the
     caller asked for `limit` rows and did not get them, which is exactly
-    the case where agents were stopping.
+    the case where agents were stopping. The note does not know which page
+    of a search it is on, so what it says about stopping early is about what
+    has been fetched so far, never about "this page" alone.
     """
     # The count is an estimate and can lag live data. One that is not
     # above what this page already returned, while a next page exists,
@@ -780,15 +782,19 @@ def _continuation_note(
             f"({returned_count} of {page_size})."
         )
     if returned_count >= limit:
-        # The page holds everything the caller asked for, so stopping here
-        # is legitimate unless the question needs every match. "First
-        # results in this query's sort order" rather than "most recent":
-        # the JQL may sort ascending.
+        # The page holds everything the caller asked for, so stopping is
+        # legitimate unless the question needs every match. This is also
+        # the note of a later page, whose issues are not the first results,
+        # so the stopping condition is stated over what has been fetched so
+        # far and in terms of a count N. "First N in this query's sort
+        # order" rather than "most recent": the JQL may sort ascending.
         parts.append(
             "If the question needs every match (counting, listing, "
             "summarizing), call again with next_page_token until truncated "
-            "is false before answering; if only the first results in this "
-            "query's sort order are needed, this page is enough."
+            "is false before answering; stop early only if the issues "
+            "fetched so far already answer it (for example, it needs only "
+            "the first N results in this query's sort order and you already "
+            "have N)."
         )
     else:
         parts.append(
