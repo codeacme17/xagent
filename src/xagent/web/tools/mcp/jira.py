@@ -13,6 +13,7 @@ from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .jira_attachment import (
+    UPLOAD_TIMEOUT_SECONDS,
     attachment_error_hint,
     confirmed_attachment,
     read_allowed_file,
@@ -2191,6 +2192,12 @@ def jira_add_comment(issue_key: str, body: str, cloud_id: str = "") -> str:
         return _error(safe_message)
 
 
+def _attachment_error(issue_key: str, exc: Exception, hint: str | None = None) -> str:
+    safe_message = _safe_text(exc)
+    logger.error(f"Error attaching a file to Jira issue {issue_key}: {safe_message}")
+    return _error(f"{hint}: {safe_message}" if hint else safe_message)
+
+
 @mcp.tool()
 def jira_add_attachment(issue_key: str, file_path: str, cloud_id: str = "") -> str:
     """
@@ -2203,11 +2210,13 @@ def jira_add_attachment(issue_key: str, file_path: str, cloud_id: str = "") -> s
     not the allowed directory, and will not find a file written to the
     task workspace. An empty file, or one over the local size limit, is
     rejected before anything is sent to Jira.
-    To reference the file from a comment, attach it first, then call
-    jira_add_comment with its name in wiki markup: [^filename] links to it,
-    !filename! embeds an image.
-    If the result says the attachment was created but reports an unexpected
-    size, check the issue before retrying -- a retry would attach it twice.
+    The file is stored under its own name (a symlink in file_path is
+    followed); the result's `filename` is the name to use when referring to
+    it. To reference it from a comment, attach it first, then mention that
+    name in jira_add_comment.
+    If the result says the attachment was created, or that the upload may
+    have completed, check the issue's attachments before retrying -- a retry
+    would attach the file twice.
     """
     try:
         # Both checks run before any request, so a bad key or file never
@@ -2217,15 +2226,22 @@ def jira_add_attachment(issue_key: str, file_path: str, cloud_id: str = "") -> s
     except (ValueError, OSError) as e:
         return _error(_safe_text(e))
     try:
-        result = _request("POST", cloud_id, path, files={"file": (filename, data)})
+        resolved_cloud_id = _resolve_cloud_id(cloud_id)
+    except Exception as e:
+        # Not the upload yet: a failure here says nothing about attachments,
+        # so it gets no upload hint.
+        return _attachment_error(issue_key, e)
+    try:
+        result = _request(
+            "POST",
+            resolved_cloud_id,
+            path,
+            files={"file": (filename, data)},
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
         return _success(attachment=confirmed_attachment(result, len(data)))
     except Exception as e:
-        safe_message = _safe_text(e)
-        logger.error(
-            f"Error attaching a file to Jira issue {issue_key}: {safe_message}"
-        )
-        hint = attachment_error_hint(e)
-        return _error(f"{hint}: {safe_message}" if hint else safe_message)
+        return _attachment_error(issue_key, e, hint=attachment_error_hint(e))
 
 
 @mcp.tool()

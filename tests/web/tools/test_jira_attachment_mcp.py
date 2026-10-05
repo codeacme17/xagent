@@ -9,6 +9,9 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+from xagent.core.tools.adapters.vibe.mcp_adapter import _build_mcp_tool_adapter
+from xagent.core.workspace import TaskWorkspace
+from xagent.web.tools.config import WebToolConfig
 from xagent.web.tools.mcp import jira, jira_attachment
 
 _ALLOWED_DIRS_ENV_VAR = "XAGENT_JIRA_FILE_ALLOWED_DIRS"
@@ -86,6 +89,19 @@ def test_read_allowed_file_returns_name_and_bytes(allowed_dir):
     path = _write(allowed_dir, data=b"abc")
 
     assert jira_attachment.read_allowed_file(str(path)) == ("report.txt", b"abc")
+
+
+def test_read_allowed_file_follows_a_symlink_inside_the_allowlist(allowed_dir):
+    """The tool docstring says the file is stored under its own name and a
+    symlink in file_path is followed; the result's `filename` is what the
+    agent must use to refer to it."""
+    target = _write(allowed_dir, name="real.txt", data=b"real bytes")
+    (allowed_dir / "alias.txt").symlink_to(target)
+
+    assert jira_attachment.read_allowed_file(str(allowed_dir / "alias.txt")) == (
+        "real.txt",
+        b"real bytes",
+    )
 
 
 def test_read_allowed_file_resolves_relative_path_against_cwd(allowed_dir, monkeypatch):
@@ -224,6 +240,30 @@ def test_read_allowed_file_keeps_the_host_path_out_of_a_read_failure(
     assert str(path) in caplog.text
 
 
+@pytest.mark.parametrize("method", ["exists", "is_file"])
+def test_read_allowed_file_keeps_the_host_path_out_of_a_stat_failure(
+    allowed_dir, monkeypatch, caplog, method
+):
+    """exists()/is_file() raise PermissionError carrying the host path (EACCES
+    or ESTALE on stat); it must not reach the model."""
+    path = _write(allowed_dir)
+    real = getattr(Path, method)
+
+    def failing(self):
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, method, failing)
+
+    with caplog.at_level(logging.WARNING, logger="jira-mcp"):
+        with pytest.raises(ValueError, match="Could not read the file") as excinfo:
+            jira_attachment.read_allowed_file(str(path))
+
+    assert str(allowed_dir) not in str(excinfo.value)
+    assert str(path) in caplog.text
+
+
 def test_read_allowed_file_rejects_a_file_that_shrinks_while_being_read(
     allowed_dir, monkeypatch
 ):
@@ -268,6 +308,10 @@ def test_add_attachment_posts_multipart_with_no_check_header(allowed_dir, monkey
     # retry and re-send an empty file.
     assert call["files"] == {"file": ("report.txt", b"hello jira")}
     assert call["json"] is None
+    # requests' timeout bounds the whole body send, so the 30s default would
+    # need ~7 Mbit/s for a 25 MiB file.
+    assert call["timeout"] == jira_attachment.UPLOAD_TIMEOUT_SECONDS
+    assert call["timeout"] > jira.DEFAULT_TIMEOUT_SECONDS
     headers = call["headers"]
     assert headers["X-Atlassian-Token"] == "no-check"
     assert headers["Authorization"] == "Bearer access-token"
@@ -427,6 +471,10 @@ def test_add_attachment_reports_invalid_allowlist_configuration(
         (404, "cannot view"),
         (404, "cloud_id"),
         (413, "too large"),
+        # A gateway answering after the body was sent leaves the outcome open.
+        (502, "may have completed"),
+        (503, "may have completed"),
+        (504, "may have completed"),
     ],
 )
 def test_add_attachment_maps_http_errors_to_actionable_messages(
@@ -566,3 +614,148 @@ def test_add_attachment_redacts_credentials_from_errors(allowed_dir, monkeypatch
     )
 
     assert "sk-abc123XYZ" not in payload["message"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.ReadTimeout("read timed out"),
+        # A send-side timeout surfaces as a ConnectionError, not a Timeout.
+        requests.ConnectionError("Connection aborted.", TimeoutError("timed out")),
+        # Nothing was sent here, but a refused connection or a failed TLS
+        # handshake cannot be told apart from a drop mid-send, so it gets the
+        # hint too: checking once is cheaper than a duplicate attachment.
+        requests.exceptions.SSLError("handshake failed"),
+        requests.exceptions.ChunkedEncodingError("response ended prematurely"),
+        requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0),
+    ],
+    ids=[
+        "read-timeout",
+        "send-timeout-as-connection-error",
+        "tls-failure-treated-as-possibly-sent",
+        "truncated-response",
+        "non-json-response",
+    ],
+)
+def test_add_attachment_says_the_upload_may_have_completed_when_the_outcome_is_unknown(
+    allowed_dir, monkeypatch, error
+):
+    """The file may already be on the issue when the connection drops or the
+    answer is unusable, so a blind retry would attach a duplicate."""
+    path = _write(allowed_dir)
+    mock_request = Mock(side_effect=error)
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    payload = json.loads(
+        jira.jira_add_attachment("ENG-1", str(path), cloud_id="site-a")
+    )
+
+    assert payload["status"] == "error"
+    assert "may have completed" in payload["message"]
+    assert "check the issue" in payload["message"]
+    assert mock_request.call_count == 1
+
+
+def test_add_attachment_gives_no_completion_hint_for_a_connect_timeout(
+    allowed_dir, monkeypatch
+):
+    """A ConnectTimeout is the one failure known to have sent nothing."""
+    path = _write(allowed_dir)
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(side_effect=requests.ConnectTimeout("connect timed out")),
+    )
+
+    payload = json.loads(
+        jira.jira_add_attachment("ENG-1", str(path), cloud_id="site-a")
+    )
+
+    assert payload["status"] == "error"
+    assert "may have completed" not in payload["message"]
+
+
+def test_add_attachment_gives_no_completion_hint_for_a_site_lookup_connection_error(
+    allowed_dir, monkeypatch
+):
+    """With an empty cloud_id the site lookup runs first. A dropped connection
+    there happened before any upload, so claiming the upload may have
+    completed would be false."""
+    path = _write(allowed_dir)
+    mock_request = Mock(side_effect=requests.ConnectionError("lookup dropped"))
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    payload = json.loads(jira.jira_add_attachment("ENG-1", str(path)))
+
+    assert payload["status"] == "error"
+    assert "may have completed" not in payload["message"]
+    assert "lookup dropped" in payload["message"]
+    # Only the site lookup was attempted; no upload was sent.
+    assert mock_request.call_count == 1
+
+
+def test_a_staged_chat_file_passes_the_jira_allowlist_guard(tmp_path, monkeypatch):
+    """The headline case: the user sends a file in chat and asks for it to be
+    attached. _DURABLE_UPLOAD_FIELDS makes the host stage the registered file
+    into the task workspace, and the connector's guard must accept that path
+    under the allowlist WebToolConfig injects, or the file is rejected."""
+    workspace = TaskWorkspace(id="web_task_9999", base_dir=str(tmp_path))
+    source = workspace.output_dir / "report.pdf"
+    source.write_bytes(b"%PDF-1.4 chat file")
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda file_id: source)
+    staged = workspace.stage_file_for_external_upload("chat-file-id")
+
+    config = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="web_task_9999",
+        workspace_base_dir=str(tmp_path),
+    )
+    monkeypatch.setenv(
+        _ALLOWED_DIRS_ENV_VAR, json.dumps(config._mcp_file_allowed_dir_paths())
+    )
+
+    assert jira_attachment.read_allowed_file(str(staged)) == (
+        "report.pdf",
+        b"%PDF-1.4 chat file",
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_jira_adapter_stages_a_chat_file_id_into_file_path():
+    """The wiring _DURABLE_UPLOAD_FIELDS exists for: the adapter built for the
+    Jira connector advertises that a file_id may be passed, and swaps a
+    registered file:<id> for a staged workspace path before the tool runs."""
+    staged_path = Path("/task/temp/.xagent-internal/mcp-upload/abc/report.pdf")
+
+    class FakeWorkspace:
+        def stage_file_for_external_upload(self, file_id):
+            return staged_path
+
+    mcp_tool = SimpleNamespace(
+        name="jira_add_attachment",
+        description="Attach a local file to an issue.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "issue_key": {"type": "string"},
+                "file_path": {"type": "string"},
+            },
+        },
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Jira",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=FakeWorkspace(),
+    )
+
+    assert "file_id" in adapter.description
+    prepared, staged, sources = await adapter._stage_external_upload_args(
+        {
+            "issue_key": "ENG-1",
+            "file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+        }
+    )
+    assert prepared == {"issue_key": "ENG-1", "file_path": str(staged_path)}
+    assert staged == [staged_path]

@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from .utils import allowed_dirs_from_env
 
 logger = logging.getLogger("jira-mcp")
@@ -21,6 +23,15 @@ UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_JIRA_FILE_ALLOWED_DIRS"
 # second body). It is NOT Jira's own limit: that is a per-site admin setting
 # (Jira Cloud's default is 1 GB), and Jira's 413 gets its own message below.
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+# requests' timeout bounds the WHOLE body send, not each socket operation, so
+# the 30s default would need ~7 Mbit/s of uplink for a 25 MiB file. 120s
+# matches OneDrive's upload timeout and needs under 2 Mbit/s.
+UPLOAD_TIMEOUT_SECONDS = 120
+
+_ATTACHMENT_MAY_HAVE_COMPLETED = (
+    "the upload may have completed -- check the issue's attachments before retrying"
+)
 
 _ATTACHMENT_STATUS_HINTS = {
     403: (
@@ -35,11 +46,22 @@ _ATTACHMENT_STATUS_HINTS = {
         "Jira rejected the upload as too large -- the file exceeds the site's "
         "attachment size limit, or the issue has reached its attachment limit"
     ),
+    # A gateway answers after the body was sent, so Jira may have stored it.
+    502: _ATTACHMENT_MAY_HAVE_COMPLETED,
+    503: _ATTACHMENT_MAY_HAVE_COMPLETED,
+    504: _ATTACHMENT_MAY_HAVE_COMPLETED,
 }
 
 _ATTACHMENT_UNCONFIRMED = (
     "Jira did not confirm the attachment (no attachment id in the response); "
     "check the issue before retrying"
+)
+
+_OUTCOME_UNKNOWN_ERRORS = (
+    requests.Timeout,
+    requests.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.JSONDecodeError,
 )
 
 
@@ -106,17 +128,22 @@ def read_allowed_file(file_path: str) -> tuple[str, bytes]:
     that path: a path swapped for a symlink inside that window is not
     detected.
     """
-    if not isinstance(file_path, str) or not file_path.strip():
+    if not file_path.strip():
         raise ValueError("file_path must not be blank")
-    if "\0" in file_path:
-        raise ValueError("file_path must not contain NUL bytes")
 
     local_path = _resolve(file_path)
     _require_allowed(local_path)
 
-    if local_path.exists() and not local_path.is_file():
+    try:
+        exists = local_path.exists()
+        is_file = exists and local_path.is_file()
+    except OSError as exc:
+        # An EACCES or ESTALE on stat raises with the host path in its text.
+        logger.warning("Could not stat Jira attachment %s: %s", local_path, exc)
+        raise ValueError("Could not read the file") from exc
+    if exists and not is_file:
         raise ValueError("The given path is not a regular file")
-    if not local_path.is_file():
+    if not is_file:
         raise FileNotFoundError("File not found at the given path")
 
     try:
@@ -140,21 +167,32 @@ def read_allowed_file(file_path: str) -> tuple[str, bytes]:
 
 
 def attachment_error_hint(exc: Exception) -> str | None:
-    """An actionable hint for a failed upload, or None.
+    """An actionable hint for a failed upload request, or None.
 
-    _request_absolute raises RuntimeError(...) from the HTTPError, which is
-    where the failing response lives. The hint is only given when that
-    response is the upload request's own: a 403/404 from the site lookup made
-    when cloud_id is empty says nothing about attachment permissions.
+    Only call this for an exception raised by the upload POST itself: it has
+    no way to tell that apart from a failure of the site lookup that precedes
+    it, and a hint about attachment permissions, or about the upload having
+    completed, would be false for the lookup.
+
+    Once the body has been sent, a failure leaves it unknown whether Jira
+    stored the file, so the agent is told to check before retrying: a
+    timeout or dropped connection (a send-side timeout surfaces as a
+    ConnectionError, not a Timeout), a response that is cut off or is not
+    JSON, and a gateway 502/503/504. A ConnectTimeout is the one failure
+    known to have sent nothing, so it gets no hint. Other connection errors
+    that sent nothing, such as a refused connection or a failed TLS
+    handshake, cannot be told apart from a drop mid-send and get the hint
+    too: telling the agent to check once is cheaper than a duplicate.
+    _request_absolute raises RuntimeError(...) from the HTTPError for an HTTP
+    error status, which is where the failing response lives.
     """
+    if isinstance(exc, _OUTCOME_UNKNOWN_ERRORS) and not isinstance(
+        exc, requests.ConnectTimeout
+    ):
+        return _ATTACHMENT_MAY_HAVE_COMPLETED
     response = getattr(exc.__cause__, "response", None)
     status = getattr(response, "status_code", None)
-    url = getattr(response, "url", None)
-    if not isinstance(status, int) or not isinstance(url, str):
-        return None
-    if not url.endswith("/attachments"):
-        return None
-    return _ATTACHMENT_STATUS_HINTS.get(status)
+    return _ATTACHMENT_STATUS_HINTS.get(status) if isinstance(status, int) else None
 
 
 def confirmed_attachment(result: Any, sent_bytes: int) -> dict[str, Any]:
