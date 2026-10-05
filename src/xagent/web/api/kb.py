@@ -163,6 +163,7 @@ from ..services.kb_ingest_targets import (
     tombstone_kb_ingest_target,
     tombstone_kb_ingest_targets_for_collection,
 )
+from ..services.kb_reference_protection import select_new_ingest_file_id
 from ..services.knowledge_base_team_scope import (
     KnowledgeBaseAccess,
     notify_knowledge_base_deleted,
@@ -3751,7 +3752,9 @@ async def create_ingest_job(
     file_id = (
         str(existing_file_record.file_id)
         if existing_file_record is not None
-        else _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+        else select_new_ingest_file_id(
+            db, _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+        )
     )
     staged_file_path = _build_background_ingest_staging_path(
         user_id=int(_user.id),
