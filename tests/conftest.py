@@ -215,6 +215,14 @@ def isolate_process_database_binding() -> Iterator[None]:
             engine.dispose()
 
 
+@pytest.fixture
+def monkeypatch(
+    isolate_process_database_binding: None, monkeypatch: pytest.MonkeyPatch
+) -> pytest.MonkeyPatch:
+    """Undo test patches before restoring the original process SQL binding."""
+    return monkeypatch
+
+
 @pytest.fixture(autouse=True, scope="function")
 def isolate_rag_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate per-test RAG/KB storage paths and reset global storage state.

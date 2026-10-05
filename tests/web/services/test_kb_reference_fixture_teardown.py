@@ -1,5 +1,8 @@
 """Temporary module databases must not affect later KB reference writers."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -56,3 +59,28 @@ def test_module_database_teardown_preserves_standalone_registration(
         ["standalone-file"]
     )
     assert [row.doc_id for row in records] == [result["doc_id"]]
+
+
+def test_pool_monkeypatch_teardown_preserves_later_kb_ingest(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-o",
+            "addopts=",
+            "tests/web/api/test_agents_management.py::test_create_from_template_releases_request_session_before_async_runtime",
+            "tests/web/api/test_kb_raised_ingest_identity.py::test_ingest_raise_after_registration_removes_the_new_document",
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        env={**os.environ, "XAGENT_STORAGE_ROOT": str(tmp_path / "storage")},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    failures = [
+        line for line in result.stdout.splitlines() if line.startswith("FAILED ")
+    ]
+    exit_code = result.returncode
+    assert exit_code == 0, "\n".join(failures)
