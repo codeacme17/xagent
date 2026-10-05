@@ -611,11 +611,11 @@ def test_sql_connections_are_returned_before_lancedb_writes(boundary, monkeypatc
     def checkout(connection, _record, _proxy):
         active.add(id(connection))
 
-    def checkin(connection, _record):
+    def returned(connection, _record):
         active.discard(id(connection))
 
     sa.event.listen(engine, "checkout", checkout)
-    sa.event.listen(engine, "checkin", checkin)
+    sa.event.listen(engine, "checkin", returned)  # codespell:ignore checkin
     original = store._get_connection
 
     def connection():
@@ -630,7 +630,7 @@ def test_sql_connections_are_returned_before_lancedb_writes(boundary, monkeypatc
         write(store, "snapshot")
     finally:
         sa.event.remove(engine, "checkout", checkout)
-        sa.event.remove(engine, "checkin", checkin)
+        sa.event.remove(engine, "checkin", returned)  # codespell:ignore checkin
 
 
 def test_released_reference_preserves_detachment_window(boundary):

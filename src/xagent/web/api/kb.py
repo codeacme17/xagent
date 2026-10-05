@@ -3753,7 +3753,8 @@ async def create_ingest_job(
         str(existing_file_record.file_id)
         if existing_file_record is not None
         else select_new_ingest_file_id(
-            db, _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+            db,
+            _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path),
         )
     )
     staged_file_path = _build_background_ingest_staging_path(
