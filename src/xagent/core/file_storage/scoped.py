@@ -37,6 +37,10 @@ class ScopedFileStorage:
     def backend(self) -> str:
         return self._storage.backend
 
+    @property
+    def base_uri(self) -> str:
+        return self._storage.base_uri
+
     def _scoped(self, key: str, *, strict: bool = True) -> str:
         normalized = normalize_storage_key(key, strict=strict)
         if normalized != self._prefix and not normalized.startswith(self._prefix + "/"):

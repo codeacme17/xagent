@@ -39,6 +39,8 @@ from ...core.file_storage.keys import (
 from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
 from ..models.uploaded_file import UploadedFile
 
+from .uploaded_file_cleanup_publication import guard_managed_copy_publication
+
 logger = logging.getLogger(__name__)
 FILE_INTEGRITY_REUPLOAD_MESSAGE = (
     "File integrity verification failed. Please re-upload this file."
@@ -512,6 +514,7 @@ class ManagedFileRef:
     def has_durable_object(self) -> bool:
         return bool(self.storage_key and self.record.storage_status == "available")
 
+    @guard_managed_copy_publication
     def ensure_local(self) -> Path:
         path = self.local_path
         if path.exists() and path.is_file():
@@ -523,7 +526,7 @@ class ManagedFileRef:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(
             dir=path.parent,
-            prefix=f".{path.name}.",
+            prefix=f".{hashlib.sha256(str(self.record.file_id).encode()).hexdigest()[:24]}.{path.name}.",
             suffix=".tmp",
             delete=False,
         )
@@ -547,6 +550,7 @@ class ManagedFileRef:
                 storage_key=self.storage_key,
             ) from exc
 
+    @guard_managed_copy_publication
     def materialize(self, *, allow_existing_local: bool = True) -> Path:
         path = self.local_path
         if allow_existing_local and path.exists() and path.is_file():

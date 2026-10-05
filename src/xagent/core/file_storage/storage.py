@@ -78,6 +78,10 @@ class FsspecFileStorage:
     def backend(self) -> str:
         return self._backend
 
+    @property
+    def base_uri(self) -> str:
+        return self._base_uri
+
     def put_file(
         self, source: Path, key: str, content_type: str | None = None
     ) -> StoredObject:
