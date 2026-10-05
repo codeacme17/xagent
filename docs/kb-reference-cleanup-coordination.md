@@ -72,6 +72,15 @@ No transaction spans both SQL and LanceDB. Serialization instead spans their
 short operations, without retaining a SQL connection over LanceDB publication,
 checksum work, or durable-object I/O. The existing compensation batch behavior
 is preserved, including finishing the batch before reporting unresolved deletes.
+Reference-query or lock failures abort the compensation batch before any claim;
+this conservative behavior is distinct from finishing already-claimed durable
+deletes. Per-file isolation is tracked in
+[#2836](https://github.com/xorbitsai/xagent/issues/2836). Referenced files are
+logged and skipped. Compensation
+releases reference locks after the claim/fence transaction closes, before durable
+deletion or preview cleanup. Admission waits off the event loop with its own
+short SQL Session on the caller's engine. Contention returns a sanitized 503
+with `Retry-After`; unavailable or superseded identities return a sanitized 409.
 
 ## Persistent fences and interruption
 
@@ -79,6 +88,9 @@ is preserved, including finishing the batch before reporting unresolved deletes.
 timestamps. It deliberately has no upload/user foreign key. A corresponding
 `.claimed` marker, fsynced before the SQL claim commits, lets standalone RAG
 writers reject retired IDs even when no Web SQL factory is installed.
+Retired SQL fence rows, their `.claimed` markers, and per-ID `.lock` files grow
+monotonically in this slice. Safe compaction belongs to the 2B/2C follow-ups:
+retired identities must remain fenced, and live lock inodes cannot be replaced.
 
 These are rejection fences, not reference pins: they cannot prevent subsequent
 cleanup of an unreferenced file. A surviving available/legacy SQL upload is
@@ -91,6 +103,10 @@ the marker and retries on a subsequent Web reference operation.
   new reference state. A retry or cleanup can proceed.
 - After an atomic document merge: process exit releases the lock; the next
   exact document query protects the committed reference.
+- After successful ingest, failure to release its target is logged without
+  replacing success. The target conservatively retains protection until an
+  exact generation release, replacement, or tombstone succeeds. Release failure
+  also preserves an original ingest error; retryable attempts retain the target.
 - Before SQL claim commit: SQL rolls back. A conservative standalone marker
   may survive; a Web operation validates the still-live upload and clears it.
   It does not permanently pin that upload against a later cleanup attempt.
@@ -101,6 +117,10 @@ the marker and retries on a subsequent Web reference operation.
   so cleanup cannot race an abandoned native document commit.
 
 ## Upgrade and rollout
+
+Fresh ingestion while an old canonical-path upload is still compensating remains
+a safe conflict until cleanup settles. A fresh-ID publication/cleanup handoff is
+tracked separately in [#2835](https://github.com/xorbitsai/xagent/issues/2835).
 
 Deploy all reference writers and cleanup workers together; mixed old/new writers
 cannot honor the gate. Stop them before the online Alembic upgrade, retain the

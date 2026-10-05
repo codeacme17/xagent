@@ -187,8 +187,9 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
     request compensation) mutually exclusive, and ``task_id IS NULL`` makes
     the claim lose to any bind that committed first. Binders in turn use
     conditional updates excluding ``compensating`` rows, so whichever side
-    commits first wins outright. Committed immediately so the claim is
-    visible before any storage I/O starts.
+    commits first wins outright. After the reference guard admits this file,
+    unlink its local cache before the CAS; the guard commits the claim and
+    cleanup fence before durable-object deletion starts.
     """
     _delete_local_file(candidate.storage_path)
     claimed_at = datetime.now(timezone.utc)
@@ -228,7 +229,7 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
 
 def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
     """Reap one candidate; True only when its metadata row was deleted."""
-    # Local bytes first, while the row is still available: a consumer that
+    # The guarded claim unlinks local bytes while the row is available: a consumer that
     # binds after this re-materializes from the durable object, and the
     # generic stale-compensation recovery (which owns every post-claim crash
     # window but knows no storage_path) then never has a local file to leak.

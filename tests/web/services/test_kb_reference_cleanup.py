@@ -739,11 +739,13 @@ def test_schema_failure_retry_leaves_other_tables_intact(boundary):
 
 
 @pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("release_failure", [False, True])
 def test_real_staged_ingest_releases_final_target_and_preserves_actual_documents(
     boundary,
     tmp_path,
     monkeypatch,
     failure,
+    release_failure,
 ):
     from xagent.core.file_storage.factory import get_unscoped_file_storage
     from xagent.core.model.model import EmbeddingModelConfig
@@ -752,9 +754,35 @@ def test_real_staged_ingest_releases_final_target_and_preserves_actual_documents
     from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
     from xagent.web.jobs.exceptions import BackgroundJobHandlerError
     from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+    from xagent.web.models import database
+    from xagent.web.services import kb_ingest_targets
     from xagent.web.services.background_jobs import create_background_job
 
     sessions, store, path = boundary
+    foreign_engine = sa.create_engine(f"sqlite:///{tmp_path / 'foreign.db'}")
+    Base.metadata.create_all(foreign_engine)
+    foreign_sessions = sessionmaker(bind=foreign_engine)
+    with foreign_sessions.begin() as foreign:
+        foreign.add(User(id=1, username="foreign", password_hash="unused"))
+        foreign.flush()
+        foreign.add(
+            UploadedFile(
+                user_id=1,
+                file_id="source",
+                filename="foreign.txt",
+                storage_path="/foreign",
+                storage_status="compensating",
+            )
+        )
+    release = kb_ingest_targets.release_kb_ingest_target_generation
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("target release unavailable")
+
+    if release_failure:
+        monkeypatch.setattr(
+            kb_ingest_targets, "release_kb_ingest_target_generation", unavailable
+        )
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "durable").as_uri())
     get_unscoped_file_storage.cache_clear()
 
@@ -824,14 +852,29 @@ def test_real_staged_ingest_releases_final_target_and_preserves_actual_documents
         job = db.get(type(job), job_id)
         job.attempts = job.max_attempts
         db.commit()
-        if failure:
-            with pytest.raises(BackgroundJobHandlerError):
-                handle_kb_ingest_document(db, job)
-        else:
-            assert handle_kb_ingest_document(db, job)["status"] == "success"
-        assert db.query(KBIngestTarget).one().deleted_at is not None
+        with monkeypatch.context() as global_override:
+            global_override.setattr(database, "_SessionLocal", foreign_sessions)
+            if failure:
+                with pytest.raises(
+                    BackgroundJobHandlerError, match="embedding provider failed"
+                ):
+                    handle_kb_ingest_document(db, job)
+            else:
+                assert handle_kb_ingest_document(db, job)["status"] == "success"
+        assert (db.query(KBIngestTarget).one().deleted_at is None) is release_failure
     assert bool(store.list_document_records_by_file_ids(["source"])) is not failure
+    if release_failure:
+        assert claim(sessions).deleted == 0
+        with sessions() as db:
+            assert release(
+                db,
+                user_id=1,
+                collection="kb",
+                target_path=str(path),
+                generation_id="one",
+            )
     assert claim(sessions).deleted == (1 if failure else 0)
+    foreign_engine.dispose()
     get_unscoped_file_storage.cache_clear()
 
 
@@ -922,16 +965,121 @@ def test_admission_lock_failure_marks_job_failed_and_allows_fresh_retry(
     original = kb_reference_protection.file_reference_lock
 
     def unavailable(_ids):
-        raise Timeout("held reference lock")
+        raise Timeout(str(tmp_path / "private-reference.lock"))
 
     monkeypatch.setattr(kb_reference_protection, "file_reference_lock", unavailable)
-    assert submit_ingest().status_code >= 400
+    response = submit_ingest()
+    assert response.status_code == 503
+    assert response.json() == {"detail": "KB source is busy; retry the upload"}
+    assert response.headers["retry-after"] == "15"
+    assert str(tmp_path) not in response.text
     with sessions() as db:
         failed = db.query(BackgroundJob).one()
         assert failed.status == "failed"
+        assert failed.error_message == "KB source is busy; retry the upload"
         assert db.query(KBIngestTarget).count() == 0
     assert not (tmp_path / "staged.txt").exists()
     monkeypatch.setattr(kb_reference_protection, "file_reference_lock", original)
     response = submit_ingest()
     assert response.status_code == 202, response.text
     assert response.json()["id"] != failed.id
+
+
+def test_retryable_worker_failure_keeps_generation_and_staged_source(
+    boundary, tmp_path, monkeypatch
+):
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionConfig
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.services.background_jobs import create_background_job
+
+    sessions, store, path = boundary
+    staged = tmp_path / "retry.txt"
+    staged.write_text("retryable source")
+    error = BackgroundJobHandlerError("temporary ingest failure", retryable=True)
+
+    def temporarily_unavailable(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(kb_tasks, "run_document_ingestion", temporarily_unavailable)
+    with sessions() as db:
+        job = create_background_job(
+            db,
+            user_id=1,
+            job_type="kb.ingest.document",
+            payload={
+                "user_id": 2,
+                "collection": "kb",
+                "file_id": "source",
+                "target_path": "canonical/source",
+                "source_path": str(staged),
+                "generation_id": "one",
+                "collection_existed_before": True,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+            },
+        )
+        job_id = str(job.id)
+    admit(sessions, job_id=job_id)
+    with sessions() as db:
+        job = db.get(type(job), job_id)
+        job.attempts = 1
+        db.commit()
+        with pytest.raises(BackgroundJobHandlerError) as caught:
+            kb_tasks.handle_kb_ingest_document(db, job)
+        assert caught.value is error
+        assert db.query(KBIngestTarget).one().deleted_at is None
+    assert staged.read_text() == "retryable source"
+    assert not store.list_document_records_by_file_ids(["source"])
+    assert claim(sessions).deleted == 0
+    assert path.exists()
+
+
+def test_compensating_canonical_upload_rejects_admission_with_safe_conflict(
+    boundary, submit_ingest, tmp_path
+):
+    from xagent.web.models.background_job import BackgroundJob
+
+    sessions, store, _path = boundary
+    with sessions.begin() as db:
+        db.query(UploadedFile).update({UploadedFile.storage_status: "compensating"})
+    response = submit_ingest()
+    assert response.status_code == 409
+    message = "KB source is unavailable or the ingest was superseded"
+    assert response.json() == {"detail": message}
+    with sessions() as db:
+        failed = db.query(BackgroundJob).one()
+        assert failed.status == "failed"
+        assert failed.error_message == message
+        assert db.query(KBIngestTarget).count() == 0
+        assert db.query(UploadedFile).one().file_id == "source"
+    assert not store.list_document_records_by_file_ids(["source"])
+    assert not (tmp_path / "staged.txt").exists()
+
+
+def test_upload_admission_wait_keeps_request_event_loop_responsive(
+    boundary, submit_ingest, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from xagent.web.api import kb
+    from xagent.web.services import kb_reference_protection
+
+    tick = Event()
+    request_loops = []
+    original = kb_reference_protection.file_reference_lock
+
+    async def access(*_args, **_kwargs):
+        request_loops.append(asyncio.get_running_loop())
+
+    @contextmanager
+    def delayed_lock(ids):
+        request_loops[0].call_soon_threadsafe(tick.set)
+        assert tick.wait(3), "Admission blocked the request event loop"
+        with original(ids):
+            yield
+
+    monkeypatch.setattr(kb, "_ensure_collection_access", access)
+    monkeypatch.setattr(kb_reference_protection, "file_reference_lock", delayed_lock)
+    response = submit_ingest()
+    assert response.status_code == 202, response.text
+    assert tick.is_set()

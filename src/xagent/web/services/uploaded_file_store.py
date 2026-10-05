@@ -1178,6 +1178,8 @@ def register_local_uploads_sync(
 @guard_upload_compensation
 def compensate_registered_uploads_sync(
     claims: Sequence[RegisteredUploadCompensationClaim],
+    *,
+    _release_claim_locks: Callable[[], None] | None = None,
 ) -> None:
     """Rollback only registrations still owned by the cancelled request.
 
@@ -1260,6 +1262,9 @@ def compensate_registered_uploads_sync(
                     )
                 )
         db.commit()
+
+    if _release_claim_locks is not None:
+        _release_claim_locks()
 
     cleaned: list[ClaimedRegisteredUploadCompensation] = []
     unresolved: list[ClaimedRegisteredUploadCompensation] = []
