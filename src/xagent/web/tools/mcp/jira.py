@@ -12,6 +12,11 @@ from mcp.server.fastmcp import FastMCP
 from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
+from .jira_attachment import (
+    attachment_error_hint,
+    confirmed_attachment,
+    read_allowed_file,
+)
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -179,16 +184,28 @@ def _request_absolute(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    files: dict[str, tuple[str, bytes]] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     allow_retry: bool = True,
 ) -> Any:
     for attempt in (0, 1):
+        headers = _headers()
+        if files is not None:
+            # requests must set a multipart request's Content-Type itself (it
+            # carries the boundary), so the JSON one _headers() sets is
+            # dropped; Jira also blocks a multipart upload that lacks the
+            # XSRF opt-out header. `files` holds bytes, not an open handle,
+            # so the 429 retry below rebuilds the full body instead of
+            # re-reading a handle already at EOF.
+            headers.pop("Content-Type", None)
+            headers["X-Atlassian-Token"] = "no-check"
         response = requests.request(
             method=method,
             url=url,
-            headers=_headers(),
+            headers=headers,
             params=params,
             json=json_data,
+            files=files,
             timeout=timeout,
         )
         if allow_retry and response.status_code == 429 and attempt == 0:
@@ -277,6 +294,7 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    files: dict[str, tuple[str, bytes]] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     allow_retry: bool = True,
 ) -> Any:
@@ -286,6 +304,7 @@ def _request(
         f"{JIRA_API_BASE}/{_path_segment(resolved_cloud_id)}{path}",
         params=params,
         json_data=json_data,
+        files=files,
         timeout=timeout,
         allow_retry=allow_retry,
     )
@@ -2170,6 +2189,43 @@ def jira_add_comment(issue_key: str, body: str, cloud_id: str = "") -> str:
         safe_message = _safe_text(e)
         logger.error(f"Error adding comment to Jira issue {issue_key}: {safe_message}")
         return _error(safe_message)
+
+
+@mcp.tool()
+def jira_add_attachment(issue_key: str, file_path: str, cloud_id: str = "") -> str:
+    """
+    Attach a local file to an issue.
+    file_path: path to a file already on disk (e.g. something written to the
+    task workspace) -- must be inside an allowed directory (automatically
+    scoped to the current task workspace) so this tool cannot be used to
+    exfiltrate arbitrary files from the host. Pass an absolute path -- a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace. An empty file, or one over the local size limit, is
+    rejected before anything is sent to Jira.
+    To reference the file from a comment, attach it first, then call
+    jira_add_comment with its name in wiki markup: [^filename] links to it,
+    !filename! embeds an image.
+    If the result says the attachment was created but reports an unexpected
+    size, check the issue before retrying -- a retry would attach it twice.
+    """
+    try:
+        # Both checks run before any request, so a bad key or file never
+        # costs a call to Jira.
+        path = _issue_path(issue_key, "/attachments")
+        filename, data = read_allowed_file(file_path)
+    except (ValueError, OSError) as e:
+        return _error(_safe_text(e))
+    try:
+        result = _request("POST", cloud_id, path, files={"file": (filename, data)})
+        return _success(attachment=confirmed_attachment(result, len(data)))
+    except Exception as e:
+        safe_message = _safe_text(e)
+        logger.error(
+            f"Error attaching a file to Jira issue {issue_key}: {safe_message}"
+        )
+        hint = attachment_error_hint(e)
+        return _error(f"{hint}: {safe_message}" if hint else safe_message)
 
 
 @mcp.tool()
