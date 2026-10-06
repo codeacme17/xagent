@@ -729,10 +729,17 @@ def test_populated_upgrade_fresh_schema_retry_and_rollback_constraint(lifecycle)
         )
     )
     fresh = sa.inspect(engine).get_columns("uploaded_files")
+    with sessions.begin() as db:
+        db.query(UploadedFile).one().cleanup_manifest = {}
+    with sessions.begin() as db:
+        db.query(UploadedFile).one().cleanup_manifest = None
     with (
         engine.begin() as connection,
         Operations.context(MigrationContext.configure(connection)),
     ):
+        assert connection.execute(
+            sa.text("SELECT cleanup_manifest IS NULL FROM uploaded_files")
+        ).scalar()
         migration.downgrade()
     assert "cleanup_manifest" not in {
         column["name"] for column in sa.inspect(engine).get_columns("uploaded_files")

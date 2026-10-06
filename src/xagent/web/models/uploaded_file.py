@@ -62,6 +62,7 @@ class UploadedFile(Base):  # type: ignore
     # reap a logged-in user's un-sent draft attachments.
     upload_source = Column(String(64), nullable=True)
     storage_status = Column(String(32), nullable=False, default="legacy")
+    # SQL NULL means no persisted cleanup manifest for downgrade checks.
     cleanup_manifest = Column(JSON(none_as_null=True), nullable=True)
     mime_type = Column(String(255), nullable=True)
     file_size = Column(Integer, nullable=False, default=0)
