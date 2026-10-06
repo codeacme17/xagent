@@ -28,7 +28,6 @@ from xagent.web.services import uploaded_file_cleanup_resources as resources
 from xagent.web.services import uploaded_file_store as store
 from xagent.web.services.kb_reference_protection import install_file_reference_validator
 from xagent.web.services.managed_file_ref import (
-    DurableObjectMissingError,
     ManagedFileRef,
 )
 from xagent.web.services.orphan_upload_gc import (
@@ -36,6 +35,9 @@ from xagent.web.services.orphan_upload_gc import (
     _claim_orphan,
     _orphan_candidates,
     cleanup_orphaned_taskless_uploads,
+)
+from xagent.web.services.uploaded_file_cleanup_publication import (
+    FilePublicationUnavailable,
 )
 from xagent.web.services.uploaded_file_recovery import (
     recover_stale_uploaded_file_compensations_batch_isolated,
@@ -251,7 +253,8 @@ def test_missing_objects_and_copies_are_success(lifecycle):
     completed(lifecycle)
 
 
-def test_uncertain_presence_keeps_all_obligations(lifecycle, monkeypatch):
+@pytest.mark.parametrize("presence", ["exists", "unknown"])
+def test_non_absent_presence_keeps_all_obligations(lifecycle, presence):
     candidate, token = claim(lifecycle)
     outcome = cleanup.run_uploaded_file_cleanup(
         session_factory=lifecycle[0],
@@ -261,9 +264,9 @@ def test_uncertain_presence_keeps_all_obligations(lifecycle, monkeypatch):
         task_id=None,
         storage_key=candidate.storage_key,
         expected_updated_at=token,
-        compensation_delete=lambda **_kwargs: "unknown",
+        compensation_delete=lambda **_kwargs: presence,
     )
-    assert outcome == "unknown"
+    assert outcome == presence
     retained(lifecycle, [])
     assert lifecycle[1].exists() and lifecycle[2].exists()
     assert recover(lifecycle).deleted == 1
@@ -437,13 +440,13 @@ def test_cleanup_claim_cannot_settle_on_durable_absence_alone(lifecycle):
 def test_two_independent_workers_wait_for_inflight_delete_and_only_one_settles(
     lifecycle, monkeypatch
 ):
-    from filelock import FileLock
+    from filelock import FileLock, Timeout
 
     candidate, token = claim(lifecycle)
     sessions, *_ = lifecycle
     entered, proceed, blocked = Event(), Event(), Event()
     original_delete = store.delete_uploaded_file_compensation_object
-    original_acquire = FileLock._acquire
+    original_acquire = FileLock.acquire
     calls = []
 
     def delete(**kwargs):
@@ -452,12 +455,14 @@ def test_two_independent_workers_wait_for_inflight_delete_and_only_one_settles(
         assert proceed.wait(10)
         return original_delete(**kwargs)
 
-    def acquire(lock):
-        original_acquire(lock)
-        if lock._context.lock_file_fd is None:
+    def acquire(lock, *args, **kwargs):
+        try:
+            return original_acquire(lock, *args, **{**kwargs, "timeout": 0})
+        except Timeout:
             blocked.set()
+            return original_acquire(lock, *args, **kwargs)
 
-    monkeypatch.setattr(FileLock, "_acquire", acquire)
+    monkeypatch.setattr(FileLock, "acquire", acquire)
 
     def run():
         return cleanup.run_uploaded_file_cleanup(
@@ -543,9 +548,9 @@ def test_managed_copy_loaded_before_claim_cannot_publish_after_cleanup(lifecycle
         # Keep the caller's snapshot alive across cleanup on another connection.
         db.expunge_all()
     assert collect(lifecycle).deleted == 1
-    with pytest.raises(DurableObjectMissingError):
+    with pytest.raises(FilePublicationUnavailable):
         ref.ensure_local()
-    with pytest.raises(DurableObjectMissingError):
+    with pytest.raises(FilePublicationUnavailable):
         ref.materialize(allow_existing_local=False)
     assert not source.exists() and not materialized.exists()
 
@@ -553,7 +558,7 @@ def test_managed_copy_loaded_before_claim_cannot_publish_after_cleanup(lifecycle
 def test_existing_copy_publication_blocks_claim_until_it_finishes(
     lifecycle, monkeypatch
 ):
-    from filelock import FileLock
+    from filelock import FileLock, Timeout
 
     sessions, source, materialized, _, key, file_id = lifecycle
     source.unlink()
@@ -563,20 +568,22 @@ def test_existing_copy_publication_blocks_claim_until_it_finishes(
         db.expunge_all()
     entered, proceed, blocked = Event(), Event(), Event()
     original = get_unscoped_file_storage().copy_to_path
-    original_acquire = FileLock._acquire
+    original_acquire = FileLock.acquire
 
     def copy_to_path(*args, **kwargs):
         entered.set()
         assert proceed.wait(10)
         return original(*args, **kwargs)
 
-    def acquire(lock):
-        original_acquire(lock)
-        if lock._context.lock_file_fd is None:
+    def acquire(lock, *args, **kwargs):
+        try:
+            return original_acquire(lock, *args, **{**kwargs, "timeout": 0})
+        except Timeout:
             blocked.set()
+            return original_acquire(lock, *args, **kwargs)
 
     monkeypatch.setattr(get_unscoped_file_storage(), "copy_to_path", copy_to_path)
-    monkeypatch.setattr(FileLock, "_acquire", acquire)
+    monkeypatch.setattr(FileLock, "acquire", acquire)
     with ThreadPoolExecutor(max_workers=2) as pool:
         publication = pool.submit(ref.ensure_local)
         try:
@@ -1062,7 +1069,7 @@ def test_file_replaced_by_directory_before_claim_is_preserved(lifecycle, target)
     child.write_bytes(b"replacement tree")
     assert collect(lifecycle).deleted == 0
     assert child.read_bytes() == b"replacement tree"
-    retained(lifecycle, ["durable", "local"] if target == "preview" else ["durable"])
+    retained(lifecycle, ["durable", "local"] if target == "preview" else [])
 
 
 def test_missing_converter_child_does_not_settle_surviving_quarantine(
@@ -1095,13 +1102,27 @@ def test_missing_converter_child_does_not_settle_surviving_quarantine(
     assert not quarantine.exists()
 
 
+@pytest.mark.parametrize(
+    "basename",
+    ["source.txt", "r" * 206 + ".txt", "r" * 246 + ".txt", "还" * 80 + ".txt"],
+)
 def test_process_death_inside_real_restoration_cleans_both_temporaries(
-    lifecycle, monkeypatch
+    lifecycle, monkeypatch, basename
 ):
     import subprocess
     import sys
 
-    sessions, source, _, _, _, file_id = lifecycle
+    sessions, source, materialized, previews, key, file_id = lifecycle
+    if basename != source.name:
+        renamed_source = source.with_name(basename)
+        source.rename(renamed_source)
+        renamed_cache = materialized.with_name(basename)
+        materialized.rename(renamed_cache)
+        with sessions.begin() as db:
+            row = db.query(UploadedFile).one()
+            row.storage_path, row.filename = str(renamed_source), basename
+        source = renamed_source
+        lifecycle = sessions, source, renamed_cache, previews, key, file_id
     engine = sessions.kw["bind"]
     if engine.dialect.name == "postgresql":
         with engine.connect() as connection:
@@ -1218,6 +1239,7 @@ async def test_publication_contention_preserves_caller_error_contract(
         try:
             with sessions() as db:
                 if operation in {"restore", "materialize"}:
+                    source.unlink()
                     ref = ManagedFileRef(db.query(UploadedFile).one())
                     with pytest.raises(DurableStorageOperationError) as fault:
                         ref.ensure_local() if operation == "restore" else ref.materialize()
@@ -1253,4 +1275,7 @@ async def test_publication_contention_preserves_caller_error_contract(
         owner.result(timeout=5)
     with sessions() as db:
         assert db.query(UploadedFile).one().storage_status == "available"
-    assert source.read_bytes() == PAYLOAD
+    if operation in {"restore", "materialize"}:
+        assert not source.exists()
+    else:
+        assert source.read_bytes() == PAYLOAD

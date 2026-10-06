@@ -37,6 +37,7 @@ from ...core.file_storage.keys import (
     build_upload_storage_key as build_upload_storage_key,
 )
 from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
+from ...core.file_storage.storage import atomic_copy_temp_prefix
 from ..models.uploaded_file import UploadedFile
 from .uploaded_file_cleanup_publication import guard_managed_copy_publication
 
@@ -525,7 +526,7 @@ class ManagedFileRef:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(
             dir=path.parent,
-            prefix=f".{hashlib.sha256(str(self.record.file_id).encode()).hexdigest()[:24]}.{path.name}.",
+            prefix=atomic_copy_temp_prefix(path.name, owner=str(self.record.file_id)),
             suffix=".tmp",
             delete=False,
         )

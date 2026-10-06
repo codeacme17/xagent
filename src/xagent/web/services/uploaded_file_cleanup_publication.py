@@ -6,6 +6,7 @@ import asyncio
 import copy
 from contextlib import contextmanager
 from functools import wraps
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, TypeVar, cast
 
@@ -40,12 +41,14 @@ _COPY_FIELDS = (
 )
 
 
-def _validate_publication(file_id: str, sessions: Any, snapshot: Any = None) -> None:
-    from .managed_file_ref import DurableObjectMissingError
+class FilePublicationUnavailable(FileNotFoundError):
+    """A claim or changed generation forbids publication and local fallback."""
 
+
+def _validate_publication(file_id: str, sessions: Any, snapshot: Any = None) -> None:
     if sessions is None:
         if has_cleanup_fence(file_id):
-            raise DurableObjectMissingError("File is unavailable")
+            raise FilePublicationUnavailable("File is unavailable")
         return
     with sessions() as db:
         current = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
@@ -56,51 +59,92 @@ def _validate_publication(file_id: str, sessions: Any, snapshot: Any = None) -> 
                 or (snapshot is not None and snapshot.id is not None)
                 or has_cleanup_fence(file_id)
             ):
-                raise DurableObjectMissingError("File is unavailable")
+                raise FilePublicationUnavailable("File is unavailable")
             return
         if current.storage_status not in {"available", "legacy"}:
-            raise DurableObjectMissingError("File is unavailable")
+            raise FilePublicationUnavailable("File is unavailable")
         if snapshot is not None and any(
             getattr(current, field) != getattr(snapshot, field)
             for field in (
                 "id",
                 "user_id",
+                "filename",
                 "storage_path",
                 "storage_key",
+                "storage_backend",
+                "storage_uri",
                 "checksum",
                 "etag",
             )
-            if getattr(snapshot, field) is not None
+            if snapshot.id is not None or getattr(snapshot, field) is not None
         ):
-            raise DurableObjectMissingError("File generation is unavailable")
+            raise FilePublicationUnavailable("File generation is unavailable")
+
+
+def _prepare_copy(ref: Any) -> tuple[Any, Any, bool]:
+    snapshot = SimpleNamespace(
+        **{field: getattr(ref.record, field, None) for field in _COPY_FIELDS}
+    )
+    try:
+        db = object_session(ref.record)
+    except UnmappedInstanceError:
+        db = None
+    sessions = getattr(ref, "_cleanup_sessions", get_optional_session_local())
+    read_only = getattr(ref, "_cleanup_read_only", False)
+    if db is not None:
+        bind = db.get_bind()
+        if isinstance(bind, Connection):
+            bind = bind.engine
+        sessions = sessionmaker(bind=bind)
+        read_only = not release_db_connection_if_clean(db)
+    clone = copy.copy(ref)
+    clone.record = snapshot
+    clone._cleanup_sessions = sessions
+    clone._cleanup_read_only = read_only
+    return clone, sessions, read_only
+
+
+async def async_managed_copy(
+    ref: Any, *, restore_local: bool = False, allow_existing_local: bool = True
+) -> Path:
+    """Snapshot and release a clean request session before off-loop storage work."""
+    clone, _, _ = _prepare_copy(ref)
+    operation = (
+        clone.ensure_local
+        if restore_local
+        else lambda: clone.materialize(allow_existing_local=allow_existing_local)
+    )
+    return cast(Path, await _drain(asyncio.to_thread(operation)))
+
+
+def preview_cache_hit(path: Path, cached: Path, file_id: str | None) -> Path | None:
+    """Read an existing cache without serializing readers or publishing bytes."""
+    if file_id:
+        _validate_publication(file_id, get_optional_session_local())
+    try:
+        if cached.is_file() and cached.stat().st_mtime >= path.stat().st_mtime:
+            return cached
+    except OSError:
+        pass
+    return None
 
 
 def guard_managed_copy_publication(operation: _Operation) -> _Operation:
     @wraps(operation)
     def publish(self: Any, *args: Any, **kwargs: Any) -> Any:
-        snapshot = SimpleNamespace(
-            **{field: getattr(self.record, field, None) for field in _COPY_FIELDS}
-        )
-        try:
-            db = object_session(self.record)
-        except UnmappedInstanceError:
-            db = None
-        sessions = get_optional_session_local()
-        if db is not None:
-            bind = db.get_bind()
-            if isinstance(bind, Connection):
-                bind = bind.engine
-            sessions = sessionmaker(bind=bind)
-            if not release_db_connection_if_clean(db):
-                # Existing bytes require no publication or transaction change.
-                if (
-                    kwargs.get("allow_existing_local", True)
-                    and self.local_path.is_file()
-                ):
-                    return self.local_path
-                raise RuntimeError("Local publication requires a clean transaction")
-        clone = copy.copy(self)
-        clone.record = snapshot
+        clone, sessions, read_only = _prepare_copy(self)
+        snapshot = clone.record
+        if kwargs.get("allow_existing_local", True):
+            _validate_publication(str(snapshot.file_id), sessions, snapshot)
+            if clone.local_path.is_file():
+                return cast(Any, clone.local_path)
+        if read_only:
+            from .managed_file_ref import DurableStorageOperationError
+
+            raise DurableStorageOperationError(
+                "Local publication requires a clean transaction",
+                storage_key=snapshot.storage_key,
+            )
         try:
             with file_cleanup_lock(str(snapshot.file_id)):
                 _validate_publication(str(snapshot.file_id), sessions, snapshot)

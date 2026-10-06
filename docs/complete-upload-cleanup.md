@@ -71,6 +71,17 @@ also compare the exact token. Local publishers validate current available/legacy
 metadata through an independent short session under the execution guard. A
 previously loaded `ManagedFileRef` cannot restore a retired upload. Async preview
 conversion drains publication and releases its guard before propagating cancellation.
+Existing local copies and fresh preview caches are read without taking the execution
+lock, after current availability/generation validation. File API callers snapshot
+ORM values and return clean request connections before offloading storage and lock
+waits. Dirty transactions retain their changes; a cache miss reports the typed
+storage error instead of publishing through that transaction. Claimed, retired,
+and changed generations have a distinct unavailable error and cannot use the
+durable-missing local fallback.
+Cache-miss conversion keeps its execution guard while the converter can write
+owned temporary output. Moving only the final rename under the guard would let
+cleanup settle while the converter can recreate files; narrowing that interval
+requires a separate producer/recovery contract. Cached reads do not wait for it.
 Publication contention uses the existing storage-error/503 path for copies and
 SVGs, and the converter's existing None/503 canvas fallback for PPTX. The
 execution-lock timeout does not escape as an unhandled request error.
@@ -86,6 +97,15 @@ execution-lock timeout does not escape as an unhandled request error.
 | Authentication | Current configured provider credentials are used on retry and may rotate. Passwords, signed query strings and URI userinfo are not persisted. Credentials do not confer ownership or change the captured destination. |
 | Ownership | Sources must lie inside the configured owner's managed upload root, outside external-read roots, have SHA-256 evidence, and match captured inode/content evidence. Shared hard links are preserved. Materialization ownership derives from the exact normalized key/hash directory; previews and new restoration temporaries carry the stable owner identity. |
 | Scope | The existing storage consumer validates the exact owner prefix using the same tolerant key normalization. Existing workspace segments stay in the captured key; a deleted task is not used to invent another namespace. Cross-owner KB references still protect cleanup without granting read access. |
+
+Configured root symlinks are mapped to their canonical roots without resolving
+children beneath them. Explicit external-read roots remain preserved, including
+aliases nested in uploads. Local materializations are captured from the storage
+layer's exact normalized-key namespace, including backend-derived hash directories;
+manifest capture does not read durable bytes or probe the provider under reference
+locks. Unverifiable namespaces remain pending before durable deletion. Quarantine
+and producer temp names are bounded in bytes; restoration reserves enough space
+for the nested atomic-copy name to retain the same ownership prefix after a crash.
 
 Managed source restoration temporaries now include a hash of the stable file ID;
 materialization temporaries live in the exact key/checksum directory. Owned
@@ -129,11 +149,20 @@ protocol and remains explicit follow-up work; this PR performs none.
 
 - #1086 2C still owns detached seven-day TTL, scan indexes, scheduling and work
   budget. Detached uploads remain excluded from the existing collector.
+  Per-manifest directory scans still scale with directory size; batching or
+  bounded discovery belongs to this performance/work-budget follow-up.
 - #1086 legacy/local-only backfill and historical inventory remain later delivery.
 - [#2835](https://github.com/xorbitsai/xagent/issues/2835) owns fresh canonical-path
   publication while old metadata is compensating; the existing safe conflict remains.
 - [#2836](https://github.com/xorbitsai/xagent/issues/2836) owns per-file isolation of
   uncertain reference checks before compensation claims; batch behavior remains.
+- [#2848](https://github.com/xorbitsai/xagent/issues/2848) owns removing SQL/row-lock
+  ownership across immediate direct deletion. Deferred KB cleanup now queues
+  durable/local/preview work only after its generation CAS succeeds and runs it
+  after commit; the immediate-delete caller contract remains separate.
+- [#2849](https://github.com/xorbitsai/xagent/issues/2849) owns consolidating existing
+  managed preview locators/matchers; current PDF/SVG producer and cleanup layouts
+  are covered by lifecycle regressions.
 - Pre-existing collection rollback/concurrent ingestion
   [#1242](https://github.com/xorbitsai/xagent/issues/1242), job takeover/duplicate
   execution [#1566](https://github.com/xorbitsai/xagent/issues/1566), worker bookkeeping

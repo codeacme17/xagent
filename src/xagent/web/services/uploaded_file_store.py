@@ -1924,29 +1924,42 @@ class UploadedFileStore:
             )
         ref = ManagedFileRef(file_record)
         file_id = str(getattr(file_record, "file_id", "") or "")
+        deferred: list[tuple[str, Callable[[], None]]] = []
         if after_commit is None:
             ref.delete_durable()
         elif ref.has_durable_object:
             storage = get_user_file_storage(int(file_record.user_id))
             key = ref.storage_key
-            after_commit.append((key, lambda: storage.delete(key)))
+            deferred.append((key, lambda: storage.delete(key)))
+        unlink: Callable[[], None] | None = None
         if delete_local:
             unlink = functools.partial(
                 self._delete_local, str(file_record.storage_path), local_root=local_root
             )
             if after_commit is None:
                 unlink()
-            else:
-                after_commit.append((file_id, unlink))
         # Remove any server-side PDF preview cache so derived content doesn't
         # outlive the source upload.  Called here (not only in the HTTP route)
         # so reconcile / orphan-cleanup paths that go through this service also
         # clean up the cache.
-        delete_registered_preview_caches(file_id)
+        if after_commit is None:
+            delete_registered_preview_caches(file_id)
+        else:
+
+            def _delete_local_and_previews() -> None:
+                try:
+                    if unlink is not None:
+                        unlink()
+                finally:
+                    delete_registered_preview_caches(file_id)
+
+            deferred.append((file_id, _delete_local_and_previews))
         if deletable.delete(synchronize_session=False) != 1:
             raise UploadedFileVersionConflict(
                 "Uploaded file was claimed before deletion"
             )
+        if after_commit is not None:
+            after_commit.extend(deferred)
         if file_record in self.db:
             self.db.expunge(file_record)
         self.db.flush()

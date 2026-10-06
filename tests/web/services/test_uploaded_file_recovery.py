@@ -272,17 +272,19 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
     assert original_delete_started.wait(timeout=5)
 
     try:
-        from filelock import FileLock
+        from filelock import FileLock, Timeout
 
         blocked = Event()
-        original_acquire = FileLock._acquire
+        original_acquire = FileLock.acquire
 
-        def acquire(lock):
-            original_acquire(lock)
-            if lock._context.lock_file_fd is None:
+        def acquire(lock, *args, **kwargs):
+            try:
+                return original_acquire(lock, *args, **{**kwargs, "timeout": 0})
+            except Timeout:
                 blocked.set()
+                return original_acquire(lock, *args, **kwargs)
 
-        monkeypatch.setattr(FileLock, "_acquire", acquire)
+        monkeypatch.setattr(FileLock, "acquire", acquire)
         with ThreadPoolExecutor(max_workers=1) as pool:
             recovery = pool.submit(
                 recover_stale_uploaded_file_compensations_batch_isolated,

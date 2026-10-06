@@ -105,6 +105,18 @@ def run_uploaded_file_cleanup(
                     "Cleanup manifest identity does not match its claim"
                 )
             validate_configuration(manifest)
+            # Retain the object when captured evidence already requires reconciliation.
+            if "local" not in manifest["done"]:
+                uncertainty = manifest.get("uncertain_materialization") or next(
+                    (
+                        resource["uncertain"]
+                        for resource in manifest["local"]
+                        if resource.get("uncertain")
+                    ),
+                    None,
+                )
+                if uncertainty:
+                    raise CleanupResourceUncertain(uncertainty)
             for phase in CLEANUP_PHASES:
                 if phase in manifest["done"]:
                     continue
