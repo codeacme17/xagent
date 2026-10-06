@@ -38,7 +38,6 @@ from ...core.file_storage.keys import (
 )
 from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
 from ..models.uploaded_file import UploadedFile
-
 from .uploaded_file_cleanup_publication import guard_managed_copy_publication
 
 logger = logging.getLogger(__name__)

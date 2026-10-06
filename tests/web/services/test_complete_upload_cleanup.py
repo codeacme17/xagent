@@ -284,7 +284,7 @@ def test_claim_commit_precedes_all_destructive_io_and_returns_connections(
         active.discard(id(connection))
 
     sa.event.listen(engine, "checkout", checked_out)
-    sa.event.listen(engine, "checkin", returned)
+    sa.event.listen(engine, "checkin", returned)  # codespell:ignore checkin
     original_delete = get_unscoped_file_storage().delete
     original_unlink = resources.os.unlink
 
@@ -316,7 +316,7 @@ def test_claim_commit_precedes_all_destructive_io_and_returns_connections(
         assert collect(lifecycle).deleted == 1
     finally:
         sa.event.remove(engine, "checkout", checked_out)
-        sa.event.remove(engine, "checkin", returned)
+        sa.event.remove(engine, "checkin", returned)  # codespell:ignore checkin
     completed(lifecycle)
 
 
@@ -1188,8 +1188,8 @@ async def test_publication_contention_preserves_caller_error_contract(
     def checkout(*_args):
         checked_out[0] += 1
 
-    @sa.event.listens_for(sessions.kw["bind"], "checkin")
-    def checkin(*_args):
+    @sa.event.listens_for(sessions.kw["bind"], "checkin")  # codespell:ignore checkin
+    def returned(*_args):
         checked_out[0] -= 1
 
     def slow_publication():
