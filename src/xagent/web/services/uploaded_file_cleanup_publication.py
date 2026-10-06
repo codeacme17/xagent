@@ -26,7 +26,6 @@ from ..models.uploaded_file_cleanup_fence import UploadedFileCleanupFence
 
 _Operation = TypeVar("_Operation", bound=Callable[..., Any])
 _COPY_FIELDS = (
-    "id",
     "user_id",
     "file_id",
     "filename",
@@ -34,7 +33,6 @@ _COPY_FIELDS = (
     "storage_key",
     "storage_status",
     "checksum",
-    "task_id",
     "etag",
     "storage_backend",
     "storage_uri",
@@ -81,9 +79,12 @@ def _validate_publication(file_id: str, sessions: Any, snapshot: Any = None) -> 
             raise FilePublicationUnavailable("File generation is unavailable")
 
 
-def _prepare_copy(ref: Any) -> tuple[Any, Any, bool]:
+def _prepare_copy(ref: Any) -> Any:
+    row_id = getattr(ref.record, "id", None)
+    if row_id is None:
+        row_id = getattr(ref.record, "row_id", None)
     snapshot = SimpleNamespace(
-        **{field: getattr(ref.record, field, None) for field in _COPY_FIELDS}
+        id=row_id, **{field: getattr(ref.record, field, None) for field in _COPY_FIELDS}
     )
     try:
         db = object_session(ref.record)
@@ -101,14 +102,14 @@ def _prepare_copy(ref: Any) -> tuple[Any, Any, bool]:
     clone.record = snapshot
     clone._cleanup_sessions = sessions
     clone._cleanup_read_only = read_only
-    return clone, sessions, read_only
+    return clone
 
 
 async def async_managed_copy(
     ref: Any, *, restore_local: bool = False, allow_existing_local: bool = True
 ) -> Path:
     """Snapshot and release a clean request session before off-loop storage work."""
-    clone, _, _ = _prepare_copy(ref)
+    clone = _prepare_copy(ref)
     operation = (
         clone.ensure_local
         if restore_local
@@ -132,7 +133,9 @@ def preview_cache_hit(path: Path, cached: Path, file_id: str | None) -> Path | N
 def guard_managed_copy_publication(operation: _Operation) -> _Operation:
     @wraps(operation)
     def publish(self: Any, *args: Any, **kwargs: Any) -> Any:
-        clone, sessions, read_only = _prepare_copy(self)
+        clone = _prepare_copy(self)
+        sessions = clone._cleanup_sessions
+        read_only = clone._cleanup_read_only
         snapshot = clone.record
         if kwargs.get("allow_existing_local", True):
             _validate_publication(str(snapshot.file_id), sessions, snapshot)
@@ -145,6 +148,43 @@ def guard_managed_copy_publication(operation: _Operation) -> _Operation:
                 "Local publication requires a clean transaction",
                 storage_key=snapshot.storage_key,
             )
+        if operation.__name__ == "materialize" and clone.has_durable_object:
+            from .managed_file_ref import (
+                NAMESPACE_AUTHORITY_ERRORS,
+                DurableObjectIntegrityError,
+                DurableStorageOperationError,
+            )
+
+            _validate_publication(str(snapshot.file_id), sessions, snapshot)
+            try:
+                cache_locator = getattr(
+                    clone._bound_storage(), "materialized_path", None
+                )
+                cached = (
+                    cache_locator(clone.storage_key, clone.filename)
+                    if cache_locator is not None
+                    else None
+                )
+                if cached is not None and cached.is_file():
+                    try:
+                        clone._verify_content_checksum(cached)
+                    except DurableObjectIntegrityError:
+                        pass
+                    else:
+                        _validate_publication(str(snapshot.file_id), sessions, snapshot)
+                        return cast(Any, cached)
+            except NAMESPACE_AUTHORITY_ERRORS:
+                raise
+            except FilePublicationUnavailable:
+                raise
+            except OSError:
+                # A disappearing cache is a miss; publication re-checks under lock.
+                pass
+            except Exception as exc:
+                raise DurableStorageOperationError(
+                    "Failed to materialize durable object",
+                    storage_key=snapshot.storage_key,
+                ) from exc
         try:
             with file_cleanup_lock(str(snapshot.file_id)):
                 _validate_publication(str(snapshot.file_id), sessions, snapshot)

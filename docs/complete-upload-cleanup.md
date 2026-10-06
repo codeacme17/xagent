@@ -71,10 +71,12 @@ also compare the exact token. Local publishers validate current available/legacy
 metadata through an independent short session under the execution guard. A
 previously loaded `ManagedFileRef` cannot restore a retired upload. Async preview
 conversion drains publication and releases its guard before propagating cancellation.
-Existing local copies and fresh preview caches are read without taking the execution
-lock, after current availability/generation validation. File API callers snapshot
-ORM values and return clean request connections before offloading storage and lock
-waits. Dirty transactions retain their changes; a cache miss reports the typed
+Existing local copies, validated materialization copies, and fresh preview caches
+are read without taking the execution lock. Materialized reads validate the owner
+scope and checksum and recheck availability/generation after probing the cache.
+File APIs, Chat, WebSocket attachment resolution, and KB ingestion snapshot ORM
+values and return clean request connections before offloading storage and lock
+waits. Dirty transactions retain their changes; a copy requiring storage I/O reports the typed
 storage error instead of publishing through that transaction. Claimed, retired,
 and changed generations have a distinct unavailable error and cannot use the
 durable-missing local fallback.
@@ -163,6 +165,10 @@ protocol and remains explicit follow-up work; this PR performs none.
 - [#2849](https://github.com/xorbitsai/xagent/issues/2849) owns consolidating existing
   managed preview locators/matchers; current PDF/SVG producer and cleanup layouts
   are covered by lifecycle regressions.
+- [#2851](https://github.com/xorbitsai/xagent/issues/2851) owns classifying retained
+  cleanup uncertainty for reconciliation. An already claimed row with ambiguous
+  ownership or changed resource identity remains compensating with its manifest;
+  later recovery attempts preserve it and report failure until reconciled.
 - Pre-existing collection rollback/concurrent ingestion
   [#1242](https://github.com/xorbitsai/xagent/issues/1242), job takeover/duplicate
   execution [#1566](https://github.com/xorbitsai/xagent/issues/1566), worker bookkeeping

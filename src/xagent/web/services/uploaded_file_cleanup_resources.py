@@ -53,9 +53,6 @@ def _canonical_path(path: Path, configured_root: Path, canonical_root: Path) -> 
 
 
 def _quarantine_name(name: str, generation: str) -> str:
-    legacy = f".{name}.cleanup-{generation}"
-    if len(legacy.encode("utf-8")) <= 255:
-        return legacy
     ownership = hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
     return f".cleanup-{ownership}-{generation[:16]}"
 

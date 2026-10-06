@@ -691,7 +691,9 @@ async def store_uploaded_files(
 
                     def _delete_local_paths() -> None:
                         for path in written_paths:
-                            if not upload_path_is_registered_sync(path):
+                            try:
+                                if upload_path_is_registered_sync(path):
+                                    continue
                                 try:
                                     info = path.lstat()
                                 except FileNotFoundError:
@@ -700,6 +702,10 @@ async def store_uploaded_files(
                                     path
                                 ]:
                                     _delete_staged_upload(path)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to reconcile staged upload path: %s", path
+                                )
 
                     cleanup_worker = asyncio.create_task(
                         asyncio.to_thread(_delete_local_paths)

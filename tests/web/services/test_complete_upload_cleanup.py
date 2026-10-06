@@ -183,9 +183,16 @@ def test_each_failure_retains_metadata_and_converges_in_fresh_session(
             failing.setattr(type(get_unscoped_file_storage()), "delete", fail_delete)
         elif phase in {"local", "previews"}:
             original = resources.os.unlink
+            preview_directories = {
+                (info.st_dev, info.st_ino)
+                for preview in previews
+                for info in [preview.parent.stat()]
+            }
 
             def fail_unlink(path, *args, **kwargs):
-                if ("preview" in str(path)) == (phase == "previews"):
+                parent = os.fstat(kwargs["dir_fd"])
+                is_preview = (parent.st_dev, parent.st_ino) in preview_directories
+                if is_preview == (phase == "previews"):
                     raise OSError("transient unlink")
                 return original(path, *args, **kwargs)
 
@@ -1208,7 +1215,7 @@ async def test_publication_contention_preserves_caller_error_contract(
     from xagent.web.api import files
     from xagent.web.services.managed_file_ref import DurableStorageOperationError
 
-    sessions, source, _, _, key, file_id = lifecycle
+    sessions, source, materialized, _, key, file_id = lifecycle
     entered, release = Event(), Event()
     checked_out = [0]
 
@@ -1226,6 +1233,11 @@ async def test_publication_contention_preserves_caller_error_contract(
             assert release.wait(10)
 
     original_acquire = FileLock.acquire
+    conversions = []
+
+    async def unexpected_conversion(*args, **kwargs):
+        conversions.append(args)
+        raise AssertionError("Conversion must not start while publication is blocked")
 
     def bounded_acquire(lock, *args, **kwargs):
         if str(lock.lock_file).endswith(".cleanup.lock"):
@@ -1240,6 +1252,7 @@ async def test_publication_contention_preserves_caller_error_contract(
             with sessions() as db:
                 if operation in {"restore", "materialize"}:
                     source.unlink()
+                    materialized.unlink()
                     ref = ManagedFileRef(db.query(UploadedFile).one())
                     with pytest.raises(DurableStorageOperationError) as fault:
                         ref.ensure_local() if operation == "restore" else ref.materialize()
@@ -1259,23 +1272,31 @@ async def test_publication_contention_preserves_caller_error_contract(
                     )
                 else:
                     pptx = source.with_suffix(".pptx")
-                    pptx.write_bytes(PAYLOAD)
+                    row = db.query(UploadedFile).one()
+                    row.filename = pptx.name
+                    row.storage_path = str(pptx)
+                    db.commit()
+                    source.unlink()
                     monkeypatch.setattr(
-                        files, "_resolve_file_path", lambda *_: (None, pptx, 1)
+                        files.asyncio, "create_subprocess_exec", unexpected_conversion
                     )
                     with pytest.raises(HTTPException) as fault:
                         await files.preview_pptx_as_pdf(
                             file_id, user=SimpleNamespace(id=1), db=db
                         )
                     assert fault.value.status_code == 503
-                    assert "canvas renderer" in fault.value.detail
+                    assert isinstance(
+                        fault.value.__cause__, DurableStorageOperationError
+                    )
+                    assert isinstance(fault.value.__cause__.__cause__, Timeout)
+                    assert not conversions
                 assert checked_out[0] == 0
         finally:
             release.set()
         owner.result(timeout=5)
     with sessions() as db:
         assert db.query(UploadedFile).one().storage_status == "available"
-    if operation in {"restore", "materialize"}:
+    if operation in {"restore", "materialize", "pptx"}:
         assert not source.exists()
     else:
         assert source.read_bytes() == PAYLOAD

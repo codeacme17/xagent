@@ -247,17 +247,23 @@ class FsspecFileStorage:
             self._fs.rm(full_path)
 
     def materialize(self, key: str, filename: str | None = None) -> Path:
+        target_path = self.materialized_path(key, filename)
+        if target_path.is_file():
+            return target_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        return self._copy_to_path_atomic(
+            self._normalize_key(key, strict=False), target_path
+        )
+
+    def materialized_path(self, key: str, filename: str | None = None) -> Path:
+        """Return the cache path for the durable object's current content."""
         normalized_key = self._normalize_key(key, strict=False)
-        target_path = materialized_file_path(
+        return materialized_file_path(
             self._materialize_dir,
             normalized_key,
             self.content_hash(normalized_key),
             filename,
         )
-        if target_path.exists() and target_path.is_file():
-            return target_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._copy_to_path_atomic(normalized_key, target_path)
 
     def copy_to_path(self, key: str, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
