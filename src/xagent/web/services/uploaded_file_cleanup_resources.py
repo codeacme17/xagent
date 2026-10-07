@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import stat
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,9 +20,7 @@ from ...config import (
 )
 from ...core.file_storage import get_user_file_storage
 from ...core.file_storage.storage import (
-    atomic_copy_temp_prefix,
     materialized_file_path,
-    materialized_key_directory,
     normalize_storage_key,
 )
 from ...core.workspace import scoped_user_root
@@ -55,27 +52,6 @@ def _canonical_path(path: Path, configured_root: Path, canonical_root: Path) -> 
 def _quarantine_name(name: str, generation: str) -> str:
     ownership = hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
     return f".cleanup-{ownership}-{generation[:16]}"
-
-
-def _materialized_candidates(
-    materialize: Path, storage_key: str, filename: str
-) -> tuple[list[Path], str | None]:
-    """List literal filename copies inside one key-owned cache namespace."""
-    key_directory = materialized_key_directory(materialize, storage_key)
-    candidates: list[Path] = []
-    try:
-        with _parent_descriptor(key_directory / "entry", materialize) as parent:
-            with os.scandir(parent) as entries:
-                for entry in entries:
-                    if entry.is_symlink():
-                        return candidates, "materialization namespace has a symlink"
-                    if entry.is_dir(follow_symlinks=False):
-                        candidates.append(key_directory / entry.name / filename)
-    except FileNotFoundError:
-        return candidates, None
-    except (OSError, ValueError):
-        return candidates, "materialization namespace is unverifiable"
-    return candidates, None
 
 
 def _locator(uri: str) -> str:
@@ -226,62 +202,20 @@ def build_cleanup_manifest(snapshot: Any) -> dict[str, Any]:
     else:
         manifest["preserved_source"] = str(path)
     filename = Path(snapshot.filename).name
-    cached_paths, materialization_uncertainty = _materialized_candidates(
-        materialize, key, filename
-    )
     if checksum:
-        cached_paths.append(
-            materialized_file_path(materialize, key, checksum, filename)
+        manifest["local"].append(
+            capture_resource(
+                materialized_file_path(materialize, key, checksum, filename),
+                root=materialize,
+                generation=generation,
+                checksum=checksum,
+            )
         )
     else:
-        materialization_uncertainty = "materialization checksum unavailable"
-    if materialization_uncertainty:
-        manifest["uncertain_materialization"] = materialization_uncertainty
-    for cached in cached_paths:
-        if not any(resource["path"] == str(cached) for resource in manifest["local"]):
-            manifest["local"].append(
-                capture_resource(
-                    cached, root=materialize, generation=generation, checksum=checksum
-                )
-            )
-    for resource in tuple(manifest["local"]):
-        target = Path(resource["path"])
-        prefixes: tuple[str, ...]
-        if Path(resource["root"]) == materialize:
-            prefixes = (
-                f".{target.name}.",
-                atomic_copy_temp_prefix(target.name),
-            )
-        else:
-            legacy = (
-                f".{hashlib.sha256(str(snapshot.file_id).encode()).hexdigest()[:24]}."
-                f"{target.name}."
-            )
-            current = atomic_copy_temp_prefix(target.name, owner=str(snapshot.file_id))
-            prefixes = (legacy, "." + legacy, current, "." + current)
-        prefixes = tuple(dict.fromkeys(prefixes))
-        try:
-            with _parent_descriptor(target, Path(resource["root"])) as parent:
-                with os.scandir(parent) as entries:
-                    names = (
-                        entry.name
-                        for entry in entries
-                        if entry.name.startswith(prefixes)
-                        and entry.name.endswith(".tmp")
-                    )
-                    for name in names:
-                        manifest["local"].append(
-                            capture_resource(
-                                target.parent / name,
-                                root=Path(resource["root"]),
-                                generation=generation,
-                            )
-                        )
-        except FileNotFoundError:
-            continue
-        except OSError:
-            resource["uncertain"] = "temporary namespace is unverifiable"
-            continue
+        manifest["uncertain_materialization"] = "materialization checksum unavailable"
+    from .uploaded_file_cleanup_discovery import prepare_discovery
+
+    prepare_discovery(manifest, filename)
     return manifest
 
 
@@ -305,7 +239,7 @@ def validate_configuration(manifest: dict[str, Any]) -> None:
     storage._scoped(manifest["storage_key"], strict=False)
 
 
-def dispose_resource(resource: dict[str, Any]) -> None:
+def dispose_resource(resource: dict[str, Any], *, budget: Any = None) -> None:
     """Quarantine before deleting; an unexpected replacement is never unlinked.
 
     The quarantine locator is already durable. Exit after rename therefore
@@ -342,11 +276,12 @@ def dispose_resource(resource: dict[str, Any]) -> None:
                     "Retained quarantine contains a replacement"
                 )
             if stat.S_ISDIR(info.st_mode):
-                if not shutil.rmtree.avoids_symlink_attacks:
-                    raise CleanupResourceUncertain(
-                        "Directory disposal requires safe rmtree"
-                    )
-                shutil.rmtree(quarantine, dir_fd=parent)
+                from .uploaded_file_cleanup_discovery import (
+                    CleanupWorkBudget,
+                    dispose_directory,
+                )
+
+                dispose_directory(parent, quarantine, budget or CleanupWorkBudget())
             else:
                 if resource.get("checksum"):
                     descriptor = os.open(
@@ -394,42 +329,3 @@ def dispose_resource(resource: dict[str, Any]) -> None:
                     )
         except FileNotFoundError:
             return
-
-
-def capture_previews(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    root = Path(manifest["roots"][2])
-    file_id = manifest["file_id"]
-    if Path(file_id).name != file_id or file_id in {".", ".."}:
-        raise CleanupResourceUncertain("Invalid preview owner identity")
-    resources = []
-    for name in ("pptx_pdf_cache", "svg_png_cache"):
-        directory = root / name
-        try:
-            with _parent_descriptor(directory / "entry", root) as parent:
-                names = os.listdir(parent)
-        except FileNotFoundError:
-            continue
-        for entry in names:
-            owned = (
-                entry == f"{file_id}.preview.pdf"
-                or (
-                    entry.startswith(f"{file_id}.")
-                    and ".preview.png" in entry
-                    and (entry.endswith(".preview.png") or entry.endswith(".tmp"))
-                )
-                or (
-                    entry.startswith(f"{file_id}.preview.pdf.")
-                    and entry.endswith(".tmp")
-                )
-                or entry.startswith(f".{file_id}.preview-")
-            )
-            if owned:
-                resources.append(
-                    capture_resource(
-                        directory / entry,
-                        root=root,
-                        generation=manifest["generation"],
-                        allow_directory=entry.startswith(f".{file_id}.preview-"),
-                    )
-                )
-    return resources
