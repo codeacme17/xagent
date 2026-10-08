@@ -950,9 +950,9 @@ def excel_delete_rows(
     and formatting move with the remaining cells. Pass the same number twice to
     delete a single row, for example ``5`` and ``5``, and pass the whole range
     in one call to delete adjacent rows. Rows below end_row move up, so their
-    numbers change: when deleting several separate rows, delete from the bottom
-    up or re-read the sheet between calls. To delete a row of an Excel table
-    instead, use excel_delete_table_row.
+    numbers change: when deleting several separate rows, delete them from the
+    bottom up (highest row number first), using the row numbers from a single
+    read. To delete a row of an Excel table instead, use excel_delete_table_row.
     """
     try:
         address = _normalize_row_range(start_row, end_row)
