@@ -208,7 +208,7 @@ async def run_uploaded_file_compensation_recovery_loop(
             if result.scanned:
                 logger.info(
                     "Uploaded-file compensation recovery: scanned=%s "
-                    "deleted=%s exists=%s unknown=%s failed=%s yielded=%s",
+                    "deleted=%s exists=%s unknown=%s failed=%s deferred_budget=%s",
                     result.scanned,
                     result.deleted,
                     result.deferred_exists,

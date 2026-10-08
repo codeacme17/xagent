@@ -12,13 +12,13 @@ import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 
 import pytest
 import sqlalchemy as sa
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from tests.web.services.test_complete_upload_cleanup import (
     claim,
@@ -64,29 +64,49 @@ def test_registered_compensation_hands_off_budget_yield_to_recovery(lifecycle):
     assert not converter.exists()
 
 
+@pytest.mark.parametrize("shape", ["files", "directories"])
 def test_converter_disposal_obeys_budgets_and_survives_shared_namespace_mutation(
-    lifecycle, monkeypatch
+    lifecycle, monkeypatch, shape
 ):
     sessions, source, _, previews, _, file_id = lifecycle
-    converter = create_converter_tree(previews, file_id)
+    if shape == "files":
+        converter = create_converter_tree(previews, file_id)
+    else:
+        converter = previews[0].parent / f".{file_id}.preview-abandoned"
+        leaf = converter
+        for _ in range(32):
+            leaf /= "prefix"
+        leaf.mkdir(parents=True)
+        for index in range(200):
+            (leaf / f"empty-{index}").mkdir()
     nested = converter / "nested"
     nested.mkdir()
     external = previews[0].parent.parent / "keep.txt"
     external.write_text("unrelated")
     (nested / "external-link").symlink_to(external)
     converter_inodes = {
-        (info.st_dev, info.st_ino) for info in (converter.stat(), nested.stat())
+        (info.st_dev, info.st_ino)
+        for info in (
+            path.stat()
+            for path in [converter, *converter.rglob("*")]
+            if path.is_dir() and not path.is_symlink()
+        )
     }
     for index in range(600):
         (previews[0].parent / f"unrelated-{index}").touch()
         (source.parent / f"unrelated-{index}").touch()
     deleted = entries = 0
-    original_unlink, original_scandir = os.unlink, os.scandir
+    original_unlink, original_rmdir, original_scandir = os.unlink, os.rmdir, os.scandir
 
     def unlink(*args, **kwargs):
         nonlocal deleted
         deleted += 1
         return original_unlink(*args, **kwargs)
+
+    def rmdir(*args, **kwargs):
+        nonlocal deleted
+        deleted += 1
+        return original_rmdir(*args, **kwargs)
 
     class CountedScan:
         def __init__(self, scan):
@@ -118,10 +138,13 @@ def test_converter_disposal_obeys_budgets_and_survives_shared_namespace_mutation
         raise AssertionError("Unbounded recursive disposal")
 
     monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "rmdir", rmdir)
     monkeypatch.setattr(os, "scandir", scandir)
     monkeypatch.setattr(shutil, "rmtree", forbidden)
     assert collect(lifecycle).deleted == 0
     assert deleted <= 128 and entries <= 256
+    if shape == "directories":
+        assert entries == 256 and deleted < 128
     with sessions() as db:
         row = db.query(UploadedFile).one()
         assert row.cleanup_manifest["done"] == ["durable", "local"]
@@ -256,9 +279,9 @@ def test_converter_replacement_preserves_both_directories(
     converter.mkdir()
     (converter / "original").touch()
     inode = converter.stat().st_ino
-    original_open, original_stat = os.open, os.stat
+    original_open, original_stat, original_unlink = os.open, os.stat, os.unlink
     swapped = False
-    stats = 0
+    drained = False
     original_copy = converter.parent / "original-converter"
     replacement = None
 
@@ -283,26 +306,37 @@ def test_converter_replacement_preserves_both_directories(
             swap(path, parent)
         return original_open(path, flags, *args, **kwargs)
 
+    def unlink(path, *args, **kwargs):
+        nonlocal drained
+        result = original_unlink(path, *args, **kwargs)
+        parent = kwargs.get("dir_fd")
+        if (
+            path == "original"
+            and parent is not None
+            and os.fstat(parent).st_ino == inode
+        ):
+            drained = True
+        return result
+
     def inspect(path, *args, **kwargs):
-        nonlocal stats
         info = original_stat(path, *args, **kwargs)
         parent = kwargs.get("dir_fd")
         if (
             stage == "finish"
+            and drained
             and not swapped
             and parent is not None
             and stat.S_ISDIR(info.st_mode)
             and info.st_ino == inode
             and str(path).startswith(".cleanup-")
         ):
-            stats += 1
-            if stats == 3:
-                swap(path, parent)
-                return original_stat(path, *args, **kwargs)
+            swap(path, parent)
+            return original_stat(path, *args, **kwargs)
         return info
 
     monkeypatch.setattr(os, "open", open_directory)
     monkeypatch.setattr(os, "stat", inspect)
+    monkeypatch.setattr(os, "unlink", unlink)
     assert collect(lifecycle).deleted == 0
     assert swapped
     assert replacement is not None and (replacement / "keep").exists()
@@ -343,12 +377,22 @@ def test_real_v1_captured_temps_preserve_receipts(lifecycle, done):
         manifest["done"] = done
         row.cleanup_manifest = manifest
         row.updated_at = datetime.now(UTC)
+    if "local" in done:
+        for path in temps:
+            path.write_text("replacement after local receipt")
     assert recover(lifecycle).deleted == 1
     completed(lifecycle)
-    assert not any(path.exists() for path in temps)
+    if "local" in done:
+        assert all(
+            path.read_text() == "replacement after local receipt" for path in temps
+        )
+    else:
+        assert not any(path.exists() for path in temps)
 
 
-def test_abandoned_v2_proposal_is_retained_without_reinterpreting_evidence(lifecycle):
+def test_unknown_manifest_version_is_retained_without_reinterpreting_evidence(
+    lifecycle,
+):
     sessions, source, _, previews, _, _ = lifecycle
     claim(lifecycle)
     with sessions.begin() as db:
@@ -390,8 +434,10 @@ def test_overlapping_workers_wait_for_disposal_and_keep_sql_reference_locks_free
     converter = create_converter_tree(previews, file_id)
     inode = converter.stat().st_ino
     candidate, token = claim(lifecycle)
-    entered, proceed, attempted = Event(), Event(), Event()
+    entered, proceed, contended = Event(), Event(), Event()
     original = os.scandir
+    original_acquire = FileLock.acquire
+    second_thread = None
     engine = sessions.kw["bind"]
     checked_out = 0
 
@@ -402,6 +448,17 @@ def test_overlapping_workers_wait_for_disposal_and_keep_sql_reference_locks_free
     def returned(*_args):
         nonlocal checked_out
         checked_out -= 1
+
+    def acquire(lock, *args, **kwargs):
+        if get_ident() == second_thread and lock.lock_file.endswith(".cleanup.lock"):
+            try:
+                with original_acquire(lock, timeout=0):
+                    raise AssertionError(
+                        "Second worker acquired the active cleanup lock"
+                    )
+            except Timeout:
+                contended.set()
+        return original_acquire(lock, *args, **kwargs)
 
     def blocked(path):
         if (
@@ -421,6 +478,7 @@ def test_overlapping_workers_wait_for_disposal_and_keep_sql_reference_locks_free
         return original(path)
 
     monkeypatch.setattr(os, "scandir", blocked)
+    monkeypatch.setattr(FileLock, "acquire", acquire)
     sa.event.listen(engine, "checkout", checkout)
     sa.event.listen(engine, "checkin", returned)  # codespell:ignore checkin
 
@@ -437,7 +495,8 @@ def test_overlapping_workers_wait_for_disposal_and_keep_sql_reference_locks_free
         )
 
     def second():
-        attempted.set()
+        nonlocal second_thread
+        second_thread = get_ident()
         return recover(lifecycle)
 
     try:
@@ -448,7 +507,7 @@ def test_overlapping_workers_wait_for_disposal_and_keep_sql_reference_locks_free
                     first_worker.result(timeout=10)
                     raise AssertionError("First worker did not enter disposal")
                 second_worker = pool.submit(second)
-                assert attempted.wait(10)
+                assert contended.wait(10)
                 assert not second_worker.done()
             finally:
                 proceed.set()

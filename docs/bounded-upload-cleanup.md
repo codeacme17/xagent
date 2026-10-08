@@ -24,11 +24,13 @@ Durable, local and preview receipts retain their existing order. Settlement
 requires every receipt; a partial converter tree cannot authorize a preview
 receipt or row removal.
 
-Each activation adds optional `disposal_positions` to the version 1 manifest and
-marks completed resources `disposed`. Positions advance only after successful
-resource disposal. Budget exhaustion commits the completed prefix and returns
-`yielded`, leaving the claimed row unavailable and recoverable. A resource's
-quarantine locator is durable before its original path is renamed.
+Each activation adds optional `disposal_positions` to the version 1 manifest.
+The position for a phase advances only after successful resource disposal and is
+the authoritative completed prefix. Budget exhaustion commits that prefix and
+returns `yielded`, leaving the claimed row unavailable and recoverable. Old
+version 1 manifests that contain per-resource `disposed` fields remain valid;
+the fields are harmless and ignored. A resource's quarantine locator is durable
+before its original path is renamed.
 
 ## Disposal budgets
 
@@ -58,8 +60,21 @@ Compensation recovery counts `yielded` as `deferred_budget`, separately from
 uncertainty failures. Registered-upload rollback treats a committed budget yield
 as handoff to recovery and does not report a durable-storage double fault.
 `exists`, `unknown`, `pending` and actual operation errors keep their existing
-failure contracts. Recovery cadence, stale-claim delay and cursor are unchanged;
-2C-2 owns detached/task-less scheduling.
+failure contracts.
+
+The default recovery cadence still uses a 300-second stale window and a
+60-second poll. A takeover writes a current claim token, and a budget yield saves
+that token, so the next activation normally waits for the token to become stale
+again. The initial activation is often immediate. With fast local I/O, `K`
+activations therefore spend roughly `(K - 1) * 300` seconds waiting for stale
+eligibility, plus polling alignment, queue backlog and I/O. This is not a hard
+completion bound, and the final activation settles immediately rather than
+waiting through another stale window. A converter with mostly regular files
+needs about four activations for 400 files and eight for 1,000 files: roughly 15
+and 35 minutes of stale-window waiting respectively, before the additional
+factors above. [#2891](https://github.com/xorbitsai/xagent/issues/2891) tracks
+prompt rescheduling after `yielded` as a later 2C-2 enhancement; this PR does not
+change scheduler behavior or add scheduling state.
 
 A failed progress commit leaves the previous SQL obligations intact. Retry can
 revisit absent resources or partially reduced quarantines using their original
@@ -102,11 +117,12 @@ resource roots, coordination directory and effective OS file-lock semantics.
 Older 2B workers understand version 1 evidence but do not enforce the new budgets;
 consistent disposal limits require updating every cleanup/recovery worker.
 
-If an experimental deployment ran the earlier unmerged `cdd26e31` proposal,
-quiesce writers and drain/reconcile its version **2** claims with that compatible
-worker before switching. This narrowed implementation retains version 2 claims
-as pending; it never strips their discovery obligations or treats them as version
-1. Preserve those handles until their outstanding work has been accounted for.
+Before replacing any experimental or separately deployed worker that wrote an
+unsupported manifest version, quiesce writers and drain or reconcile those
+claims with a worker compatible with that version. This implementation retains
+unsupported versions as pending; it never strips unknown obligations or treats
+them as version 1. Preserve those handles until their outstanding work has been
+accounted for.
 
 Rolling back to 2B preserves version 1 obligations and captured ownership, but
 returns to unbounded disposal. Quiesce active workers before changing versions;
