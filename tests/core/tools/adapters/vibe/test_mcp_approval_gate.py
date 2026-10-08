@@ -1114,6 +1114,11 @@ async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
 
     task = asyncio.ensure_future(run())
     await started.wait()
+    # Let the gate arm its observation deadline before the half-budget sleep
+    # starts (it needs 2 loop iterations; 3 keep one spare), so a stall can
+    # only shrink the drain budget.
+    for _ in range(3):
+        await asyncio.sleep(0)
     # Let the observation wait consume roughly half its budget before the
     # external cancellation arrives - the shape that used to restart it.
     await asyncio.sleep(dispatch_observe_seconds / 2)

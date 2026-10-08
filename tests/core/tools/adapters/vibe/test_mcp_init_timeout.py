@@ -437,7 +437,13 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
 
     assert client.aclose_calls == 1
     _assert_reaper_waited_out_grace(ended_after, grace)
-    await _wait_until_no_new_reapers(reapers_before)
+    # The reaper leaves _RECLAIM_TASKS 2 loop iterations after this test's own
+    # asyncio.wait on the load returns (both wait on the same task); 3 yields
+    # keep one spare. Iteration-based, not wall-clock: a reaper that lingers
+    # after its force-close fails this.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
 
 
@@ -491,7 +497,13 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     assert calls["n"] == 1  # zero new attempts
     assert [c.aclose_calls for c in counts["clients"]] == [1]  # force-closed
     _assert_reaper_waited_out_grace(ended_after, grace)
-    await _wait_until_no_new_reapers(reapers_before)
+    # The reaper leaves _RECLAIM_TASKS 2 loop iterations after this test's own
+    # asyncio.wait on the load returns (both wait on the same task); 3 yields
+    # keep one spare. Iteration-based, not wall-clock: a reaper that lingers
+    # after its force-close fails this.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
     assert _still_alive_warnings(caplog.records) == []
 
