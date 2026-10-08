@@ -11,18 +11,15 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.core.RAG_tools.storage.file_reference import file_cleanup_lock
 from ..models.uploaded_file import UploadedFile
-from .uploaded_file_cleanup_discovery import (
+from .uploaded_file_cleanup_disposal import (
     CleanupBudgetExhausted,
     CleanupWorkBudget,
-    advance_discovery,
-    close_discovery_streams,
-    dispose_resource_page,
-    prepare_discovery,
-    validate_local_evidence,
 )
 from .uploaded_file_cleanup_resources import (
     CleanupResourceUncertain,
     build_cleanup_manifest,
+    capture_previews,
+    dispose_resource,
     validate_configuration,
 )
 
@@ -34,15 +31,8 @@ CLEANUP_PHASES = ("durable", "local", "previews")
 def cleanup_complete(manifest: Any) -> bool:
     return bool(
         isinstance(manifest, dict)
-        and manifest.get("version") in {1, 2}
+        and manifest.get("version") == 1
         and all(phase in manifest.get("done", []) for phase in CLEANUP_PHASES)
-        and (
-            manifest["version"] == 1
-            or all(
-                manifest.get("discovery", {}).get(phase, {}).get("complete")
-                for phase in ("local", "previews", "preview_check")
-            )
-        )
     )
 
 
@@ -110,7 +100,7 @@ def run_uploaded_file_cleanup(
                 return "stale"
         try:
             if (
-                manifest.get("version") not in {1, 2}
+                manifest.get("version") != 1
                 or manifest.get("file_id") != file_id
                 or manifest.get("user_id") != user_id
                 or manifest.get("storage_key") != storage_key
@@ -119,11 +109,10 @@ def run_uploaded_file_cleanup(
                     "Cleanup manifest identity does not match its claim"
                 )
             validate_configuration(manifest)
-            prepare_discovery(manifest, snapshot.filename)
             budget = CleanupWorkBudget()
 
             def save_progress() -> bool:
-                saved = _save_manifest(
+                return _save_manifest(
                     session_factory,
                     row_id,
                     user_id,
@@ -133,18 +122,19 @@ def run_uploaded_file_cleanup(
                     token,
                     manifest,
                 )
-                if not saved:
-                    close_discovery_streams(manifest["generation"])
-                return saved
 
-            validate_local_evidence(manifest)
-            if not manifest["discovery"]["local"]["complete"]:
-                advance_discovery(manifest, "local", budget)
-                if not save_progress():
-                    return "stale"
-                if not manifest["discovery"]["local"]["complete"]:
-                    return "yielded"
-            validate_local_evidence(manifest)
+            # Retain the object when captured evidence already needs reconciliation.
+            if "local" not in manifest["done"]:
+                uncertainty = manifest.get("uncertain_materialization") or next(
+                    (
+                        resource["uncertain"]
+                        for resource in manifest["local"]
+                        if resource.get("uncertain")
+                    ),
+                    None,
+                )
+                if uncertainty:
+                    raise CleanupResourceUncertain(uncertainty)
             for phase in CLEANUP_PHASES:
                 if phase in manifest["done"]:
                     continue
@@ -154,52 +144,32 @@ def run_uploaded_file_cleanup(
                     )
                     if presence != "absent":
                         return "exists" if presence == "exists" else "unknown"
+                elif phase == "local":
+                    _dispose_resource_page(manifest, phase, budget)
                 else:
-                    if (
-                        phase == "previews"
-                        and not manifest["discovery"][phase]["complete"]
-                    ):
-                        advance_discovery(manifest, phase, budget)
+                    if manifest["previews"] is None:
+                        manifest["previews"] = capture_previews(manifest)
                         if not save_progress():
                             return "stale"
-                        if not manifest["discovery"][phase]["complete"]:
-                            return "yielded"
-                    dispose_resource_page(manifest, phase, budget)
-                    if phase == "previews":
-                        advance_discovery(manifest, "preview_check", budget)
-                        if not save_progress():
-                            return "stale"
-                        if not manifest["discovery"]["preview_check"]["complete"]:
-                            return "yielded"
-                        if manifest["preview_check"]:
-                            raise CleanupResourceUncertain(
-                                "Owned previews remain after disposal"
-                            )
+                    _dispose_resource_page(manifest, phase, budget)
+                    # Producers hold the same execution guard and cannot publish
+                    # another preview between this check and settlement.
+                    if capture_previews(manifest):
+                        raise CleanupResourceUncertain(
+                            "Owned previews remain after disposal"
+                        )
                 manifest["done"].append(phase)
-                if not _save_manifest(
-                    session_factory,
-                    row_id,
-                    user_id,
-                    file_id,
-                    task_id,
-                    storage_key,
-                    token,
-                    manifest,
-                ):
+                if not save_progress():
                     return "stale"
         except CleanupBudgetExhausted:
             if not save_progress():
                 return "stale"
             return "yielded"
         except (CleanupResourceUncertain, OSError):
-            close_discovery_streams(manifest["generation"])
             logger.warning(
                 "Upload cleanup needs reconciliation for %s", file_id, exc_info=True
             )
             return "pending"
-        except BaseException:
-            close_discovery_streams(manifest["generation"])
-            raise
         with session_factory() as db:
             result = settle_uploaded_file_compensation_no_commit(
                 db,
@@ -215,6 +185,23 @@ def run_uploaded_file_cleanup(
                 return "stale"
             db.commit()
             return "deleted"
+
+
+def _dispose_resource_page(
+    manifest: dict[str, Any], phase: str, budget: CleanupWorkBudget
+) -> None:
+    """Advance a durable prefix through the resources captured for one phase."""
+    positions = manifest.setdefault("disposal_positions", {})
+    position = positions.get(phase, 0)
+    resources = manifest[phase] or []
+    while position < len(resources):
+        budget.consume_disposal()
+        resource = resources[position]
+        if not resource.get("disposed"):
+            dispose_resource(resource, budget=budget)
+            resource["disposed"] = True
+        position += 1
+        positions[phase] = position
 
 
 def _claim_query(
