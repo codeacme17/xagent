@@ -289,3 +289,68 @@ async def test_bare_grant_stays_connected_where_the_policy_does_not_apply(
     assert response.connected_account == "microsoft@example.com"
 
     assert (await _runtime_config(db, user))["transport"] == "stdio"
+
+
+@pytest.mark.asyncio
+async def test_another_users_bare_grant_is_not_the_requesting_users_connection(
+    db_session,
+):
+    """Bob's bare grant must not turn alice's grant-less row into "reconnect".
+    Guards the user scoping of the rejected-grant lookup on both surfaces."""
+    db, alice = db_session
+    bob = User(username="bob", password_hash="x", is_admin=False)
+    db.add(bob)
+    db.commit()
+    db.refresh(bob)
+
+    _builtin_app(db, "onedrive")
+    server = _connect(db, alice, "onedrive")
+    db.add(
+        UserOAuth(
+            user_id=bob.id,
+            provider="microsoft",
+            provider_user_id="microsoft-bob",
+            access_token="bob-token",
+            email="bob@example.com",
+        )
+    )
+    db.commit()
+
+    assert _catalog_entry(db, alice, "onedrive")["is_connected"] is False
+
+    response = _server_listing(db, alice, server)
+    assert response.connection_status is None
+    assert response.connected_account is None
+
+    _assert_credential_unavailable(
+        await _runtime_config(db, alice), message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "grant_order", [("onedrive", "microsoft"), ("microsoft", "onedrive")]
+)
+async def test_cleared_app_scoped_grant_beside_a_bare_grant_keeps_the_generic_state(
+    db_session, grant_order
+):
+    """The app-scoped grant is the accepted one even when its token was cleared,
+    so the user does have a grant for this app. The provider-level reconnect
+    hint only applies when no accepted grant exists."""
+    db, user = db_session
+    _builtin_app(db, "onedrive")
+    server = _connect(db, user, "onedrive", *grant_order)
+    db.query(UserOAuth).filter(UserOAuth.provider == "onedrive").update(
+        {"access_token": "", "refresh_token": None}
+    )
+    db.commit()
+
+    assert _catalog_entry(db, user, "onedrive")["is_connected"] is False
+
+    response = _server_listing(db, user, server)
+    assert response.connection_status == "needs_reconnect"
+    assert response.connected_account is None
+
+    _assert_credential_unavailable(
+        await _runtime_config(db, user), message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE
+    )

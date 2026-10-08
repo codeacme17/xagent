@@ -14,7 +14,7 @@ import os
 import random
 import re
 import shlex
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -4118,7 +4118,6 @@ class WebToolConfig(BaseToolConfig):
             )
 
         oauth_db = self._new_legacy_oauth_session()
-        policy_rejected_grant_present = False
         try:
             if app_id:
                 # A bare provider-level grant (e.g. UserOAuth.provider ==
@@ -4156,7 +4155,7 @@ class WebToolConfig(BaseToolConfig):
                     rejected_keys = oauth_grant_keys_rejected_by_app_scope(
                         policy_app, provider_candidates
                     )
-                    policy_rejected_grant_present = bool(rejected_keys) and (
+                    rejected_grant_present = bool(rejected_keys) and (
                         scoped_user_oauth_query(
                             oauth_db,
                             user_id=user_id,
@@ -4165,6 +4164,12 @@ class WebToolConfig(BaseToolConfig):
                         .filter(UserOAuth.provider.in_(rejected_keys))
                         .first()
                         is not None
+                    )
+                    # The finish helper's no-account result, plus whether a
+                    # grant the policy rejected exists.
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        policy_rejected_grant_present=rejected_grant_present,
                     )
             else:
                 oauth_account = (
@@ -4186,16 +4191,13 @@ class WebToolConfig(BaseToolConfig):
                     oauth_account is not None,
                 )
 
-            resolution = await self._finish_legacy_oauth_access_token_resolution(
+            return await self._finish_legacy_oauth_access_token_resolution(
                 oauth_db=oauth_db,
                 oauth_account=oauth_account,
                 provider_name=provider_name,
                 user_id=user_id,
                 resource_owner_key=None,
             )
-            if policy_rejected_grant_present:
-                resolution = replace(resolution, policy_rejected_grant_present=True)
-            return resolution
         except Exception:
             oauth_db.rollback()
             raise
