@@ -432,6 +432,7 @@ _CALLER_VISIBLE_ITEM = {
     "id": "item-1",
     "name": "report.pdf",
     "remoteItem": {"id": "remote-1"},
+    "children": [{"id": "child-1"}],
 }
 
 
@@ -446,6 +447,8 @@ def _signed_drive_item() -> dict:
         ),
         "@Content.DownloadURL": _SIGNED_URL,
         "remoteItem": {"id": "remote-1", "@microsoft.graph.downloadUrl": _SIGNED_URL},
+        # A list nested inside a dict is scrubbed too.
+        "children": [{"id": "child-1", "@microsoft.graph.downloadUrl": _SIGNED_URL}],
     }
 
 
@@ -473,12 +476,21 @@ def test_caller_safe_drive_item_drops_every_download_url_field():
             "items",
         ),
         (
+            lambda: sharepoint.sharepoint_search_files("root", "report"),
+            {"value": [_signed_drive_item()]},
+            "items",
+        ),
+        (
             lambda: sharepoint.sharepoint_upload_text_file("root", "notes.txt", "hi"),
             _signed_drive_item(),
             "item",
         ),
     ],
-    ids=["sharepoint_list_items", "sharepoint_upload_text_file"],
+    ids=[
+        "sharepoint_list_items",
+        "sharepoint_search_files",
+        "sharepoint_upload_text_file",
+    ],
 )
 def test_drive_item_tools_omit_download_urls(monkeypatch, call, payload, field):
     monkeypatch.setattr(

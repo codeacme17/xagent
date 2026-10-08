@@ -3262,6 +3262,8 @@ def _signed_drive_item(item_id: str = "item-1") -> dict:
         # The match is case-insensitive; pin that with an off-case variant.
         "@Content.DownloadURL": _SIGNED_URL,
         "remoteItem": {"id": "remote-1", "@microsoft.graph.downloadUrl": _SIGNED_URL},
+        # A list nested inside a dict is scrubbed too.
+        "children": [{"id": "child-1", "@microsoft.graph.downloadUrl": _SIGNED_URL}],
     }
 
 
@@ -3273,6 +3275,7 @@ def _caller_visible_item(item_id: str = "item-1") -> dict:
         "file": {"mimeType": "application/octet-stream"},
         "parentReference": {"driveId": "drive-1", "path": "/drive/root:"},
         "remoteItem": {"id": "remote-1"},
+        "children": [{"id": "child-1"}],
     }
 
 
@@ -3313,6 +3316,27 @@ def test_listing_tools_omit_download_urls(monkeypatch, call):
     result = _assert_no_download_urls(call())
 
     assert result["items"] == [_caller_visible_item("a"), _caller_visible_item("b")]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: onedrive.onedrive_list_items(),
+        lambda: onedrive.onedrive_search_files("report"),
+    ],
+    ids=["onedrive_list_items", "onedrive_search_files"],
+)
+def test_listing_tools_keep_null_value_as_null_items(monkeypatch, call):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"value": None})),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "success"
+    assert result["items"] is None
 
 
 @pytest.mark.parametrize(
