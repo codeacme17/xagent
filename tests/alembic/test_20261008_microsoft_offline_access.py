@@ -187,7 +187,17 @@ def test_offline_sqlite_upgrade_round_trips_scopes() -> None:
     )
     connection.executemany(
         "INSERT INTO public_mcp_apps VALUES (?, 'microsoft', ?)",
-        [(app_id, json.dumps(scopes)) for app_id, scopes in OLD_SCOPES.items()],
+        [
+            (app_id, json.dumps(scopes))
+            for app_id, scopes in OLD_SCOPES.items()
+            if app_id != "sharepoint"
+        ],
+    )
+    # app_id is unique, so a custom row squatting a builtin app_id takes the
+    # place of that builtin row rather than sitting beside it.
+    connection.execute(
+        "INSERT INTO public_mcp_apps VALUES "
+        "('sharepoint', 'custom-idp', '[\"custom-scope\"]')"
     )
     connection.executescript(output.getvalue())
     scopes = {
@@ -198,7 +208,7 @@ def test_offline_sqlite_upgrade_round_trips_scopes() -> None:
     }
     connection.close()
 
-    assert scopes == NEW_SCOPES
+    assert scopes == {**NEW_SCOPES, "sharepoint": ["custom-scope"]}
 
 
 def test_offline_postgresql_upgrade_contains_only_literal_updates() -> None:
@@ -215,6 +225,8 @@ def test_offline_postgresql_upgrade_contains_only_literal_updates() -> None:
     sql = output.getvalue()
     assert sql.count("UPDATE public_mcp_apps SET") == len(OLD_SCOPES)
     assert sql.count("offline_access") == len(OLD_SCOPES)
+    assert sql.count("provider_name = 'microsoft'") == len(OLD_SCOPES)
+    assert sql.count("CAST(") == len(OLD_SCOPES)
     assert "%(" not in sql
 
 
