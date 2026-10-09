@@ -907,8 +907,10 @@ def _resolve_upload_file_path(file_path: str) -> Path:
         )
         raise PermissionError(
             "file path is outside the allowed directories; pass an absolute "
-            "path inside the task workspace, or pass a registered file as "
-            "file:<file_id>"
+            "path inside the task workspace, or, if this tool's description "
+            "says a registered file_id may be supplied, pass the xagent "
+            "file_id as file:<file_id> (from list_all_user_files or a file "
+            "reference; not a Google Drive file id)"
         )
 
     if not local_path.is_file():
