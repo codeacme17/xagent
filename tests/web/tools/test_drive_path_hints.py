@@ -31,13 +31,15 @@ class _Response:
         self.headers = {}
 
     def json(self):
-        return self._payload
+        # Like requests: a non-JSON body raises ValueError.
+        return json.loads(self.content)
 
     def raise_for_status(self):
         if self.status_code >= 400:
+            # requests puts the final URL in its own message. After a /content
+            # redirect that URL is the preauthenticated one.
             raise requests.HTTPError(
-                f"{self.status_code} Client Error: Error for url: "
-                "https://graph.microsoft.com/v1.0/me/drive",
+                f"{self.status_code} Client Error: Error for url: {_SECRET_URL}",
                 response=self,
             )
 
@@ -93,6 +95,61 @@ def test_onedrive_path_lookup_miss_explains_how_to_find_the_path(monkeypatch, ca
     assert "itemNotFound" in result["message"]
     _assert_path_hint(result["message"])
     assert "SECRETVALUE" not in result["message"]
+
+
+def test_onedrive_non_json_path_miss_still_gets_the_hint(monkeypatch):
+    _patch_onedrive(
+        monkeypatch,
+        _Response(status_code=404, content=f"<html>{_SECRET_URL}</html>".encode()),
+    )
+
+    result = json.loads(onedrive.onedrive_get_item(path="Documents/deck.pptx"))
+
+    assert result["status"] == "error"
+    _assert_path_hint(result["message"])
+    assert "SECRETVALUE" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: onedrive.onedrive_get_item(path="Documents/deck.pptx"),
+        lambda: onedrive.onedrive_download_file("Documents/deck.pptx"),
+        lambda: powerpoint.powerpoint_list_slides("Documents/deck.pptx"),
+    ],
+    ids=["onedrive_get_item", "onedrive_download_file", "powerpoint_list_slides"],
+)
+def test_a_404_that_is_not_item_not_found_gets_no_path_hint(
+    monkeypatch, tmp_path, call
+):
+    # e.g. a drive that does not exist: the path is not what is wrong.
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(tmp_path))
+    _patch_onedrive(monkeypatch, _graph_error(404, "ResourceNotFound"))
+    _patch_powerpoint(monkeypatch, _graph_error(404, "ResourceNotFound"))
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "HTTP 404" in result["message"]
+    assert "relative to the drive root" not in result["message"]
+
+
+def test_graph_request_adds_the_hint_only_for_an_opted_in_path_lookup(monkeypatch):
+    # Internal lookups that expect a 404 (e.g. _current_upload_item probing an
+    # upload target) must not build the hint.
+    _patch_onedrive(
+        monkeypatch,
+        _graph_error(404, "itemNotFound"),
+        _graph_error(404, "itemNotFound"),
+    )
+
+    with pytest.raises(onedrive._GraphRequestError) as plain:
+        onedrive._graph_request("GET", "/me/drive/root:/a.txt:")
+    with pytest.raises(onedrive._GraphRequestError) as lookup:
+        onedrive._graph_request("GET", "/me/drive/root:/a.txt:", path_lookup=True)
+
+    assert "relative to the drive root" not in str(plain.value)
+    _assert_path_hint(str(lookup.value))
 
 
 def test_onedrive_download_metadata_miss_explains_how_to_find_the_path(

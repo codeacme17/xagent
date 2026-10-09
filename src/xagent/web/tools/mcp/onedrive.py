@@ -598,7 +598,14 @@ def _graph_request(
     extra_headers: dict[str, str] | None = None,
     raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    path_lookup: bool = False,
 ) -> Any:
+    """Send one Graph request.
+
+    path_lookup marks a request whose drive path the agent supplied and which
+    must already exist (a lookup, or the parent of a new folder); only then
+    does a missing item get _PATH_NOT_FOUND_HINT.
+    """
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
@@ -619,14 +626,7 @@ def _graph_request(
         message = f"Graph {method} {path} failed with HTTP {response.status_code}"
         if code:
             message = f"{message} ({code})"
-        # Only a lookup, or a create under a parent folder that must already
-        # exist. A content PUT or upload session targets a path that need not
-        # exist yet, so its 404 is not reported as a wrong path.
-        if (
-            response.status_code == 404
-            and path.startswith("/me/drive/root:/")
-            and (method == "GET" or path.endswith(":/children"))
-        ):
+        if path_lookup and _is_path_miss(response.status_code, code):
             message = f"{message}. {_PATH_NOT_FOUND_HINT}"
         raise _GraphRequestError(message, response.status_code, code) from exc
 
@@ -635,6 +635,14 @@ def _graph_request(
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _is_path_miss(status_code: int, code: str | None) -> bool:
+    """Whether a 404 says the item is missing, rather than e.g. the drive.
+
+    A body without a parsable Graph code is still treated as a miss.
+    """
+    return status_code == 404 and code in (None, "itemNotFound")
 
 
 def _graph_error_code(response: Any) -> str | None:
@@ -1249,6 +1257,7 @@ def onedrive_list_items(
             "GET",
             _children_path(folder_path),
             params={"$top": max(1, min(top, 200))},
+            path_lookup=True,
         )
         return _success(items=_caller_safe_drive_item(result.get("value", [])))
     except Exception as e:
@@ -1295,7 +1304,7 @@ def onedrive_get_item(
                 f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             )
         elif path:
-            result = _graph_request("GET", _item_path(path))
+            result = _graph_request("GET", _item_path(path), path_lookup=True)
         else:
             raise ValueError("either path or item_id is required")
         return _success(item=_caller_safe_drive_item(result))
@@ -1308,7 +1317,9 @@ def onedrive_get_item(
 def onedrive_get_file_content(file_path: _DriveFilePath) -> str:
     """Read text content by path; use onedrive_download_file for binaries."""
     try:
-        content = _graph_request("GET", _content_path(file_path), raw=True)
+        content = _graph_request(
+            "GET", _content_path(file_path), raw=True, path_lookup=True
+        )
         text_content, base64_content = _decode_bytes(content)
         return _success(
             file_path=file_path,
@@ -1339,6 +1350,7 @@ def onedrive_download_file(file_path: _DriveFilePath, filename: str = "") -> str
             "GET",
             _item_path(file_path),
             params={"$select": "id,name,size,file,@microsoft.graph.downloadUrl"},
+            path_lookup=True,
         )
         if (
             not isinstance(metadata, dict)
@@ -1408,7 +1420,7 @@ def onedrive_download_file(file_path: _DriveFilePath, filename: str = "") -> str
             # Only the metadata lookup by path goes through _graph_request
             # here; a failed content stream raises a plain RuntimeError.
             public_message = f"OneDrive file download failed with HTTP {e.status_code}"
-            if e.status_code == 404:
+            if _is_path_miss(e.status_code, e.code):
                 public_message = f"{public_message}. {_PATH_NOT_FOUND_HINT}"
         elif raw_message.startswith(
             (
@@ -1627,6 +1639,7 @@ def onedrive_create_folder(
                 "folder": {},
                 "@microsoft.graph.conflictBehavior": normalized_behavior,
             },
+            path_lookup=True,
         )
         return _success(folder=_caller_safe_drive_item(result))
     except Exception as e:

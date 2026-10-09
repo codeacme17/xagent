@@ -98,11 +98,14 @@ _DEFAULT_SLIDE_LAYOUT_INDEX = 1
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure that keeps its status and parsed Graph error code."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
+    def __init__(
+        self, message: str, *, status_code: int, code: str | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 class _ConflictError(RuntimeError):
@@ -380,9 +383,13 @@ def _graph_request(
             code = error.get("code") if isinstance(error, dict) else None
         except (ValueError, TypeError):
             code = None
-        if isinstance(code, str) and code:
+        if not isinstance(code, str) or not code:
+            code = None
+        if code:
             message = f"{message} ({code})"
-        raise _GraphRequestError(message, status_code=response.status_code) from None
+        raise _GraphRequestError(
+            message, status_code=response.status_code, code=code
+        ) from None
 
     if response.status_code == 204 or not response.content:
         return {}
@@ -497,9 +504,11 @@ def _presentation_metadata(
             },
         )
     except _GraphRequestError as exc:
-        if exc.status_code == 404:
+        # itemNotFound, or no parsable code: the item is missing. Any other
+        # 404 code (e.g. the drive itself) is not a wrong file_path.
+        if exc.status_code == 404 and exc.code in (None, "itemNotFound"):
             raise _GraphRequestError(
-                f"{exc}. {_PATH_NOT_FOUND_HINT}", status_code=404
+                f"{exc}. {_PATH_NOT_FOUND_HINT}", status_code=404, code=exc.code
             ) from None
         raise
     if not isinstance(item, dict) or not item.get("id"):
