@@ -231,6 +231,85 @@ def test_unknown_item_or_destination_fails_before_any_change(
     assert graph.patches == []
 
 
+@pytest.mark.parametrize(
+    ("denied", "field"),
+    [("file-1", "item_id"), ("folder-b", "destination_folder_id")],
+)
+def test_inaccessible_item_or_destination_fails_before_any_change(
+    monkeypatch, denied, field
+):
+    items = {"file-1": _file(), "folder-b": _folder()}
+    items[denied] = _Response({"error": {"code": "accessDenied"}}, 403)
+    graph = _install(monkeypatch, _FakeGraph(items))
+
+    result = _move("file-1", "folder-b")
+
+    assert result["status"] == "error"
+    assert field in result["message"]
+    assert "permission" in result["message"]
+    assert graph.patches == []
+
+
+def test_item_gone_by_the_time_of_the_move_reports_a_clear_error(monkeypatch):
+    _install(
+        monkeypatch,
+        _FakeGraph(
+            {"file-1": _file(), "folder-b": _folder()},
+            patch_response=_Response({"error": {"code": "itemNotFound"}}, 404),
+        ),
+    )
+
+    result = _move("file-1", "folder-b")
+
+    assert result["status"] == "error"
+    assert "no longer exists" in result["message"]
+
+
+@pytest.mark.parametrize("side", ["source", "destination"])
+def test_missing_drive_id_does_not_block_the_move(monkeypatch, side):
+    """The cross-drive check only clarifies Graph's own refusal, so it is
+    skipped when either item leaves driveId out."""
+    items = {"file-1": _file(), "folder-b": _folder()}
+    key = "file-1" if side == "source" else "folder-b"
+    del items[key]["parentReference"]["driveId"]
+    graph = _install(monkeypatch, _FakeGraph(items))
+
+    result = _move("file-1", "folder-b")
+
+    assert result["status"] == "success"
+    assert len(graph.patches) == 1
+
+
+def test_ids_that_resolve_to_the_same_item_are_a_self_move(monkeypatch):
+    """Ids that differ only in case pass the raw-equality pre-check, so the
+    check on the resolved ids is what refuses them."""
+    graph = _install(
+        monkeypatch,
+        _FakeGraph({"FILE-1": _folder("file-1"), "file-1": _folder("file-1")}),
+    )
+
+    result = _move("FILE-1", "file-1")
+
+    assert result["status"] == "error"
+    assert "itself" in result["message"]
+    assert len(graph.calls) == 2
+    assert graph.patches == []
+
+
+@pytest.mark.asyncio
+async def test_move_item_is_registered_with_an_optional_new_name():
+    tools = {tool.name: tool for tool in await onedrive.mcp.list_tools()}
+
+    schema = tools["onedrive_move_item"].inputSchema
+    assert set(schema["properties"]) == {
+        "item_id",
+        "destination_folder_id",
+        "new_name",
+    }
+    assert sorted(schema["required"]) == ["destination_folder_id", "item_id"]
+    assert schema["properties"]["new_name"]["default"] == ""
+
+
 def test_destination_that_is_a_file_is_rejected(monkeypatch):
     graph = _install(
         monkeypatch,
