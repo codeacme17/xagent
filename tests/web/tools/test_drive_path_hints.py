@@ -339,6 +339,14 @@ def test_onedrive_search_hit_gets_no_hint(monkeypatch):
     assert result == {"status": "success", "items": [item]}
 
 
+async def test_onedrive_search_description_points_at_listing_the_folder():
+    tools = {tool.name: tool for tool in await onedrive.mcp.list_tools()}
+    description = tools["onedrive_search_files"].description
+
+    assert "can miss" in description
+    assert "onedrive_list_items" in description
+
+
 async def test_onedrive_download_prefers_editing_office_files_in_place():
     # In #2875 the agent downloaded a deck and edited a local copy instead of
     # calling the PowerPoint connector on the drive path it had just used.
