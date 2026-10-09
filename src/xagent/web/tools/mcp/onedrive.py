@@ -869,9 +869,9 @@ def _resolve_upload_file_path(local_file_path: str) -> Path:
             ", ".join(str(path) for path in allowed_dirs),
         )
         raise PermissionError(
-            "local_file_path is outside the allowed upload directories; ask the "
-            "user for a file inside the task workspace or another allowed "
-            "location"
+            "local_file_path is outside the allowed upload directories; pass "
+            "an absolute path inside the task workspace, or pass a registered "
+            "file as file:<file_id>"
         )
 
     if local_path.exists() and not local_path.is_file():
