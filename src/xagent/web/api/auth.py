@@ -4679,7 +4679,13 @@ def generic_oauth_callback(
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present
             actual_url = userinfo_url.replace("{{access_token}}", access_token)
-            info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
+            info_get_kwargs: dict[str, Any] = {}
+            if bound_account is not None:
+                # A redirect would skip the account host's private-network check.
+                info_get_kwargs["allow_redirects"] = False
+            info_response = requests.get(
+                actual_url, headers=info_headers, timeout=10.0, **info_get_kwargs
+            )
             if info_response.status_code != 200:
                 # A non-200 userinfo response (401/403/429/5xx -- an
                 # expired/insufficiently-scoped token, or the provider's
@@ -4755,6 +4761,24 @@ def generic_oauth_callback(
                 )
             provider_user_id = info_data.get(db_provider.user_id_path or "id")
             email = info_data.get(db_provider.email_path or "email")
+
+        if bound_account is not None and not provider_user_id:
+            # Fail closed before any write: an account-bound grant without an
+            # identity could not be told apart from another account's.
+            _log_oauth_callback_rejection(
+                provider,
+                "account_identity_missing",
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error verifying the connected account</h1>"
+                    f"<p>{html.escape(provider)} did not return an account "
+                    "identity.</p>"
+                ),
+                status_code=400,
+            )
 
         if is_actor_flow:
             assert user_id is not None

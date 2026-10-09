@@ -1021,6 +1021,8 @@ async def refresh_oauth_token_if_needed(
                 resolve_oauth_account_endpoints, account_host, stored_account
             )
             refresh_token_url = account_endpoints.token_url
+            # A redirect would skip the account host's private-network check.
+            post_kwargs["follow_redirects"] = False
         if normalized_provider == "deputy":
             # Deputy's docs (both the code-exchange and refresh legs) list
             # `redirect_uri` and `scope` as required body params here too,

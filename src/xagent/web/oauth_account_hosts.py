@@ -27,6 +27,7 @@ import socket
 from dataclasses import dataclass
 
 from ..core.utils.security import PrivateNetworkHostError, reject_private_network_host
+from .oauth_provider_quirks import matches_provider_family
 
 # One DNS label: letters, digits and inner hyphens, at most 63 characters.
 # Matched with fullmatch, so a trailing newline cannot slip past "$".
@@ -40,6 +41,8 @@ class OAuthAccountHost:
     host_suffix: str
     authorize_path: str
     token_path: str
+    # None only for a provider with its own identity branch in
+    # generic_oauth_callback; otherwise the callback fails closed.
     userinfo_path: str | None
     input_label: str
     input_placeholder: str
@@ -70,15 +73,27 @@ class OAuthAccountError(ValueError):
 
 
 # provider_name (lowercase) -> host spec. Empty until a provider registers
-# itself in its own change (Zendesk: #2930, Shopify: #2810).
+# itself in its own change (Zendesk: #2930, Shopify: #2810). "-"-anchored
+# variant rows (e.g. "zendesk-sandbox") share the base provider's account host.
 OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {}
 
 
 def get_oauth_account_host(provider: str | None) -> OAuthAccountHost | None:
-    """Return the account host spec for ``provider``, if it has one."""
+    """Return the account host spec for ``provider``, if it has one.
+
+    "-"-anchored variant rows (e.g. "zendesk-sandbox") share the base
+    provider's account host.
+    """
     if not provider:
         return None
-    return OAUTH_ACCOUNT_HOSTS.get(provider.lower())
+    host = OAUTH_ACCOUNT_HOSTS.get(provider.lower())
+    if host is not None:
+        return host
+    # Longest name first, so "foo-bar-sandbox" prefers "foo-bar" over "foo".
+    for name in sorted(OAUTH_ACCOUNT_HOSTS, key=len, reverse=True):
+        if matches_provider_family(provider, name):
+            return OAUTH_ACCOUNT_HOSTS[name]
+    return None
 
 
 def normalize_oauth_account(account: object) -> str:

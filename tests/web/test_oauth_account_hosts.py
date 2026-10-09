@@ -7,6 +7,7 @@ change -- so every test here registers a fake provider entry.
 """
 
 import base64
+import dataclasses
 import json
 import socket
 from datetime import datetime, timedelta, timezone
@@ -161,6 +162,24 @@ def test_lookup_is_case_insensitive_and_unknown_providers_have_no_host(fake_prov
     assert get_oauth_account_host(None) is None
 
 
+def test_variant_rows_match_the_longest_registered_provider_name(
+    fake_provider, monkeypatch
+):
+    regional = dataclasses.replace(fake_provider, host_suffix="eu.acmedesk.example")
+    monkeypatch.setitem(
+        oauth_account_hosts.OAUTH_ACCOUNT_HOSTS, f"{FAKE_PROVIDER}-eu", regional
+    )
+
+    assert get_oauth_account_host("acmedesk-eu-sandbox") is regional
+    assert get_oauth_account_host("acmedesk-sandbox") is fake_provider
+
+
+def test_dash_anchored_variant_rows_share_the_base_providers_host(fake_provider):
+    assert get_oauth_account_host("acmedesk-sandbox") is fake_provider
+    assert get_oauth_account_host("ACMEDESK-Sandbox") is fake_provider
+    assert get_oauth_account_host("acmedesklite") is None
+
+
 # ---------- login entry ------------------------------------------------------
 
 FAKE_APP_ID = "acmedesk-app"
@@ -170,6 +189,15 @@ FAKE_APP_EXECUTION = {
     "provider_name": FAKE_PROVIDER,
     "oauth_scopes": ["tickets:read"],
     "launch_config": {"command": "acmedesk"},
+}
+# A catalog app on a provider that has no account host.
+PLAIN_APP_ID = "plain-app"
+PLAIN_APP_EXECUTION = {
+    "name": "Plain",
+    "transport": "oauth",
+    "provider_name": "custom",
+    "oauth_scopes": ["tickets:read"],
+    "launch_config": {"command": "plain"},
 }
 ACTOR_OWNER = "toby:slack:41:UALICE"
 
@@ -181,6 +209,8 @@ def oauth_db(tmp_path, monkeypatch, fake_provider):
     def test_registry(app_id: str):
         if app_id == FAKE_APP_ID:
             return FAKE_APP_EXECUTION, []
+        if app_id == PLAIN_APP_ID:
+            return PLAIN_APP_EXECUTION, []
         return registry_lookup(app_id)
 
     monkeypatch.setattr(
@@ -201,6 +231,18 @@ def oauth_db(tmp_path, monkeypatch, fake_provider):
                 provider_name=FAKE_PROVIDER,
                 oauth_scopes=["tickets:read"],
                 launch_config={"command": "acmedesk"},
+                is_visible_in_connector=True,
+            )
+        )
+        db.add(
+            PublicMCPApp(
+                app_id=PLAIN_APP_ID,
+                name="Plain",
+                description="Plain",
+                transport="oauth",
+                provider_name="custom",
+                oauth_scopes=["tickets:read"],
+                launch_config={"command": "plain"},
                 is_visible_in_connector=True,
             )
         )
@@ -292,12 +334,11 @@ def test_login_rejects_an_account_resolving_to_a_private_address(oauth_db, monke
     assert "location" not in response.headers
 
 
-def test_login_escapes_the_rejected_account_in_the_error_page(oauth_db):
-    db, user = oauth_db
-
-    response = _login(db, user, account="<script>alert(1)</script>")
+def test_account_error_page_escapes_its_message():
+    response = auth_api._oauth_account_error_response("<script>alert(1)</script>")
 
     assert response.status_code == 400
+    assert b"&lt;script&gt;" in response.body
     assert b"<script>" not in response.body
 
 
@@ -359,13 +400,19 @@ def test_login_route_forwards_the_account_query_parameter(oauth_db, monkeypatch)
     assert captured["account"] == "acme"
 
 
-def _actor_link(db: Session, user: User) -> None:
+def _actor_link(
+    db: Session,
+    user: User,
+    *,
+    provider: str = FAKE_PROVIDER,
+    app_id: str = FAKE_APP_ID,
+) -> None:
     server = MCPServer(
-        name="Acmedesk",
-        description="Acmedesk",
+        name="Acmedesk" if app_id == FAKE_APP_ID else "Plain",
+        description="Acmedesk" if app_id == FAKE_APP_ID else "Plain",
         managed="external",
         transport="oauth",
-        auth={"app_id": FAKE_APP_ID, "provider": FAKE_PROVIDER},
+        auth={"app_id": app_id, "provider": provider},
     )
     db.add(server)
     db.flush()
@@ -414,6 +461,53 @@ def test_actor_login_without_a_valid_account_starts_no_flow(oauth_db, account):
         db=db,
         db_provider=_db_provider(),
         account=account,
+    )
+    db.commit()
+
+    assert response.status_code == 400
+    assert "set-cookie" not in response.headers
+    assert db.query(ActorOAuthFlowState).count() == 0
+
+
+def test_actor_login_with_an_account_for_a_provider_without_account_hosts_starts_no_flow(
+    oauth_db,
+):
+    db, user = oauth_db
+    _actor_link(db, user, provider="custom", app_id=PLAIN_APP_ID)
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="custom",
+        app_id=PLAIN_APP_ID,
+        user=user,
+        resource_owner_key=ACTOR_OWNER,
+        db=db,
+        db_provider=_db_provider("custom"),
+        account="acme",
+    )
+    db.commit()
+
+    assert response.status_code == 400
+    assert "set-cookie" not in response.headers
+    assert db.query(ActorOAuthFlowState).count() == 0
+
+
+def test_actor_login_rejects_an_account_resolving_to_a_private_address(
+    oauth_db, monkeypatch
+):
+    db, user = oauth_db
+    _actor_link(db, user)
+    monkeypatch.setattr(
+        oauth_account_hosts.socket, "getaddrinfo", _resolve_to("10.0.0.5")
+    )
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider=FAKE_PROVIDER,
+        app_id=FAKE_APP_ID,
+        user=user,
+        resource_owner_key=ACTOR_OWNER,
+        db=db,
+        db_provider=_db_provider(),
+        account="acme",
     )
     db.commit()
 
@@ -497,6 +591,7 @@ def test_callback_exchanges_the_code_on_the_account_bound_at_login(
     assert post.call_args.args[0] == "https://acme.acmedesk.example/oauth/token"
     assert post.call_args.kwargs["allow_redirects"] is False
     assert get.call_args.args[0] == "https://acme.acmedesk.example/api/me"
+    assert get.call_args.kwargs["allow_redirects"] is False
     grant = _grant(db, user)
     assert grant is not None
     assert grant.access_token == "new-access"
@@ -558,6 +653,35 @@ def test_callback_rejects_an_account_bound_for_a_provider_without_account_hosts(
 
     assert response.status_code == 400
     post.assert_not_called()
+
+
+def test_callback_without_a_userinfo_endpoint_persists_no_grant(oauth_db, monkeypatch):
+    db, user = oauth_db
+    monkeypatch.setitem(
+        oauth_account_hosts.OAUTH_ACCOUNT_HOSTS,
+        FAKE_PROVIDER,
+        dataclasses.replace(FAKE_HOST, userinfo_path=None),
+    )
+    _post, get = _mock_provider_http(monkeypatch)
+
+    response = _callback(db, _state_for(user, oauth_account="acme"))
+
+    assert response.status_code == 400
+    get.assert_not_called()
+    assert _grant(db, user) is None
+
+
+def test_callback_with_a_nested_userinfo_identity_persists_no_grant(
+    oauth_db, monkeypatch
+):
+    db, user = oauth_db
+    _post, get = _mock_provider_http(monkeypatch)
+    get.return_value = _ProviderResponse({"user": {"id": 1}})
+
+    response = _callback(db, _state_for(user, oauth_account="acme"))
+
+    assert response.status_code == 400
+    assert _grant(db, user) is None
 
 
 def _login_state(db: Session, user: User, account: str) -> str:
@@ -726,6 +850,7 @@ async def test_refresh_posts_to_the_stored_account_token_endpoint(
 
     assert [url for url, _ in posted] == ["https://acme.acmedesk.example/oauth/token"]
     assert posted[0][1]["data"]["refresh_token"] == "old-refresh"
+    assert posted[0][1]["follow_redirects"] is False
     assert grant.access_token == "new-access"
     assert grant.refresh_token == "new-refresh"
 
