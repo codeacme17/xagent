@@ -1168,6 +1168,7 @@ class DAGPattern(AgentPattern):
                 task_id=root_context.execution_id,
                 step_id=step.id,
                 code=getattr(exc, "code", None) or type(exc).__name__,
+                exc_info=exc,
             )
             self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             self._clear_active_step(step.id)
@@ -1603,17 +1604,18 @@ class DAGPattern(AgentPattern):
             )
         except ExecutionInterrupted:
             return failure
-        # A step that failed on a model-provider error keeps its failure
-        # result: that is how the provider error reaches the client.
-        deterministic_handoff = args is None and "model_error" not in failure
-        if deterministic_handoff:
-            # The delivery call gave nothing usable (it can be cut off at its
-            # own output cap); completed results must still reach the user.
+        deterministic_handoff = False
+        # The delivery call gave nothing usable (it can be cut off at its own
+        # output cap); completed results must still reach the user. A step that
+        # failed on a model-provider error never gets this handoff, so its
+        # failure result keeps carrying the provider error to the client.
+        if args is None and "model_error" not in failure:
             args = step_results_handoff(
                 self.plan.steps if self.plan is not None else [],
                 self.step_results,
                 failure.get("failed_step_id"),
             )
+            deterministic_handoff = args is not None
         if args is None or await runtime.should_interrupt():
             await runtime.checkpoint(
                 "dag_failed",

@@ -453,3 +453,23 @@ def test_handoff_keeps_results_of_steps_a_replan_dropped() -> None:
     assert "### old1\n\nEarlier finding" in answer
     assert "### Draft the summary\n\nSummary draft" in answer
     assert "- Publish (failed)" in answer
+
+
+def test_handoff_lists_results_in_plan_order_with_one_line_names() -> None:
+    steps = [
+        PlanStep(id="a", task="Collect\n  market data"),
+        PlanStep(id="b", task="Collect pricing"),
+        PlanStep(id="c", task="Write\nthe report"),
+    ]
+
+    # Parallel steps finish out of plan order; a replan dropped "old".
+    args = step_results_handoff(
+        steps, {"b": "Pricing", "old": "Earlier", "a": "Market"}, "c"
+    )
+
+    assert args is not None
+    answer = args["answer"]
+    assert "### Collect market data\n\nMarket" in answer
+    assert answer.index("### Collect market data") < answer.index("### Collect pricing")
+    assert answer.index("### Collect pricing") < answer.index("### old")
+    assert "- Write the report (failed)" in answer

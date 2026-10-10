@@ -1588,6 +1588,9 @@ class ReActPattern(AgentPattern):
         ``response`` is the rejected last response. Its protocol code and stop
         reason go on the result, so a call cut off at the output limit fails
         as ``truncated_tool_arguments`` rather than as a generic violation.
+        A cut-off response also overrides the caller's ``empty_final_answer``:
+        a cut-off ``final_answer`` only looks empty because its arguments were
+        dropped, and the run did not end for lack of an answer.
 
         ``empty_final_answer`` distinguishes "the model never produced an answer"
         from the status's other producers (provider protocol errors, mixed

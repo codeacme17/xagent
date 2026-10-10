@@ -10,7 +10,8 @@ failure under its own code when the retry is cut off too.
 Two response shapes are recognised:
 
 * a provider tool-protocol error (DeepSeek's ``malformed_tool_arguments``)
-  that carries the length stop (``length``, or Anthropic's ``max_tokens``), and
+  that carries the length stop (``length``, or ``max_tokens`` on a streamed
+  Anthropic response: non-streamed Claude drops a cut-off call's tool use), and
 * a provider that passes arguments through unvalidated: a tool call whose
   arguments string is not valid JSON, under the same length stop.
 
@@ -70,13 +71,15 @@ def truncated_tool_arguments_instruction(
             lead + "This turn only accepts an answer: call final_answer with a "
             "shorter answer that fits in one response."
         )
+    split = "Split the work into several smaller tool calls. "
     if _SPLIT_WRITE_TOOL in tool_names:
-        split = (
-            "Write long content in parts: create the file with the first part, "
-            f"then add each further part with {_SPLIT_WRITE_TOOL} in later turns. "
+        # The cut-off tool is not always known (a protocol-error envelope
+        # carries no tool calls), so the file advice is conditional in wording.
+        split += (
+            "If the cut-off call was writing a file, create it with the first "
+            f"part, then add each further part with {_SPLIT_WRITE_TOOL} in "
+            "later turns. "
         )
-    else:
-        split = "Split the work into several smaller tool calls. "
     return (
         lead + split + "Keep every tool call's arguments well under the limit. "
         "If the user only needs the answer itself, call final_answer with a "
