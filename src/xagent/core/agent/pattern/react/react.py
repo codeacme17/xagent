@@ -158,6 +158,13 @@ from .duplicate_write_guard import (
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
+from .truncation import (
+    TRUNCATED_TOOL_ARGUMENTS,
+    TRUNCATED_TOOL_ARGUMENTS_ERROR,
+    is_truncated_tool_call,
+    response_finish_reason,
+    truncated_tool_arguments_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1231,6 +1238,7 @@ class ReActPattern(AgentPattern):
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
+                        response=response,
                     )
                 if answer_streamer is not None:
                     await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
@@ -1269,7 +1277,12 @@ class ReActPattern(AgentPattern):
                     # Handing this one the full tool set would run ordinary
                     # work there, so stop as the loop does at its bound.
                     break
-                empty_final_answer = self._empty_final_answer_call(normalized)
+                truncated = is_truncated_tool_call(response)
+                # A cut-off final_answer has its arguments dropped, so it looks
+                # empty; the truncation is the cause the retry has to address.
+                empty_final_answer = (
+                    None if truncated else self._empty_final_answer_call(normalized)
+                )
                 if empty_final_answer is not None:
                     logger.warning(
                         "ReAct final_answer carried no answer text; discarding the "
@@ -1277,12 +1290,23 @@ class ReActPattern(AgentPattern):
                         iteration,
                         sorted(self._tool_call_args_dict(empty_final_answer), key=str),
                     )
+                protocol_error = get_tool_protocol_error(response)
                 if recover_full_tool_set:
                     recovery_reason: str | None = "unavailable_tool_call"
+                elif truncated and not settlement_fence:
+                    # A fenced turn keeps its own instruction: it must not be
+                    # steered back toward work tools.
+                    recovery_reason = TRUNCATED_TOOL_ARGUMENTS
                 elif empty_final_answer is not None:
                     recovery_reason = "empty_final_answer"
                 elif settlement_fence:
                     recovery_reason = "settlement_final_answer_required"
+                elif (
+                    protocol_error is not None
+                    and protocol_error.get("code") == "malformed_tool_arguments"
+                ):
+                    # The same repair the raised form of this error gets.
+                    recovery_reason = "malformed_tool_arguments"
                 else:
                     recovery_reason = None
                 try:
@@ -1330,6 +1354,7 @@ class ReActPattern(AgentPattern):
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
+                        response=response,
                     )
             original_tool_calls = normalized.get("tool_calls") or []
             kept_tool_calls, stripped_final_answers = (
@@ -1556,8 +1581,13 @@ class ReActPattern(AgentPattern):
         answer_streamer: ReActFinalAnswerStreamer | None,
         stream_failure_message: str,
         empty_final_answer: bool = False,
+        response: Any = None,
     ) -> dict[str, Any]:
         """Abandon the run after the one repair attempt failed.
+
+        ``response`` is the rejected last response. Its protocol code and stop
+        reason go on the result, so a call cut off at the output limit fails
+        as ``truncated_tool_arguments`` rather than as a generic violation.
 
         ``empty_final_answer`` distinguishes "the model never produced an answer"
         from the status's other producers (provider protocol errors, mixed
@@ -1567,12 +1597,27 @@ class ReActPattern(AgentPattern):
         produced an answer" - see ``agent_tool._classify_delegated_failure``.
         """
 
+        truncated = is_truncated_tool_call(response)
+        if truncated:
+            # A cut-off final_answer only looks empty: its arguments were dropped.
+            empty_final_answer = False
+        protocol_error = get_tool_protocol_error(response)
+        protocol_code: str | None
+        if truncated:
+            protocol_code = TRUNCATED_TOOL_ARGUMENTS
+        elif protocol_error is not None:
+            protocol_code = protocol_error.get("code")
+        else:
+            protocol_code = None
+        finish_reason = response_finish_reason(response)
         logger.warning(
             "ReAct failing the run after an invalid tool protocol: %s "
-            "(iteration=%s empty_final_answer=%s)",
+            "(iteration=%s empty_final_answer=%s code=%s finish_reason=%s)",
             stream_failure_message,
             iteration,
             empty_final_answer,
+            protocol_code,
+            finish_reason,
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
@@ -1585,21 +1630,31 @@ class ReActPattern(AgentPattern):
             pattern=self,
             metadata={"iteration": iteration},
         )
-        error = (
-            "The model called final_answer without an answer twice, so the run "
-            "produced no response."
-            if empty_final_answer
-            else "The model returned an invalid tool protocol response "
-            "after one repair attempt."
-        )
+        if truncated:
+            error = TRUNCATED_TOOL_ARGUMENTS_ERROR
+        elif empty_final_answer:
+            error = (
+                "The model called final_answer without an answer twice, so the "
+                "run produced no response."
+            )
+        else:
+            error = (
+                "The model returned an invalid tool protocol response "
+                "after one repair attempt."
+            )
+        metadata: dict[str, Any] = {
+            "iterations": iteration + 1,
+            "status": "invalid_tool_protocol",
+            "empty_final_answer": empty_final_answer,
+        }
+        if protocol_code:
+            metadata["protocol_code"] = protocol_code
+        if finish_reason:
+            metadata["finish_reason"] = finish_reason
         return PatternResult(
             success=False,
             error=error,
-            metadata={
-                "iterations": iteration + 1,
-                "status": "invalid_tool_protocol",
-                "empty_final_answer": empty_final_answer,
-            },
+            metadata=metadata,
         ).to_dict()
 
     async def _close_streamed_answer(
@@ -1935,6 +1990,11 @@ class ReActPattern(AgentPattern):
                 "complete user-facing response in its answer field."
             )
             retry_phase = "malformed_tool_arguments_recovery"
+        elif recovery_reason == TRUNCATED_TOOL_ARGUMENTS:
+            retry_instruction = truncated_tool_arguments_instruction(
+                self._schema_tool_names(tools), force_final_answer=force_final_answer
+            )
+            retry_phase = "truncated_tool_arguments_recovery"
         elif recovery_reason == "empty_final_answer":
             # On a forced turn ``tools`` above holds no work tool, so offering
             # one would instruct the model to do something the schema forbids
@@ -2064,6 +2124,10 @@ class ReActPattern(AgentPattern):
         without it only final_answer is allowed.
         """
         if get_tool_protocol_error(normalized.get("raw")) is not None:
+            return True
+        if is_truncated_tool_call(normalized.get("raw")):
+            # Unvalidated providers pass cut-off arguments through; running
+            # the call would hand the tool a fragment of what was asked.
             return True
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
