@@ -7,6 +7,7 @@ deliverable is lost when the task workspace is removed (#2953).
 import asyncio
 import json
 import os
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -115,18 +116,44 @@ def test_touch_registers_a_file_left_over_from_an_earlier_call(workspace):
     assert result["generated_files"] == ["deck.pptx"]
 
 
-def test_dependency_and_cache_trees_are_skipped(workspace, registrations):
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "node_modules/pkg/logo.png",
+        "__pycache__/chart.png",
+        ".cache/chart.png",
+        "venv/lib/chart.png",
+        "site-packages/pkg/chart.png",
+        ".hidden.png",
+    ],
+)
+def test_dependency_cache_and_hidden_paths_are_skipped(
+    workspace, registrations, relative_path
+):
     tool = CommandExecutorTool(workspace=workspace)
 
     result = _run(
         tool,
-        "mkdir -p node_modules/pkg __pycache__ && "
-        "printf 'x' > node_modules/pkg/logo.png && "
-        "printf 'x' > __pycache__/chart.png",
+        f"mkdir -p \"$(dirname {relative_path})\" && printf 'x' > {relative_path}",
     )
 
+    assert (workspace.output_dir / relative_path).exists()
     assert registrations == []
     assert "file_refs" not in result
+
+
+def test_file_in_a_nested_directory_is_registered(workspace):
+    tool = CommandExecutorTool(workspace=workspace)
+
+    result = _run(
+        tool,
+        "mkdir -p reports/q3 && printf 'PK\\003\\004 deck' > reports/q3/deck.pptx",
+    )
+
+    assert result["generated_files"] == ["deck.pptx"]
+    file_ref = result["file_refs"][0]
+    assert file_ref["file_id"]
+    assert file_ref["relative_path"].endswith("reports/q3/deck.pptx")
 
 
 def test_engine_owned_spill_directory_is_skipped(workspace, registrations):
@@ -143,12 +170,13 @@ def test_engine_owned_spill_directory_is_skipped(workspace, registrations):
 
 def test_over_cap_registers_none_and_says_so(workspace, registrations):
     tool = CommandExecutorTool(workspace=workspace)
-    count = MAX_REGISTERED_FILES_PER_COMMAND + 1
+    cap = MAX_REGISTERED_FILES_PER_COMMAND
 
     result = _run(
         tool,
-        f"mkdir -p parts && for i in $(seq 1 {count}); do "
-        "printf 'x' > parts/image$i.png; done",
+        f"mkdir -p parts && for i in $(seq 1 {cap + 1}); do "
+        "printf 'x' > parts/image$i.png; done && "
+        "printf 'PK\\003\\004 deck' > deck.pptx",
     )
 
     assert registrations == []
@@ -156,8 +184,28 @@ def test_over_cap_registers_none_and_says_so(workspace, registrations):
     assert result["artifacts"] == []
     observation = ExecutionContext()._format_tool_result("execute_command", result)
     assert "registration_note" in observation
-    assert str(count) in result["registration_note"]
-    assert str(MAX_REGISTERED_FILES_PER_COMMAND) in result["registration_note"]
+    note = result["registration_note"]
+    assert str(cap + 2) in note
+    assert str(cap) in note
+    assert "deck.pptx" in note
+    assert not re.search(r"image\d+\.png", note)
+    assert str(workspace.output_dir) not in note
+
+
+def test_over_cap_note_truncates_the_non_image_list(workspace, registrations):
+    tool = CommandExecutorTool(workspace=workspace)
+    cap = MAX_REGISTERED_FILES_PER_COMMAND
+
+    result = _run(
+        tool,
+        f"mkdir -p parts && for i in $(seq 1 {cap + 5}); do "
+        "printf 'x' > parts/part$i.csv; done",
+    )
+
+    note = result["registration_note"]
+    assert registrations == []
+    assert "and 5 more" in note
+    assert len(re.findall(r"parts/part\d+\.csv", note)) == cap
 
 
 def test_exactly_the_cap_is_registered(workspace):
@@ -187,6 +235,24 @@ def test_failed_registration_is_reported(workspace, monkeypatch):
     assert "deck.pptx" in result["registration_note"]
 
 
+def test_failed_registrations_are_listed_by_relative_path(workspace, monkeypatch):
+    def _fail(self, file_path, *args, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(TaskWorkspace, "register_file", _fail)
+    tool = CommandExecutorTool(workspace=workspace)
+
+    result = _run(
+        tool,
+        "mkdir -p a b && printf 'x' > a/chart.png && printf 'x' > b/chart.png",
+    )
+
+    note = result["registration_note"]
+    assert "a/chart.png" in note
+    assert "b/chart.png" in note
+    assert str(workspace.output_dir) not in note
+
+
 def test_ref_dropped_after_registration_is_reported(workspace, monkeypatch):
     def _no_ref(**kwargs):
         raise RuntimeError("validator crashed")
@@ -197,7 +263,10 @@ def test_ref_dropped_after_registration_is_reported(workspace, monkeypatch):
     result = _run(tool, "printf 'PK\\003\\004 deck' > deck.pptx")
 
     assert result["file_refs"] == []
-    assert "deck.pptx" in result["registration_note"]
+    note = result["registration_note"]
+    assert "Registered, but no file reference could be built" in note
+    assert "deck.pptx" in note
+    assert "Written but not registered" not in note
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")

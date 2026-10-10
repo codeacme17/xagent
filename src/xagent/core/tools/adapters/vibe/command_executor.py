@@ -16,6 +16,7 @@ from ....workspace import SPILL_DIR_NAME, TaskWorkspace
 from ...artifacts import (
     GENERATED_ARTIFACT_EXTENSIONS,
     GeneratedArtifactSnapshot,
+    artifact_type_for_filename,
     build_generated_file_metadata,
     changed_generated_artifact_files,
 )
@@ -93,7 +94,7 @@ Supports any shell command including system commands, scripts, pipes, and redire
 {workspace_line}
 Use concrete paths, URLs, or file identifiers already returned by previous tool results directly. If a tool returned an absolute path or a path relative to the command working directory, pass that path to the next command instead of rediscovering it.
 Only search for files when no usable path was provided, and keep searches scoped to the command working directory or another explicitly relevant directory. Do not run broad recursive searches from `/` or the user's home directory unless the user explicitly asks for that scope.
-Documents, spreadsheets, PDFs, images and videos the command writes under the working directory are registered and returned in file_refs with a file_id; registration_note explains any of these that were not.
+Documents, spreadsheets, PDFs, images and videos the command writes under the working directory are registered and returned in file_refs with a file_id; registration_note explains files that failed to register. Hidden files and directories, node_modules, venv, site-packages, __pycache__ and symlinks are not registered.
 Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt | grep error"""
 
     @property
@@ -129,7 +130,9 @@ Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt |
         changed = changed_generated_artifact_files(
             files_before, _snapshot_artifacts(working_directory, self._workspace)
         )
-        result.update(_register_changed_files(self._workspace, changed))
+        result.update(
+            _register_changed_files(self._workspace, changed, working_directory)
+        )
         return _dump_result(result)
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -164,18 +167,40 @@ def _dump_result(result: dict[str, Any]) -> dict[str, Any]:
     return dumped
 
 
+def _display_path(file_path: Path, root: str) -> str:
+    """``file_path`` relative to the command working directory, never absolute."""
+    try:
+        return file_path.relative_to(root).as_posix()
+    except ValueError:
+        return file_path.name
+
+
 def _register_changed_files(
-    workspace: TaskWorkspace, changed: set[Path]
+    workspace: TaskWorkspace, changed: set[Path], root: str
 ) -> dict[str, Any]:
     if not changed:
         return {}
     if len(changed) > MAX_REGISTERED_FILES_PER_COMMAND:
+        # Images are what bulk extraction floods the directory with; listing the
+        # rest shows which deliverables the model has to touch.
+        others = sorted(
+            _display_path(p, root)
+            for p in changed
+            if artifact_type_for_filename(p.name) != "image"
+        )
+        shown = ", ".join(others[:MAX_REGISTERED_FILES_PER_COMMAND])
+        if len(others) > MAX_REGISTERED_FILES_PER_COMMAND:
+            shown += f" and {len(others) - MAX_REGISTERED_FILES_PER_COMMAND} more"
+        listing = f" Changed files that are not images: {shown}." if others else ""
         return {
             "registration_note": (
                 f"{len(changed)} files changed, more than the "
                 f"{MAX_REGISTERED_FILES_PER_COMMAND} registered per command, "
-                "so none got a file_id. To register a deliverable, run "
-                "`touch <path>` on it in a separate command; do not rewrite it."
+                "so none got a file_id."
+                f"{listing} To register a deliverable, run `touch <path>` on at "
+                f"most {MAX_REGISTERED_FILES_PER_COMMAND} paths per command, in a "
+                "separate command from the one that wrote them; do not rewrite "
+                "the files."
             )
         }
     # register_file is called explicitly: build_workspace_file_ref reuses an
@@ -190,20 +215,30 @@ def _register_changed_files(
             logger.warning(
                 "Failed to register command output %s", file_path, exc_info=True
             )
-            failed.append(file_path.name)
+            failed.append(_display_path(file_path, root))
             continue
         registered.append(file_path)
     result: dict[str, Any] = build_generated_file_metadata(
         workspace=workspace, file_paths=registered
     )
     described = {Path(ref["file_path"]).resolve() for ref in result["file_refs"]}
-    failed.extend(p.name for p in registered if p.resolve() not in described)
+    no_ref = [
+        _display_path(p, root) for p in registered if p.resolve() not in described
+    ]
+    # Without a note the file reads as never written, which invites a rewrite.
+    notes: list[str] = []
     if failed:
-        # Without this the file reads as never written, which invites a rewrite.
-        result["registration_note"] = (
+        notes.append(
             f"Written but not registered: {', '.join(failed)}. "
             "No file_id is available for these in this call."
         )
+    if no_ref:
+        notes.append(
+            f"Registered, but no file reference could be built: {', '.join(no_ref)}. "
+            "get_workspace_output_files lists their file_id."
+        )
+    if notes:
+        result["registration_note"] = " ".join(notes)
     return result
 
 
