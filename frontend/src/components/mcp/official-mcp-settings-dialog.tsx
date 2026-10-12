@@ -1,4 +1,4 @@
-import React from "react"
+import React, { useRef } from "react"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
@@ -57,6 +57,10 @@ export function OfficialMcpSettingsDialog({
   const { token, inTeam } = useAuth()
   const { t } = useI18n()
   const { requestAccount, accountDialog } = useOAuthAccountStep()
+  // Mirrors the latest render for the popup poll below, whose closure outlives
+  // the render that started it.
+  const liveRef = useRef({ open, appId: app?.id })
+  liveRef.current = { open, appId: app?.id }
 
   // Only reached without onConnectStart (the Tools page): a provider hosted
   // on the customer's own account needs the account label before the popup.
@@ -131,8 +135,16 @@ export function OfficialMcpSettingsDialog({
         clearInterval(checkPopup);
         window.removeEventListener('message', handleMessage);
         // Closed without connecting: the server's own error page, if any,
-        // was shown in the popup, so offer the account step again.
-        if (account !== undefined) requestAppAccount(appToConnect, true)
+        // was shown in the popup, so offer the account step again. The Tools
+        // page keeps this dialog mounted, so only reopen while it is still
+        // open for the same app.
+        if (
+          account !== undefined &&
+          liveRef.current.open &&
+          liveRef.current.appId === appToConnect.id
+        ) {
+          requestAppAccount(appToConnect, true)
+        }
       }
     }, 500);
   }

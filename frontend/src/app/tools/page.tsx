@@ -623,7 +623,7 @@ function ToolsPageContent() {
         auth_type: "builtin_oauth",
         // Server rows don't carry the account input; the catalog entry does,
         // and Configure re-runs the login that needs it.
-        ...(accountInput ? { oauth_account_input: accountInput } : {}),
+        oauth_account_input: accountInput,
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {

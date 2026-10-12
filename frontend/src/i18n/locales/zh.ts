@@ -1217,7 +1217,7 @@ const zh = {
       // hosted on the customer's own account (oauth-account-dialog.tsx).
       accountStep: {
         continue: "继续",
-        invalid: "请只输入账号名，仅可包含字母、数字和连字符。",
+        invalid: "请只输入账号名：仅可包含字母、数字和连字符（连字符不能在开头或结尾），最长 63 个字符。",
         retryHint: "尚未连接。如果登录窗口显示了错误，请检查账号名后重试。",
       },
       dialog: {

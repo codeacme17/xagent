@@ -126,6 +126,52 @@ describe("OfficialMcpSettingsDialog account step", () => {
 
     expect(screen.getByLabelText("Zendesk subdomain")).toHaveValue("acme")
     expect(screen.getByText("tools.mcp.accountStep.retryHint")).toBeInTheDocument()
+
+    // Resubmitting from the reopened step starts a second popup.
+    submitAccount("acme2")
+
+    expect(openSpy).toHaveBeenCalledTimes(2)
+    expect(new URL(openSpy.mock.calls[1][0] as string).searchParams.get("account")).toBe("acme2")
+  })
+
+  it("does not reopen the account step after the settings dialog was closed", async () => {
+    const onOpenChange = vi.fn()
+    const app = zendeskApp()
+    const { rerender } = render(<OfficialMcpSettingsDialog open onOpenChange={onOpenChange} app={app} />)
+    fireEvent.click(screen.getByRole("button", { name: /tools\.mcp\.dialog\.connect/ }))
+    vi.useFakeTimers()
+    submitAccount("acme")
+
+    // The Tools page keeps this component mounted with a non-null app.
+    rerender(<OfficialMcpSettingsDialog open={false} onOpenChange={onOpenChange} app={app} />)
+    popup.closed = true
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+    })
+
+    expect(screen.queryByLabelText("Zendesk subdomain")).not.toBeInTheDocument()
+  })
+
+  it("does not reopen the account step after another app's settings were opened", async () => {
+    const onOpenChange = vi.fn()
+    const { rerender } = render(<OfficialMcpSettingsDialog open onOpenChange={onOpenChange} app={zendeskApp()} />)
+    fireEvent.click(screen.getByRole("button", { name: /tools\.mcp\.dialog\.connect/ }))
+    vi.useFakeTimers()
+    submitAccount("acme")
+
+    rerender(
+      <OfficialMcpSettingsDialog
+        open
+        onOpenChange={onOpenChange}
+        app={zendeskApp({ id: "zendesk-sandbox", name: "Zendesk Sandbox" })}
+      />,
+    )
+    popup.closed = true
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+    })
+
+    expect(screen.queryByLabelText("Zendesk subdomain")).not.toBeInTheDocument()
   })
 
   it("does not reopen the account step once the popup reported success", async () => {

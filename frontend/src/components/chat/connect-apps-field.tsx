@@ -338,7 +338,7 @@ export function ConnectAppsField({
           provider: group.provider,
           appId,
           token,
-          ...(account !== undefined ? { account } : {}),
+          account,
         });
         if (!isMountedRef.current) return;
         if (!result.success && accountInput && !result.popupBlocked) {

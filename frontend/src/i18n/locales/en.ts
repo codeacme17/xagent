@@ -1217,7 +1217,7 @@ Build when you need.`,
       // hosted on the customer's own account (oauth-account-dialog.tsx).
       accountStep: {
         continue: "Continue",
-        invalid: "Enter only your account name: letters, digits, and hyphens.",
+        invalid: "Enter only your account name: letters, digits, and hyphens (not at the start or end), up to 63 characters.",
         retryHint: "Not connected yet. If the sign-in window showed an error, check the account name and try again.",
       },
       dialog: {

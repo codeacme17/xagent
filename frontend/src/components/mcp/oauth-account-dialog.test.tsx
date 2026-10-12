@@ -173,7 +173,7 @@ describe("useOAuthAccountStep", () => {
     fireEvent.change(open(), { target: { value: "acme" } })
     submit()
 
-    rerender(<Harness onSubmit={onSubmit} requestKey="other" />)
+    rerender(<Harness onSubmit={onSubmit} requestKey="other" retry />)
 
     expect(open()).toHaveValue("")
   })

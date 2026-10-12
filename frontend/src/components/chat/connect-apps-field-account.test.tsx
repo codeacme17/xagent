@@ -154,6 +154,17 @@ describe("ConnectAppsField account step", () => {
     // The reopened step carries the retry hint; no second message on top.
     await waitFor(() => expect(mcpAppsMock.refresh).toHaveBeenCalled());
     expect(toastErrorMock).not.toHaveBeenCalled();
+
+    // Resubmitting from the reopened step starts a second popup, which shows
+    // the connecting key was released after the first attempt.
+    submitAccount("acme2");
+
+    await waitFor(() => expect(openBuiltinOAuthPopupMock).toHaveBeenCalledTimes(2));
+    expect(openBuiltinOAuthPopupMock.mock.calls[1][0]).toMatchObject({
+      provider: "zendesk",
+      appId: "zendesk",
+      account: "acme2",
+    });
   });
 
   it("does not reopen the account step when the popup was blocked", async () => {
@@ -205,6 +216,6 @@ describe("ConnectAppsField account step", () => {
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(openBuiltinOAuthPopupMock).toHaveBeenCalledTimes(1);
-    expect(openBuiltinOAuthPopupMock.mock.calls[0][0]).not.toHaveProperty("account");
+    expect(openBuiltinOAuthPopupMock.mock.calls[0][0].account).toBeUndefined();
   });
 });
