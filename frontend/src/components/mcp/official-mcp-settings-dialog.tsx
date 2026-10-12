@@ -10,6 +10,7 @@ import { useI18n } from "@/contexts/i18n-context"
 
 import type { AppIntegration } from "./types"
 import { GoogleDrivePickerButton } from "./google-drive-picker-button"
+import { useOAuthAccountStep } from "./oauth-account-dialog"
 
 export type { AppIntegration }
 
@@ -55,8 +56,25 @@ export function OfficialMcpSettingsDialog({
 }: OfficialMcpSettingsDialogProps) {
   const { token, inTeam } = useAuth()
   const { t } = useI18n()
+  const { requestAccount, accountDialog } = useOAuthAccountStep()
 
-  const handleConnectApp = (appToConnect: AppIntegration) => {
+  // Only reached without onConnectStart (the Tools page): a provider hosted
+  // on the customer's own account needs the account label before the popup.
+  const requestAppAccount = (appToConnect: AppIntegration, retry = false) => {
+    if (!appToConnect.oauth_account_input) return
+    requestAccount(
+      {
+        key: appToConnect.id,
+        name: appToConnect.name,
+        icon: appToConnect.icon,
+        input: appToConnect.oauth_account_input,
+        onSubmit: (account) => handleConnectApp(appToConnect, account),
+      },
+      { retry },
+    )
+  }
+
+  const handleConnectApp = (appToConnect: AppIntegration, account?: string) => {
     if (appToConnect.is_custom && onConnectStart) {
       onConnectStart(appToConnect);
       return;
@@ -71,6 +89,11 @@ export function OfficialMcpSettingsDialog({
       }
     }
 
+    if (appToConnect.oauth_account_input && account === undefined) {
+      requestAppAccount(appToConnect)
+      return
+    }
+
     const provider = appToConnect.provider || "linkedin"
 
     // Open OAuth in a popup window to handle the callback smoothly
@@ -79,7 +102,8 @@ export function OfficialMcpSettingsDialog({
     const left = window.screenX + (window.outerWidth - width) / 2;
     const top = window.screenY + (window.outerHeight - height) / 2;
 
-    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${appToConnect.id}&redirect=${encodeURIComponent(window.location.href)}`;
+    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : ''
+    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${appToConnect.id}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
       `${provider} OAuth`,
@@ -90,6 +114,9 @@ export function OfficialMcpSettingsDialog({
     const handleMessage = (event: MessageEvent) => {
       if (event.data?.type === 'oauth-success') {
         window.removeEventListener('message', handleMessage)
+        // Stop the closed-popup poll too, so a popup that closes itself after
+        // success is not read as a failed attempt below.
+        clearInterval(checkPopup)
 
         if (onSuccess) onSuccess();
         onOpenChange(false);
@@ -103,6 +130,9 @@ export function OfficialMcpSettingsDialog({
       if (popup?.closed) {
         clearInterval(checkPopup);
         window.removeEventListener('message', handleMessage);
+        // Closed without connecting: the server's own error page, if any,
+        // was shown in the popup, so offer the account step again.
+        if (account !== undefined) requestAppAccount(appToConnect, true)
       }
     }, 500);
   }
@@ -188,6 +218,7 @@ export function OfficialMcpSettingsDialog({
   const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md text-center p-0 overflow-hidden bg-white shadow-xl">
         <div className="relative pt-12 pb-8 px-8 flex flex-col items-center">
@@ -338,5 +369,7 @@ export function OfficialMcpSettingsDialog({
         </div>
       </DialogContent>
     </Dialog>
+    {accountDialog}
+    </>
   )
 }

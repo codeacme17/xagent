@@ -13,7 +13,10 @@ import { useI18n } from "./i18n-context"
 // the exact drift that file's own header comment exists to prevent. All
 // three are already in the API response.
 export interface McpApp
-  extends Pick<AppIntegration, "auth_type" | "launch_config" | "configured_env_keys"> {
+  extends Pick<
+    AppIntegration,
+    "auth_type" | "launch_config" | "configured_env_keys" | "oauth_account_input"
+  > {
   id: string
   name: string
   description: string
