@@ -2842,6 +2842,7 @@ const zh = {
       },
     },
     configForm: {
+      listLoadFailed: "列表加载失败。",
       logo: {
         label: "Logo",
         upload: "上传 Logo",

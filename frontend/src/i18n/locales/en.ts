@@ -2847,6 +2847,7 @@ Build when you need.`,
       },
     },
     configForm: {
+      listLoadFailed: "Couldn't load this list.",
       logo: {
         label: "Logo",
         upload: "Upload Logo",
