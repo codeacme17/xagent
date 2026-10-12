@@ -220,7 +220,8 @@ def _insert_oauth_provider(bind: sa.engine.Connection) -> None:
 
 
 def _remove_inserted_oauth_provider(bind: sa.engine.Connection) -> None:
-    required = {"provider_name", *OAUTH_PROVIDER_STATIC_FIELDS}
+    configured_fields = ("client_id", "client_secret", "redirect_uri")
+    required = {"provider_name", *OAUTH_PROVIDER_STATIC_FIELDS, *configured_fields}
     if not required.issubset(_columns(bind, "oauth_providers")):
         return
     row = (
@@ -235,6 +236,10 @@ def _remove_inserted_oauth_provider(bind: sa.engine.Connection) -> None:
     if row is None or any(
         row[name] != expected for name, expected in OAUTH_PROVIDER_STATIC_FIELDS.items()
     ):
+        return
+    # An admin who entered credentials in the provider settings owns the row
+    # now; deleting it would destroy their secret.
+    if any(row[name] for name in configured_fields):
         return
     bind.execute(
         sa.delete(OAUTH_PROVIDERS).where(OAUTH_PROVIDERS.c.provider_name == APP_ID)

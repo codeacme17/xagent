@@ -381,7 +381,7 @@ def _extract_field_reasons(details: Any) -> str | None:
     return truncate_error_text("; ".join(reasons))
 
 
-def _extract_error_detail(response: requests.Response) -> str | None:
+def _extract_error_detail(body: str) -> str | None:
     """Pull the human-readable message out of a Zendesk error body.
 
     Zendesk's error shape is inconsistent across endpoints: a plain string
@@ -391,7 +391,7 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     nor field-level details are present.
     """
     try:
-        payload = response.json()
+        payload = json.loads(body)
     except ValueError:
         return None
     if not isinstance(payload, dict):
@@ -487,16 +487,15 @@ def _request(
         # (documented with an email-address example). Status + Zendesk's
         # own (redacted) error detail is everything the caller can act on.
         message = f"Zendesk returned HTTP {response.status_code}"
-        # A provider error body could echo the credential back; it is
-        # removed before truncation could cut it into an unmatched prefix.
-        detail = _extract_error_detail(response)
+        # A provider error body could echo the credential back. It is removed
+        # from the raw body once, before any parsing or truncation could cut
+        # it into a prefix that no longer matches.
+        body = response.text.replace(_access_token(), "[redacted]")
+        detail = _extract_error_detail(body)
         if detail is None:
-            detail = truncate_error_text(
-                response.text.strip().replace(_access_token(), "[redacted]")
-            )
+            detail = truncate_error_text(body.strip())
         if detail:
             detail = _scrub_query_strings(redact_sensitive_text(detail))
-            detail = detail.replace(_access_token(), "[redacted]")
             message = f"{message} - {detail}"
         # Neither heals on retry, so say what does.
         if response.status_code == 401:

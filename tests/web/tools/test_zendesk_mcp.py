@@ -285,13 +285,13 @@ def test_extract_error_detail_prefers_description():
         json_data={"error": "RecordNotFound", "description": "Not found"}
     )
 
-    assert zendesk._extract_error_detail(response) == "Not found"
+    assert zendesk._extract_error_detail(response.text) == "Not found"
 
 
 def test_extract_error_detail_falls_back_to_string_error():
     response = MockResponse(json_data={"error": "Couldn't authenticate you"})
 
-    assert zendesk._extract_error_detail(response) == "Couldn't authenticate you"
+    assert zendesk._extract_error_detail(response.text) == "Couldn't authenticate you"
 
 
 def test_extract_error_detail_handles_nested_error_object():
@@ -299,19 +299,19 @@ def test_extract_error_detail_handles_nested_error_object():
         json_data={"error": {"title": "Unauthorized", "message": "Bad credentials"}}
     )
 
-    assert zendesk._extract_error_detail(response) == "Bad credentials"
+    assert zendesk._extract_error_detail(response.text) == "Bad credentials"
 
 
 def test_extract_error_detail_falls_back_to_title_when_message_absent():
     response = MockResponse(json_data={"error": {"title": "Unauthorized"}})
 
-    assert zendesk._extract_error_detail(response) == "Unauthorized"
+    assert zendesk._extract_error_detail(response.text) == "Unauthorized"
 
 
 def test_extract_error_detail_returns_none_for_non_json_body():
     response = MockResponse(status_code=500, text="not json", json_raises=True)
 
-    assert zendesk._extract_error_detail(response) is None
+    assert zendesk._extract_error_detail(response.text) is None
 
 
 def test_extract_error_detail_appends_record_invalid_field_reasons():
@@ -326,7 +326,7 @@ def test_extract_error_detail_appends_record_invalid_field_reasons():
     )
 
     assert (
-        zendesk._extract_error_detail(response)
+        zendesk._extract_error_detail(response.text)
         == "Record validation errors: Status: closed is not valid"
     )
 
@@ -346,7 +346,8 @@ def test_extract_error_detail_falls_back_to_field_reasons_without_description():
     )
 
     assert (
-        zendesk._extract_error_detail(response) == "Email: a@example.com already in use"
+        zendesk._extract_error_detail(response.text)
+        == "Email: a@example.com already in use"
     )
 
 
@@ -724,6 +725,34 @@ def test_request_error_redacts_a_token_echoed_past_the_truncation_point(monkeypa
         zendesk._request("GET", "/tickets/999.json")
 
     assert "t" * 20 not in str(excinfo.value)
+
+
+def test_request_error_redacts_a_token_cut_by_the_details_truncation(monkeypatch):
+    # The field-level reasons are truncated while being extracted, so a token
+    # echoed across that cut must be removed from the raw body beforehand.
+    token = "k" * 40
+    monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", token)
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422,
+                json_data={
+                    "error": "RecordInvalid",
+                    "description": "Record validation errors",
+                    "details": {"base": [{"description": "y" * 980 + token}]},
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("POST", "/tickets.json")
+
+    message = str(excinfo.value)
+    assert "Record validation errors" in message
+    assert "k" * 20 not in message
 
 
 def test_request_error_is_not_a_reconnect_hint_for_other_statuses(monkeypatch):

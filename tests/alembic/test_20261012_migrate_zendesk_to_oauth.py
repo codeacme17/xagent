@@ -427,6 +427,31 @@ def test_downgrade_restores_the_legacy_row(database):
     assert _ids(connection, tables[4]) == []
 
 
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"client_id": "admin-id", "client_secret": "admin-secret"},
+        {"redirect_uri": "https://xagent.example/api/auth/zendesk/callback"},
+    ],
+)
+def test_downgrade_keeps_a_provider_row_an_admin_configured(database, credentials):
+    connection, tables = database
+    providers = tables[4]
+    _seed_legacy(connection, tables)
+    migration = _run(connection, "upgrade")
+    connection.execute(
+        providers.update()
+        .where(providers.c.provider_name == "zendesk")
+        .values(**credentials)
+    )
+
+    _run(connection, "downgrade", migration)
+
+    row = connection.execute(select(providers)).mappings().one()
+    for name, value in credentials.items():
+        assert row[name] == value
+
+
 def test_downgrade_removes_oauth_connections(database):
     connection, tables = database
     _apps, servers, associations, _actor, _providers, user_oauth = tables

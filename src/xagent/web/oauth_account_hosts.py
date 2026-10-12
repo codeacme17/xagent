@@ -30,6 +30,21 @@ from dataclasses import dataclass, field
 from ..core.utils.security import PrivateNetworkHostError, reject_private_network_host
 from .oauth_provider_quirks import matches_provider_family
 
+# Fields the code exchange and refresh set themselves. token_params is merged
+# into those requests at different points, so it must not name any of them.
+_RESERVED_TOKEN_PARAMS = frozenset(
+    {
+        "grant_type",
+        "code",
+        "redirect_uri",
+        "code_verifier",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+        "scope",
+    }
+)
+
 # One DNS label: letters, digits and inner hyphens, at most 63 characters.
 # Matched with fullmatch, so a trailing newline cannot slip past "$".
 _ACCOUNT_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -53,6 +68,14 @@ class OAuthAccountHost:
     userinfo_envelope: str | None = None
     # Extra form fields sent on both the code exchange and every refresh.
     token_params: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reserved = sorted(_RESERVED_TOKEN_PARAMS.intersection(self.token_params))
+        if reserved:
+            raise ValueError(
+                f"token_params must not set standard token request fields: "
+                f"{', '.join(reserved)}"
+            )
 
     def input_metadata(self) -> dict[str, str]:
         """What the connect UI shows when asking for the account label."""

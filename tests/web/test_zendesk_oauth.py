@@ -464,6 +464,54 @@ def test_losing_a_concurrent_rotation_keeps_the_winners_grant(
     assert stored.expires_at is not None
 
 
+def test_tombstone_rereads_the_grant_under_a_write_lock(
+    zendesk_db, session_factory, monkeypatch
+):
+    """Nothing serializes a personal refresh, so the check-then-clear must
+    hold the row's write lock from the re-read until the commit; otherwise a
+    concurrent rotation can land between the check and the clear."""
+    from sqlalchemy import event
+
+    db, user = zendesk_db
+    _expired_grant(db, user)
+    engine = session_factory.kw["bind"]
+    database = engine.url.database
+    armed: list[bool] = []
+    probes: list[str] = []
+
+    async def dead_refresh(*args, **kwargs):
+        armed.append(True)
+        raise tool_config._OAuthRefreshPermanentlyInvalid()
+
+    def probe_at_reread(conn, cursor, statement, parameters, context, many):
+        if not armed or probes:
+            return
+        if not statement.lstrip().upper().startswith("SELECT"):
+            return
+        if "user_oauth" not in statement:
+            return
+        # BEGIN IMMEDIATE asks only for the write (RESERVED) lock, which the
+        # re-read's own open read cursor does not hold.
+        other_writer = sqlite3.connect(database, timeout=0, isolation_level=None)
+        try:
+            other_writer.execute("BEGIN IMMEDIATE")
+            other_writer.execute("ROLLBACK")
+            probes.append("write lock free")
+        except sqlite3.OperationalError as exc:
+            probes.append(str(exc))
+        finally:
+            other_writer.close()
+
+    monkeypatch.setattr(tool_config, "refresh_oauth_token_if_needed", dead_refresh)
+    event.listen(engine, "after_cursor_execute", probe_at_reread)
+    try:
+        _resolve(session_factory, int(user.id))
+    finally:
+        event.remove(engine, "after_cursor_execute", probe_at_reread)
+
+    assert probes == ["database is locked"]
+
+
 def test_gmail_tombstone_takes_no_database_write_lock_before_its_own_lock(
     zendesk_db, session_factory, monkeypatch
 ):

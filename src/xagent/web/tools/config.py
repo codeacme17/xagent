@@ -3985,13 +3985,14 @@ class WebToolConfig(BaseToolConfig):
                 oauth_db.rollback()
                 # Unlike the actor flow, nothing serialized the refresh, so
                 # lock the row for the check-then-clear below (the same
-                # per-dialect lock the actor flow takes). Ordinary Gmail is
-                # the exception on SQLite: its tombstone enters an
-                # in-process transition lock with this session, and every
-                # other Gmail writer takes that lock before writing, so
-                # holding the database write lock first would invert that
-                # order. Its check below is therefore not atomic with the
-                # clear; Gmail does not rotate refresh tokens.
+                # per-dialect lock the actor flow takes). Ordinary Gmail's
+                # check below is not atomic with its clear on either dialect:
+                # its tombstone enters the mailbox transition lock, which
+                # commits this session first on PostgreSQL (releasing the
+                # row lock), and on SQLite is an in-process lock that every
+                # other Gmail writer takes before writing, so this session
+                # must not hold the database write lock while waiting for
+                # it. Gmail does not rotate refresh tokens.
                 reread_query = scoped_user_oauth_query(
                     oauth_db, user_id=user_id, resource_owner_key=None
                 ).filter(UserOAuth.id == account_id)
