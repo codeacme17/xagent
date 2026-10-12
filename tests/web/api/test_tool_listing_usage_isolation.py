@@ -40,6 +40,11 @@ def _seed(db: Session, task_id: int) -> None:
     db.commit()
 
 
+def _broken_usage_query(db: Session):
+    # A real database error: on PostgreSQL it aborts the transaction.
+    return db.query(sa.literal_column("missing_column").label("tool_name"))
+
+
 def test_usage_counts_are_read_without_touching_the_request_transaction(
     engine, task_id
 ):
@@ -69,11 +74,7 @@ def test_usage_counts_are_read_without_touching_the_request_transaction(
 def test_failed_usage_query_leaves_tool_metadata_readable(
     engine, task_id, monkeypatch: pytest.MonkeyPatch
 ):
-    def broken_usage_query(db: Session):
-        # A real database error: on PostgreSQL it aborts the transaction.
-        return db.query(sa.literal_column("missing_column").label("tool_name"))
-
-    monkeypatch.setattr(tools_api, "_tool_usage_query", broken_usage_query)
+    monkeypatch.setattr(tools_api, "_tool_usage_query", _broken_usage_query)
     with Session(engine) as db:
         _seed(db, task_id)
 
@@ -133,9 +134,6 @@ async def test_listing_applies_tool_policy_after_usage_statistics_fail(
             )
         ]
 
-    def broken_usage_query(db: Session):
-        return db.query(sa.literal_column("missing_column").label("tool_name"))
-
     monkeypatch.setattr(tools_api, "WebToolConfig", Config)
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
@@ -143,7 +141,7 @@ async def test_listing_applies_tool_policy_after_usage_statistics_fail(
     )
     monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
     monkeypatch.setattr(tools_api, "get_default_tool_configs", lambda: [])
-    monkeypatch.setattr(tools_api, "_tool_usage_query", broken_usage_query)
+    monkeypatch.setattr(tools_api, "_tool_usage_query", _broken_usage_query)
     with Session(engine) as db:
         _seed(db, task_id)
 
