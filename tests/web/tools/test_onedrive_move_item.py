@@ -233,6 +233,10 @@ def test_locked_item_reports_a_clear_error_and_asks_not_to_retry(monkeypatch, co
     assert "close it or check it in" in result["message"]
     assert "Do not retry until they confirm" in result["message"]
     assert "423" not in result["message"]
+    if code is not None:
+        assert f"(Graph error code: {code})" in result["message"]
+    else:
+        assert "Graph error code" not in result["message"]
 
 
 @pytest.mark.parametrize(

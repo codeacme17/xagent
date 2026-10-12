@@ -1842,7 +1842,9 @@ def onedrive_move_item(
                 ) from None
             # Graph answers 423 whatever its error code (production sent
             # notAllowed) while the file is open or checked out elsewhere;
-            # repeating the call at once only meets the same lock.
+            # repeating the call at once only meets the same lock. The code
+            # stays in the message because the tool result is what reaches
+            # the trace.
             if exc.status_code == 423:
                 raise ValueError(
                     "OneDrive refused the move because the item, or a file in "
@@ -1851,6 +1853,7 @@ def onedrive_move_item(
                     "checked out. Ask the user to close it or check it in; a "
                     "lock can take a few minutes to clear after the file is "
                     "closed. Do not retry until they confirm"
+                    + (f" (Graph error code: {exc.code})" if exc.code else "")
                 ) from None
             raise
         if not isinstance(result, dict):
