@@ -19,12 +19,12 @@ import { getApiUrl } from "@/lib/utils"
 
 export type CatalogStatus = "loading" | "ready" | "error"
 
-export interface KnowledgeBase {
+interface KnowledgeBase {
   name: string
   [key: string]: any
 }
 
-export interface Skill {
+interface Skill {
   name: string
   description?: string
   when_to_use?: string
@@ -32,7 +32,7 @@ export interface Skill {
   [key: string]: any
 }
 
-export interface Tool {
+interface Tool {
   name: string
   description: string
   type: string

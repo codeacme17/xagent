@@ -767,7 +767,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const loadedAgentId = originalData?.id
   // previewConfigKey reads the model seed and the MCP list; opening a record
-  // before either lands would have it invalidated straight away.
+  // before either lands would have it invalidated straight away. This waits
+  // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
   const previewInputsSettled = modelDefaultsSettled && mcpSettled
   useEffect(() => {
     if (!localAgentId || !previewInputsSettled || String(loadedAgentId) !== localAgentId || readOnly) return
@@ -807,12 +808,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [localAgentId, previewInputsSettled, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
 
   // Server-side creation paths persisted no model config, which rendered "--"
-  // and tripped the required-model guard on save. Both mount fetches must have
-  // landed before we can tell an unset slot from one still loading.
+  // and tripped the required-model guard on save. Seeds only once both the
+  // viewer's default and a model list containing it have landed.
   useEffect(() => {
     // Not in a read-only cross-user view: the default below is the viewer's,
     // so seeding there would render someone else's model as this agent's.
-    if (!isEditMode || readOnly || !modelDefaultsSettled || !originalData) return
+    if (!isEditMode || readOnly || !originalData) return
     if (seededGeneralRef.current !== null || modelConfig.general) return
     const seeded = userDefaultGeneral
     // Only an id the dropdown can actually show: seeding one that is missing
@@ -820,7 +821,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (!seeded || !models.some(m => m.id === seeded)) return
     seededGeneralRef.current = seeded
     setModelConfig(prev => ({ ...prev, general: seeded }))
-  }, [isEditMode, readOnly, modelDefaultsSettled, originalData, modelConfig.general, models, userDefaultGeneral])
+  }, [isEditMode, readOnly, originalData, modelConfig.general, models, userDefaultGeneral])
 
   // Load agent data in edit mode
   useEffect(() => {
@@ -881,7 +882,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const ownerMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers?user_id=${agent.user_id}`)
             if (!active) return
             if (ownerMcpRes.ok) {
-              setMcpServers((await ownerMcpRes.json()) || [])
+              // A non-list body would break every connector lookup at render.
+              const ownerServers = await ownerMcpRes.json()
+              if (Array.isArray(ownerServers)) setMcpServers(ownerServers)
             }
           } else if (ownerScopedMcpRef.current) {
             // Switching back to a self-owned agent after an admin cross-user view:
@@ -891,7 +894,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const selfMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
             if (!active) return
             if (selfMcpRes.ok) {
-              setMcpServers((await selfMcpRes.json()) || [])
+              const selfServers = await selfMcpRes.json()
+              if (Array.isArray(selfServers)) setMcpServers(selfServers)
             }
           }
 
@@ -2614,7 +2618,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               </div>
             </BuilderListStatus>
           )}
-          {selectedToolCategories.length > 0 && (
+          {/* The tool count is meaningless until the tools list has loaded. */}
+          {toolsStatus === "ready" && selectedToolCategories.length > 0 && (
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,

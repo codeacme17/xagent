@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 // #3007: the builder used to wait for every catalog request in one Promise.all,
@@ -390,6 +390,23 @@ describe("AgentBuilder catalog lists load independently", () => {
   })
 })
 
+describe("AgentBuilder tools summary while tools load", () => {
+  it("hides the selected-tools count until the tools list has loaded", async () => {
+    const tools = gate({ tools: [webSearchTool] })
+    installApi({ tools: tools.handler, agent: json(agentResponse({ tool_categories: ["web_search"] })) })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => expect(screen.getByDisplayValue("Catalog Agent")).toBeInTheDocument())
+    expect(within(toolsSection()).getByRole("status")).toHaveTextContent("common.loading")
+    expect(within(toolsSection()).queryByText("builds.configForm.tools.selectedCount")).toBeNull()
+
+    tools.release()
+    await waitFor(() =>
+      expect(within(toolsSection()).getByText("builds.configForm.tools.selectedCount")).toBeInTheDocument()
+    )
+  })
+})
+
 describe("AgentBuilder new-agent default models", () => {
   it("does not overwrite a model picked before the user default lands", async () => {
     const defaults = gate([
@@ -467,7 +484,7 @@ describe("AgentBuilder template entry with lists still loading", () => {
 })
 
 describe("AgentBuilder edit-mode seed with independent lists", () => {
-  it("waits for the model list before seeding", async () => {
+  it("seeds once the model list lands", async () => {
     const models = gate([{ id: MODEL_ID, model_id: "m", model_name: "llm-a", model_provider: "p", category: "llm" }])
     installApi({ models: models.handler, tools: hang })
     render(<AgentBuilder agentId={AGENT_ID} />)
@@ -479,7 +496,7 @@ describe("AgentBuilder edit-mode seed with independent lists", () => {
     await waitFor(() => expect(modelSelect().value).toBe(String(MODEL_ID)))
   })
 
-  it("waits for the user default before seeding", async () => {
+  it("seeds once the user default lands", async () => {
     const defaults = gate([{ config_type: "general", model: { id: MODEL_ID } }])
     installApi({ defaults: defaults.handler, tools: hang })
     render(<AgentBuilder agentId={AGENT_ID} />)
@@ -529,8 +546,10 @@ describe("AgentBuilder owner-scoped MCP list", () => {
     await waitFor(() => expect(screen.getByText("owner's foo")).toBeInTheDocument())
 
     mount.release()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    await waitFor(() => expect(screen.getByText("owner's foo")).toBeInTheDocument())
+    // Preview history waits for the mount MCP fetch to settle, which happens
+    // after that fetch would have written its list: a positive signal.
+    await waitFor(() => expect(calls(`/api/agents/${AGENT_ID}/preview-task`)).toBe(1))
+    expect(screen.getByText("owner's foo")).toBeInTheDocument()
     expect(screen.queryByText("admin's own foo")).toBeNull()
   })
 
@@ -561,8 +580,10 @@ describe("AgentBuilder owner-scoped MCP list", () => {
     agent.release()
     await waitFor(() => expect(screen.getByText("owner's foo")).toBeInTheDocument())
 
+    expect(calls(`/api/agents/${AGENT_ID}/preview-task`)).toBe(0)
     releaseBody()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Same positive signal as above: the mount fetch has fully settled.
+    await waitFor(() => expect(calls(`/api/agents/${AGENT_ID}/preview-task`)).toBe(1))
     expect(screen.getByText("owner's foo")).toBeInTheDocument()
     expect(screen.queryByText("admin's own foo")).toBeNull()
   })
@@ -574,9 +595,15 @@ describe("AgentBuilder MCP refresh after connecting", () => {
     installApi({
       mcp: () => {
         mcpCalls += 1
+        // The failing refresh's body resolves at once, so act() below flushes
+        // everything a regression could write.
         return mcpCalls === 1
           ? json([{ name: "foo", description: "Foo server" }])()
-          : json({ detail: "boom" }, 500)()
+          : Promise.resolve({
+              ok: false,
+              status: 500,
+              json: () => Promise.resolve({ detail: "boom" }),
+            } as unknown as Response)
       },
       agent: json(agentResponse({ tool_categories: ["mcp:foo"] })),
     })
@@ -584,10 +611,33 @@ describe("AgentBuilder MCP refresh after connecting", () => {
 
     await waitFor(() => expect(screen.getByText("Foo server")).toBeInTheDocument())
 
-    fireEvent.click(screen.getByText("mock-connect-mcp-success"))
-    await waitFor(() => expect(mcpCalls).toBe(2))
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-connect-mcp-success"))
+    })
+    expect(mcpCalls).toBe(2)
+    await act(async () => {})
 
     expect(screen.getByText("Foo server")).toBeInTheDocument()
+  })
+})
+
+describe("AgentBuilder MCP lists fetched by the agent load", () => {
+  it("ignores a non-list owner-scoped MCP body instead of crashing", async () => {
+    authUser.current = { id: "1", is_admin: true }
+    let ownerCalls = 0
+    installApi({
+      ownerMcp: () => {
+        ownerCalls += 1
+        return json({})()
+      },
+      agent: json(agentResponse({ user_id: 99, tool_categories: ["mcp:foo"] })),
+    })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => expect(ownerCalls).toBe(1))
+    await act(async () => {})
+
+    expect(screen.getByDisplayValue("Catalog Agent")).toBeInTheDocument()
+    expect(within(mcpSection()).getByText("tools.mcp.mcpUnavailable")).toBeInTheDocument()
   })
 })
