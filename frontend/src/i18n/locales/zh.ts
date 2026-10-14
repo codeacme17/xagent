@@ -1443,7 +1443,7 @@ const zh = {
       },
       mcpUnavailable: "暂不可用",
       needsReconnect: "需要重新连接",
-      needsReconnectDescription: "重新连接后才能在 agent 运行中使用该连接器。",
+      needsReconnectDescription: "该连接器需要重新连接，agent 运行才能使用它。",
       notConnected: "未连接，请点击连接器进行配置",
       notSupported: "平台暂未支持该应用",
       delete: {

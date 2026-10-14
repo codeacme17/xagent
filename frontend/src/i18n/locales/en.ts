@@ -1443,7 +1443,7 @@ Build when you need.`,
       },
       mcpUnavailable: "MCP unavailable",
       needsReconnect: "Needs reconnect",
-      needsReconnectDescription: "Reconnect to use this connector in agent runs.",
+      needsReconnectDescription: "This connector must be reconnected before agent runs can use it.",
       notConnected: "Not connected, please click connector to configure",
       notSupported: "Platform does not support this app yet",
       delete: {

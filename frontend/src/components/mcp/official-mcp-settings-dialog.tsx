@@ -24,10 +24,12 @@ interface OfficialMcpSettingsDialogProps {
   isGloballyConnected?: boolean
   // Whether this viewer's Configure route would resolve — a backend fact
   // (list_mcp_apps.can_configure), passed in like isGloballyConnected rather
-  // than read off `app`, because the two call sites answer it differently: the
+  // than read off `app`, because the call sites answer it differently: the
   // connector picker reads the listing field, while the Tools page hands this
-  // dialog a hand-built entry that carries no listing fields at all. Omitted
-  // means "use the connection state", which is exactly the gate this replaced.
+  // dialog a hand-built entry that carries no listing fields at all. The agent
+  // builder's reconnect omits this prop and isGloballyConnected, so Configure
+  // stays hidden and the Connect button runs the login. Omitted means "use the
+  // connection state", which is exactly the gate this replaced.
   canConfigure?: boolean
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void

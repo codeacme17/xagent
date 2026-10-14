@@ -2822,10 +2822,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
-                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>
+                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && !reconnectNeeded && "opacity-50 bg-muted/50")}>
                   <div className="bg-slate-100 p-1.5 rounded">
                     {icon ? (
-                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && "grayscale")} />
+                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && !reconnectNeeded && "grayscale")} />
                     ) : (
                       <span className="text-xl">🔌</span>
                     )}

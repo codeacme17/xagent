@@ -235,6 +235,11 @@ describe("AgentBuilder selected connector needs_reconnect", () => {
     expect(screen.queryByText("tools.mcp.mcpUnavailable")).not.toBeInTheDocument()
     expect(screen.queryByTestId("reconnect-dialog")).not.toBeInTheDocument()
 
+    // The row is not connected, but its Reconnect action must not look disabled.
+    const row = screen.getByRole("button", { name: RECONNECT }).closest("div.rounded-md.border")
+    expect(row).not.toBeNull()
+    expect(row).not.toHaveClass("opacity-50")
+
     fireEvent.click(screen.getByRole("button", { name: RECONNECT }))
     expect(screen.getByTestId("reconnect-dialog")).toHaveTextContent("zendesk:needs_reconnect")
   })
