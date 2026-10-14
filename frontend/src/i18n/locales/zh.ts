@@ -1290,6 +1290,8 @@ const zh = {
           team: "归属团队",
         },
         configure: "配置",
+        reconnect: "重新连接",
+        reconnectNotice: "{name} 的连接需要重新授权，之后 agent 才能使用它。",
         connectSuccess: "已连接 {name}",
         disconnect: "断开连接",
         disconnectSuccess: "已成功断开 {name} 的连接",
@@ -1440,6 +1442,8 @@ const zh = {
         providerNotDefined: "应用未定义 provider",
       },
       mcpUnavailable: "暂不可用",
+      needsReconnect: "需要重新连接",
+      needsReconnectDescription: "重新连接后才能在 agent 运行中使用该连接器。",
       notConnected: "未连接，请点击连接器进行配置",
       notSupported: "平台暂未支持该应用",
       delete: {
