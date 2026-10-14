@@ -126,7 +126,7 @@ async def _close_stream(stream: Any) -> None:
         return
     try:
         await close()
-    except Exception as exc:  # pragma: no cover - best effort
+    except Exception as exc:  # best effort
         logger.debug("Closing aborted Gemini stream failed (%s)", type(exc).__name__)
 
 
@@ -713,10 +713,6 @@ class GeminiLLM(BaseLLM):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat completion using official Google Generative AI SDK."""
-        import time
-
-        start_time = time.time()
-
         current_content = ""
         usage_received = False
 
@@ -791,12 +787,15 @@ class GeminiLLM(BaseLLM):
             # Both limits are deadlines on the wait itself, not checks made
             # when a chunk arrives: a check on arrival never runs for a stream
             # that stays silent, and without a configured ``base_url`` the SDK
-            # client has no HTTP timeout to bound it either (#3058). The SDK
-            # sends the request on the first read, which the first-token
-            # deadline bounds; opening the stream is bounded by it as well.
+            # client has no HTTP timeout to bound it either (#3058). With tools
+            # (AFC is disabled in ``_build_gemini_tool_config``) the SDK sends
+            # the request and waits for the response headers inside
+            # ``generate_content_stream(...)``; without tools it sends the
+            # request on the first read. The first-token deadline bounds both.
             loop = asyncio.get_running_loop()
             first_token_timeout = self.timeout_config.first_token_timeout
-            first_token_deadline = loop.time() + first_token_timeout
+            opened_at = loop.time()
+            first_token_deadline = opened_at + first_token_timeout
             first_token_message = (
                 f"First token timeout: no chunk within {first_token_timeout}s"
             )
@@ -850,7 +849,7 @@ class GeminiLLM(BaseLLM):
                 if first_chunk:
                     first_chunk = False
                     logger.debug(
-                        "First token received after %.2fs", time.time() - start_time
+                        "First token received after %.2fs", loop.time() - opened_at
                     )
 
                 # Check for usage metadata

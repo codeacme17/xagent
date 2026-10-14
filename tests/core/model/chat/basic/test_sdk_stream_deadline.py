@@ -8,6 +8,7 @@ deadline. The OpenAI-compatible path is covered by
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -65,11 +66,25 @@ class ClaudeStream(FakeStream):
         self.closed = True
 
 
+class RaisingCloseClaudeStream(ClaudeStream):
+    """A stream whose ``close()`` fails, as a broken transport can."""
+
+    async def close(self):
+        raise RuntimeError("close failed")
+
+
 class GeminiStream(FakeStream):
     """Shaped like the async generator ``generate_content_stream`` returns."""
 
     async def aclose(self):
         self.closed = True
+
+
+class RaisingCloseGeminiStream(GeminiStream):
+    """A generator whose ``aclose()`` fails, as a broken transport can."""
+
+    async def aclose(self):
+        raise RuntimeError("aclose failed")
 
 
 async def _hang(*_args, **_kwargs):
@@ -84,8 +99,9 @@ def _claude_text(text):
     )
 
 
-def _make_claude(mocker, config, script, block, end_delay):
-    stream = ClaudeStream(script or [], then_block=block, end_delay=end_delay)
+def _make_claude(mocker, config, script, block, end_delay, close_raises, timeouts):
+    stream_cls = RaisingCloseClaudeStream if close_raises else ClaudeStream
+    stream = stream_cls(script or [], then_block=block, end_delay=end_delay)
     client = mocker.AsyncMock()
     if script is not None:
         client.messages.create.return_value = stream
@@ -94,7 +110,7 @@ def _make_claude(mocker, config, script, block, end_delay):
     mocker.patch(
         "xagent.core.model.chat.basic.claude.AsyncAnthropic", return_value=client
     )
-    return ClaudeLLM(**config, timeout_config=TIMEOUT_CONFIG), stream
+    return ClaudeLLM(**config, timeout_config=timeouts), stream
 
 
 def _gemini_text(text):
@@ -103,8 +119,9 @@ def _gemini_text(text):
     return SimpleNamespace(candidates=[candidate], usage_metadata=None)
 
 
-def _make_gemini(mocker, config, script, block, end_delay):
-    stream = GeminiStream(script or [], then_block=block, end_delay=end_delay)
+def _make_gemini(mocker, config, script, block, end_delay, close_raises, timeouts):
+    stream_cls = RaisingCloseGeminiStream if close_raises else GeminiStream
+    stream = stream_cls(script or [], then_block=block, end_delay=end_delay)
     client = mocker.MagicMock()
     if script is not None:
 
@@ -114,7 +131,7 @@ def _make_gemini(mocker, config, script, block, end_delay):
         client.aio.models.generate_content_stream = generate_content_stream
     else:
         client.aio.models.generate_content_stream = _hang
-    llm = GeminiLLM(**config, timeout_config=TIMEOUT_CONFIG)
+    llm = GeminiLLM(**config, timeout_config=timeouts)
     mocker.patch.object(llm, "_ensure_client")
     llm._client = client
     return llm, stream
@@ -131,9 +148,24 @@ def adapter(request, mocker):
     make, text_event = ADAPTERS[request.param]
     config = request.getfixturevalue(f"{request.param}_llm_config")
 
-    def _make(script=None, *, then_block=False, end_delay=0.0):
+    def _make(
+        script=None,
+        *,
+        then_block=False,
+        end_delay=0.0,
+        close_raises=False,
+        timeout_config=TIMEOUT_CONFIG,
+    ):
         """``script=None`` makes opening the stream hang forever."""
-        return make(mocker, config, script, then_block, end_delay)
+        return make(
+            mocker,
+            config,
+            script,
+            then_block,
+            end_delay,
+            close_raises,
+            timeout_config,
+        )
 
     return SimpleNamespace(make=_make, text=text_event)
 
@@ -233,11 +265,17 @@ async def test_silence_past_interval_then_clean_end_times_out(adapter):
 
 @pytest.mark.asyncio
 async def test_events_inside_each_limit_are_all_delivered(adapter):
-    # Each gap is inside the interval limit, while the whole stream runs well
-    # past the first-token limit: neither limit is a cap on total duration.
-    texts = ["a", "b", "c", "d", "e", "f", "g", "h"]
-    gap = TOKEN_INTERVAL_TIMEOUT / 4
-    llm, stream = adapter.make([(gap, adapter.text(t)) for t in texts])
+    # The first event arrives at once and each later gap is well inside the
+    # interval limit, while the whole stream (~0.4 s) runs past the 0.2 s
+    # first-token limit: neither limit is a cap on total duration.
+    texts = ["a", "b", "c", "d", "e"]
+    llm, stream = adapter.make(
+        [(0.0, adapter.text(texts[0]))] + [(0.1, adapter.text(t)) for t in texts[1:]],
+        timeout_config=TimeoutConfig(
+            first_token_timeout=FIRST_TOKEN_TIMEOUT,
+            token_interval_timeout=1.0,
+        ),
+    )
     received = []
 
     await _drain(llm, received)
@@ -261,3 +299,23 @@ async def test_consumer_time_between_events_is_not_provider_silence(adapter):
             await asyncio.sleep(TOKEN_INTERVAL_TIMEOUT * 1.5)
 
     assert _token_deltas(received) == texts
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_raised_even_when_closing_the_stream_fails(adapter):
+    llm, _ = adapter.make([], then_block=True, close_raises=True)
+
+    with pytest.raises(LLMTimeoutError, match="First token timeout"):
+        await _drain(llm, [])
+
+
+@pytest.mark.asyncio
+async def test_first_token_timeout_is_logged_once_at_error_level(adapter, caplog):
+    llm, _ = adapter.make([], then_block=True)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(LLMTimeoutError):
+            await _drain(llm, [])
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]

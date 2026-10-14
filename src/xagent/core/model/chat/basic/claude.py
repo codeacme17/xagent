@@ -73,7 +73,7 @@ async def _close_stream(stream: Any) -> None:
         return
     try:
         await close()
-    except Exception as exc:  # pragma: no cover - best effort
+    except Exception as exc:  # best effort
         logger.debug("Closing aborted Claude stream failed (%s)", type(exc).__name__)
 
 
@@ -1176,6 +1176,9 @@ class ClaudeLLM(BaseLLM):
                                     raw=event,
                                 )
 
+        except LLMTimeoutError:
+            # Already logged where the deadline expired.
+            raise
         except Exception as e:
             logger.error(f"Claude streaming API error: {str(e)}")
             # Re-raise LLMRetryableError for retry
