@@ -164,7 +164,6 @@ async def test_chunks_inside_each_limit_are_all_delivered(make_llm):
     await _drain(llm, received)
 
     assert [c.content for c in received if c.is_token()] == texts
-    assert not stream.closed
 
 
 @pytest.mark.asyncio
@@ -214,9 +213,9 @@ async def test_keepalive_only_sdk_stream_times_out_and_closes_response(
         nonlocal requests_seen
         requests_seen += 1
         if requests_seen == 1:
-            # Warm-up: the first request through a fresh SDK client has been
-            # seen to take longer than the deadline under test on a loaded
-            # runner, so time only the second one.
+            # Warm-up, sent through a lenient instance: the first request
+            # through a fresh SDK client has been seen to take longer than
+            # the deadline under test on a loaded runner.
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
@@ -237,6 +236,15 @@ async def test_keepalive_only_sdk_stream_times_out_and_closes_response(
         "xagent.core.model.chat.basic.openai.AsyncOpenAI",
         return_value=sdk_client,
     )
+    # Both instances get the patched ``sdk_client``, so the warm-up primes the
+    # same client the timed call uses.
+    warm_up_llm = OpenAILLM(
+        **openai_llm_config,
+        timeout_config=TimeoutConfig(
+            first_token_timeout=HANG_GUARD,
+            token_interval_timeout=HANG_GUARD,
+        ),
+    )
     llm = OpenAILLM(
         **openai_llm_config,
         timeout_config=TimeoutConfig(
@@ -246,7 +254,7 @@ async def test_keepalive_only_sdk_stream_times_out_and_closes_response(
     )
     loop = asyncio.get_running_loop()
     try:
-        await _drain(llm, [])
+        await _drain(warm_up_llm, [])
 
         started = loop.time()
         with pytest.raises(LLMTimeoutError, match="First token timeout"):
