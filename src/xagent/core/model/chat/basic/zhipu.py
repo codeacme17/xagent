@@ -32,7 +32,7 @@ def _close_stream_response(stream: Any) -> None:
     try:
         close()
     except Exception as exc:  # best effort
-        logger.debug("Closing abandoned Zhipu stream failed (%s)", type(exc).__name__)
+        logger.debug("Closing Zhipu stream response failed (%s)", type(exc).__name__)
 
 
 def _zhipu_stream_tool_calls(
@@ -506,22 +506,26 @@ class ZhipuLLM(BaseLLM):
         # reaching this check and reset the read timeout, so against a
         # provider that sends them the wait is unbounded. Closing the response
         # from the event loop cannot cut the read short, since httpcore's sync
-        # close does not shut the socket down (#3058).
+        # close does not shut the socket down (#3097).
         stop_producer = threading.Event()
 
         try:
             # Create a queue to bridge the synchronous stream to async generator
-            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+            queue: asyncio.Queue[Union[Dict[str, Any], Exception, None]] = (
+                asyncio.Queue()
+            )
 
             # Get the event loop in the main thread before spawning the worker thread
             loop = asyncio.get_event_loop()
 
-            def enqueue(item: Any) -> None:
+            def enqueue(item: Union[Dict[str, Any], Exception, None]) -> bool:
                 try:
                     loop.call_soon_threadsafe(queue.put_nowait, item)
                 except RuntimeError:
                     # The loop is closed, so nobody is left to read the item.
                     stop_producer.set()
+                    return False
+                return True
 
             def stream_producer() -> None:
                 """
@@ -618,7 +622,9 @@ class ZhipuLLM(BaseLLM):
                             chunk_dict["usage"] = usage_dict
 
                         # Put chunk in queue using the event loop from main thread
-                        enqueue(chunk_dict)
+                        # A closed loop means nobody reads further events.
+                        if not enqueue(chunk_dict):
+                            return
 
                     # Signal end of stream with sentinel value
                     enqueue(None)

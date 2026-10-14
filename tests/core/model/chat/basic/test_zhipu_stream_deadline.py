@@ -10,6 +10,7 @@ consumer had gone. The Claude and Gemini paths are covered by
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -85,9 +86,10 @@ def _text(text):
 
 @pytest.fixture
 async def make_llm():
-    # Async so it is torn down before the event loop: closing the loop joins
-    # the default executor's threads, and a producer still blocked in a fake
-    # read would hang that join until released here.
+    # Async so it is torn down before the runner's teardown
+    # (``asyncio.Runner.close()`` -> ``loop.shutdown_default_executor()``, which
+    # pytest-asyncio uses) joins the default executor's threads: a producer
+    # still blocked in a fake read would hang that join until released here.
     streams = []
 
     def _make(
@@ -98,13 +100,16 @@ async def make_llm():
         fail=None,
         hang_on_open=False,
         timeouts=None,
+        creates=None,
     ):
         stream = FakeZhipuStream(
             script, then_block=then_block, end_delay=end_delay, fail=fail
         )
         streams.append(stream)
 
-        def create(**_kwargs):
+        def create(**kwargs):
+            if creates is not None:
+                creates.append(kwargs)
             if hang_on_open:
                 stream.release.wait()
             return stream
@@ -137,8 +142,19 @@ def _token_deltas(chunks):
 
 
 @pytest.mark.asyncio
-async def test_silent_stream_times_out_at_first_token_deadline(make_llm):
-    llm, _ = make_llm([], then_block=True)
+@pytest.mark.parametrize(
+    "llm_kwargs",
+    [
+        pytest.param({"script": [], "then_block": True}, id="silent"),
+        pytest.param({"script": [(1.5, _text("late"))]}, id="late_first_chunk"),
+        pytest.param(
+            {"script": [(0.0, _text("never"))], "hang_on_open": True},
+            id="hangs_on_open",
+        ),
+    ],
+)
+async def test_first_token_deadline(make_llm, llm_kwargs):
+    llm, _ = make_llm(**llm_kwargs)
     loop = asyncio.get_running_loop()
 
     started = loop.time()
@@ -149,51 +165,27 @@ async def test_silent_stream_times_out_at_first_token_deadline(make_llm):
 
 
 @pytest.mark.asyncio
-async def test_late_first_chunk_times_out_at_the_deadline_not_on_arrival(make_llm):
-    llm, _ = make_llm([(1.5, _text("late"))])
-    loop = asyncio.get_running_loop()
-
-    started = loop.time()
-    with pytest.raises(LLMTimeoutError, match="First token timeout"):
-        await _drain(llm, [])
-
-    assert loop.time() - started < FIRST_TOKEN_TIMEOUT + MARGIN
-
-
-@pytest.mark.asyncio
-async def test_first_token_deadline_covers_opening_the_stream(make_llm):
-    llm, _ = make_llm([(0.0, _text("never"))], hang_on_open=True)
-    loop = asyncio.get_running_loop()
-
-    started = loop.time()
-    with pytest.raises(LLMTimeoutError, match="First token timeout"):
-        await _drain(llm, [])
-
-    assert loop.time() - started < FIRST_TOKEN_TIMEOUT + MARGIN
-
-
-@pytest.mark.asyncio
-async def test_stall_after_first_chunk_times_out_at_interval_deadline(make_llm):
-    llm, _ = make_llm(
-        [(0.0, _text("hello"))], then_block=True, timeouts=AFTER_FIRST_CHUNK_CONFIG
-    )
-    loop = asyncio.get_running_loop()
-    received = []
-
-    started = loop.time()
-    with pytest.raises(LLMTimeoutError, match="Token interval timeout"):
-        await _drain(llm, received)
-
-    assert _token_deltas(received) == ["hello"]
-    assert loop.time() - started < TOKEN_INTERVAL_TIMEOUT + MARGIN
-
-
-@pytest.mark.asyncio
-async def test_late_second_chunk_times_out_at_interval_deadline(make_llm):
-    llm, _ = make_llm(
-        [(0.0, _text("hello")), (1.5, _text("late"))],
-        timeouts=AFTER_FIRST_CHUNK_CONFIG,
-    )
+@pytest.mark.parametrize(
+    "llm_kwargs",
+    [
+        pytest.param(
+            {"script": [(0.0, _text("hello"))], "then_block": True}, id="stall"
+        ),
+        pytest.param(
+            {"script": [(0.0, _text("hello")), (1.5, _text("late"))]},
+            id="late_second_chunk",
+        ),
+        # Before #3058 the loop exited on end-of-stream without checking, so a
+        # stream that went silent past the limit and then ended was accepted.
+        # The wait for the end is now bounded like any other wait.
+        pytest.param(
+            {"script": [(0.0, _text("hello"))], "end_delay": 1.5},
+            id="silence_then_clean_end",
+        ),
+    ],
+)
+async def test_interval_deadline(make_llm, llm_kwargs):
+    llm, _ = make_llm(**llm_kwargs, timeouts=AFTER_FIRST_CHUNK_CONFIG)
     loop = asyncio.get_running_loop()
     received = []
 
@@ -270,6 +262,30 @@ async def test_producer_stops_when_the_stream_opens_after_a_timeout(make_llm):
 
 
 @pytest.mark.asyncio
+async def test_producer_started_after_a_timeout_sends_no_request(make_llm):
+    creates = []
+    llm, _ = make_llm([(0.0, _text("unread"))], creates=creates)
+    loop = asyncio.get_running_loop()
+    # One worker, kept busy, so the producer only starts after the deadline.
+    # The executor is not restored: each test has its own loop, and the
+    # runner's teardown joins whatever default executor is installed.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    gate = threading.Event()
+    try:
+        blocker = loop.run_in_executor(None, gate.wait)
+        with pytest.raises(LLMTimeoutError, match="First token timeout"):
+            await _drain(llm, [])
+        gate.set()
+        await blocker
+        # FIFO on the single worker: this runs after the queued producer returned.
+        await loop.run_in_executor(None, lambda: None)
+    finally:
+        gate.set()
+
+    assert creates == []
+
+
+@pytest.mark.asyncio
 async def test_caller_abandoning_the_stream_stops_the_producer(make_llm):
     script = [(0.0, _text("a")), (1.0, _text("b"))] + [
         (0.0, _text(t)) for t in ["c", "d", "e"]
@@ -284,19 +300,6 @@ async def test_caller_abandoning_the_stream_stops_the_producer(make_llm):
     assert first.delta == "a"
     await _wait_until(lambda: stream.response.closed)
     assert stream.pulled == 2
-
-
-@pytest.mark.asyncio
-async def test_silence_past_interval_then_clean_end_times_out(make_llm):
-    # Before #3058 the loop exited on end-of-stream without checking, so a
-    # stream that went silent past the limit and then ended was accepted. The
-    # wait for the end is now bounded like any other wait.
-    llm, _ = make_llm(
-        [(0.0, _text("hello"))], end_delay=1.5, timeouts=AFTER_FIRST_CHUNK_CONFIG
-    )
-
-    with pytest.raises(LLMTimeoutError, match="Token interval timeout"):
-        await _drain(llm, [])
 
 
 @pytest.mark.asyncio
