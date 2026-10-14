@@ -830,7 +830,7 @@ class BedrockLLM(BaseLLM):
         )
         client = await self._get_client()
         event_stream = None
-        stream_ended = False
+        read_in_flight = False
         current_text = ""
         tool_calls: dict[int, dict[str, Any]] = {}
         reasoning_deltas: dict[int, dict[str, Any]] = {}
@@ -890,6 +890,7 @@ class BedrockLLM(BaseLLM):
                 else:
                     deadline = loop.time() + interval_timeout
                     timeout_message = interval_message
+                read_in_flight = True
                 present, event = await await_before_deadline(
                     run_in_thread_with_telemetry(
                         "bedrock.stream_next", self._next_event, iterator
@@ -897,8 +898,8 @@ class BedrockLLM(BaseLLM):
                     deadline=deadline,
                     timeout_message=timeout_message,
                 )
+                read_in_flight = False
                 if not present:
-                    stream_ended = True
                     break
                 first_event = False
                 if "contentBlockStart" in event:
@@ -1102,13 +1103,26 @@ class BedrockLLM(BaseLLM):
         finally:
             close = getattr(event_stream, "close", None)
             if callable(close):
-                # On any early exit (a deadline, cancellation, an error) a
-                # worker may still be blocked in the socket read, which neither
-                # cancelling its wait nor close() interrupts: shut the socket
-                # down first. Without that, close() would wait for the read, so
-                # it is left to run in the background instead.
-                if stream_ended or _shutdown_event_stream(event_stream):
+                # Only a read still pending in a worker (a deadline,
+                # cancellation, or an error out of the await) needs the socket
+                # shut down first: neither cancelling its wait nor close()
+                # interrupts it. Without a shutdown, close() would wait for
+                # that read, so it is left to run in the background instead.
+                if not read_in_flight:
                     await run_in_thread_with_telemetry("bedrock.stream_close", close)
+                elif _shutdown_event_stream(event_stream):
+                    try:
+                        await run_in_thread_with_telemetry(
+                            "bedrock.stream_close", close
+                        )
+                    except Exception as exc:
+                        # The woken worker's urllib3 cleanup can race this
+                        # close (release_conn() clears _connection while
+                        # close() checks it unlocked), and a close error must
+                        # not replace the error already in flight.
+                        logger.debug(
+                            "Closing Bedrock stream failed (%s)", type(exc).__name__
+                        )
                 else:
                     _close_in_background(close)
 

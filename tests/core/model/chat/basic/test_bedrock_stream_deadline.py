@@ -69,7 +69,10 @@ class FakeEventStream:
     stays silent. A read blocked in a wait returns early when the raw stream is
     shut down, as a socket read does, and raises like urllib3 then does. With
     ``close_blocks``, ``close()`` waits as urllib3's does behind a blocked read.
-    ``release`` ends every wait at teardown so no thread is left behind.
+    ``close_raises`` makes ``close()`` fail the way urllib3's does when the
+    woken reader's cleanup races it. ``close_thread`` records which thread ran
+    ``close()``. ``release`` ends every wait at teardown so no thread is left
+    behind.
     """
 
     def __init__(
@@ -80,11 +83,13 @@ class FakeEventStream:
         end_delay=0.0,
         supports_shutdown=True,
         close_blocks=False,
+        close_raises=False,
     ):
         self._script = list(script)
         self._then_block = then_block
         self._end_delay = end_delay
         self._close_blocks = close_blocks
+        self._close_raises = close_raises
         self.release = threading.Event()
         self._raw_stream = FakeRawStream(
             self.release, supports_shutdown=supports_shutdown
@@ -92,6 +97,7 @@ class FakeEventStream:
         self.pulled = 0
         self.reader_woken = threading.Event()
         self.close_called = threading.Event()
+        self.close_thread = None
 
     def _wait(self, timeout=None):
         self.release.wait(timeout)
@@ -111,9 +117,12 @@ class FakeEventStream:
             self._wait(self._end_delay)
 
     def close(self):
+        self.close_thread = threading.current_thread().name
         self.close_called.set()
         if self._close_blocks:
             self.release.wait()
+        if self._close_raises:
+            raise AttributeError("'NoneType' object has no attribute 'close'")
         self._raw_stream.close()
 
 
@@ -148,6 +157,7 @@ async def make_llm():
         hang_on_open=False,
         supports_shutdown=True,
         close_blocks=False,
+        close_raises=False,
         timeouts=TIMEOUT_CONFIG,
     ):
         stream = FakeEventStream(
@@ -156,6 +166,7 @@ async def make_llm():
             end_delay=end_delay,
             supports_shutdown=supports_shutdown,
             close_blocks=close_blocks,
+            close_raises=close_raises,
         )
         streams.append(stream)
         llm = BedrockLLM(
@@ -309,6 +320,46 @@ async def test_expiry_without_shutdown_does_not_wait_for_close(make_llm):
 
     assert loop.time() - started < TOKEN_INTERVAL_TIMEOUT + MARGIN
     assert await asyncio.to_thread(stream.close_called.wait, HANG_GUARD)
+
+
+@pytest.mark.asyncio
+async def test_close_error_after_shutdown_does_not_replace_the_timeout(make_llm):
+    llm, stream = make_llm(
+        [(0.0, _text("hello"))],
+        then_block=True,
+        close_raises=True,
+        timeouts=AFTER_FIRST_EVENT_CONFIG,
+    )
+
+    with pytest.raises(LLMTimeoutError, match="Token interval timeout"):
+        await _drain(llm, [])
+
+    assert stream._raw_stream.shut_down
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supports_shutdown", [True, False])
+async def test_caller_closing_the_stream_between_events_closes_it_inline(
+    make_llm, supports_shutdown
+):
+    # No read is pending when the caller stops at a yield, so there is nothing
+    # to wake: the stream is closed before aclose() returns, without shutting
+    # the socket down and without falling back to the background close.
+    llm, stream = make_llm(
+        [(0.0, _text("a")), (0.0, _text("b"))],
+        supports_shutdown=supports_shutdown,
+        timeouts=AFTER_FIRST_EVENT_CONFIG,
+    )
+
+    async with asyncio.timeout(HANG_GUARD):
+        stream_iter = llm.stream_chat([{"role": "user", "content": "Hi"}])
+        first = await anext(stream_iter)
+        await stream_iter.aclose()
+
+    assert first.delta == "a"
+    assert stream._raw_stream.closed
+    assert not stream._raw_stream.shut_down
+    assert stream.close_thread != "bedrock-stream-close"
 
 
 @pytest.mark.asyncio
