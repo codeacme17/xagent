@@ -1555,8 +1555,15 @@ def test_delete_container_403_names_group_membership(
     assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
 
 
+@pytest.mark.parametrize(
+    ("etag", "failing_method"),
+    [(None, "GET"), ('W/"etag-1"', "DELETE")],
+    ids=["on-etag-read", "on-delete"],
+)
 @pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
-def test_delete_container_missing_scope_asks_for_reconnect(monkeypatch, delete, path):
+def test_delete_container_missing_scope_asks_for_reconnect(
+    monkeypatch, delete, path, etag, failing_method
+):
     mock_request = Mock(
         return_value=MockResponse(
             {
@@ -1570,14 +1577,14 @@ def test_delete_container_missing_scope_asks_for_reconnect(monkeypatch, delete, 
     )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
-    result = json.loads(delete(etag='W/"etag-1"'))
+    result = json.loads(delete(etag=etag))
 
     assert result["status"] == "error"
     assert "disconnect Planner" in result["message"]
     assert "Tasks.ReadWrite" in result["message"]
     assert "member of the Microsoft 365 group" not in result["message"]
     mock_request.assert_called_once()
-    assert mock_request.call_args.kwargs["method"] == "DELETE"
+    assert mock_request.call_args.kwargs["method"] == failing_method
     assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
 
 

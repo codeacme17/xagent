@@ -1151,8 +1151,9 @@ def planner_delete_task(task_id: str, etag: str | None = None) -> str:
 
 
 def _delete_conflict(resource_name: str) -> str:
-    # The user confirmed deleting the version they saw; a changed resource
-    # needs a fresh confirmation, not a silent retry.
+    # The resource changed after its etag was read -- when the caller passed
+    # the etag from the read the user confirmed, that is the version they
+    # agreed to delete -- so it needs a fresh confirmation, not a silent retry.
     return _conflict(
         f"This {resource_name} changed after it was read, so it was not "
         "deleted. Read it again and confirm with the user before retrying."
@@ -1186,8 +1187,10 @@ def planner_delete_plan(plan_id: str, etag: str | None = None) -> str:
     """Permanently delete a Planner plan, including all of its buckets and
     tasks. Confirm with the user before calling this; it cannot be undone.
 
-    etag is optional -- pass the @odata.etag from a recent planner_get_plan
-    call on this plan to skip a read; omit it to fetch the current one."""
+    Pass the @odata.etag from the planner_get_plan read you showed the user
+    as etag, so the delete only applies to the version they confirmed. If
+    that read did not include one, omit etag and the current one is fetched
+    just before deleting."""
     try:
         plan_path = f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
         _etag_guarded_write(plan_path, "DELETE", etag=etag)
@@ -1214,9 +1217,10 @@ def planner_delete_bucket(plan_id: str, bucket_id: str, etag: str | None = None)
 
     plan_id is the plan that contains the bucket; it is only used to say
     where to check (planner_list_buckets) when the outcome is unknown.
-    etag is optional -- pass the bucket's @odata.etag from a recent
-    planner_list_buckets call to skip a read; omit it to fetch the current
-    one."""
+    Pass the bucket's @odata.etag from the planner_list_buckets read you
+    showed the user as etag, so the delete only applies to the version they
+    confirmed. If that read did not include one, omit etag and the current
+    one is fetched just before deleting."""
     try:
         require_clean_identifier(plan_id, "plan_id")
         bucket_path = f"/planner/buckets/{url_path_id(bucket_id, 'bucket_id')}"
