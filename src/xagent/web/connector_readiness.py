@@ -29,34 +29,48 @@ can start here, without any credential:
 One line per connector, ``PASS``, ``SKIP sandboxed`` or ``FAIL <class>``
 with the class one of ``spawn`` (command not found), ``missing`` (the child
 exited before the handshake: a Python import error, or an npm package absent
-from the offline cache), ``handshake`` (no reply within the timeout),
-``no-tools`` and ``unreachable``. A failure line carries the last line of the
+from the offline cache), ``handshake`` (no usable ``initialize``/``tools/list`` reply within the
+timeout, or an error reply), ``no-tools`` and ``unreachable``. A failure line carries the last line of the
 child's stderr or the exception, never the environment. The exit code is 1
 when any connector fails.
 
 Each connector is bounded by ``XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS`` (the
 same bound task startup uses) and the whole run by ``--total-timeout``, which
 defaults to the connector count times that value.
+
+The child's environment is the placeholders, the offline switches and
+``PATH``, plus the SDK's inherited allowlist (``HOME``, ``USER``, ...). A task
+also forwards ``static_env`` entries, the proxy and CA-bundle variables and the
+file allowlists (``web/tools/config.py``); building a connector's environment
+outside a task is #3261's work. A connector that needs one of those before it
+answers ``tools/list`` would fail here and not in a task; no registry row does.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import posixpath
 import sys
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Literal, TextIO, cast
 
 import anyio
 import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED
 
+from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
+    should_sandbox_mcp_connection,
+)
 from ..core.tools.core.mcp.http import create_mcp_http_client
+
+if TYPE_CHECKING:
+    from ..core.tools.core.mcp.sessions import Connection
 
 Status = Literal["PASS", "SKIP", "FAIL"]
 Reason = Literal[
@@ -68,17 +82,29 @@ Origin = Literal["builtin", "custom"]
 # credential key. The stdio check stops after tools/list, so it never reaches
 # a vendor.
 PLACEHOLDER = "readiness-placeholder"
-# Same set as sandboxed_mcp_tool_helper._MCP_SANDBOX_COMMANDS: the commands
-# load_mcp_tools_as_agent_tools routes into the sandbox when one is attached.
-SANDBOXED_COMMANDS = frozenset({"npx", "uvx"})
 # Forces a cache miss to fail instead of reaching the registry; NPM_CONFIG_*
 # is how Dockerfile.sandbox verifies its own warm-up.
 OFFLINE_ENV = {"NPM_CONFIG_OFFLINE": "true", "UV_OFFLINE": "1"}
-SANDBOXED_DETAIL = "npx/uvx rows run in the sandbox image, not this one"
 _STDERR_TAIL_LINES = 5
 _DETAIL_MAX_CHARS = 300
 # npm ends every failure with this pointer; the error itself is the line above.
 _STDERR_NOISE = ("A complete log of this run can be found in",)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one check found, before it is tied to a row."""
+
+    status: Status
+    reason: Reason | None
+    detail: str
+    stderr_tail: str = ""
+
+
+SKIPPED_SANDBOXED = Outcome(
+    "SKIP", "sandboxed", "npx/uvx rows run in the sandbox image, not this one"
+)
+NO_LAUNCH = Outcome("FAIL", "spawn", "launch_config has neither a command nor a url")
 
 
 @dataclass(frozen=True)
@@ -91,15 +117,37 @@ class ConnectorReadiness:
     detail: str
     stderr_tail: str
 
+    @classmethod
+    def of(cls, row: Any, *, origin: Origin, outcome: Outcome) -> ConnectorReadiness:
+        return cls(
+            app_id=str(row.app_id),
+            origin=origin,
+            hidden=_hidden(row),
+            status=outcome.status,
+            reason=outcome.reason,
+            detail=outcome.detail,
+            stderr_tail=outcome.stderr_tail,
+        )
+
     @property
     def failed(self) -> bool:
         return self.status == "FAIL"
+
+
+def _hidden(row: Any) -> bool:
+    return not bool(getattr(row, "is_visible_in_connector", True))
 
 
 def sandbox_enabled_from_env() -> bool:
     """Whether a task attaches a sandbox, read the way
     ``sandbox_manager._create_sandbox_service`` reads it."""
     return os.getenv("SANDBOX_ENABLED", "false").lower() == "true"
+
+
+def is_sandbox_command(command: str) -> bool:
+    """Whether a task routes this stdio command into the sandbox (npx, uvx)."""
+    connection = cast("Connection", {"transport": "stdio", "command": command})
+    return should_sandbox_mcp_connection(connection)
 
 
 def placeholder_env(launch_config: Mapping[str, Any]) -> dict[str, str]:
@@ -149,9 +197,6 @@ def _classify_stdio_failure(exc: BaseException) -> tuple[Reason, BaseException]:
 
 
 def _is_connection_closed(exc: BaseException) -> bool:
-    from mcp.shared.exceptions import McpError
-    from mcp.types import CONNECTION_CLOSED
-
     if isinstance(exc, McpError):
         return exc.error.code == CONNECTION_CLOSED
     return isinstance(
@@ -194,7 +239,7 @@ async def _list_tool_count(
 
 async def check_stdio(
     launch_config: Mapping[str, Any], *, timeout: float, offline: bool
-) -> tuple[Status, Reason | None, str, str]:
+) -> Outcome:
     """Spawn the row's command and require a tools/list reply with a tool."""
     command = str(launch_config.get("command", "")).strip()
     raw_args = launch_config.get("args")
@@ -225,16 +270,14 @@ async def check_stdio(
                 detail = _last_stderr_line(tail)
             else:
                 detail = _describe(leaf)
-            return "FAIL", reason, detail, tail
+            return Outcome("FAIL", reason, detail, tail)
         tail = _stderr_tail(errlog)
     if count == 0:
-        return "FAIL", "no-tools", "tools/list returned no tools", tail
-    return "PASS", None, f"{count} tool{'s' if count != 1 else ''}", tail
+        return Outcome("FAIL", "no-tools", "tools/list returned no tools", tail)
+    return Outcome("PASS", None, f"{count} tool{'s' if count != 1 else ''}", tail)
 
 
-async def check_remote(
-    url: str, *, timeout: float
-) -> tuple[Status, Reason | None, str, str]:
+async def check_remote(url: str, *, timeout: float) -> Outcome:
     """One unauthenticated GET through the runtime's MCP HTTP client."""
     http_timeout = httpx.Timeout(timeout) if timeout > 0 else None
     try:
@@ -243,49 +286,28 @@ async def check_remote(
         ) as client:
             response = await client.get(url)
     except Exception as exc:  # noqa: BLE001 - any failure is "unreachable"
-        return "FAIL", "unreachable", _describe(exc), ""
-    return "PASS", None, f"HTTP {response.status_code}", ""
+        return Outcome("FAIL", "unreachable", _describe(exc))
+    return Outcome("PASS", None, f"HTTP {response.status_code}")
 
 
-async def check_row(
-    row: Any, *, origin: Origin, sandbox_enabled: bool, timeout: float
-) -> ConnectorReadiness:
-    app_id = str(row.app_id)
-    hidden = not bool(getattr(row, "is_visible_in_connector", True))
-    launch_config = row.launch_config if isinstance(row.launch_config, Mapping) else {}
+async def check_launch(
+    launch_config: Any, *, sandbox_enabled: bool, timeout: float
+) -> Outcome:
+    """Pick the check by the row's launch_config shape and run it."""
+    if not isinstance(launch_config, Mapping):
+        return NO_LAUNCH
     command = launch_config.get("command")
     url = launch_config.get("url")
-
-    status: Status
-    reason: Reason | None
-    detail: str
-    tail: str
     if isinstance(command, str) and command.strip():
-        sandboxed = posixpath.basename(command.strip()) in SANDBOXED_COMMANDS
-        if sandboxed and sandbox_enabled:
-            status, reason, detail, tail = "SKIP", "sandboxed", SANDBOXED_DETAIL, ""
-        else:
-            status, reason, detail, tail = await check_stdio(
-                launch_config, timeout=timeout, offline=sandboxed
-            )
-    elif isinstance(url, str) and url.strip():
-        status, reason, detail, tail = await check_remote(url.strip(), timeout=timeout)
-    else:
-        status, reason, detail, tail = (
-            "FAIL",
-            "spawn",
-            "launch_config has neither a command nor a url",
-            "",
+        sandbox_command = is_sandbox_command(command.strip())
+        if sandbox_command and sandbox_enabled:
+            return SKIPPED_SANDBOXED
+        return await check_stdio(
+            launch_config, timeout=timeout, offline=sandbox_command
         )
-    return ConnectorReadiness(
-        app_id=app_id,
-        origin=origin,
-        hidden=hidden,
-        status=status,
-        reason=reason,
-        detail=detail,
-        stderr_tail=tail,
-    )
+    if isinstance(url, str) and url.strip():
+        return await check_remote(url.strip(), timeout=timeout)
+    return NO_LAUNCH
 
 
 async def check_rows(
@@ -323,24 +345,20 @@ async def check_rows(
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                outcome = Outcome(
+                    "FAIL",
+                    "handshake",
+                    f"not checked: total bound of {total_timeout:g}s exhausted",
+                )
                 results.append(
-                    ConnectorReadiness(
-                        app_id=app_id,
-                        origin=origin,
-                        hidden=not bool(getattr(row, "is_visible_in_connector", True)),
-                        status="FAIL",
-                        reason="handshake",
-                        detail=f"not checked: total bound of {total_timeout:g}s exhausted",
-                        stderr_tail="",
-                    )
+                    ConnectorReadiness.of(row, origin=origin, outcome=outcome)
                 )
                 continue
             row_timeout = min(timeout, remaining) if timeout > 0 else remaining
-        results.append(
-            await check_row(
-                row, origin=origin, sandbox_enabled=sandbox_enabled, timeout=row_timeout
-            )
+        outcome = await check_launch(
+            row.launch_config, sandbox_enabled=sandbox_enabled, timeout=row_timeout
         )
+        results.append(ConnectorReadiness.of(row, origin=origin, outcome=outcome))
     return results
 
 
@@ -413,10 +431,12 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
         print(f"FAIL database: {type(exc).__name__}", file=out)
         return 1
 
+    exclude = _parse_exclude(args.exclude)
     timeout = float(get_mcp_tool_init_timeout_seconds())
     total_timeout = args.total_timeout
     if total_timeout is None and timeout > 0:
-        total_timeout = timeout * len(rows)
+        checked = [row for row in rows if str(row.app_id) not in exclude]
+        total_timeout = timeout * len(checked)
     builtin_app_ids = {str(row["app_id"]) for row in get_builtin_public_mcp_app_rows()}
     try:
         results = anyio.run(
@@ -426,7 +446,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
                 sandbox_enabled=sandbox_enabled_from_env(),
                 timeout=timeout,
                 total_timeout=total_timeout,
-                exclude=_parse_exclude(args.exclude),
+                exclude=exclude,
             )
         )
     except ValueError as exc:
