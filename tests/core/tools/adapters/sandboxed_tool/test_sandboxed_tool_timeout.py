@@ -87,7 +87,7 @@ async def test_python_executor_runs_under_in_sandbox_timeout(monkeypatch):
     await _run(wrapper)
 
     tool_command = sandbox.commands[0]
-    assert tool_command[:4] == ["timeout", "-k", "10", "45"]
+    assert tool_command[:4] == ["timeout", "-s", "KILL", "45"]
     assert tool_command[4] == "python"
 
 
@@ -101,33 +101,29 @@ async def test_tools_without_exec_timeout_stay_unbounded():
     assert sandbox.commands[0][0] == "python"
 
 
+# `timeout -s KILL` also kills itself with the process group, so the exec
+# reports a SIGKILL death: 137 from docker, -9 from boxlite.
 @pytest.mark.asyncio
-async def test_timeout_exit_code_becomes_timeout_error():
-    wrapper = SandboxedToolWrapper(BoundedTool(), RecordingSandbox(tool_exit_code=124))
+@pytest.mark.parametrize("exit_code", [137, -9])
+async def test_sigkill_after_limit_is_reported_as_timeout(exit_code):
+    sandbox = RecordingSandbox(tool_exit_code=exit_code, tool_delay=1.1)
+    wrapper = SandboxedToolWrapper(ShortBoundedTool(), sandbox)
 
-    with pytest.raises(RuntimeError, match="timed out after 30 seconds"):
+    with pytest.raises(RuntimeError, match="timed out after 1 seconds"):
         await _run(wrapper)
 
 
 @pytest.mark.asyncio
-async def test_early_sigkill_is_not_reported_as_timeout():
-    wrapper = SandboxedToolWrapper(BoundedTool(), RecordingSandbox(tool_exit_code=137))
+@pytest.mark.parametrize("exit_code", [137, -9])
+async def test_sigkill_before_limit_is_not_reported_as_timeout(exit_code):
+    wrapper = SandboxedToolWrapper(
+        BoundedTool(), RecordingSandbox(tool_exit_code=exit_code)
+    )
 
     with pytest.raises(RuntimeError) as exc_info:
         await _run(wrapper)
 
     assert "timed out" not in str(exc_info.value)
-
-
-@pytest.mark.asyncio
-async def test_grace_period_sigkill_after_limit_is_reported_as_timeout():
-    # coreutils `timeout` exits 128+9 when the runner ignored SIGTERM and the
-    # -k grace period had to SIGKILL it.
-    sandbox = RecordingSandbox(tool_exit_code=137, tool_delay=1.1)
-    wrapper = SandboxedToolWrapper(ShortBoundedTool(), sandbox)
-
-    with pytest.raises(RuntimeError, match="timed out after 1 seconds"):
-        await _run(wrapper)
 
 
 class LocalProcessSandbox:
@@ -173,7 +169,13 @@ def _process_alive(pid: int) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("timeout") is None, reason="needs coreutils timeout")
-async def test_timeout_kills_runner_and_its_children(monkeypatch, tmp_path):
+# A surviving grandchild keeps the exec's output open, so a regression hangs
+# instead of failing; fail it well inside the CI job.
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("ignore_sigterm", [False, True])
+async def test_timeout_kills_runner_and_its_children(
+    monkeypatch, tmp_path, ignore_sigterm
+):
     # Leaves room for the runner's cold xagent and pandas imports on CI.
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", "15")
     monkeypatch.setattr(
@@ -184,8 +186,9 @@ async def test_timeout_kills_runner_and_its_children(monkeypatch, tmp_path):
     pid_file = tmp_path / "child.pid"
     # Written via rename so a kill mid-write never leaves an empty pid file.
     grandchild = (
-        "import os, time; "
-        f"open({str(pid_file) + '.tmp'!r}, 'w').write(str(os.getpid())); "
+        "import os, signal, time; "
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_sigterm else "")
+        + f"open({str(pid_file) + '.tmp'!r}, 'w').write(str(os.getpid())); "
         f"os.replace({str(pid_file) + '.tmp'!r}, {str(pid_file)!r}); "
         "time.sleep(600)"
     )

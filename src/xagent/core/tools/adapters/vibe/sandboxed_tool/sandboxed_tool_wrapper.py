@@ -46,12 +46,10 @@ _TOOL_RUNNER_PATH = (
     f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/tool_runner.py"
 )
 
-# Seconds coreutils `timeout` waits after SIGTERM before sending SIGKILL.
-_EXEC_TIMEOUT_KILL_GRACE_SECONDS = 10
-# `timeout` exits 124 when the limit expires, or 128+9 when the grace-period
-# SIGKILL was needed.
-_TIMEOUT_EXIT_CODE = 124
-_KILLED_EXIT_CODE = 137
+# `timeout -s KILL` SIGKILLs its whole process group at the deadline, itself
+# included, so the exec reports a SIGKILL death: 128+9 from docker, -9 from
+# boxlite (negative exit codes mean "terminated by signal").
+_SIGKILL_EXIT_CODES = (137, -9)
 
 SANDBOX_BASE_DEPENDENCIES = [
     "pydantic>=2.0.0",
@@ -666,24 +664,19 @@ class SandboxedToolWrapper(AbstractBaseTool):
                 if timeout_seconds is not None:
                     # Bound inside the sandbox: `timeout` kills the runner's
                     # whole process group, which cancelling this await would not.
-                    command = [
-                        "timeout",
-                        "-k",
-                        str(_EXEC_TIMEOUT_KILL_GRACE_SECONDS),
-                        str(timeout_seconds),
-                        *command,
-                    ]
+                    # SIGKILL rather than TERM-then-KILL: once the runner dies
+                    # `timeout` exits, so a delayed KILL would never reach a
+                    # child that ignores SIGTERM.
+                    command = ["timeout", "-s", "KILL", str(timeout_seconds), *command]
                 started = time.monotonic()
                 result = await sandbox.exec(
                     command[0], *command[1:], env=self._build_execution_env()
                 )
 
-                if timeout_seconds is not None and (
-                    result.exit_code == _TIMEOUT_EXIT_CODE
-                    or (
-                        result.exit_code == _KILLED_EXIT_CODE
-                        and time.monotonic() - started >= timeout_seconds
-                    )
+                if (
+                    timeout_seconds is not None
+                    and result.exit_code in _SIGKILL_EXIT_CODES
+                    and time.monotonic() - started >= timeout_seconds
                 ):
                     raise RuntimeError(
                         f"Tool execution timed out after {timeout_seconds} seconds "
