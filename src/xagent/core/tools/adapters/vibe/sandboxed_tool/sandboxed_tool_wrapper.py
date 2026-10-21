@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import (
@@ -44,6 +45,13 @@ SANDBOX_SRC_ROOT = "/app/src"
 _TOOL_RUNNER_PATH = (
     f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/tool_runner.py"
 )
+
+# Seconds coreutils `timeout` waits after SIGTERM before sending SIGKILL.
+_EXEC_TIMEOUT_KILL_GRACE_SECONDS = 10
+# `timeout` exits 124 when the limit expires, or 128+9 when the grace-period
+# SIGKILL was needed.
+_TIMEOUT_EXIT_CODE = 124
+_KILLED_EXIT_CODE = 137
 
 SANDBOX_BASE_DEPENDENCIES = [
     "pydantic>=2.0.0",
@@ -347,6 +355,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         # base dependencies + tool dependencies
         self._requirements = SANDBOX_BASE_DEPENDENCIES + list(sandbox_config.packages)
         self._env_vars = list(sandbox_config.env_vars)
+        self._exec_timeout = sandbox_config.exec_timeout
 
         # Proxy target tool attributes
         self._visibility = getattr(target_tool, "_visibility", None)
@@ -653,9 +662,35 @@ class SandboxedToolWrapper(AbstractBaseTool):
                 # Execute script in sandbox
                 logger.debug(f"Executing tool {self._target.name} in sandbox")
                 command = self._build_execution_command(args, result_file)
+                timeout_seconds = self._exec_timeout() if self._exec_timeout else None
+                if timeout_seconds is not None:
+                    # Bound inside the sandbox: `timeout` kills the runner's
+                    # whole process group, which cancelling this await would not.
+                    command = [
+                        "timeout",
+                        "-k",
+                        str(_EXEC_TIMEOUT_KILL_GRACE_SECONDS),
+                        str(timeout_seconds),
+                        *command,
+                    ]
+                started = time.monotonic()
                 result = await sandbox.exec(
                     command[0], *command[1:], env=self._build_execution_env()
                 )
+
+                if timeout_seconds is not None and (
+                    result.exit_code == _TIMEOUT_EXIT_CODE
+                    or (
+                        result.exit_code == _KILLED_EXIT_CODE
+                        and time.monotonic() - started >= timeout_seconds
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Tool execution timed out after {timeout_seconds} seconds "
+                        "and its sandbox process was terminated. Split the work "
+                        "into smaller steps or avoid unbounded operations such as "
+                        "recursive scans of '/'."
+                    )
 
                 # Check execution result
                 if result.exit_code != 0:
