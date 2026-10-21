@@ -161,3 +161,42 @@ def test_undecodable_filename_output_survives():
     )
 
     assert result == {"success": True, "output": "\udcff\n", "error": ""}
+
+
+def test_leftover_non_daemon_thread_does_not_turn_success_into_timeout():
+    code = (
+        "import threading, time\n"
+        "threading.Thread(target=time.sleep, args=(600,)).start()\n"
+        "print('done')\n"
+    )
+    started = time.monotonic()
+
+    result = run_python_code_in_subprocess(code, timeout_seconds=60)
+
+    assert time.monotonic() - started < 30
+    assert result == {"success": True, "output": "done\n", "error": ""}
+
+
+def test_unclosed_file_is_still_written_before_the_child_exits(tmp_path):
+    result = run_python_code_in_subprocess(
+        "report = open('report.txt', 'w')\nreport.write('kept')\n",
+        working_directory=str(tmp_path),
+        timeout_seconds=60,
+    )
+
+    assert result["success"] is True
+    assert (tmp_path / "report.txt").read_text() == "kept"
+
+
+def test_crash_reports_the_end_of_a_large_stderr():
+    code = (
+        # fd 2 directly: the executor captures sys.stderr into a buffer.
+        "import os\nos.write(2, b'x' * 100_000 + b'LAST-LINE')\nos._exit(7)\n"
+    )
+
+    result = run_python_code_in_subprocess(code, timeout_seconds=60)
+
+    assert result["success"] is False
+    assert "exited with code 7" in result["error"]
+    assert result["error"].endswith("LAST-LINE")
+    assert len(result["error"]) < 3000

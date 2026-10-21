@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 # Loads python_executor.py by file path so the child needs neither the xagent
 # package nor its import-time side effects.
 _BOOTSTRAP = """
-import importlib.util, json, sys
+import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("_xagent_python_executor", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -34,10 +34,17 @@ result = module.PythonExecutorCore(request["working_directory"]).execute_code(
 with open(sys.argv[3], "w", encoding="utf-8") as f:
     # ASCII escapes keep lone surrogates (undecodable filenames) encodable.
     json.dump(result, f)
+# Exit without waiting on threads the code left running, which would hold the
+# interpreter open until the limit. Files the code left open were already
+# closed when its namespace was freed; only atexit hooks it registered are
+# skipped.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 """
 
 _EXECUTOR_PATH = Path(__file__).with_name("python_executor.py")
-_STDERR_TAIL_CHARS = 2000
+_STDERR_TAIL_BYTES = 2000
 
 
 def _kill_process_group(process: "subprocess.Popen[bytes]") -> None:
@@ -132,8 +139,9 @@ def run_python_code_in_subprocess(
                 result: Dict[str, Any] = json.load(f)
             return result
         except (OSError, ValueError):
-            with open(stderr_path, encoding="utf-8", errors="replace") as f:
-                stderr_tail = f.read()[-_STDERR_TAIL_CHARS:]
+            with open(stderr_path, "rb") as f:
+                f.seek(max(0, os.path.getsize(stderr_path) - _STDERR_TAIL_BYTES))
+                stderr_tail = f.read().decode("utf-8", errors="replace")
             return {
                 "success": False,
                 "output": "",
