@@ -152,6 +152,7 @@ What it checks depends on the row's `launch_config`:
 | `command` (`python -m xagent.web.tools.mcp.<app>`) | Spawns the command with a placeholder for every `env_mapping` and `required_env` key, runs MCP `initialize` and `tools/list`, and requires at least one tool. The in-repo servers' tool lists are static, and the check stops after `tools/list`, so the placeholder never reaches a vendor. |
 | `command` `npx`/`uvx` | `SKIP sandboxed` when `SANDBOX_ENABLED` is on, because tasks run these in the sandbox image, not the backend image. With the sandbox off, spawned as above with npm and uv forced offline, so a package missing from the image's cache fails instead of being fetched from a registry. |
 | `url` (remote MCP, e.g. Notion, Atlassian, HubSpot) | One unauthenticated `GET` through the runtime's MCP HTTP client, so the probe sees the same proxy and egress policy a task does. Any HTTP response passes. No OAuth flow is started. |
+| `url` with a `ws://`/`wss://` scheme | `SKIP websocket`; websocket rows are not probed. |
 
 It prints one line per connector, labelled `builtin` (a registry app) or
 `custom` (an administrator-created row), plus `hidden` for a row the catalog
@@ -159,26 +160,35 @@ does not show, then a summary:
 
 ```text
 PASS connector:slack builtin: 11 tools
-SKIP sandboxed connector:chrome-devtools builtin hidden: npx/uvx rows run in the sandbox image, not this one
+SKIP sandboxed connector:chrome-devtools builtin hidden: tasks run npx/uvx rows in the sandbox image, not this one
+SKIP sandboxed connector:google-maps builtin: tasks run npx/uvx rows in the sandbox image, not this one
 FAIL missing connector:xero builtin: /usr/local/bin/python: No module named xagent.web.tools.mcp.xero
 FAIL unreachable connector:notion builtin: ConnectError: [Errno -3] Temporary failure in name resolution
-51 checks, 2 failed, 1 skipped
+51 checks, 2 failed, 2 skipped
 ```
 
-A failure's class is one of `spawn` (command not found), `missing` (the child
-exited before the MCP handshake: a Python import error, or an npm package
-absent from the offline cache), `handshake` (no reply within the timeout),
-`no-tools`, or `unreachable`. The detail is the last line of the child's
-stderr or the exception, never the environment. The exit code is `1` when any
+A failure's class is one of `spawn` (command not found, or a row with neither
+a command nor a url), `missing` (the child exited before the MCP handshake: a
+Python import error, or an npm package absent from the offline cache),
+`handshake` (no usable `initialize`/`tools/list` reply within the timeout, an
+error reply, or a connector not reached before the total bound), `no-tools`, or `unreachable`. The
+detail is the last line of the child's stderr or the exception, never the
+environment. When the database cannot be read, `FAIL database: <ExceptionClass>`
+is printed once and the run exits `1`; when no row is checked (an empty
+catalog, or every row excluded), `FAIL catalog: no public_mcp_apps rows to
+check` is printed and the run exits `1`. The exit code is also `1` when any
 connector fails and `2` for a usage error.
 
 Each connector is bounded by `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS` (60 s by
 default, the same bound task startup uses) and the whole run by
 `--total-timeout`, which defaults to the connector count times that value; a
-connector not reached in time fails as `handshake`. `--exclude` takes catalog
-app IDs, like this script's `--exclude`, for a connector the deployment leaves
-unstartable on purpose. A full run over the 51 registry connectors took 12
-seconds on a developer machine.
+connector not reached in time fails as `handshake`.
+`XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS=0` disables both bounds, and
+`--total-timeout 0` disables the total bound. `--exclude` takes catalog app
+IDs, like this script's `--exclude`, for a connector the deployment leaves
+unstartable on purpose. On a developer machine the 44 python-module rows took
+12 seconds in total; an npx row that resolves offline and a remote probe add a
+few seconds each.
 
 What a pass proves: the module or package is present in the backend image and
 answers the handshake, or the remote host answers HTTP from the backend
