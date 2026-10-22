@@ -349,6 +349,27 @@ async def test_call_is_bounded_by_the_init_timeout(db_users, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_call_is_bounded_even_when_the_init_timeout_is_disabled(
+    db_users, monkeypatch
+):
+    db, user, _ = db_users
+    server = _connect_github(db, user)
+    adapter = _Adapter("github_get_current_user", _text_result("{}"), delay=5)
+    monkeypatch.setattr(LOADER, _Loader(adapter))
+    monkeypatch.setattr(
+        "xagent.web.services.connector_probe.get_mcp_tool_init_timeout_seconds",
+        lambda: 0,
+    )
+    monkeypatch.setattr(connector_probe, "_PROBE_CALL_FALLBACK_SECONDS", 0.05)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result.outcome is ConnectorProbeOutcome.TIMED_OUT
+    assert result.reason == "probe_call"
+    assert connector_probe._probe_running is False
+
+
+@pytest.mark.asyncio
 async def test_not_connected_passes_the_builder_reason_through(db_users, monkeypatch):
     db, user, _ = db_users
     server = _connect_github(db, user, token=None)
@@ -705,7 +726,9 @@ async def test_one_probe_at_a_time(db_users, monkeypatch):
     await first
     # The slot is free again once the first probe finishes.
     adapter.delay = 0
-    assert (await run_connector_probe(db, user=user, server_id=server.id)).outcome
+    adapter.result = _text_result(json.dumps({"status": "success", "user": {}}))
+    second = await run_connector_probe(db, user=user, server_id=server.id)
+    assert second.outcome is ConnectorProbeOutcome.OK
 
 
 @pytest.mark.asyncio

@@ -52,8 +52,8 @@ class ConnectorProbe:
     """One read-only tool call.
 
     ``arguments`` are the fixed call arguments. ``expect_keys`` names keys the
-    result object must carry when the tool does not use the
-    ``{"status": ...}`` envelope.
+    result object must carry, checked whenever declared; it is required for a
+    tool that does not use the ``{"status": ...}`` envelope.
     """
 
     tool: str

@@ -49,8 +49,8 @@ def _module_name(row: dict[str, Any]) -> str | None:
     return None
 
 
-async def _registered_tools(module_name: str) -> dict[str, set[str]]:
-    """Tool name -> accepted argument names, as the server registers them."""
+async def _registered_tools(module_name: str) -> dict[str, dict[str, set[str]]]:
+    """Tool name -> accepted and required argument names, per the server's schema."""
     module = importlib.import_module(module_name)
     fastmcp = getattr(module, "mcp", None)
     if fastmcp is not None and hasattr(fastmcp, "list_tools"):
@@ -59,7 +59,11 @@ async def _registered_tools(module_name: str) -> dict[str, set[str]]:
         # The low-level Server modules (linkedin) expose the handler directly.
         tools = await module.list_tools()
     return {
-        tool.name: set((tool.inputSchema or {}).get("properties", {})) for tool in tools
+        tool.name: {
+            "properties": set((tool.inputSchema or {}).get("properties", {})),
+            "required": set((tool.inputSchema or {}).get("required", [])),
+        }
+        for tool in tools
     }
 
 
@@ -122,7 +126,7 @@ async def test_declared_tool_is_registered_with_those_arguments(app_id):
     assert module_name is not None
     tools = await _registered_tools(module_name)
     assert probe.tool in tools, (app_id, probe.tool, sorted(tools))
-    unknown = set(probe.arguments) - tools[probe.tool]
+    unknown = set(probe.arguments) - tools[probe.tool]["properties"]
     assert unknown == set(), (app_id, probe.tool, unknown)
 
 
@@ -137,8 +141,15 @@ async def test_declared_tool_needs_no_argument_beyond_the_declared_ones(app_id):
     module = importlib.import_module(module_name)
     fn = getattr(module, probe.tool, None)
     if fn is None:
-        # The low-level Server modules dispatch by name; their declared probe
-        # tools take no required argument, which the schema test covers.
+        # The low-level Server modules dispatch by name, so there is no
+        # function signature to read; check the registered input schema.
+        tools = await _registered_tools(module_name)
+        schema_required = tools[probe.tool]["required"]
+        assert schema_required <= set(probe.arguments), (
+            app_id,
+            probe.tool,
+            schema_required,
+        )
         return
     required = {
         name

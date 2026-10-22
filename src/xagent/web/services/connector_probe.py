@@ -108,7 +108,7 @@ class ConnectorProbeResult:
 
     def payload(self) -> dict[str, Any]:
         """The route's response body, or its error ``detail``."""
-        status, code = _HTTP_STATUS[self.outcome]
+        _, code = _HTTP_STATUS[self.outcome]
         if self.outcome is ConnectorProbeOutcome.NOT_CONNECTED and self.reason:
             code = self.reason
         body: dict[str, Any] = {
@@ -131,6 +131,10 @@ class ConnectorProbeBusy(Exception):
     either, #3265).
     """
 
+
+# Bound on the probe call when the init timeout is 0: 0 disables only the
+# agent-setup/listing bound, never the probe call.
+_PROBE_CALL_FALLBACK_SECONDS = 60
 
 # A plain flag rather than an asyncio primitive: it is read and set without
 # yielding, and binds to no event loop.
@@ -155,7 +159,7 @@ def is_connector_probe_user(user: Any) -> bool:
     if not isinstance(email, str):
         return False
     normalized = email.strip().lower()
-    return any(entry.strip().lower() == normalized for entry in allowed)
+    return any(entry.lower() == normalized for entry in allowed)
 
 
 async def run_connector_probe(
@@ -235,7 +239,7 @@ async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
     timeout = get_mcp_tool_init_timeout_seconds()
     try:
         call = tool.run_json_async(dict(probe.arguments))
-        raw = await (asyncio.wait_for(call, timeout) if timeout else call)
+        raw = await asyncio.wait_for(call, timeout or _PROBE_CALL_FALLBACK_SECONDS)
     except asyncio.TimeoutError:
         return result(
             ConnectorProbeOutcome.TIMED_OUT, tool=tool_name, reason="probe_call"
@@ -263,7 +267,9 @@ def evaluate_probe_result(
     The adapter's result is ``{"content": [...], "is_error": bool, ...}``.
     A flagged error fails the probe. Otherwise the single text item must be a
     JSON object; one carrying ``status`` must say ``success``, and one without
-    it must carry every ``expect_keys`` entry, which must then be non-empty.
+    it must have declared ``expect_keys``. Whenever ``expect_keys`` is declared,
+    the object must carry every entry (presence only, values are not checked),
+    with or without the status envelope.
     """
     if not isinstance(raw, Mapping):
         return ConnectorProbeOutcome.PROBE_FAILED, "invalid_result"

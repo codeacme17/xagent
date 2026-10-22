@@ -995,8 +995,9 @@ def is_user_owned_server(db: Session, server_id: int) -> bool:
     """Whether a user owns the server row (any link with ``is_owner`` true).
 
     The shared catalog row is created without any association, so it never has
-    an owner; a user-owned row under a catalog id is a squat. The one query
-    behind every such check, so a hardening fix cannot land in only one copy.
+    an owner; a user-owned row under a catalog id is a squat. Catalog connect
+    (``_reject_user_owned_catalog_squat``) and the connector probe share this
+    query, so a hardening fix cannot land in only one of them.
     """
     from .models.mcp import UserMCPServer
 

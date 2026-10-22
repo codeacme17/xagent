@@ -21,6 +21,8 @@ from xagent.web.services.connector_probe import (
     ConnectorProbeResult,
 )
 
+from .conftest import _admin_headers, client
+
 RUNNER = "xagent.web.services.connector_probe.run_connector_probe"
 
 
@@ -220,3 +222,16 @@ async def test_unexpected_errors_are_opaque(allow_monitor, monkeypatch):
 
     assert exc_info.value.status_code == 500
     assert "ghp_secret" not in str(exc_info.value.detail)
+
+
+@pytest.mark.usefixtures("_test_db")
+def test_route_is_a_post_gated_on_the_probe_allowlist(monkeypatch):
+    """The method, the path and the dependency wiring, through the real app."""
+    monkeypatch.delenv("XAGENT_CONNECTOR_PROBE_USERS", raising=False)
+    headers = _admin_headers()
+
+    posted = client.post("/api/mcp/servers/1/probe", headers=headers)
+    assert posted.status_code == 403, posted.text
+    assert posted.json()["detail"]["code"] == "probe_forbidden"
+
+    assert client.get("/api/mcp/servers/1/probe", headers=headers).status_code == 405
