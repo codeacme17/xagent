@@ -152,6 +152,7 @@ def _unavailable(*phases: str, reason: str | None = None) -> dict[str, Any]:
         (404, {"detail": "MCP server not found"}, False, "server not found"),
         (500, {"detail": "Failed to get MCP server tools"}, False, "HTTP 500"),
         (502, "<html>Bad Gateway</html>", False, "HTTP 502"),
+        (200, "<html>ok</html>", False, "unexpected response (HTTP 200)"),
     ],
 )
 def test_tools_responses_are_classified(
@@ -192,6 +193,9 @@ class FakeDeployment:
             5: (200, {"server_name": "stripe", "tool_count": 9, "tools": []}),
         }
         self.slow: set[int] = set()
+        self.errors: set[int] = set()
+        self.servers_status = 200
+        self.apps_status = 200
         self.requests: list[httpx.Request] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -205,14 +209,16 @@ class FakeDeployment:
         if request.headers.get("authorization") != f"Bearer {ACCESS_TOKEN}":
             return httpx.Response(401, json={"detail": "Not authenticated"})
         if path == "/api/mcp/apps":
-            return httpx.Response(200, json=self.catalog)
+            return httpx.Response(self.apps_status, json=self.catalog)
         if path == "/api/mcp/servers":
-            return httpx.Response(200, json=self.servers)
+            return httpx.Response(self.servers_status, json=self.servers)
         parts = path.split("/")
         if len(parts) == 6 and parts[1:4] == ["api", "mcp", "servers"]:
             server_id = int(parts[4])
             if server_id in self.slow:
                 raise httpx.ReadTimeout("timed out", request=request)
+            if server_id in self.errors:
+                raise httpx.ConnectError("refused", request=request)
             status_code, payload = self.tools.get(server_id, (404, {"detail": "x"}))
             return httpx.Response(status_code, json=payload)
         return httpx.Response(404)
@@ -319,6 +325,7 @@ def test_tools_requests_use_the_tools_timeout() -> None:
 
     by_path = {entry["path"]: entry["read"] for entry in seen}
     assert by_path["/api/mcp/apps"] == 15
+    assert by_path["/api/mcp/servers"] == 15
     assert by_path["/api/mcp/servers/7/tools"] == 130
 
 
@@ -335,7 +342,6 @@ def test_expected_connectors_that_are_not_connected_fail() -> None:
     assert "FAIL l2:google-calendar: not connected" in lines
     assert "FAIL l2:gmail: needs reconnect" in lines
     assert "PASS l2:slack: 12 tools" in lines
-    assert "/api/mcp/servers/11/tools" not in _tools_requests(fake)
 
 
 def test_expect_list_comes_from_the_environment() -> None:
@@ -358,7 +364,88 @@ def test_a_builtin_app_that_needs_reconnect_fails_even_when_not_expected() -> No
 
     assert code == 1
     assert "FAIL l2:gmail: needs reconnect" in lines
-    assert "/api/mcp/servers/11/tools" not in _tools_requests(fake)
+
+
+def test_a_connected_app_is_not_reported_when_its_server_row_needs_reconnect() -> None:
+    # /api/mcp/apps picks the first connectable account and /api/mcp/servers
+    # lists the newest, so the two can disagree about one app.
+    fake = FakeDeployment()
+    fake.servers[0]["connection_status"] = "needs_reconnect"
+
+    _code, lines = _run(fake)
+
+    assert "PASS l2:slack: 12 tools" in lines
+    assert not any(line.startswith("FAIL l2:slack") for line in lines)
+    assert _tools_requests(fake).count("/api/mcp/servers/7/tools") == 1
+
+
+def test_a_request_that_gets_no_answer_fails_and_the_run_continues() -> None:
+    fake = FakeDeployment()
+    fake.errors.add(7)
+
+    code, lines = _run(fake)
+
+    assert code == 1
+    assert "FAIL l2:slack: GET request failed: ConnectError" in lines
+    assert "PASS l2:stripe: 9 tools" in lines
+
+
+def test_a_failed_server_list_is_reported_and_connected_apps_still_pass() -> None:
+    fake = FakeDeployment()
+    fake.servers_status = 500
+
+    code, lines = _run(fake, "--expect", "google-calendar")
+
+    assert code == 1
+    assert "FAIL servers: server list request failed: HTTP 500" in lines
+    assert "FAIL l2:google-calendar: not connected" in lines
+    assert "PASS l2:slack: 12 tools" in lines
+    assert "PASS l2:notion: 4 tools" in lines
+    assert "PASS l2:stripe: 9 tools" in lines
+
+
+def test_a_failed_catalog_request_stops_the_run() -> None:
+    fake = FakeDeployment()
+    fake.apps_status = 500
+
+    code, lines = _run(fake)
+
+    assert code == 1
+    assert lines[0] == "FAIL catalog: catalog request failed: HTTP 500"
+    assert _tools_requests(fake) == []
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan"])
+def test_a_tools_timeout_that_is_not_a_positive_number_is_a_usage_error(
+    value: str,
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            ["l2", "--tools-timeout", value],
+            env=ENV,
+            transport=httpx.MockTransport(FakeDeployment().handler),
+            out=io.StringIO(),
+        )
+
+    assert exc.value.code == 2
+
+
+def test_a_malformed_cookie_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as exc:
+        _run(FakeDeployment(), "--cookie", "novalue")
+
+    assert exc.value.code == 2
+
+
+def test_a_cookie_is_sent_on_every_request() -> None:
+    fake = FakeDeployment()
+
+    code, lines = _run(fake, "--cookie", "selected_region=sg")
+
+    assert code == 0, lines
+    assert fake.requests
+    for request in fake.requests:
+        assert "selected_region=sg" in request.headers.get("cookie", "")
 
 
 def test_a_run_that_checks_nothing_fails() -> None:
@@ -389,9 +476,24 @@ def test_output_never_contains_the_token() -> None:
     fake = FakeDeployment()
     fake.tools[7] = (
         400,
-        {"detail": {"code": "token_refresh_failed", "message": ACCESS_TOKEN}},
+        {"detail": {"code": ACCESS_TOKEN, "message": ACCESS_TOKEN}},
+    )
+    fake.tools[3] = (502, _unavailable(reason=ACCESS_TOKEN))
+    fake.tools[5] = (
+        502,
+        {
+            "detail": {
+                "code": "mcp_tools_unavailable",
+                "failures": [
+                    {"server_name": "x", "phase": ACCESS_TOKEN, "attempts": 1}
+                ],
+            }
+        },
     )
 
     _code, lines = _run(fake)
 
     assert ACCESS_TOKEN not in "\n".join(lines)
+    assert "FAIL l2:slack: failed to start (unknown)" in lines
+    assert "FAIL l2:notion: failed to start (unknown)" in lines
+    assert "FAIL l2:stripe: failed to start (unknown)" in lines

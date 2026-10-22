@@ -150,7 +150,9 @@ not connected fails as `needs reconnect`, `not connected`, or `not in the
 catalog`. A builtin OAuth app whose stored token was cleared (`connection_status`
 is `needs_reconnect` in `GET /api/mcp/servers`) fails as `needs reconnect` even
 when it is not expected. Any other connector the account loses drops out of the
-run, so the scheduled job should always pass `--expect`. A run that finds no
+run (for example a builtin OAuth token that expired with no refresh token,
+which `GET /api/mcp/servers` still reports as `connected`), so the scheduled
+job should always pass `--expect`. A run that finds no
 connected connector and expects none fails.
 Vendor test accounts for the monitor account are tracked in
 [#3262](https://github.com/xorbitsai/xagent/issues/3262).
@@ -168,7 +170,9 @@ Vendor test accounts for the monitor account are tracked in
 
 - Each connector runs once, one at a time. A stdio connector starts a process on
   the backend host for the length of one `tools/list`; an `npx` connector runs
-  in a sandbox when the deployment has a sandbox manager.
+  in a sandbox when the deployment has a sandbox manager. A load the server
+  abandons at its timeout may still be cleaned up in the background while the
+  next connector starts.
 - A builtin OAuth token that expires within 5 minutes is refreshed, and the new
   token is stored, as a task would do. A refresh token the vendor has revoked
   permanently is cleared, so that connector then needs a reconnect.
@@ -178,12 +182,11 @@ Vendor test accounts for the monitor account are tracked in
 
 Each connector takes as long as its server needs to start and answer
 `tools/list`, usually a few seconds. A connector that hangs costs at most
-`--tools-timeout` (120 s by default). That default sits above the server's own
-bound on one load, `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS` (60 s by default) plus
-its 15 s reclaim grace, with headroom for the token refresh and, for an `npx`
-connector, the sandbox lease that run before that bound starts. A shorter client
-timeout would move on while the server is still loading, and the run would no
-longer be one connector at a time. If the deployment raises
+`--tools-timeout` (120 s by default). That default sits above the server's bound
+on one answer: it responds within `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS` (60 s
+by default) of starting the load, after the token refresh and, for an `npx`
+connector, the sandbox lease. A shorter client timeout gives up on a connector
+the server is still starting. If the deployment raises
 `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS`, raise `--tools-timeout` by the same
 amount. The worst case is the number of
 connected apps times `--tools-timeout`: 50 connectors that all hang take 100
@@ -226,11 +229,19 @@ FAIL l2:gmail: needs reconnect
 | --- | --- |
 | `not connected (<code>)` | The server answered 400 with a credential code (`oauth_token_required`, `authorization_required`, `insufficient_scope`, `token_refresh_failed`, …), or the vendor rejected the token (`auth_rejected`). |
 | `needs reconnect`, `not connected`, `not in the catalog` | An expected app is not connected; see above. |
-| `failed to start (<phase or reason>)` | The server could not be started or did not answer the MCP handshake. The phase is where the loader gave up (`src/xagent/core/tools/adapters/vibe/mcp_adapter.py`): `session_start` when the session could not be opened (for example the command could not be spawned), `initialize` when the process exited or never answered the handshake (a missing Python module ends here), `list_tools`. A code such as `sandbox_unavailable`, or a remote OAuth discovery code such as `metadata_not_found`, means the server was never started. A connector that hangs past the server's own load bound also ends here, as `initialize`: the route reports the phase, not that it timed out. |
+| `failed to start (<phase or reason>)` | The server could not be started or did not answer the MCP handshake. The phase is where the loader gave up (`src/xagent/core/tools/adapters/vibe/mcp_adapter.py`): `session_start` when the session could not be opened (for example the command could not be spawned), `initialize` when the process exited or never answered the handshake (a missing Python module ends here), `list_tools`, `sandbox_list_tools` (an `npx` connector that fails or hangs in the sandbox ends here). A code such as `sandbox_unavailable`, or a remote OAuth discovery code such as `metadata_not_found`, means the server was never started. A host (non-`npx`) connector that hangs past the server's own load bound ends as `initialize`: the route reports the phase, not that it timed out. |
 | `no tools` | The server started and listed no tools. |
 | `timed out after <n>s` | No answer within `--tools-timeout`. The server gives up on a hung connector before this, so this means the request itself stalled, for example in the token refresh that runs before the load. |
 | `unsupported outside a task` | An execution-scoped connector; see the table above. |
+| `server not found` | The server row disappeared between the catalog and the call (HTTP 404). |
+| `<METHOD> request failed: <Class>` | No HTTP answer, for example a connection error. |
+| `unexpected response (HTTP 200)` | The server answered 200 with a body that is not a JSON object. |
 | `HTTP <status>` | Any other answer, for example `HTTP 504` from a reverse proxy whose idle timeout is shorter than the server's load bound. |
+
+Two checks are not about one connector. `FAIL servers: ...` means the server
+list request failed; expected apps are then reported without the `needs
+reconnect` distinction. `FAIL connectors: no connected connector to check`
+means the run found nothing to start and expected nothing.
 
 Reasons are the codes and failure phases the server reports. The route does not
 return exception class names, and the output never contains a token, a key, a

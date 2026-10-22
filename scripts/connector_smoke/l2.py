@@ -76,7 +76,9 @@ def select_unconnected(
     That is every expected app that is not connected, plus every builtin OAuth
     app whose stored token was cleared (``needs_reconnect``), expected or not:
     the catalog stops listing such an app as connected, so it would otherwise
-    leave the run without a trace.
+    leave the run without a trace. A builtin OAuth token that expired with no
+    refresh token is not caught: the server list still reports it connected, so
+    such an app is reported only when it is expected.
     """
     stale = {
         server["app_id"]
@@ -114,7 +116,9 @@ def check_tools_response(app_id: str, status_code: int, payload: Any) -> CheckRe
     """Classify one ``GET /api/mcp/servers/{id}/tools`` response."""
     name = _name(app_id)
     detail = payload.get("detail") if isinstance(payload, dict) else None
-    if status_code == 200 and isinstance(payload, dict):
+    if status_code == 200:
+        if not isinstance(payload, dict):
+            return CheckResult(name, False, "unexpected response (HTTP 200)")
         count = payload.get("tool_count")
         if type(count) is int and count > 0:
             return CheckResult(name, True, f"{count} tools")

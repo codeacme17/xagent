@@ -132,8 +132,9 @@ class SmokeClient:
     def list_server_tools(self, server_id: int, *, timeout: float) -> JSONResponse:
         """Start one connected server and list its tools.
 
-        The server may take its own load timeout plus a reclaim grace to
-        answer, so this request carries its own, longer timeout.
+        The server may take its own load timeout, after the token refresh and
+        (for npx) the sandbox lease, to answer, so this request carries its own,
+        longer timeout.
         """
         response = self._request(
             "GET", f"/api/mcp/servers/{int(server_id)}/tools", timeout=timeout

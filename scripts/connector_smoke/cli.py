@@ -7,6 +7,7 @@ See ``scripts/connector_smoke/README.md``.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -28,10 +29,10 @@ ENV_COOKIES = "XAGENT_CONNECTOR_SMOKE_COOKIES"
 ENV_OAUTH_ACCOUNTS = "XAGENT_CONNECTOR_SMOKE_OAUTH_ACCOUNTS"
 ENV_EXPECT = "XAGENT_CONNECTOR_SMOKE_EXPECT"
 
-# Above the server's own bound on one load: XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS
-# (60 s by default) plus the loader's 15 s reclaim grace, with headroom for the
-# credential refresh that runs before that bound starts. A shorter client
-# timeout would move on while the server is still loading.
+# Above the server's bound on one answer: XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS
+# (60 s by default) plus the token refresh and, for an npx connector, the
+# sandbox lease that run before it. A shorter client timeout gives up while the
+# server is still working.
 DEFAULT_TOOLS_TIMEOUT = 120.0
 
 
@@ -271,8 +272,8 @@ def _main_l2(
         )
     except ValueError as exc:
         parser.error(f"{exc} (--cookie)")
-    if args.tools_timeout <= 0:
-        parser.error("--tools-timeout must be positive")
+    if not math.isfinite(args.tools_timeout) or args.tools_timeout <= 0:
+        parser.error("--tools-timeout must be a positive number")
 
     started = time.monotonic()
     with SmokeClient(
