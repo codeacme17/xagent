@@ -61,6 +61,7 @@ from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
     get_catalog_mcp_oauth_credentials,
+    is_user_owned_server,
     normalize_catalog_key,
     oauth_grant_keys_rejected_by_app_scope,
     restrict_to_app_scoped_oauth_grant,
@@ -3695,15 +3696,7 @@ def _reject_user_owned_catalog_squat(db: Session, server: MCPServer) -> None:
     owner. Shared by every catalog-connect shape so a hardening fix here can't
     land in only one copy.
     """
-    owned = (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.mcpserver_id == server.id,
-            UserMCPServer.is_owner.is_(True),
-        )
-        .first()
-    )
-    if owned is not None:
+    if is_user_owned_server(db, int(server.id)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A user-owned server already exists under this catalog id",

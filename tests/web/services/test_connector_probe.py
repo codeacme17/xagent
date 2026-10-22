@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,8 +22,6 @@ from tests.web.services.test_mcp_connector_session import (
     LOADER,
     SANDBOX_MANAGER,
     _connect_github,
-    _connect_remote_oauth,
-    _connect_stripe,
     _link,
 )
 from xagent.builtin_identity import owned_catalog_marker
@@ -31,12 +30,19 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPLoadResult,
     MCPServerLoadFailure,
 )
+from xagent.core.utils.encryption import encrypt_env_dict
 from xagent.web import mcp_apps
+from xagent.web.api.mcp import (
+    _ensure_catalog_app_server,
+    _ensure_catalog_mcp_oauth_server,
+)
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 from xagent.web.connector_probes import ConnectorProbe
 from xagent.web.models.database import Base
-from xagent.web.models.mcp import MCPServer
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_probe
 from xagent.web.services.connector_probe import (
     ConnectorProbeBusy,
@@ -93,6 +99,65 @@ class _Loader:
 def _github_ok(**extra: Any) -> _Adapter:
     payload = {"status": "success", "user": {"login": "monitor"}, **extra}
     return _Adapter("github_get_current_user", _text_result(json.dumps(payload)))
+
+
+def _link_without_owning(db, user, server: MCPServer, **fields: Any) -> None:
+    """The connect routes' link: the user never owns the shared catalog row."""
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+            is_active=True,
+            **fields,
+        )
+    )
+    db.commit()
+
+
+def _connect_catalog_stripe(db, user) -> MCPServer:
+    """Connect the shared catalog stripe row the way POST /apps/{id}/connect
+    does: the row has no owner, and the user's link is a non-owner link."""
+    server, _ = _ensure_catalog_app_server(db, "stripe")
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+            is_active=True,
+            env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
+            env_source="own",
+        )
+    )
+    db.commit()
+    return server
+
+
+def _stripe_ok() -> _Adapter:
+    payload = {"status": "success", "account": {"id": "acct_1"}}
+    return _Adapter("stripe_get_account_info", _text_result(json.dumps(payload)))
+
+
+class _ForbiddenSandboxManager:
+    """A sandbox manager whose lease methods must never run."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def get_or_create_lease_provider(self, lifecycle: str, user_id: str):
+        self.calls.append("get_or_create_lease_provider")
+        raise AssertionError("the probe must not lease a sandbox")
+
+    async def attach_provider(self, lifecycle: str, user_id: str, provider) -> bool:
+        self.calls.append("attach_provider")
+        raise AssertionError("the probe must not attach a sandbox")
+
+    async def release(self, lifecycle: str, user_id: str) -> None:
+        self.calls.append("release")
 
 
 @pytest.fixture()
@@ -192,7 +257,7 @@ def _listing_of(server_id: int, name: str, *adapters: _Adapter):
         ConnectorToolsResult,
     )
 
-    async def listing(db, *, user, server_id, name_prefix):
+    async def listing(db, *, user, server_id, name_prefix, **_):
         return ConnectorToolsResult(
             ConnectorToolsOutcome.OK,
             server_id,
@@ -335,15 +400,13 @@ async def test_a_server_the_user_has_not_linked_is_not_found(db_users, monkeypat
 
 @pytest.mark.asyncio
 async def test_remote_mcp_connector_is_unprobeable(db_users, monkeypatch):
+    """The shared catalog Notion row (the one catalog connect creates: the
+    app's transport and URL, no owner) is covered by L2."""
     db, user, _ = db_users
-    server = _connect_remote_oauth(db, user)
+    server, _ = _ensure_catalog_mcp_oauth_server(db, "notion")
+    _link_without_owning(db, user, server)
     loader = _Loader(_github_ok())
     monkeypatch.setattr(LOADER, loader)
-    # The remote OAuth fixture is not a catalog app; make it one.
-    monkeypatch.setattr(
-        "xagent.web.mcp_apps.get_app_for_mcp_server",
-        lambda db, server: {"id": "notion", "launch_config": {"url": "https://x"}},
-    )
 
     result = await run_connector_probe(db, user=user, server_id=server.id)
 
@@ -379,27 +442,253 @@ async def test_custom_server_row_has_no_probe(db_users, monkeypatch):
     assert loader.calls == []
 
 
-@pytest.mark.asyncio
-async def test_a_row_a_task_would_sandbox_fails_closed(db_users, monkeypatch):
-    """A probe is declared for python rows; if the deployment's row launches
-    npx, the call would run on the host after the lease was released."""
-    db, user, _ = db_users
-    server = _connect_stripe(db, user)
-    loader = _Loader(_Adapter("stripe_get_account_info", _text_result("{}")))
-    monkeypatch.setattr(LOADER, loader)
-    monkeypatch.setattr(
-        "xagent.web.mcp_apps.get_app_for_mcp_server",
-        lambda db, server: {
-            "id": "stripe",
-            "launch_config": {"command": "npx", "args": ["-y", "stripe-mcp"]},
-        },
+# --- the row must be the catalog's, and must run where the probe calls it ---
+
+
+def _custom_row(name: str, **fields: Any) -> MCPServer:
+    return MCPServer(
+        name=name,
+        managed="external",
+        auth={"app_id": "stripe"},
+        **fields,
     )
+
+
+@pytest.mark.asyncio
+async def test_custom_remote_row_cannot_claim_a_catalog_identity(db_users, monkeypatch):
+    """A custom row's ``auth`` is caller-authored: stamping it with a catalog
+    app id must not buy that app's probe (a lookalike tool would pass it)."""
+    db, user, _ = db_users
+    server = _custom_row(
+        "my-stripe", transport="streamable_http", url="https://evil.example.com/mcp"
+    )
+    db.add(server)
+    db.commit()
+    _link(db, user, server)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server.id)
+    assert result.http_status == 404
+    assert result.app_id is None
+    assert loader.calls == []
+
+
+@pytest.mark.asyncio
+async def test_custom_stdio_row_cannot_claim_a_catalog_identity(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _custom_row("my-stripe", transport="stdio", command="python")
+    db.add(server)
+    db.commit()
+    _link(db, user, server)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server.id)
+    assert result.http_status == 404
+    assert loader.calls == []
+
+
+@pytest.mark.asyncio
+async def test_user_owned_row_under_a_catalog_id_is_a_squat(db_users, monkeypatch):
+    """Named exactly like the app, but owned by a user: a squat created
+    before catalog ids were reserved, not the shared catalog row."""
+    db, user, _ = db_users
+    server = MCPServer(
+        name="stripe", managed="external", transport="stdio", command="python"
+    )
+    db.add(server)
+    db.commit()
+    _link(db, user, server)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server.id)
+    assert loader.calls == []
+
+
+def test_is_user_owned_server_looks_only_at_owner_links(db_users):
+    db, user, other_user = db_users
+    shared, _ = _ensure_catalog_app_server(db, "stripe")
+    assert mcp_apps.is_user_owned_server(db, shared.id) is False
+    _link_without_owning(db, user, shared)
+    assert mcp_apps.is_user_owned_server(db, shared.id) is False
+    _link(db, other_user, shared)
+    assert mcp_apps.is_user_owned_server(db, shared.id) is True
+
+
+def test_catalog_connect_still_rejects_a_user_owned_row(db_users):
+    from fastapi import HTTPException
+
+    db, user, _ = db_users
+    server, _ = _ensure_catalog_app_server(db, "stripe")
+    _link(db, user, server)
+
+    with pytest.raises(HTTPException) as caught:
+        _ensure_catalog_app_server(db, "stripe")
+
+    assert caught.value.status_code == 409
+    assert "user-owned" in caught.value.detail
+
+
+@pytest.mark.asyncio
+async def test_catalog_api_key_row_passes_its_declared_probe(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_catalog_stripe(db, user)
+    adapter = _stripe_ok()
+    loader = _Loader(adapter)
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(
+        ConnectorProbeOutcome.OK, server.id, "stripe", "stripe_get_account_info", None
+    )
+    assert adapter.calls == [{}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["node", "npx"])
+async def test_catalog_row_whose_command_drifted_is_not_the_catalog_row(
+    db_users, monkeypatch, command
+):
+    """Catalog connect adopts an ownerless row only when it launches what the
+    catalog launches; one whose own command differs is not the catalog row, so
+    nothing starts (and for npx, nothing is leased or run on the host)."""
+    db, user, _ = db_users
+    server = _connect_catalog_stripe(db, user)
+    server.command = command
+    server.args = ["-y", "some-pkg"]
+    db.commit()
+    manager = _ForbiddenSandboxManager()
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: manager)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server.id)
+    assert result.http_status == 404
+    assert manager.calls == []
+    assert loader.calls == []
+
+
+@pytest.mark.asyncio
+async def test_remote_row_under_a_catalog_id_must_have_the_catalog_url(
+    db_users, monkeypatch
+):
+    db, user, _ = db_users
+    server, _ = _ensure_catalog_mcp_oauth_server(db, "notion")
+    server.url = "https://evil.example.com/mcp"
+    db.commit()
+    _link_without_owning(db, user, server)
+    loader = _Loader(_github_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server.id)
+    assert loader.calls == []
+
+
+def _make_catalog_stripe_launch_npx(db, monkeypatch) -> None:
+    """The catalog's stripe app launches through npx (its persisted launch
+    config, read as it is for a custom app); the row created from it then
+    matches the catalog and is a launch a task would sandbox."""
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.get_builtin_execution_fields_and_optional_scopes",
+        lambda app_id: (None, []),
+    )
+    app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "stripe").one()
+    app.launch_config = {
+        **app.launch_config,
+        "command": "npx",
+        "args": ["-y", "stripe-mcp"],
+    }
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_row_a_task_would_sandbox_fails_closed(db_users, monkeypatch):
+    """Identity passes (the row matches the catalog), but the effective
+    connection is one a task would sandbox, and the probe's call would open a
+    session on the web host after the listing released its lease."""
+    db, user, _ = db_users
+    _make_catalog_stripe_launch_npx(db, monkeypatch)
+    server = _connect_catalog_stripe(db, user)
+    assert server.command == "npx"
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
 
     result = await run_connector_probe(db, user=user, server_id=server.id)
 
     assert result.outcome is ConnectorProbeOutcome.UNSUPPORTED
     assert result.reason == "sandboxed"
+    assert result.tool == "stripe_get_account_info"
     assert loader.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_sandboxed_row_never_leases_a_sandbox_for_the_probe(
+    db_users, monkeypatch
+):
+    db, user, _ = db_users
+    _make_catalog_stripe_launch_npx(db, monkeypatch)
+    server = _connect_catalog_stripe(db, user)
+    manager = _ForbiddenSandboxManager()
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: manager)
+    loader = _Loader(_stripe_ok())
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result.outcome is ConnectorProbeOutcome.UNSUPPORTED
+    assert result.reason == "sandboxed"
+    assert manager.calls == []
+    assert loader.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_unstamped_oauth_row_named_by_display_name_still_probes(
+    db_users, monkeypatch
+):
+    """Builtin OAuth rows are written by the platform and launch from the
+    catalog; one that predates ``auth.app_id`` and carries the display name
+    keeps resolving through the name."""
+    db, user, _ = db_users
+    app = mcp_apps.get_app_by_id(db, "github")
+    assert app is not None
+    server = MCPServer(name=app["name"], managed="external", transport="oauth")
+    assert server.name == "GitHub"
+    db.add(server)
+    db.commit()
+    _link(db, user, server)
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="github",
+            access_token="gh-token",
+            refresh_token="gh-refresh",
+            provider_user_id="1",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        )
+    )
+    db.commit()
+    adapter = _github_ok()
+    monkeypatch.setattr(LOADER, _Loader(adapter))
+
+    result = await run_connector_probe(db, user=user, server_id=server.id)
+
+    assert result == ConnectorProbeResult(
+        ConnectorProbeOutcome.OK, server.id, "github", "github_get_current_user", None
+    )
+    assert adapter.calls == [{}]
 
 
 @pytest.mark.asyncio

@@ -991,6 +991,26 @@ def _get_app_for_server_name(
     return _app_to_dict(candidates[0])
 
 
+def is_user_owned_server(db: Session, server_id: int) -> bool:
+    """Whether a user owns the server row (any link with ``is_owner`` true).
+
+    The shared catalog row is created without any association, so it never has
+    an owner; a user-owned row under a catalog id is a squat. The one query
+    behind every such check, so a hardening fix cannot land in only one copy.
+    """
+    from .models.mcp import UserMCPServer
+
+    return (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.mcpserver_id == server_id,
+            UserMCPServer.is_owner.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
 def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 

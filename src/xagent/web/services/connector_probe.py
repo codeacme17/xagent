@@ -8,6 +8,20 @@ with the declared arguments, and the result is judged by the tool's own
 envelope. The caller never chooses the tool or its arguments, so this cannot
 serve as a general tool-execution path.
 
+Two rules decide whether a probe may run at all. The row must be the
+catalog's own: an OAuth-transport row is written by the platform and launches
+from the catalog, so it resolves through ``get_app_for_mcp_server``; any other
+row owns a catalog identity only as catalog connect adopts it (exact
+``name == app_id``, no user owning it, and the catalog's own transport and
+command or URL), because a custom row's ``auth`` is caller-authored. And the
+row must not run in a sandbox: the listing's lease is released before the
+call, so the call would open a new session on the web host. That is judged on
+the effective connection the listing builds, not on the catalog's launch
+config: an ``npx``/``uvx`` connection is refused whether or not a sandbox
+manager is configured, after the task's config build (database lookups, env
+decryption and, for an OAuth row, a possible token refresh) but before any
+sandbox lease, process spawn or loader call.
+
 Nothing here returns the tool's text: the in-repo servers put the vendor's
 raw error in it, which may carry a URL or a credential fragment. A result
 carries codes only, like the tools route.
@@ -180,7 +194,11 @@ async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
 
     app = get_app_for_mcp_server(db, server)
     app_id = app.get("id") if app else None
-    if not isinstance(app_id, str):
+    if (
+        app is None
+        or not isinstance(app_id, str)
+        or not _owns_catalog_identity(db, server, app)
+    ):
         return ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server_id)
 
     def result(
@@ -196,16 +214,12 @@ async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
         return result(ConnectorProbeOutcome.NOT_DECLARED, tool=None, reason=None)
     tool_name = probe.tool
 
-    # A probe is declared only for in-repo python servers; if a deployment's
-    # row launches something a task would sandbox, the call would run it on
-    # the web host after the listing released its lease. Fail closed.
-    if _launches_in_sandbox(app.get("launch_config") if app else None):
-        return result(
-            ConnectorProbeOutcome.UNSUPPORTED, tool=tool_name, reason="sandboxed"
-        )
-
     listing = await list_connector_tools(
-        db, user=user, server_id=server_id, name_prefix="probe_"
+        db,
+        user=user,
+        server_id=server_id,
+        name_prefix="probe_",
+        refuse_sandboxed=True,
     )
     if listing.outcome is not ConnectorToolsOutcome.OK or listing.load_result is None:
         return result(
@@ -295,10 +309,30 @@ def _find_tool(tools: Any, name: str) -> Any | None:
     return None
 
 
-def _launches_in_sandbox(launch_config: Any) -> bool:
-    from ..connector_readiness import is_sandbox_command
+def _owns_catalog_identity(db: Any, server: Any, app: Mapping[str, Any]) -> bool:
+    """Whether ``server`` is the catalog's row for ``app``, not a lookalike.
 
-    if not isinstance(launch_config, Mapping):
+    OAuth-transport rows are written by the platform, so their resolution is
+    trusted. For every other row a custom row's auth is caller-authored and
+    must not be able to claim a catalog identity (api/mcp.py), so the row
+    must be what catalog connect adopts: named exactly ``app["id"]``, not
+    user-owned (``_reject_user_owned_catalog_squat``), and launching what the
+    catalog launches (``_ensure_catalog_app_server`` for stdio,
+    ``_ensure_catalog_mcp_oauth_server`` for remote rows).
+    """
+    from ..mcp_apps import is_user_owned_server
+
+    transport = str(server.transport or "").lower()
+    if transport == "oauth":
+        return True
+    if str(server.name or "") != app.get("id") or is_user_owned_server(db, server.id):
         return False
-    command = launch_config.get("command")
-    return isinstance(command, str) and is_sandbox_command(command)
+    launch = app.get("launch_config")
+    if not isinstance(launch, Mapping):
+        return False
+    if transport != str(app.get("transport") or "").lower():
+        return False
+    if transport == "stdio":
+        return bool(server.command == launch.get("command"))
+    url = launch.get("url")
+    return isinstance(url, str) and server.url == url
