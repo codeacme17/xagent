@@ -38,6 +38,7 @@ from tests.web.tools.test_mcp_actor_owner_runtime import (
     _add_remote_server,
 )
 from xagent.config import TOBY_PERSONAL_STDIO_ENABLED
+from xagent.core.tools.adapters.vibe.config import ACTOR_STDIO_SHADOWED_REASON
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ConnectorRef,
     ConnectorRuntimeError,
@@ -309,14 +310,17 @@ async def test_remote_oauth_prefers_the_actor_grant_like_the_task(
 # --- team-owned servers ------------------------------------------------------
 
 
-def _team_owns(*servers: MCPServer) -> None:
+def _team_owns(*servers: MCPServer, owns_definitions: bool = False) -> None:
     ids = {int(server.id) for server in servers}
-    connector_team_scope.set_connector_team_hooks(
-        team_visibility=lambda _db, *, team_id: {
-            "mcp": set(ids) if team_id == TEAM_ID else set(),
-            "custom_api": set(),
-        }
-    )
+
+    def team_visibility(_db, *, team_id):
+        mine = set(ids) if team_id == TEAM_ID else set()
+        answer: dict[str, set[int]] = {"mcp": mine, "custom_api": set()}
+        if owns_definitions:
+            answer[connector_team_scope.TEAM_OWNED_MCP_DEFINITIONS_KEY] = set(mine)
+        return answer
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=team_visibility)
 
 
 def _add_unlinked_stdio(db) -> MCPServer:
@@ -361,6 +365,43 @@ async def test_team_owned_server_lists_with_the_team_like_the_task(
     assert refs == task_refs == {server.name: ConnectorRef("mcp", server.id)}
 
 
+@pytest.mark.asyncio
+async def test_team_only_remote_oauth_lists_with_the_actor_grant_like_the_task(
+    db_users, monkeypatch
+):
+    db, user = db_users
+    server = _add_remote_server(db, user)
+    # Team-only: drop the user's personal link, so only the team hook shows it.
+    db.query(UserMCPServer).filter(UserMCPServer.mcpserver_id == server.id).delete()
+    db.commit()
+    _team_owns(server, owns_definitions=True)
+    _add_remote_grant(db, user, server, owner=OWNER, token="actor-token")
+    task_connections, task_refs = await _task_load(
+        db,
+        user,
+        monkeypatch,
+        mcp_runtime_authorization_policy=_policy(),
+        connector_team_id=TEAM_ID,
+    )
+
+    loader = _Loader()
+    monkeypatch.setattr(LOADER, loader)
+    result = await list_connector_tools(
+        db,
+        user=user,
+        server_id=server.id,
+        name_prefix="mcp_",
+        mcp_runtime_authorization_policy=_policy(),
+        connector_team_id=TEAM_ID,
+    )
+
+    assert result.outcome is ConnectorToolsOutcome.OK
+    connection, refs = _session_load(loader, server.name)
+    assert _comparable(connection) == _comparable(task_connections[server.name])
+    assert refs == task_refs == {server.name: ConnectorRef("mcp", server.id)}
+    assert connection["headers"]["Authorization"] == "Bearer actor-token"
+
+
 @pytest.mark.parametrize("team_id", [None, TEAM_ID + 1])
 @pytest.mark.asyncio
 async def test_team_owned_server_is_not_found_outside_its_team(db_users, team_id):
@@ -384,7 +425,7 @@ async def test_team_owned_server_is_not_found_outside_its_team(db_users, team_id
 
 
 @pytest.mark.asyncio
-async def test_unresolvable_team_scope_raises_the_typed_error(db_users):
+async def test_unresolvable_team_scope_raises_the_typed_error(db_users, stdio_adapter):
     db, user = db_users
     server = _add_unlinked_stdio(db)
 
@@ -405,6 +446,25 @@ async def test_unresolvable_team_scope_raises_the_typed_error(db_users):
         await run_connector_probe(
             db, user=user, server_id=server.id, connector_team_id=TEAM_ID
         )
+    assert connector_probe._probe_running is False
+    with pytest.raises(ConnectorRuntimeError):
+        await list_actor_stdio_connector_tools(
+            db,
+            user=user,
+            app_id=STDIO_APP_ID,
+            name_prefix="mcp_",
+            connector_team_id=TEAM_ID,
+            **_stdio_actor(stdio_adapter),
+        )
+    with pytest.raises(ConnectorRuntimeError):
+        await run_actor_stdio_connector_probe(
+            db,
+            user=user,
+            app_id=STDIO_APP_ID,
+            connector_team_id=TEAM_ID,
+            **_stdio_actor(stdio_adapter),
+        )
+    assert connector_probe._probe_running is False
 
 
 @pytest.mark.asyncio
@@ -523,6 +583,25 @@ async def test_actor_stdio_is_not_found_when_the_policy_disallows_stdio(
 
 
 @pytest.mark.asyncio
+async def test_actor_stdio_is_not_found_when_the_deployment_flag_is_off(
+    db_users, monkeypatch, stdio_adapter
+):
+    db, user = db_users
+    monkeypatch.setenv(TOBY_PERSONAL_STDIO_ENABLED, "false")
+
+    result = await list_actor_stdio_connector_tools(
+        db,
+        user=user,
+        app_id=STDIO_APP_ID,
+        name_prefix="mcp_",
+        **_stdio_actor(stdio_adapter),
+    )
+
+    assert result.outcome is ConnectorToolsOutcome.NOT_FOUND
+    assert stdio_adapter.list_calls == []
+
+
+@pytest.mark.asyncio
 async def test_actor_stdio_shadowed_by_a_visible_server_is_not_found_like_the_task(
     db_users, monkeypatch, stdio_adapter
 ):
@@ -540,13 +619,21 @@ async def test_actor_stdio_shadowed_by_a_visible_server_is_not_found_like_the_ta
     db.commit()
     _team_owns(shadow)
     actor = {**_stdio_actor(stdio_adapter), "connector_team_id": TEAM_ID}
-    task_connections, _ = await _task_load(db, user, monkeypatch, **actor)
+    # _task_load returns {} when the loader is never called, which would make
+    # an absence check vacuous: read the configs the task itself builds.
+    task_configs = await WebToolConfig(
+        db=db, request=None, user=user, user_id=user.id, **actor
+    ).get_mcp_server_configs()
 
     result = await list_actor_stdio_connector_tools(
         db, user=user, app_id=STDIO_APP_ID, name_prefix="mcp_", **actor
     )
 
-    assert STDIO_APP_ID not in task_connections
+    (task_config,) = [c for c in task_configs if c.get("name") == STDIO_APP_ID]
+    assert task_config["transport"] == "unavailable"
+    assert task_config["config"]["unavailable"] is True
+    assert task_config["config"]["reason"] == ACTOR_STDIO_SHADOWED_REASON
+    assert task_config["config"]["server_id"] == shadow.id
     assert result.outcome is ConnectorToolsOutcome.NOT_FOUND
 
 
@@ -712,12 +799,14 @@ async def test_probe_passes_every_actor_keyword_through(
         "mcp_actor_execution_identity": MCPActorExecutionIdentity(
             task_id=7, run_id="run", turn_id="turn", lease_attempt_id="lease"
         ),
-        "connector_team_id": None,
+        "connector_team_id": TEAM_ID,
     }
     seen: list[dict[str, Any]] = []
+    running_during_listing: list[bool] = []
 
     async def listing(_db, **kwargs: Any) -> ConnectorToolsResult:
         seen.append(kwargs)
+        running_during_listing.append(connector_probe._probe_running)
         return ConnectorToolsResult(ConnectorToolsOutcome.NOT_CONNECTED, None)
 
     if entry == "server":
@@ -733,3 +822,6 @@ async def test_probe_passes_every_actor_keyword_through(
 
     (kwargs,) = seen
     assert {key: kwargs[key] for key in actor} == actor
+    # The probe holds the one probe slot while it lists, and frees it after.
+    assert running_during_listing == [True]
+    assert connector_probe._probe_running is False

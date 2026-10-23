@@ -115,6 +115,13 @@ async def list_connector_tools(
     A failure to resolve the team scope raises the config's typed
     ``ConnectorRuntimeError``, as a task's would.
 
+    ``connector_team_id`` and the actor policy, adapter and identity carry
+    authorization meaning and are trusted as given: they must come from an
+    agent or turn the caller has already authorized ``user`` to run (the
+    governing agent's owning team, never request input), as ``WebToolConfig``
+    documents for ``connector_team_id``. The team hook does no membership
+    check.
+
     The sandbox lease is released when this returns, so a caller that goes on
     to call a tool would open a new session on the web host. Such a caller
     passes ``refuse_sandboxed``: an effective connection a task would sandbox
@@ -125,7 +132,6 @@ async def list_connector_tools(
     process spawn or loader call.
     """
     from ...core.tools.adapters.vibe.config import MCPConfigLoadError
-    from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
 
     user_id = int(user.id)
     server = find_visible_server(
@@ -181,7 +187,6 @@ async def list_connector_tools(
         server_name=server_name,
         name_prefix=name_prefix,
         refuse_sandboxed=refuse_sandboxed,
-        connector_refs={server_name: ConnectorRef("mcp", int(server_id))},
         result=result,
     )
 
@@ -219,8 +224,15 @@ async def list_actor_stdio_connector_tools(
     actor never connected the app. A failure to resolve the team scope
     raises the config's typed ``ConnectorRuntimeError``, as in
     ``list_connector_tools``; ``refuse_sandboxed`` behaves as it does there.
+
+    The team id, policy and adapter are trusted as given, under the same
+    contract as ``list_connector_tools``: they must come from an agent or
+    turn the caller has already authorized ``user`` to run, and the team hook
+    does no membership check. ``mcp_actor_execution_identity`` has no effect
+    here: execution-scoped apps are UNSUPPORTED before resolution, and the
+    resolver reads the identity only for those apps. It is accepted for
+    signature parity with ``list_connector_tools``.
     """
-    from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
     from ..builtin_mcp_registry import get_builtin_stdio_session_scope
     from .actor_mcp_runtime import resolve_actor_mcp_stdio_configs
 
@@ -247,8 +259,6 @@ async def list_actor_stdio_connector_tools(
             visible_servers=visible_query.all(),
             execution_identity=mcp_actor_execution_identity,
         )
-    except ConnectorRuntimeError:
-        raise
     except Exception as error:
         logger.warning(
             "Failed to scan actor stdio configs with %s", type(error).__name__
@@ -278,7 +288,6 @@ async def list_actor_stdio_connector_tools(
         server_name=app_id,
         name_prefix=name_prefix,
         refuse_sandboxed=refuse_sandboxed,
-        connector_refs={},
         result=result,
     )
 
@@ -304,22 +313,18 @@ def find_visible_server(
 def _visible_server_query(
     db: Any, *, user_id: int, connector_team_id: int | None
 ) -> Any:
-    """The query ``WebToolConfig._visible_mcp_server_query`` builds, with the
-    team ids resolved the way ``_load_mcp_server_configs`` resolves them."""
-    from ..models.mcp import MCPServer
-    from .connector_team_scope import (
-        resolve_team_connector_selection_or_raise,
-        visible_mcp_server_clause,
-    )
+    """The config's own ``_visible_mcp_server_query``, run with the team ids
+    resolved by the same function ``_load_mcp_server_configs`` uses, so the
+    two cannot drift."""
+    from ..tools.config import WebToolConfig
+    from .connector_team_scope import resolve_team_connector_selection_or_raise
 
     team_selection = resolve_team_connector_selection_or_raise(
         db, team_id=connector_team_id, log_subject=user_id
     )
-    return (
-        db.query(MCPServer)
-        .filter(visible_mcp_server_clause(user_id, team_selection.mcp_ids))
-        .order_by(MCPServer.id)
-    )
+    return WebToolConfig(
+        db=db, request=None, user_id=user_id
+    )._visible_mcp_server_query(team_selection.mcp_ids)
 
 
 def _task_tool_config(
@@ -354,11 +359,11 @@ async def _start_and_list(
     server_name: str,
     name_prefix: str,
     refuse_sandboxed: bool,
-    connector_refs: dict[str, Any],
     result: Callable[..., ConnectorToolsResult],
 ) -> ConnectorToolsResult:
     """Start one built task config and list its tools, as a task would."""
     from ...core.tools.adapters.vibe import mcp_adapter
+    from ...core.tools.adapters.vibe.factory import ToolFactory
     from ...core.tools.adapters.vibe.mcp_tools import _apply_stdio_output_limit_env
     from ...core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
         should_sandbox_mcp_connection,
@@ -384,7 +389,9 @@ async def _start_and_list(
             load_result = await mcp_adapter.load_mcp_tools_as_agent_tools(
                 connections,
                 name_prefix=name_prefix,
-                connector_refs=connector_refs,
+                connector_refs=ToolFactory._mcp_connector_refs(
+                    {server_name: server_config}
+                ),
                 **load_kwargs,
             )
     except _SandboxUnavailable:

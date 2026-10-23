@@ -26,7 +26,7 @@ A caller that checks a connector the way an actor-scoped task loads it
 passes the task's actor policy, adapter, execution identity and governing
 team through to the connector session unchanged; an actor stdio connection,
 which has no server row, is probed by catalog app id through
-``run_actor_stdio_connector_probe``. Its row is synthesized from the catalog
+``run_actor_stdio_connector_probe``. Its config is synthesized from the catalog
 definition, so the catalog-identity rule above holds by construction.
 
 Nothing here returns the tool's text: the in-repo servers put the vendor's
@@ -199,6 +199,10 @@ async def run_connector_probe(
     Raises ``ConnectorProbeBusy`` when a probe is already running, and the
     config's typed ``ConnectorRuntimeError`` when ``connector_team_id`` is
     given and its team scope cannot be resolved, as a task's load would.
+
+    The team id and actor keywords are trusted as given, under the contract
+    ``list_connector_tools`` states: they must come from an agent or turn the
+    caller has already authorized ``user`` to run, never from request input.
     """
     return await _exclusive(
         lambda: _run(
@@ -232,6 +236,12 @@ async def run_actor_stdio_connector_probe(
     one probe slot with ``run_connector_probe``; raises ``ConnectorProbeBusy``
     when a probe is already running, and ``ConnectorRuntimeError`` as
     ``run_connector_probe`` does.
+
+    The trust contract of ``list_actor_stdio_connector_tools`` applies to the
+    team id, policy and adapter. ``mcp_actor_execution_identity`` has no
+    effect here, because execution-scoped apps are UNSUPPORTED before
+    resolution and the resolver reads the identity only for those apps; it
+    is accepted for signature parity.
     """
     return await _exclusive(
         lambda: _run_actor_stdio(
