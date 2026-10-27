@@ -1073,7 +1073,10 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             # subdomain/credential would otherwise be masked as "no
             # results" instead of surfacing as the usual config error.
             _ensure_configured()
-            return _success(results=[], count=None, has_more=False, truncated=False)
+            return _finalize_capped(
+                _success(results=[], count=None, has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
         return _list_offset_paginated(
             "/search.json",
             "results",
@@ -1412,7 +1415,10 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
             # identical guard for the config-validation/response-shape
             # rationale.
             _ensure_configured()
-            return _success(users=[], has_more=False, truncated=False)
+            return _finalize_capped(
+                _success(users=[], has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
         return _list_offset_paginated(
             "/users/search.json",
             "users",
@@ -1491,7 +1497,10 @@ def zendesk_search_articles(query: str, limit: int = 25, page: int = 1) -> str:
         if _past_search_window(page, max_results, _MAX_ARTICLE_SEARCH_RESULT_WINDOW):
             # See zendesk_search's identical guard.
             _ensure_configured()
-            return _success(results=[], count=None, has_more=False, truncated=False)
+            return _finalize_capped(
+                _success(results=[], count=None, has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
         return _list_offset_paginated(
             "/help_center/articles/search.json",
             "results",

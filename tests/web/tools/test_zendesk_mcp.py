@@ -1063,6 +1063,19 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
     mock_request.assert_not_called()
 
 
+def test_search_past_result_window_respects_the_output_cap(monkeypatch):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    raw = zendesk.zendesk_search("type:ticket", limit=100, page=page)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_search_past_result_window_still_surfaces_missing_credentials(monkeypatch):
     # The past-window guard returns before ever calling _request(), which
     # is normally what validates ZENDESK_SUBDOMAIN/ACCESS_TOKEN -- a
@@ -2133,6 +2146,19 @@ def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
     mock_request.assert_not_called()
 
 
+def test_search_users_past_result_window_respects_the_output_cap(monkeypatch):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_USER_SEARCH_RESULT_WINDOW // 100 + 1
+
+    raw = zendesk.zendesk_search_users("jane@example.com", limit=100, page=page)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_search_users_does_not_trip_the_unified_search_window(monkeypatch):
     # Regression for F6: reusing /search.json's 1,000-result ceiling for
     # /users/search.json (which supports 10,000) would silently return an
@@ -2640,6 +2666,21 @@ def test_search_articles_returns_empty_past_result_window_without_calling_zendes
         "has_more": False,
         "truncated": False,
     }
+    mock_request.assert_not_called()
+
+
+def test_search_articles_past_result_window_respects_the_output_cap(monkeypatch):
+    # The past-window early return must still go through the output cap: a
+    # configured cap smaller than the fixed success envelope may not be
+    # bypassed.
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    raw = zendesk.zendesk_search_articles("a", limit=100, page=11)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
     mock_request.assert_not_called()
 
 
