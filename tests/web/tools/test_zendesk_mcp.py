@@ -3176,6 +3176,7 @@ def test_get_side_conversation_returns_it_with_a_page_of_messages(monkeypatch):
                         {"user_id": 8, "name": "Vendor", "email": "vendor@example.com"}
                     ],
                     "body": "Can you confirm the new ship date?",
+                    "body_is_html": False,
                     "attachments": [],
                 },
             }
@@ -3252,7 +3253,7 @@ def test_get_side_conversation_encodes_the_id_into_one_path_segment(monkeypatch)
     )
 
 
-def test_get_side_conversation_trims_messages_but_keeps_the_conversation(
+def test_get_side_conversation_trims_events_but_keeps_the_conversation(
     monkeypatch,
 ):
     events = [_side_conversation_event(f"e{i}", "x" * 1000) for i in range(10)]
@@ -3272,6 +3273,53 @@ def test_get_side_conversation_trims_messages_but_keeps_the_conversation(
     assert result["truncated"] is True
     assert result["has_more"] is True
     assert 0 < len(result["events"]) < 10
+    kept = [e["id"] for e in result["events"]]
+    assert kept == [f"e{i}" for i in range(len(kept))]
+    assert result["count"] == 10
+    assert result["side_conversation"]["id"] == "5c623337-d419-11f1-8809-7698c7f03fad"
+
+
+def test_get_side_conversation_clamps_limit_to_100(monkeypatch):
+    mock_request = Mock(side_effect=_side_conversation_responses([]))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_get_side_conversation(1, "5c62", limit=500)
+
+    _, events_call = mock_request.call_args_list
+    assert events_call.kwargs["params"] == {"per_page": 100, "page": 1}
+
+
+def test_list_side_conversations_trims_to_fit_and_keeps_count(monkeypatch):
+    side_conversations = [
+        {**_SIDE_CONVERSATION, "id": f"sc{i}", "preview_text": "x" * 1000}
+        for i in range(10)
+    ]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "side_conversations": side_conversations,
+                    "count": 10,
+                    "next_page": None,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 4000)
+
+    raw = zendesk.zendesk_list_side_conversations(1, limit=10)
+    result = json.loads(raw)
+
+    assert len(raw) <= 4000
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["count"] == 10
+    kept = [sc["id"] for sc in result["side_conversations"]]
+    assert kept == [f"sc{i}" for i in range(len(kept))]
+    assert 0 < len(kept) < 10
 
 
 def test_get_side_conversation_surfaces_a_not_found_error(monkeypatch):
@@ -3302,6 +3350,7 @@ def test_get_side_conversation_falls_back_to_the_html_body(monkeypatch):
     result = json.loads(zendesk.zendesk_get_side_conversation(1, "5c62"))
 
     assert result["events"][0]["message"]["body"] == "<div>Only HTML</div>"
+    assert result["events"][0]["message"]["body_is_html"] is True
 
 
 def test_get_side_conversation_accepts_a_ticket_url(monkeypatch):

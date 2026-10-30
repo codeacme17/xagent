@@ -964,7 +964,8 @@ def _side_conversation_summary(conversation: dict[str, Any]) -> dict[str, Any]:
 
 def _side_conversation_event_summary(event: dict[str, Any]) -> dict[str, Any]:
     """One event in a side conversation's history. A message event carries
-    its plain-text body, falling back to html_body when that is empty; a
+    its plain-text body, falling back to html_body when that is empty (then
+    `body_is_html` is true, so a caller can tell markup from plain text); a
     state change carries `updates` and no message."""
     message = event.get("message")
     return {
@@ -979,6 +980,8 @@ def _side_conversation_event_summary(event: dict[str, Any]) -> dict[str, Any]:
                 "from": message.get("from"),
                 "to": message.get("to"),
                 "body": message.get("body") or message.get("html_body"),
+                "body_is_html": not message.get("body")
+                and bool(message.get("html_body")),
                 "attachments": message.get("attachments"),
             }
             if isinstance(message, dict)
@@ -1667,11 +1670,11 @@ def zendesk_get_side_conversation(
     """
     Get one side conversation on a ticket with a page of its history: each
     message's sender, recipients, subject, body (plain text, or the HTML
-    body when the plain text is empty), and attachments, plus state
-    changes. If the response is too large, messages
-    are dropped (`truncated: true`, `has_more` forced true) while the side
-    conversation itself is kept; re-run with a smaller `limit` from
-    `page=1` to read them.
+    body when the plain text is empty; `body_is_html` is true in that
+    case), and attachments, plus state changes. If the response is too
+    large, events are dropped (`truncated: true`, `has_more` forced true)
+    while the side conversation itself is kept; re-run with a smaller
+    `limit` from `page=1` to read them.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI. Zendesk answers HTTP 403, not 404, for a ticket that
     doesn't exist.
