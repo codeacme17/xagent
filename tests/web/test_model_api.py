@@ -279,6 +279,59 @@ def _platform_config(model_id: str, category: str = "llm"):
     return ChatModelConfig(**common, model_name="gpt-4", abilities=["chat"])
 
 
+@pytest.mark.parametrize("provider", ["xinference", "elevenlabs"])
+def test_speech_defaults_survive_create_read_update_and_clear(
+    test_db, regular_headers, sample_speech_model_data, provider
+):
+    settings = {
+        "language": "en",
+        "voice": "configured-voice",
+        "format": "pcm",
+        "sample_rate": 16000,
+    }
+    payload = {**sample_speech_model_data, "model_provider": provider, **settings}
+    created = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert created.status_code == 200, created.text
+    saved = created.json()
+    assert {key: saved[key] for key in settings} == settings
+    model_id = saved["model_id"]
+    detail_url = f"/api/models/by-id/{model_id}"
+
+    detail = client.get(detail_url, headers=regular_headers)
+    assert detail.status_code == 200
+    assert {key: detail.json()[key] for key in settings} == settings
+    listed = client.get("/api/models/", headers=regular_headers)
+    assert listed.status_code == 200
+    listed_model = next(item for item in listed.json() if item["model_id"] == model_id)
+    assert {key: listed_model[key] for key in settings} == settings
+
+    db = next(get_db())
+    try:
+        config = CoreStorage(db, DBModel).load(model_id)
+        assert {key: getattr(config, key) for key in settings} == settings
+    finally:
+        db.close()
+
+    changed = {"voice": "updated-voice", "sample_rate": 24000}
+    updated = client.put(detail_url, json=changed, headers=regular_headers)
+    assert updated.status_code == 200, updated.text
+    expected = {**settings, **changed}
+    refreshed = client.get("/api/models/", headers=regular_headers)
+    refreshed_model = next(
+        item for item in refreshed.json() if item["model_id"] == model_id
+    )
+    assert {key: refreshed_model[key] for key in expected} == expected
+
+    cleared = client.put(
+        detail_url, json={key: None for key in settings}, headers=regular_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    reread = client.get(detail_url, headers=regular_headers)
+    assert {key: reread.json()[key] for key in settings} == {
+        key: None for key in settings
+    }
+
+
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
 def test_user_creation_rejects_platform_namespace(
     test_db, regular_headers, sample_model_data, path

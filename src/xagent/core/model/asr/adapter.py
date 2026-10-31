@@ -13,7 +13,7 @@ def get_asr_model_instance(db_model: Any) -> BaseASR:
 
     Args:
         db_model: Database model instance with fields: model_name, model_provider,
-                  api_key, base_url, abilities, timeout, max_retries
+                  api_key, base_url, and optional default language
 
     Returns:
         BaseASR instance
@@ -25,6 +25,7 @@ def get_asr_model_instance(db_model: Any) -> BaseASR:
     model_name = str(db_model.model_name)
     api_key = str(db_model.api_key) if db_model.api_key else None
     base_url = str(db_model.base_url) if db_model.base_url else None
+    language = getattr(db_model, "language", None)
 
     model: BaseASR
     if provider == "xinference":
@@ -33,12 +34,14 @@ def get_asr_model_instance(db_model: Any) -> BaseASR:
             model_uid=model_name,
             base_url=base_url,
             api_key=api_key,
+            language=language,
         )
     elif provider == "elevenlabs":
         model = ElevenLabsASR(
             model=model_name,
             base_url=base_url,
             api_key=api_key,
+            language=language,
         )
     else:
         raise ValueError(
