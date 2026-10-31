@@ -31,6 +31,12 @@ logger = logging.getLogger("zendesk-mcp")
 
 mcp = FastMCP("zendesk-mcp")
 
+
+class _OutcomeUnknownError(RuntimeError):
+    """A request whose effect on Zendesk is unknown: the connection failed, or
+    Zendesk answered 5xx. A write may still have been applied."""
+
+
 # A shared Session (HTTP keep-alive / connection pooling) rather than a bare
 # requests.request() per call -- most benefit accrues to this module's own
 # 429-retry (a second request to the same host right after the first), and
@@ -484,7 +490,7 @@ def _request(
         # credentials, and urllib3's "Max retries exceeded with url:
         # /search.json?query=..." echoing the request's own query string
         # (which for the search tools can carry end-user PII).
-        raise RuntimeError(_sanitize_exception_text(exc)) from exc
+        raise _OutcomeUnknownError(_sanitize_exception_text(exc)) from exc
 
     if 300 <= response.status_code < 400:
         raise RuntimeError(
@@ -522,6 +528,8 @@ def _request(
                 "granted to this connection do not allow this request; "
                 "reconnecting Zendesk requests the scopes again."
             )
+        if response.status_code >= 500:
+            raise _OutcomeUnknownError(message) from exc
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
@@ -1020,10 +1028,9 @@ def _macro_comment_is_public(actions: list[dict[str, Any]]) -> bool:
         if action.get("field") != _MACRO_COMMENT_MODE_ACTION:
             continue
         value = action.get("value")
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
-            return value.strip().lower() == "true"
+        normalized = str(value).strip().lower()
+        if normalized in ("true", "false"):
+            return normalized == "true"
         raise ValueError(
             f"the macro sets {_MACRO_COMMENT_MODE_ACTION} to {value!r}, which "
             "is not true or false; nothing was saved"
@@ -1041,7 +1048,12 @@ def _build_apply_macro_response(payload: dict[str, Any]) -> str:
     response = _success(**payload)
     comment = payload["changes"].get("comment")
     body = comment.get("body") if isinstance(comment, dict) else None
-    while len(response) > max_output_length and isinstance(body, str) and body:
+    while (
+        not payload["dry_run"]
+        and len(response) > max_output_length
+        and isinstance(body, str)
+        and body
+    ):
         body = body[: len(body) // 2]
         payload = {
             **payload,
@@ -1846,11 +1858,16 @@ def zendesk_apply_macro(
     Zendesk agent UI.
     macro_id: a bare numeric id (from zendesk_list_macros), or the macro's
     Admin Center URL.
-    preview_token: required to save; the `preview_token` from the preview
-    the user approved.
+    preview_token: required to save; the `preview_token` from a preview of
+    this macro on this ticket. It binds the exact write that preview showed
+    (ticket state, macro version, and the rendered changes); it is not a
+    record of a human approval, so show the preview to the user before
+    saving.
     """
     try:
-        if not dry_run and not (preview_token and preview_token.strip()):
+        if isinstance(preview_token, str):
+            preview_token = preview_token.strip()
+        if not dry_run and not preview_token:
             raise ValueError(
                 "to save, pass the preview_token from a preview (dry_run=true) "
                 "of this macro on this ticket; nothing was saved"
@@ -1893,6 +1910,11 @@ def zendesk_apply_macro(
         update: dict[str, Any] = {}
         for field in _MACRO_FIELD_ACTIONS:
             if field in fields:
+                if field not in preview_ticket:
+                    raise RuntimeError(
+                        f"Zendesk's preview of this macro has no {field}; "
+                        "nothing was saved"
+                    )
                 changes[field] = update[field] = preview_ticket.get(field)
         if fields & _MACRO_TAG_ACTIONS:
             # The whole final set: a single-ticket update ignores
@@ -1951,10 +1973,10 @@ def zendesk_apply_macro(
             "dry_run": dry_run,
             "ticket_id": preview_ticket.get("id"),
             "macro": {"id": macro.get("id"), "title": macro.get("title")},
-            "preview_token": token,
             "changes": changes,
         }
         if dry_run:
+            payload["preview_token"] = token
             return _build_apply_macro_response(payload)
 
         if token != preview_token:
@@ -1968,17 +1990,24 @@ def zendesk_apply_macro(
         # saves nothing if the ticket changes between this check and the
         # save. It also makes a retry after a successful save fail instead of
         # posting the comment twice, since the save itself moves updated_at.
-        result = _request(
-            "PUT",
-            f"/tickets/{ticket_path_id}.json",
-            json_data={
-                "ticket": {
-                    **update,
-                    "safe_update": True,
-                    "updated_stamp": preview_stamp,
-                }
-            },
-        )
+        try:
+            result = _request(
+                "PUT",
+                f"/tickets/{ticket_path_id}.json",
+                json_data={
+                    "ticket": {
+                        **update,
+                        "safe_update": True,
+                        "updated_stamp": preview_stamp,
+                    }
+                },
+            )
+        except _OutcomeUnknownError as exc:
+            raise RuntimeError(
+                f"{exc}. The save may have been applied: check the ticket with "
+                "zendesk_get_ticket and zendesk_list_ticket_comments before "
+                "applying this macro again."
+            ) from exc
         ticket = _unwrap(result, "ticket")
         payload["ticket"] = (
             _ticket_summary(ticket) if isinstance(ticket, dict) else ticket
