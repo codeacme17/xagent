@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import re
@@ -1034,8 +1035,8 @@ def _build_apply_macro_response(payload: dict[str, Any]) -> str:
     """Cap an apply-macro response, shrinking in order of what the caller
     loses least: the reported comment body, then the saved ticket's summary
     (down to its id), then the change details. A saved result is never
-    turned into an error: an error invites a retry, and a retry of a save
-    posts the comment again."""
+    turned into an error, down to the smallest success envelope: an error
+    invites a retry, and a retry of a save posts the comment again."""
     max_output_length = get_tool_max_output_length()
     response = _success(**payload)
     comment = payload["changes"].get("comment")
@@ -1070,9 +1071,21 @@ def _build_apply_macro_response(payload: dict[str, Any]) -> str:
         payload = {**payload, "truncated": True, "changes": {"truncated": True}}
         response = _success(**payload)
     if len(response) > max_output_length and not payload["dry_run"]:
-        response = _success(
-            dry_run=False, ticket_id=payload.get("ticket_id"), truncated=True
-        )
+        # The save is committed: keep shrinking to the smallest success
+        # envelope rather than let the cap turn it into an error.
+        for fallback in (
+            {
+                "dry_run": False,
+                "ticket_id": payload.get("ticket_id"),
+                "truncated": True,
+            },
+            {"dry_run": False, "truncated": True},
+            {"dry_run": False},
+            {},
+        ):
+            response = _success(**fallback)
+            if len(response) <= max_output_length:
+                break
     return _finalize_capped(response, max_output_length)
 
 
@@ -1820,7 +1833,8 @@ def zendesk_apply_macro(
     changes and a `preview_token`; then save with dry_run=false and that
     same preview_token. The save is refused, with nothing saved, if the
     ticket or the macro changed since that preview -- preview again and
-    re-confirm.
+    re-confirm. A save is also refused if the macro renders differently
+    than in the preview (e.g. the requester's details changed).
     Only macros whose actions set status, priority, assignee, group,
     tags, or add a comment can be applied. A macro with any other action
     (for example a side conversation, CCs, a custom field, or a custom
@@ -1916,7 +1930,13 @@ def zendesk_apply_macro(
                 "was saved"
             )
         # Binds a save to exactly what was previewed: the ticket and its
-        # state, and the macro and its version.
+        # state, and the macro and its version. The digest also binds the
+        # exact write (rendered comment, its visibility, fields and tags), so
+        # a macro edited mid-call or a placeholder rendering differently
+        # can't change what is saved.
+        write_digest = hashlib.sha256(
+            json.dumps(update, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:32]
         token = "|".join(
             str(part)
             for part in (
@@ -1924,6 +1944,7 @@ def zendesk_apply_macro(
                 preview_stamp,
                 macro.get("id"),
                 macro.get("updated_at"),
+                write_digest,
             )
         )
         payload: dict[str, Any] = {
