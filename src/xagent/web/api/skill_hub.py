@@ -251,7 +251,9 @@ def _classify_source(skill_path: str) -> str:
 
 
 def _validate_skill_name(name: str) -> None:
-    if not name or not _NAME_RE.match(name):
+    # ``fullmatch``: with ``match`` the pattern's ``$`` also accepts a single
+    # trailing newline.
+    if not name or not _NAME_RE.fullmatch(name):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -796,17 +798,37 @@ def _write_personal_skill(
 
 
 def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) -> None:
+    """Replace the SKILL.md of one personal skill the caller owns.
+
+    The new SKILL.md is validated before the row is looked up. The checks read
+    only the new content, and parsing a frontmatter near the size cap takes
+    about a quarter of a second, which must not be spent holding the row lock:
+    the web edit and delete routes call these helpers on the event loop, so a
+    request waiting for the lock holds up the loop. Invalid content is
+    therefore a 400 for any name, including one the caller has no personal
+    skill under; the answer depends only on the request, so it says nothing
+    about which skills exist. Attachments stored earlier are not validated
+    again, so an edit does not start failing because of a file it never
+    touched.
+
+    The row is then locked, so on PostgreSQL a concurrent delete that commits
+    first leaves this call with a 404 instead of a write to a vanished row.
+    SQLite takes no row locks.
+    """
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
 
+    content = skill_md.encode("utf-8")
+    _check_skill_md_content(content)
+    _assert_bundle_parses({"SKILL.md": content})
     skill = (
         db.query(UserSkill)
         .filter(UserSkill.user_id == int(user.id), UserSkill.name == name)
+        .with_for_update()
         .first()
     )
     if skill is None:
         raise HTTPException(status_code=404, detail="Personal skill not found")
-    content = skill_md.encode("utf-8")
     file = next((item for item in skill.files if item.path == "SKILL.md"), None)
     if file is None:
         file = UserSkillFile(skill_id=skill.id, path="SKILL.md")
@@ -820,12 +842,17 @@ def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) 
 
 
 def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
-    """Delete one personal skill the caller owns, addressed by name."""
+    """Delete one personal skill the caller owns, addressed by name.
+
+    The row is locked first, so on PostgreSQL the second of two concurrent
+    deletes gets a 404. SQLite takes no row locks.
+    """
     from xagent.web.models.skill import UserSkill
 
     skill = (
         db.query(UserSkill)
         .filter(UserSkill.user_id == int(user.id), UserSkill.name == name)
+        .with_for_update()
         .first()
     )
     if skill is None:
@@ -856,9 +883,18 @@ def _personal_summary_from_bundle(
 
 
 def _personal_upload_matches_bundle(
-    *, db: Any, user: User, name: str, files: dict[str, bytes]
+    *,
+    db: Any,
+    user: User,
+    name: str,
+    files: dict[str, bytes],
+    origin: str = "upload",
 ) -> bool:
-    """Whether an upload retry already produced this exact personal skill."""
+    """Whether this write is a retry of one that already committed.
+
+    A retry is the same owner writing the same name from the same ``origin``
+    with byte-identical files.
+    """
     from sqlalchemy.orm import selectinload
 
     from xagent.web.models.skill import UserSkill
@@ -869,7 +905,7 @@ def _personal_upload_matches_bundle(
         .filter(
             UserSkill.user_id == int(user.id),
             UserSkill.name == name,
-            UserSkill.origin == "upload",
+            UserSkill.origin == origin,
         )
         .first()
     )
@@ -1347,11 +1383,14 @@ async def edit_installed(
     mgr = await _get_scoped_manager(request, context, db)
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
+        # A personal SKILL.md was parsed before it was committed, so for a
+        # personal skill a missing record here means the library read side
+        # did not return it, not that the stored content is bad.
         raise HTTPException(
             status_code=400,
             detail=(
-                "Edit written to disk but the parser rejected it. Fix the "
-                "SKILL.md and PUT again — the bad version is still on disk."
+                "The edit was saved, but the skill library did not return it. "
+                "Reload the skill and try again."
             ),
         )
     logger.info("Skill Hub: edited user skill %r", name)
@@ -1385,7 +1424,7 @@ def _derive_upload_skill_name(
         # round-trip. The slugifier strips leading and trailing "-"/"_", so it
         # rejected names like "_foo" and "my_skill_" that _NAME_RE accepts and
         # POST /create takes — with an error citing the regex they do match.
-        if not _NAME_RE.match(candidate) or len(candidate) > 64:
+        if not _NAME_RE.fullmatch(candidate) or len(candidate) > 64:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1411,6 +1450,23 @@ def _derive_upload_skill_name(
     raise HTTPException(
         status_code=400, detail="Could not derive a skill name from the upload."
     )
+
+
+def _upload_limit_exceeded_detail(limit: int) -> str:
+    """The 413 detail for an upload larger than ``limit`` bytes.
+
+    ``XAGENT_MAX_UPLOAD_SIZE`` takes any positive byte count (``1K``,
+    ``1.5M``, ``1000``), so the limit is written in the largest unit that
+    divides it exactly: ``1.5M`` reads "1536 KiB", not "1 MiB".
+    """
+    mib, kib = 1024 * 1024, 1024
+    if limit % mib == 0:
+        size = f"{limit // mib} MiB"
+    elif limit % kib == 0:
+        size = f"{limit // kib} KiB"
+    else:
+        size = f"{limit} bytes"
+    return f"Upload exceeds {size} limit."
 
 
 @router.post("/upload", response_model=SkillSummary)
@@ -1451,7 +1507,7 @@ async def upload_skill(
     if len(data) > limit:
         raise HTTPException(
             status_code=413,
-            detail=f"Upload exceeds {limit // (1024 * 1024)} MiB limit.",
+            detail=_upload_limit_exceeded_detail(limit),
         )
 
     filename = (file.filename or "").strip()
