@@ -34,9 +34,12 @@ import {
 import { useSessionOpenMessage } from "./use-session-open-message"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
-// Asks the session server to confirm and send heartbeat frames. A server that
-// does not know the marker ignores it, and the connection then runs without
-// dead-connection detection.
+// Asks the session server to send a connection_capabilities frame, then
+// heartbeat frames. This page requires a server that honors it. A server that
+// ignores the marker sends no capabilities frame: the connection runs without
+// dead-connection detection, and sessionConversationAttachment stays
+// "pending", so neither data-initial-message (see useWidgetInitialMessage
+// below) nor a message from XagentWidget.open() is ever sent.
 const SESSION_LIVENESS_PROTOCOL = "xagent-session-liveness-v1"
 // Asks the session server to announce when attach, including any resume replay, has finished.
 const SESSION_ATTACH_PROTOCOL = "xagent-session-attach-v1"
@@ -184,7 +187,20 @@ function SessionConversationContent({
   }, [startNewConversation])
 
   useWidgetInitialMessage({
-    ready: status === "active" && agent !== null && isConnected,
+    // An open socket does not yet tell whether the server is restoring a
+    // conversation, because its replay arrives after the open. Attach
+    // completion follows that replay, so the page knows from there on. A
+    // server whose connection_capabilities frame does not list attach
+    // completion ("unsupported") leaves nothing more to wait for, so the page
+    // asks once that frame arrives. The page requires a server that sends
+    // connection_capabilities: without it the value stays "pending" and the
+    // message is never requested. No timer stands in for either frame: an
+    // attach-capable server whose frames are slow would then be taken for
+    // "unsupported", and the page could ask before a restored conversation
+    // arrives.
+    // Both "attached" and "unsupported" describe the current open socket only.
+    ready: status === "active" && agent !== null
+      && sessionConversationAttachment !== "pending",
     // A first send queued during the initial connect has no task yet.
     hasConversation: state.taskId !== null || isMessageDeliveryPending,
     onMessage: (message) => handleStartMessage(message, []),
