@@ -2475,6 +2475,7 @@ async def test_id_params_accept_a_bare_int_through_tool_schema(
                     "user": {"id": 1},
                     "organization": {"id": 1},
                     "article": {"id": 1},
+                    "macro_attachments": [],
                     "macro": {
                         "id": 1,
                         "actions": [{"field": "status", "value": "open"}],
@@ -2550,6 +2551,7 @@ async def test_every_tool_sends_the_access_token_as_bearer(
                 "organization": {"id": 1},
                 "article": {"id": 1},
                 "macros": [],
+                "macro_attachments": [],
                 "macro": {
                     "id": 1,
                     "actions": [{"field": "status", "value": "open"}],
@@ -3453,13 +3455,31 @@ _PROBE_MACRO_ACTIONS = [
 ]
 
 
+def _no_attachments():
+    """GET /macros/{id}/attachments: the macro has no attached files."""
+    return MockResponse(json_data={"macro_attachments": []})
+
+
+def _macro_reads(actions=_PROBE_MACRO_ACTIONS, preview=None, **macro_kwargs):
+    """Every GET a preview makes, in order: the macro, its attachments, the
+    ticket-scoped render, and the macro again."""
+    return [
+        _macro(actions, **macro_kwargs),
+        _no_attachments(),
+        _macro_preview() if preview is None else preview,
+        _macro(actions, **macro_kwargs),
+    ]
+
+
 def _preview_token(monkeypatch, actions=_PROBE_MACRO_ACTIONS, **preview_ticket):
     """The preview_token a dry run returns for macro 5 (updated 2026-10-29)
     on the ticket, so a save test approves exactly what it then saves."""
     monkeypatch.setattr(
         zendesk._session,
         "request",
-        Mock(side_effect=[_macro(actions), _macro_preview(**preview_ticket)]),
+        Mock(
+            side_effect=_macro_reads(actions, preview=_macro_preview(**preview_ticket))
+        ),
     )
     result = json.loads(zendesk.zendesk_apply_macro(preview_ticket.get("id", 1), 5))
     assert result["status"] == "success"
@@ -3494,7 +3514,7 @@ def test_apply_macro_refuses_an_action_outside_the_allowlist_before_saving(
 
 
 def test_apply_macro_previews_without_saving_by_default(monkeypatch):
-    mock_request = Mock(side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview()])
+    mock_request = Mock(side_effect=_macro_reads())
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(zendesk.zendesk_apply_macro(1, 5))
@@ -3520,9 +3540,13 @@ def test_apply_macro_previews_without_saving_by_default(monkeypatch):
     assert [call.kwargs["method"] for call in mock_request.call_args_list] == [
         "GET",
         "GET",
+        "GET",
+        "GET",
     ]
-    assert mock_request.call_args.kwargs["url"].endswith(
-        "/tickets/1/macros/5/apply.json"
+    assert (
+        mock_request.call_args_list[2]
+        .kwargs["url"]
+        .endswith("/tickets/1/macros/5/apply.json")
     )
 
 
@@ -3548,16 +3572,14 @@ def test_apply_macro_saves_the_rendered_changes_with_a_safe_update(monkeypatch):
         }
     )
     token = _preview_token(monkeypatch)
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(), saved]
-    )
+    mock_request = Mock(side_effect=[*_macro_reads(), saved])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
         zendesk.zendesk_apply_macro(1, 5, dry_run=False, preview_token=token)
     )
 
-    put = mock_request.call_args_list[2]
+    put = mock_request.call_args_list[4]
     assert put.kwargs["method"] == "PUT"
     assert put.kwargs["url"].endswith("/tickets/1.json")
     # Only the fields the macro's actions touch: the preview's empty
@@ -3589,7 +3611,7 @@ def test_apply_macro_keeps_an_internal_comment_internal(monkeypatch, mode):
     ]
     token = _preview_token(monkeypatch, actions)
     saved = MockResponse(json_data={"ticket": {"id": 1}, "audit": {"events": []}})
-    mock_request = Mock(side_effect=[_macro(actions), _macro_preview(), saved])
+    mock_request = Mock(side_effect=[*_macro_reads(actions), saved])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
@@ -3624,7 +3646,10 @@ def test_apply_macro_sends_the_plain_body_when_there_is_no_html(monkeypatch):
     token = _preview_token(monkeypatch, actions, comment=plain_comment)
     saved = MockResponse(json_data={"ticket": {"id": 1}, "audit": {"events": []}})
     mock_request = Mock(
-        side_effect=[_macro(actions), _macro_preview(comment=plain_comment), saved]
+        side_effect=[
+            *_macro_reads(actions, preview=_macro_preview(comment=plain_comment)),
+            saved,
+        ]
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3640,10 +3665,10 @@ def test_apply_macro_sends_the_plain_body_when_there_is_no_html(monkeypatch):
 def test_apply_macro_takes_resolved_field_values_from_the_preview(monkeypatch):
     # A macro can assign to "current_user"; the preview resolves it to an id.
     mock_request = Mock(
-        side_effect=[
-            _macro([{"field": "assignee_id", "value": "current_user"}]),
-            _macro_preview(assignee_id=77),
-        ]
+        side_effect=_macro_reads(
+            [{"field": "assignee_id", "value": "current_user"}],
+            preview=_macro_preview(assignee_id=77),
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3661,9 +3686,7 @@ def test_apply_macro_reports_a_safe_update_conflict(monkeypatch):
         status_code=409,
     )
     token = _preview_token(monkeypatch)
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(), conflict]
-    )
+    mock_request = Mock(side_effect=[*_macro_reads(), conflict])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
@@ -3693,10 +3716,9 @@ def test_apply_macro_refuses_a_macro_with_nothing_to_apply(monkeypatch, actions)
 
 def test_apply_macro_refuses_an_empty_rendered_comment(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(comment={"body": "", "html_body": ""}),
-        ]
+        side_effect=_macro_reads(
+            preview=_macro_preview(comment={"body": "", "html_body": ""})
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3706,11 +3728,11 @@ def test_apply_macro_refuses_an_empty_rendered_comment(monkeypatch):
 
     assert result["status"] == "error"
     assert "empty comment" in result["message"]
-    assert mock_request.call_count == 2
+    assert mock_request.call_count == 4
 
 
 def test_apply_macro_accepts_ticket_and_macro_urls(monkeypatch):
-    mock_request = Mock(side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview()])
+    mock_request = Mock(side_effect=_macro_reads())
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     zendesk.zendesk_apply_macro(
@@ -3718,9 +3740,13 @@ def test_apply_macro_accepts_ticket_and_macro_urls(monkeypatch):
         "https://acme.zendesk.com/admin/workspaces/agent-workspace/macros/5",
     )
 
-    macro_call, preview_call = mock_request.call_args_list
+    macro_call, attachments_call, preview_call, reread_call = (
+        mock_request.call_args_list
+    )
     assert macro_call.kwargs["url"].endswith("/macros/5.json")
+    assert attachments_call.kwargs["url"].endswith("/macros/5/attachments.json")
     assert preview_call.kwargs["url"].endswith("/tickets/42/macros/5/apply.json")
+    assert reread_call.kwargs["url"].endswith("/macros/5.json")
 
 
 def test_apply_macro_gives_no_token_when_the_comment_is_too_long_to_show(
@@ -3728,10 +3754,9 @@ def test_apply_macro_gives_no_token_when_the_comment_is_too_long_to_show(
 ):
     long_body = "<p>" + "x" * 5000 + "</p>"
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(comment={"body": long_body, "html_body": long_body}),
-        ]
+        side_effect=_macro_reads(
+            preview=_macro_preview(comment={"body": long_body, "html_body": long_body})
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 1000)
@@ -3763,10 +3788,9 @@ def test_apply_macro_refuses_to_save_when_the_ticket_changed_since_the_dry_run(
 ):
     token = _preview_token(monkeypatch)
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(updated_at="2026-10-30T09:00:00Z"),
-        ]
+        side_effect=_macro_reads(
+            preview=_macro_preview(updated_at="2026-10-30T09:00:00Z")
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3777,6 +3801,8 @@ def test_apply_macro_refuses_to_save_when_the_ticket_changed_since_the_dry_run(
     assert result["status"] == "error"
     assert "changed since" in result["message"]
     assert [call.kwargs["method"] for call in mock_request.call_args_list] == [
+        "GET",
+        "GET",
         "GET",
         "GET",
     ]
@@ -3834,7 +3860,10 @@ def test_apply_macro_sends_each_allowlisted_field_from_the_preview(
     token = _preview_token(monkeypatch, [action], **preview_fields)
     saved = MockResponse(json_data={"ticket": {"id": 1}, "audit": {"events": []}})
     mock_request = Mock(
-        side_effect=[_macro([action]), _macro_preview(**preview_fields), saved]
+        side_effect=[
+            *_macro_reads([action], preview=_macro_preview(**preview_fields)),
+            saved,
+        ]
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3849,10 +3878,10 @@ def test_apply_macro_sends_each_allowlisted_field_from_the_preview(
 
 def test_apply_macro_refuses_a_tag_action_when_the_preview_has_no_tags(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro([{"field": "current_tags", "value": "x"}]),
-            _macro_preview(tags=None),
-        ]
+        side_effect=_macro_reads(
+            [{"field": "current_tags", "value": "x"}],
+            preview=_macro_preview(tags=None),
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3862,7 +3891,7 @@ def test_apply_macro_refuses_a_tag_action_when_the_preview_has_no_tags(monkeypat
 
     assert result["status"] == "error"
     assert "no tag list" in result["message"]
-    assert mock_request.call_count == 2
+    assert mock_request.call_count == 4
 
 
 def test_apply_macro_surfaces_a_missing_macro(monkeypatch):
@@ -3893,11 +3922,7 @@ def test_apply_macro_never_reports_a_saved_change_as_an_error(monkeypatch):
     )
     token = _preview_token(monkeypatch, tags=many_tags)
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(tags=many_tags),
-            saved,
-        ]
+        side_effect=[*_macro_reads(preview=_macro_preview(tags=many_tags)), saved]
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 300)
@@ -3919,12 +3944,11 @@ def test_apply_macro_refuses_when_the_macro_renders_differently_at_save(
     # rendered comment is not what the user approved.
     token = _preview_token(monkeypatch)
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(
+        side_effect=_macro_reads(
+            preview=_macro_preview(
                 comment={"body": "Internal only", "html_body": "<p>Internal only</p>"}
-            ),
-        ]
+            )
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -3934,6 +3958,8 @@ def test_apply_macro_refuses_when_the_macro_renders_differently_at_save(
 
     assert result["status"] == "error"
     assert [call.kwargs["method"] for call in mock_request.call_args_list] == [
+        "GET",
+        "GET",
         "GET",
         "GET",
     ]
@@ -3945,9 +3971,7 @@ def test_apply_macro_reports_a_committed_save_as_success_under_a_tiny_cap(
 ):
     token = _preview_token(monkeypatch)
     saved = MockResponse(json_data={"ticket": {"id": 1}, "audit": {"events": []}})
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(), saved]
-    )
+    mock_request = Mock(side_effect=[*_macro_reads(), saved])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: cap)
 
@@ -3955,24 +3979,24 @@ def test_apply_macro_reports_a_committed_save_as_success_under_a_tiny_cap(
 
     assert len(raw) <= cap
     assert json.loads(raw)["status"] == "success"
-    assert mock_request.call_count == 3
+    assert mock_request.call_count == 5
     assert mock_request.call_args.kwargs["method"] == "PUT"
 
 
 @pytest.mark.parametrize(
-    "macro_response",
+    "macro_kwargs",
     [
         # Another macro than the one previewed.
-        lambda: _macro(_PROBE_MACRO_ACTIONS, macro_id=6),
+        {"macro_id": 6},
         # The previewed macro, edited after the preview.
-        lambda: _macro(_PROBE_MACRO_ACTIONS, updated_at="2026-10-30T09:00:00Z"),
+        {"updated_at": "2026-10-30T09:00:00Z"},
     ],
 )
 def test_apply_macro_refuses_a_token_from_another_macro_or_version(
-    monkeypatch, macro_response
+    monkeypatch, macro_kwargs
 ):
     token = _preview_token(monkeypatch)
-    mock_request = Mock(side_effect=[macro_response(), _macro_preview()])
+    mock_request = Mock(side_effect=_macro_reads(**macro_kwargs))
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
@@ -3984,14 +4008,14 @@ def test_apply_macro_refuses_a_token_from_another_macro_or_version(
     assert [call.kwargs["method"] for call in mock_request.call_args_list] == [
         "GET",
         "GET",
+        "GET",
+        "GET",
     ]
 
 
 def test_apply_macro_refuses_a_token_from_another_ticket(monkeypatch):
     token = _preview_token(monkeypatch)
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(id=2)]
-    )
+    mock_request = Mock(side_effect=_macro_reads(preview=_macro_preview(id=2)))
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
@@ -4000,14 +4024,14 @@ def test_apply_macro_refuses_a_token_from_another_ticket(monkeypatch):
 
     assert result["status"] == "error"
     assert "changed since" in result["message"]
-    assert mock_request.call_count == 2
+    assert mock_request.call_count == 4
 
 
 def test_apply_macro_gives_no_token_for_a_preview_too_large_to_show(monkeypatch):
     # A token for changes the caller never saw would let it save them.
     many_tags = [f"tag_{i:03d}" for i in range(300)]
     mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(tags=many_tags)]
+        side_effect=_macro_reads(preview=_macro_preview(tags=many_tags))
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
     monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 1500)
@@ -4021,10 +4045,10 @@ def test_apply_macro_gives_no_token_for_a_preview_too_large_to_show(monkeypatch)
 
 def test_apply_macro_marks_a_plain_text_comment(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro([{"field": "comment_value", "value": "Hello"}]),
-            _macro_preview(comment={"body": "Hello Jane", "html_body": ""}),
-        ]
+        side_effect=_macro_reads(
+            [{"field": "comment_value", "value": "Hello"}],
+            preview=_macro_preview(comment={"body": "Hello Jane", "html_body": ""}),
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -4039,9 +4063,7 @@ def test_apply_macro_marks_a_plain_text_comment(monkeypatch):
 
 def _save_after_preview(monkeypatch, third):
     token = _preview_token(monkeypatch)
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(), third]
-    )
+    mock_request = Mock(side_effect=[*_macro_reads(), third])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
     result = json.loads(
         zendesk.zendesk_apply_macro(1, 5, dry_run=False, preview_token=token)
@@ -4065,13 +4087,14 @@ def test_apply_macro_warns_a_save_may_have_applied_when_the_outcome_is_unknown(
     assert result["status"] == "error"
     assert "may have been applied" in result["message"]
     assert "zendesk_get_ticket" in result["message"]
-    assert mock_request.call_count == 3
+    assert mock_request.call_count == 5
 
 
 def test_apply_macro_does_not_warn_for_a_5xx_before_saving(monkeypatch):
     mock_request = Mock(
         side_effect=[
             _macro(_PROBE_MACRO_ACTIONS),
+            _no_attachments(),
             MockResponse(json_data={"error": "Oops"}, status_code=503),
         ]
     )
@@ -4086,10 +4109,7 @@ def test_apply_macro_does_not_warn_for_a_5xx_before_saving(monkeypatch):
 
 def test_apply_macro_refuses_a_preview_without_updated_at(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            _macro_preview(_drop=("updated_at",)),
-        ]
+        side_effect=_macro_reads(preview=_macro_preview(_drop=("updated_at",)))
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -4101,10 +4121,7 @@ def test_apply_macro_refuses_a_preview_without_updated_at(monkeypatch):
 
 def test_apply_macro_refuses_a_preview_without_a_ticket(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro(_PROBE_MACRO_ACTIONS),
-            MockResponse(json_data={"result": {}}),
-        ]
+        side_effect=_macro_reads(preview=MockResponse(json_data={"result": {}}))
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -4116,10 +4133,10 @@ def test_apply_macro_refuses_a_preview_without_a_ticket(monkeypatch):
 
 def test_apply_macro_refuses_a_preview_missing_a_field_it_sets(monkeypatch):
     mock_request = Mock(
-        side_effect=[
-            _macro([{"field": "status", "value": "pending"}]),
-            _macro_preview(_drop=("status",)),
-        ]
+        side_effect=_macro_reads(
+            [{"field": "status", "value": "pending"}],
+            preview=_macro_preview(_drop=("status",)),
+        )
     )
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
@@ -4134,9 +4151,7 @@ def test_apply_macro_accepts_a_token_with_surrounding_whitespace(monkeypatch):
         json_data={"ticket": {"id": 1, "status": "pending"}, "audit": {"events": []}}
     )
     token = _preview_token(monkeypatch)
-    mock_request = Mock(
-        side_effect=[_macro(_PROBE_MACRO_ACTIONS), _macro_preview(), saved]
-    )
+    mock_request = Mock(side_effect=[*_macro_reads(), saved])
     monkeypatch.setattr(zendesk._session, "request", mock_request)
 
     result = json.loads(
@@ -4144,5 +4159,79 @@ def test_apply_macro_accepts_a_token_with_surrounding_whitespace(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert mock_request.call_args_list[2].kwargs["method"] == "PUT"
-    assert mock_request.call_count == 3
+    assert mock_request.call_args_list[4].kwargs["method"] == "PUT"
+    assert mock_request.call_count == 5
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["preview", "save"])
+def test_apply_macro_refuses_a_macro_with_attached_files(monkeypatch, dry_run):
+    # Attached files are a separate resource, not in `actions`: saving would
+    # post the comment without them.
+    token = _preview_token(monkeypatch) if not dry_run else None
+    attached = MockResponse(
+        json_data={"macro_attachments": [{"id": 1, "filename": "guide.pdf"}]}
+    )
+    mock_request = Mock(side_effect=[_macro(_PROBE_MACRO_ACTIONS), attached])
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    raw = zendesk.zendesk_apply_macro(
+        1, 5, dry_run=dry_run, preview_token=token if not dry_run else None
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "error"
+    assert "attached files" in result["message"]
+    assert "preview_token" not in raw
+    assert mock_request.call_count == 2
+    assert mock_request.call_args.kwargs["url"].endswith("/macros/5/attachments.json")
+    assert all(call.kwargs["method"] == "GET" for call in mock_request.call_args_list)
+
+
+def test_apply_macro_refuses_when_zendesk_does_not_say_about_attachments(
+    monkeypatch,
+):
+    mock_request = Mock(
+        side_effect=[_macro(_PROBE_MACRO_ACTIONS), MockResponse(json_data={})]
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    raw = zendesk.zendesk_apply_macro(1, 5)
+    result = json.loads(raw)
+
+    assert result["status"] == "error"
+    assert "didn't say whether this macro has attached files" in result["message"]
+    assert "preview_token" not in raw
+    assert mock_request.call_count == 2
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["preview", "save"])
+def test_apply_macro_refuses_when_the_macro_gains_an_action_while_it_is_applied(
+    monkeypatch, dry_run
+):
+    # The allowlist ran on the first macro read. An admin adding an
+    # unsupported action before the render leaves the render, and so the
+    # write digest, unchanged: only the second macro read can tell.
+    token = _preview_token(monkeypatch) if not dry_run else None
+    mock_request = Mock(
+        side_effect=[
+            _macro(_PROBE_MACRO_ACTIONS),
+            _no_attachments(),
+            _macro_preview(),
+            _macro(
+                [*_PROBE_MACRO_ACTIONS, {"field": "cc", "value": "42"}],
+                updated_at="2026-10-29T00:00:05Z",
+            ),
+        ]
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    raw = zendesk.zendesk_apply_macro(
+        1, 5, dry_run=dry_run, preview_token=token if not dry_run else None
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "error"
+    assert "changed while it was being applied" in result["message"]
+    assert "preview_token" not in raw
+    assert mock_request.call_count == 4
+    assert all(call.kwargs["method"] == "GET" for call in mock_request.call_args_list)

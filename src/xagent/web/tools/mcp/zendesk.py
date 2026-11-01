@@ -1851,7 +1851,8 @@ def zendesk_apply_macro(
     tags, or add a comment can be applied. A macro with any other action
     (for example a side conversation, CCs, a custom field, or a custom
     ticket status) is refused before anything is saved, listing the
-    actions it can't apply, and so is an inactive macro.
+    actions it can't apply, and so is an inactive macro or one with
+    attached files.
     The comment is public unless the macro marks it internal. In the
     reported changes, `body_is_html` marks a comment body that is HTML.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
@@ -1892,12 +1893,44 @@ def zendesk_apply_macro(
         if not fields - {_MACRO_COMMENT_MODE_ACTION}:
             raise ValueError("this macro has no actions to apply")
 
+        # Attached files are a separate resource, not in `actions`; applying
+        # the macro without them would silently drop them.
+        attachments = _request("GET", f"/macros/{macro_path_id}/attachments.json")
+        macro_attachments = (
+            attachments.get("macro_attachments")
+            if isinstance(attachments, dict)
+            else None
+        )
+        if not isinstance(macro_attachments, list):
+            raise RuntimeError(
+                "Zendesk didn't say whether this macro has attached files; "
+                "nothing was saved"
+            )
+        if macro_attachments:
+            raise ValueError(
+                "this macro has attached files, which this connector can't add "
+                "to the ticket; nothing was saved. Apply it in the Zendesk "
+                "agent UI instead."
+            )
+
         # The ticket-scoped preview, not GET /macros/{id}/apply: only this
         # one renders placeholders, and it carries the final tag set and the
         # updated_at the save is pinned to.
         preview = _request(
             "GET", f"/tickets/{ticket_path_id}/macros/{macro_path_id}/apply.json"
         )
+        # The render can't be trusted to reflect the definition the allowlist
+        # checked: an action added since that read (e.g. cc) wouldn't show in
+        # the rendered output, so compare the definition itself.
+        reread = _unwrap(_request("GET", f"/macros/{macro_path_id}.json"), "macro")
+        if any(
+            reread.get(key) != macro.get(key)
+            for key in ("updated_at", "active", "actions")
+        ):
+            raise ValueError(
+                "the macro changed while it was being applied; nothing was "
+                "saved. Preview again."
+            )
         preview_ticket = (
             (preview.get("result") or {}).get("ticket")
             if isinstance(preview, dict)
