@@ -1022,28 +1022,36 @@ _ALLOWED_MACRO_ACTIONS = (
 def _macro_comment_is_public(actions: list[dict[str, Any]]) -> bool:
     """The macro's comment visibility. Without a comment_mode_is_public
     action the comment is public, the agent UI's default reply mode. An
-    unrecognized value is refused rather than guessed: a wrong guess posts
-    an internal note to the customer."""
-    for action in actions:
-        if action.get("field") != _MACRO_COMMENT_MODE_ACTION:
-            continue
-        value = action.get("value")
-        normalized = str(value).strip().lower()
-        if normalized in ("true", "false"):
-            return normalized == "true"
+    unrecognized value, or more than one such action, is refused rather
+    than guessed: a wrong guess posts an internal note to the customer."""
+    modes = [
+        action.get("value")
+        for action in actions
+        if action.get("field") == _MACRO_COMMENT_MODE_ACTION
+    ]
+    if len(modes) > 1:
         raise ValueError(
-            f"the macro sets {_MACRO_COMMENT_MODE_ACTION} to {value!r}, which "
-            "is not true or false; nothing was saved"
+            f"the macro sets {_MACRO_COMMENT_MODE_ACTION} more than once, so "
+            "whether the comment is public is ambiguous; nothing was saved"
         )
-    return True
+    if not modes:
+        return True
+    normalized = str(modes[0]).strip().lower()
+    if normalized in ("true", "false"):
+        return normalized == "true"
+    raise ValueError(
+        f"the macro sets {_MACRO_COMMENT_MODE_ACTION} to {modes[0]!r}, which "
+        "is not true or false; nothing was saved"
+    )
 
 
 def _build_apply_macro_response(payload: dict[str, Any]) -> str:
     """Cap an apply-macro response, shrinking in order of what the caller
     loses least: the reported comment body, then the saved ticket's summary
-    (down to its id), then the change details. A saved result is never
-    turned into an error, down to the smallest success envelope: an error
-    invites a retry, and a retry of a save posts the comment again."""
+    (down to its id), then the change details. Unless the cap is below the
+    smallest success envelope, it never turns a saved result into an
+    error: an error invites a retry, and a retry of a save posts the
+    comment again."""
     max_output_length = get_tool_max_output_length()
     response = _success(**payload)
     comment = payload["changes"].get("comment")
@@ -1082,7 +1090,7 @@ def _build_apply_macro_response(payload: dict[str, Any]) -> str:
     if len(response) > max_output_length:
         payload = {**payload, "truncated": True, "changes": {"truncated": True}}
         response = _success(**payload)
-    if len(response) > max_output_length and not payload["dry_run"]:
+    if len(response) > max_output_length:
         # The save is committed: keep shrinking to the smallest success
         # envelope rather than let the cap turn it into an error.
         for fallback in (
@@ -1851,8 +1859,8 @@ def zendesk_apply_macro(
     tags, or add a comment can be applied. A macro with any other action
     (for example a side conversation, CCs, a custom field, or a custom
     ticket status) is refused before anything is saved, listing the
-    actions it can't apply, and so is an inactive macro or one with
-    attached files.
+    actions it can't apply, and so is an inactive macro, one with
+    attached files, or one that sets the comment visibility more than once.
     The comment is public unless the macro marks it internal. In the
     reported changes, `body_is_html` marks a comment body that is HTML.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
@@ -1963,15 +1971,13 @@ def zendesk_apply_macro(
             comment = preview_ticket.get("comment") or {}
             html_body = comment.get("html_body")
             body = comment.get("body")
-            if html_body:
-                update["comment"] = {"html_body": html_body, "public": public}
-            elif body:
-                update["comment"] = {"body": body, "public": public}
-            else:
+            key, text = ("html_body", html_body) if html_body else ("body", body)
+            if not text:
                 raise RuntimeError(
                     "Zendesk's preview of this macro has an empty comment; "
                     "nothing was saved"
                 )
+            update["comment"] = {key: text, "public": public}
             changes["comment"] = {
                 "body": html_body or body,
                 "body_is_html": bool(html_body),
@@ -1992,16 +1998,16 @@ def zendesk_apply_macro(
         write_digest = hashlib.sha256(
             json.dumps(update, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()[:32]
-        token = "|".join(
+        stamps = "|".join(
             str(part)
             for part in (
                 preview_ticket.get("id"),
                 preview_stamp,
                 macro.get("id"),
                 macro.get("updated_at"),
-                write_digest,
             )
         )
+        token = f"{stamps}|{write_digest}"
         payload: dict[str, Any] = {
             "dry_run": dry_run,
             "ticket_id": preview_ticket.get("id"),
@@ -2013,16 +2019,25 @@ def zendesk_apply_macro(
             return _build_apply_macro_response(payload)
 
         if token != preview_token:
+            if preview_token and preview_token.rsplit("|", 1)[0] == stamps:
+                raise ValueError(
+                    "the macro renders differently than in the preview this "
+                    "preview_token came from (for example the requester's "
+                    "details changed, or a placeholder depends on the time); "
+                    "nothing was saved. Preview again and confirm the new "
+                    "changes; if it keeps rendering differently, apply it in "
+                    "the Zendesk agent UI."
+                )
             raise ValueError(
                 "the ticket or the macro changed since the preview this "
                 "preview_token came from, or it is from another ticket or "
                 "macro; nothing was saved. Preview again and confirm the new "
                 "changes."
             )
-        # safe_update pinned to the approved preview: Zendesk answers 409 and
-        # saves nothing if the ticket changes between this check and the
-        # save. It also makes a retry after a successful save fail instead of
-        # posting the comment twice, since the save itself moves updated_at.
+        # The token check above already refuses a retry after a successful
+        # save, since the save moved updated_at. safe_update pinned to the
+        # approved preview covers the rest: Zendesk answers 409 and saves
+        # nothing if the ticket changes between that check and this save.
         try:
             result = _request(
                 "PUT",

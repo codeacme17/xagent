@@ -3623,6 +3623,44 @@ def test_apply_macro_keeps_an_internal_comment_internal(monkeypatch, mode):
     assert result["changes"]["comment"]["public"] is False
 
 
+@pytest.mark.parametrize("mode", [True, "true", " TRUE "])
+def test_apply_macro_posts_a_public_comment_when_the_macro_says_so(monkeypatch, mode):
+    actions = [
+        *_PROBE_MACRO_ACTIONS,
+        {"field": "comment_mode_is_public", "value": mode},
+    ]
+    token = _preview_token(monkeypatch, actions)
+    saved = MockResponse(json_data={"ticket": {"id": 1}, "audit": {"events": []}})
+    mock_request = Mock(side_effect=[*_macro_reads(actions), saved])
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_apply_macro(1, 5, dry_run=False, preview_token=token)
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["ticket"]["comment"]["public"] is True
+    assert result["changes"]["comment"]["public"] is True
+
+
+@pytest.mark.parametrize("modes", [[True, False], ["true", "maybe"]])
+def test_apply_macro_refuses_a_comment_mode_set_more_than_once(monkeypatch, modes):
+    actions = [
+        *_PROBE_MACRO_ACTIONS,
+        *({"field": "comment_mode_is_public", "value": mode} for mode in modes),
+    ]
+    mock_request = Mock(side_effect=[_macro(actions)])
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_apply_macro(1, 5, dry_run=False, preview_token=_UNUSED_TOKEN)
+    )
+
+    assert result["status"] == "error"
+    assert "more than once" in result["message"]
+    assert mock_request.call_count == 1
+
+
 def test_apply_macro_refuses_an_unrecognized_comment_mode(monkeypatch):
     actions = [
         *_PROBE_MACRO_ACTIONS,
@@ -3939,9 +3977,9 @@ def test_apply_macro_never_reports_a_saved_change_as_an_error(monkeypatch):
 def test_apply_macro_refuses_when_the_macro_renders_differently_at_save(
     monkeypatch,
 ):
-    # An admin edit between the save's macro read and its apply read: the
-    # macro version and the ticket stamp still match the preview, but the
-    # rendered comment is not what the user approved.
+    # The macro definition and the ticket stamp are unchanged, but the
+    # placeholder renders differently (for example the requester's details
+    # changed), so the rendered comment is not what the user approved.
     token = _preview_token(monkeypatch)
     mock_request = Mock(
         side_effect=_macro_reads(
@@ -3957,12 +3995,41 @@ def test_apply_macro_refuses_when_the_macro_renders_differently_at_save(
     )
 
     assert result["status"] == "error"
+    assert "renders differently" in result["message"]
     assert [call.kwargs["method"] for call in mock_request.call_args_list] == [
         "GET",
         "GET",
         "GET",
         "GET",
     ]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        # No stamps at all.
+        lambda token: _UNUSED_TOKEN,
+        # Another ticket's token.
+        lambda token: "9|" + token.split("|", 1)[1],
+        # Another macro version.
+        lambda token: token.replace("|2026-10-29T", "|2026-10-28T", 1),
+    ],
+)
+def test_apply_macro_names_a_changed_ticket_or_macro_when_the_token_is_stale(
+    monkeypatch, tamper
+):
+    token = tamper(_preview_token(monkeypatch))
+    mock_request = Mock(side_effect=_macro_reads())
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_apply_macro(1, 5, dry_run=False, preview_token=token)
+    )
+
+    assert result["status"] == "error"
+    assert "changed since the preview" in result["message"]
+    assert "renders differently" not in result["message"]
+    assert "PUT" not in [call.kwargs["method"] for call in mock_request.call_args_list]
 
 
 @pytest.mark.parametrize("cap", [60, 40, 22])
